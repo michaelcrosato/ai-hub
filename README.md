@@ -3,7 +3,8 @@
 An arcade wall for games built by AI models. Every game is one self-contained
 HTML file; the hub finds them, dresses them, and gets out of the way.
 
-**Live:** _(filled in on first deploy)_
+**Live:** <https://crosato-arcade.vercel.app> — public, no sign-in. This repo
+stays private; only the built site is reachable.
 
 ---
 
@@ -18,6 +19,10 @@ games/Whatever_You_Called_It.html
 Push it, and Vercel rebuilds the wall. No code to touch, no list to edit, no
 naming rules to remember — mixed case, spaces, underscores and hyphens are all
 fine.
+
+```bash
+git add games/ && git commit -m "Add Whatever You Called It" && git push
+```
 
 ### Where the game's details come from
 
