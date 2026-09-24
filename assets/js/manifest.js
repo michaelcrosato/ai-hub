@@ -14,14 +14,17 @@ export const NOT_A_FACET = new Set([
   'slug', 'name', 'tagline', 'description', 'title', 'search', 'path', 'cover',
   'icon', 'themeColor', 'version', 'added', 'updated', 'bytes', 'buildCount',
   'builds', 'lang', 'file', 'id', 'label', 'hub', 'hidden', 'addedAt', 'updatedAt',
+  // `type` has its own control — the shelf buttons — and `restricted` is a
+  // switch, not something to browse by.
+  'type', 'restricted',
   // Reserved by the router's query string: a facet may not shadow these.
-  'q', 'sort', 'fav',
+  'q', 'sort', 'fav', 'shelf',
 ]);
 
 /** Rails that exist are still found, never declared; these few just go first
  *  when they do, because they are how people actually browse. A field nobody
  *  fills in simply never shows up. */
-const LEAD = ['genre', 'collection', 'type', 'players'];
+const LEAD = ['genre', 'collection', 'players'];
 
 /** A rail needs at least this many distinct values, and this many games covered. */
 const MIN_VALUES = 2;

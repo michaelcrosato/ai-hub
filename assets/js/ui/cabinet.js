@@ -49,6 +49,8 @@ function screen(game) {
     { class: 'cab__screen' },
     art,
     game.buildCount > 1 && h('span', { class: 'cab__badge' }, plural(game.buildCount, 'build')),
+    // Only ever seen with dev settings showing everything.
+    game.restricted === true && h('span', { class: 'cab__flag' }, 'Hidden'),
     h('span', { class: 'cab__glass' })
   );
 }
@@ -86,8 +88,11 @@ export function cabinet(game, index = 0) {
             { class: 'cab__info', href: `#/g/${game.slug}` },
             infoLabel
           ),
-          // Genre when the catalogue has one; size is the fallback fact.
-          h('span', {}, game.genre || bytes(game.bytes))
+          // Genre when the catalogue has one; size is the fallback fact. Dev
+          // settings can swap in the slug, the key everything else hangs off.
+          store.dev().showSlugs
+            ? h('code', { class: 'cab__slug' }, `${game.slug} · ${bytes(game.bytes)}`)
+            : h('span', {}, game.genre || bytes(game.bytes))
         )
       ),
       faveButton(game)

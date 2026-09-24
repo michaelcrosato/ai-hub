@@ -118,6 +118,8 @@ export function createPlayer(root, { onExit }) {
   /* --- opening ---------------------------------------------------------- */
 
   function standalonePanel(game, build) {
+    // Either this one game was sent to a plain tab, or dev settings send them all.
+    const everyGame = store.dev().alwaysStandalone && !store.prefersStandalone(game.slug);
     return h(
       'div',
       { class: 'player__bail' },
@@ -125,7 +127,9 @@ export function createPlayer(root, { onExit }) {
       h(
         'p',
         {},
-        'You asked for this one to run outside the hub, so it gets a plain tab of its own with nothing wrapped around it.'
+        everyGame
+          ? 'Dev settings are set to open every game in a plain tab, with nothing wrapped around it.'
+          : 'You asked for this one to run outside the hub, so it gets a plain tab of its own with nothing wrapped around it.'
       ),
       h('a', { href: build.path, target: '_blank', rel: 'noopener' }, 'Open it now'),
       h(
@@ -133,11 +137,12 @@ export function createPlayer(root, { onExit }) {
         {
           type: 'button',
           onclick: () => {
-            store.setStandalone(game.slug, false);
+            if (everyGame) store.setDev({ alwaysStandalone: false });
+            else store.setStandalone(game.slug, false);
             open(game, build);
           },
         },
-        'Try it inside the hub again'
+        everyGame ? 'Play inside the hub again' : 'Try it inside the hub again'
       )
     );
   }
@@ -151,7 +156,7 @@ export function createPlayer(root, { onExit }) {
     Object.entries(paletteVars(palette)).forEach(([k, v]) => root.style.setProperty(k, v));
     clear(root);
 
-    if (store.prefersStandalone(game.slug)) {
+    if (store.prefersStandalone(game.slug) || store.dev().alwaysStandalone) {
       root.append(exitBar(game, build, { standalone: true }), standalonePanel(game, build));
       session = { game, build, unbind: [], idle: 0 };
       return;

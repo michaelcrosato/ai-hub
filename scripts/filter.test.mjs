@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { normalize, deriveFacets, matchesFacet } from '../assets/js/manifest.js';
-import { selectGames, facetCounts } from '../assets/js/filter.js';
+import { selectGames, facetCounts, shelfOf } from '../assets/js/filter.js';
 
 const stats = { isFave: () => false, plays: () => 0, lastPlayed: () => 0 };
 const state = (patch = {}) => ({ query: '', sort: 'name', favesOnly: false, facets: {}, ...patch });
@@ -52,4 +52,23 @@ test('single-pass facet counts match counting option by option', () => {
     }
   }
   assert.equal(matchesFacet(library[0], 'tags', 'retro'), true);
+});
+
+test('shelves split by type, uncatalogued games are games, restricted ones stay off the wall', () => {
+  const lib = [
+    normalize({ slug: 'a', name: 'A' }),
+    normalize({ slug: 'b', name: 'B', type: 'Game' }),
+    normalize({ slug: 'c', name: 'C', type: 'Tech demo' }),
+    normalize({ slug: 'd', name: 'D', type: 'Tool' }),
+    normalize({ slug: 'e', name: 'E', type: 'Website' }),
+    normalize({ slug: 'f', name: 'F', type: 'Game', restricted: true }),
+  ];
+  assert.deepEqual(lib.map(shelfOf), ['games', 'games', 'demos', 'tools', 'tools', 'games']);
+  const slugs = (patch) => selectGames(lib, state(patch), stats).map((g) => g.slug);
+  assert.deepEqual(slugs({ shelf: 'games' }), ['a', 'b']);
+  assert.deepEqual(slugs({ shelf: 'games', showAll: true }), ['a', 'b', 'f']);
+  assert.deepEqual(slugs({ shelf: 'tools' }), ['d', 'e']);
+  assert.deepEqual(slugs({ shelf: null }), ['a', 'b', 'c', 'd', 'e']);
+  const genreless = facetCounts(lib, state({ shelf: 'demos' }), stats, []);
+  assert.equal(genreless.size, 0);
 });

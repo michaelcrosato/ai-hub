@@ -6,17 +6,32 @@
  * only ever rebuilt when the filter state actually changes, which is why a
  * play session returns you to the same scroll position with the same search
  * still typed.
+ *
+ * The wall shows one shelf at a time — Games, Tech demos, Tools & websites —
+ * and the rails are worked out for the shelf in view, so a Games wall never
+ * offers a "Tech Demo" genre with nothing behind it.
  */
 
 import { h } from './dom.js';
 import { loadManifest, deriveFacets } from './manifest.js';
-import { selectGames, facetCounts, DEFAULT_SORT, SORTS } from './filter.js';
+import {
+  selectGames,
+  facetCounts,
+  DEFAULT_SORT,
+  SORTS,
+  SHELVES,
+  DEFAULT_SHELF,
+  shelfOf,
+  isVisible,
+} from './filter.js';
 import { store } from './store.js';
 import { router } from './router.js';
 import { createGrid } from './ui/grid.js';
 import { createControls } from './ui/controls.js';
+import { createShelves } from './ui/shelves.js';
 import { createDetail } from './ui/detail.js';
 import { createPlayer } from './ui/player.js';
+import { createDev } from './ui/dev.js';
 
 const wallEl = document.getElementById('wall');
 const countEl = document.getElementById('count');
@@ -29,6 +44,7 @@ const stats = {
   lastPlayed: (slug) => store.lastPlayed(slug),
 };
 
+let manifest = { games: [] };
 let games = [];
 let facets = [];
 let bySlug = new Map();
@@ -37,16 +53,34 @@ let showing = [];
 let hops = 0;
 let scrollBeforePlay = 0;
 
+/* --- what is on the wall ------------------------------------------------- */
+
+const showAll = () => store.dev().showAll;
+
+/** Rails for one shelf, remembered until the shelf or visibility changes. */
+const facetCache = new Map();
+function facetsFor(shelf) {
+  const key = `${shelf}|${showAll()}`;
+  if (!facetCache.has(key)) {
+    facetCache.set(key, deriveFacets(games.filter((g) => isVisible(g, showAll()) && shelfOf(g) === shelf)));
+  }
+  return facetCache.get(key);
+}
+
 /* --- state lives in the URL --------------------------------------------- */
 
 function readState(query) {
+  const shelf = query.get('shelf') || DEFAULT_SHELF;
   const state = {
+    shelf: SHELVES.some((s) => s.key === shelf) ? shelf : DEFAULT_SHELF,
+    showAll: showAll(),
     query: query.get('q') || '',
     sort: query.get('sort') || store.ui().sort || DEFAULT_SORT,
     favesOnly: query.get('fav') === '1',
     facets: {},
   };
   if (!SORTS.some((s) => s.key === state.sort)) state.sort = DEFAULT_SORT;
+  facets = facetsFor(state.shelf);
   for (const facet of facets) {
     const raw = query.get(facet.key);
     if (raw) state.facets[facet.key] = raw.split(',').filter(Boolean);
@@ -55,17 +89,30 @@ function readState(query) {
 }
 
 // The fave count joins the key only while the Favourites filter is on, so
-// un-starring a game inside that view actually removes it from the wall.
+// un-starring a game inside that view actually removes it from the wall. The
+// dev settings join it because they change what a cabinet shows.
 const stateKey = (state) =>
   JSON.stringify([
+    state.shelf,
     state.query,
     state.sort,
     state.favesOnly,
     state.facets,
     state.favesOnly ? store.faveCount() : 0,
+    store.dev(),
   ]);
 
 /* --- views --------------------------------------------------------------- */
+
+const shelves = createShelves(document.getElementById('shelves'), {
+  onSelect(shelf) {
+    // A genre picked on one shelf rarely exists on another, so switching
+    // shelves starts its rails fresh. The search stays: it travels well.
+    const patch = { shelf: shelf === DEFAULT_SHELF ? '' : shelf };
+    for (const facet of facets) patch[facet.key] = '';
+    router.setQuery(patch);
+  },
+});
 
 const controls = createControls(document.getElementById('controls'), {
   railsRoot: document.getElementById('filters'),
@@ -73,12 +120,12 @@ const controls = createControls(document.getElementById('controls'), {
     if (patch.sort) store.setUi({ sort: patch.sort });
     router.setQuery(patch);
   },
-  // Drawn from what the filters leave showing, so "Surprise me" inside a
-  // collection stays inside it.
   onDensity(next) {
     store.setUi({ density: next });
     applyDensity();
   },
+  // Drawn from what the shelf and filters leave showing, so "Surprise me"
+  // on the Games shelf is always a game.
   onSurprise() {
     if (!showing.length) return;
     const game = showing[Math.floor(Math.random() * showing.length)];
@@ -94,12 +141,19 @@ const player = createPlayer(document.getElementById('player'), {
   onExit: () => (hops > 1 ? history.back() : router.go('/', { replace: true })),
 });
 
-function renderCount(shown) {
+const dev = createDev(document.getElementById('dev'), { library: () => manifest });
+
+function renderCount(state, shown) {
+  const shelf = SHELVES.find((s) => s.key === state.shelf);
+  const total = games.filter((g) => isVisible(g, state.showAll) && shelfOf(g) === state.shelf).length;
+  const noun = (n) => shelf.noun[n === 1 ? 0 : 1];
   countEl.replaceChildren(
     h('b', {}, String(shown)),
-    shown === games.length
-      ? `${games.length === 1 ? 'game' : 'games'} on the wall`
-      : `of ${games.length} games`
+    shown === total ? `${noun(total)} on the wall` : `of ${total} ${noun(total)}`,
+    // A reminder that this is not the wall everyone else sees.
+    ...(state.showAll
+      ? [h('button', { type: 'button', class: 'sign__dev', onclick: () => dev.open() }, 'Dev: showing hidden content')]
+      : [])
   );
 }
 
@@ -109,8 +163,12 @@ function renderWall(state) {
   const visible = selectGames(games, state, stats);
   showing = visible;
 
+  const perShelf = new Map(
+    SHELVES.map((s) => [s.key, games.filter((g) => isVisible(g, state.showAll) && shelfOf(g) === s.key).length])
+  );
+  shelves.render(state.shelf, perShelf);
   controls.render(state, { facets, counts: facetCounts(games, state, stats, facets), shown: visible.length });
-  renderCount(visible.length);
+  renderCount(state, visible.length);
 
   if (!changed) return;
   const isRefine = lastKey !== '';
@@ -155,7 +213,14 @@ function onRoute(route) {
   const state = readState(route.query);
   renderWall(state);
 
-  const game = route.name === 'wall' ? null : bySlug.get(route.slug);
+  // A hidden game is not on the wall, and a link to one does not reach it
+  // either, unless dev settings are showing everything.
+  const found = route.name === 'wall' ? null : bySlug.get(route.slug);
+  const game = found && isVisible(found, state.showAll) ? found : null;
+  if (found && !game) {
+    router.go('/', { replace: true });
+    return;
+  }
 
   if (route.name === 'play' && game) {
     const build = findBuild(game, route.build);
@@ -163,6 +228,7 @@ function onRoute(route) {
     if (!already) {
       if (!player.isOpen()) scrollBeforePlay = window.scrollY;
       detail.close();
+      dev.close();
       player.open(game, build, { fromTile: grid.tile(game.slug) });
     }
     return;
@@ -185,13 +251,20 @@ function onRoute(route) {
   detail.close();
 }
 
-/* --- keyboard ------------------------------------------------------------ */
+/* --- keyboard, and the way into dev settings ------------------------------ */
 
 addEventListener('keydown', (event) => {
   if (player.isOpen()) return;
   const typing = /^(input|textarea|select)$/i.test(event.target?.tagName || '');
 
-  if (event.key === 'Escape' && detail.isOpen()) {
+  // Shift + F2: no browser claims it, and F2 already means "edit" to most
+  // people who would go looking for it.
+  if (event.key === 'F2' && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+    event.preventDefault();
+    dev.isOpen() ? dev.close() : dev.open();
+  } else if (event.key === 'Escape' && dev.isOpen()) {
+    dev.close();
+  } else if (event.key === 'Escape' && detail.isOpen()) {
     router.go('/');
   } else if (event.key === '/' && !typing && !event.metaKey && !event.ctrlKey) {
     event.preventDefault();
@@ -199,20 +272,32 @@ addEventListener('keydown', (event) => {
   }
 });
 
+// Phones have no F-keys: five quick taps on the sign's name instead.
+{
+  let taps = [];
+  document.querySelector('.sign__name')?.addEventListener('click', () => {
+    const now = performance.now();
+    taps = [...taps.filter((t) => now - t < 2500), now];
+    if (taps.length >= 5) {
+      taps = [];
+      dev.open();
+    }
+  });
+}
+
 /* --- go ------------------------------------------------------------------ */
 
 applyDensity();
 grid.message('Loading the wall…');
 
 loadManifest()
-  .then((manifest) => {
-    games = manifest.games;
-    facets = deriveFacets(games);
+  .then((loaded) => {
+    manifest = loaded;
+    games = loaded.games;
     bySlug = new Map(games.map((game) => [game.slug, game]));
 
     if (!games.length) {
       grid.message('No games yet. Drop an .html file into ', h('code', {}, 'games/'), ' and refresh.');
-      renderCount(0);
       return;
     }
 

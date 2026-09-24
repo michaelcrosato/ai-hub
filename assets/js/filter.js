@@ -29,6 +29,33 @@ export const SORTS = [
 
 export const DEFAULT_SORT = SORTS[0].key;
 
+/**
+ * The three shelves the wall is split into, by the catalogue's `type`. A game
+ * nobody has catalogued is a game: that is what almost everything dropped
+ * into games/ is.
+ */
+export const SHELVES = [
+  { key: 'games', label: 'Games', noun: ['game', 'games'], holds: (type) => !type || type === 'Game' },
+  { key: 'demos', label: 'Tech demos', noun: ['tech demo', 'tech demos'], holds: (type) => type === 'Tech demo' },
+  {
+    key: 'tools',
+    label: 'Tools & websites',
+    noun: ['tool or website', 'tools & websites'],
+    holds: (type) => type === 'Tool' || type === 'Website',
+  },
+];
+
+export const DEFAULT_SHELF = SHELVES[0].key;
+
+export const shelfOf = (game) => (SHELVES.find((s) => s.holds(game.type)) || SHELVES[0]).key;
+
+/** On the wall at all: restricted games only when dev settings ask for everything. */
+export const isVisible = (game, showAll) => showAll || game.restricted !== true;
+
+/** Visible and on the shelf being looked at. `state.shelf` of null means every shelf. */
+const inScope = (game, state) =>
+  isVisible(game, state.showAll) && (!state.shelf || shelfOf(game) === state.shelf);
+
 export const tokenize = (query) => fold(query).split(/\s+/).filter(Boolean);
 
 const hasAllTokens = (game, tokens) => tokens.every((t) => game.search.includes(t));
@@ -57,6 +84,7 @@ export function selectGames(games, state, stats) {
 
   let out = games.filter(
     (game) =>
+      inScope(game, state) &&
       (!state.favesOnly || stats.isFave(game.slug)) &&
       passesFacets(game, state.facets) &&
       (!tokens.length || hasAllTokens(game, tokens))
@@ -80,7 +108,10 @@ export function selectGames(games, state, stats) {
 export function facetCounts(games, state, stats, facets) {
   const tokens = tokenize(state.query);
   const pool = games.filter(
-    (game) => (!state.favesOnly || stats.isFave(game.slug)) && (!tokens.length || hasAllTokens(game, tokens))
+    (game) =>
+      inScope(game, state) &&
+      (!state.favesOnly || stats.isFave(game.slug)) &&
+      (!tokens.length || hasAllTokens(game, tokens))
   );
   const counts = new Map();
 

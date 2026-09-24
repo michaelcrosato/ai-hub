@@ -169,6 +169,12 @@ pause menu still works.
 If a game misbehaves in a frame, the ↗ button in the corner reopens it in a
 plain tab and remembers that choice for that game.
 
+The wall is split into three shelves, picked with the big buttons under the
+sign: **Games** (the default), **Tech demos**, and **Tools & websites**. The
+shelf comes from each game's `type` in `data/overrides.json`; anything not
+catalogued counts as a game. The filter rails under them are worked out per
+shelf.
+
 On a big wall: **Surprise me** plays a random game from whatever the search and
 filters are showing, and the grid button beside the sort switches to a compact
 wall with twice the cabinets per row (remembered per device). A rail with many
@@ -233,7 +239,27 @@ rest follow by how many games carry them. `docs/curation-2026-09-24.md`
 records how the library was curated: which file of each game was kept, and
 which older iterations it replaced.
 
-Setting `"hidden": true` keeps a game in the repo but off the wall.
+Setting `"hidden": true` drops a game from the catalogue entirely.
+`"restricted": true` keeps it in the catalogue but off the wall, where only dev
+settings can bring it back — used for the companionship-business sims.
+
+### Dev settings
+
+There is no button for them. **Shift + F2** opens them on a keyboard; on a
+phone, tap the "AI Hub" title five times quickly. A PIN is asked first (any of
+0000, 1111, 1234, 8888, 9999) and stays unlocked for that browser tab until
+you press Lock. Inside:
+
+- **Show all content** — restricted games appear, flagged *Hidden*, and the
+  sign shows a reminder while it is on
+- **Show slugs and file sizes on cabinets**
+- **Open every game in a plain tab** — for a game that misbehaves in the frame
+- **This device** — forget play history, favourites, or plain-tab choices
+- **Library** — counts per shelf, how many are hidden, size, when the
+  catalogue was built
+
+This is a lock for a shared screen, not security: the PINs live in the page's
+JavaScript, and every game is a public file.
 
 ## How it is put together
 

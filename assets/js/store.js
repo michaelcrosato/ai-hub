@@ -15,6 +15,9 @@ const EMPTY = {
   lastPlayed: {},
   standalone: {},
   ui: { sort: 'name' },
+  // Behind the PIN. Not security — the games are public files — just a way
+  // to keep grown-up and unfinished things off the wall on a shared device.
+  dev: { showAll: false, showSlugs: false, alwaysStandalone: false },
 };
 
 function read() {
@@ -22,7 +25,12 @@ function read() {
     const raw = localStorage.getItem(KEY);
     if (!raw) return structuredClone(EMPTY);
     const parsed = JSON.parse(raw);
-    return { ...structuredClone(EMPTY), ...parsed, ui: { ...EMPTY.ui, ...(parsed.ui || {}) } };
+    return {
+      ...structuredClone(EMPTY),
+      ...parsed,
+      ui: { ...EMPTY.ui, ...(parsed.ui || {}) },
+      dev: { ...EMPTY.dev, ...(parsed.dev || {}) },
+    };
   } catch {
     return structuredClone(EMPTY);
   }
@@ -78,6 +86,28 @@ export const store = {
   setStandalone(slug, on) {
     if (on) state.standalone[slug] = true;
     else delete state.standalone[slug];
+    commit();
+  },
+
+  standaloneCount: () => Object.keys(state.standalone).length,
+
+  dev: () => ({ ...state.dev }),
+
+  setDev(patch) {
+    state.dev = { ...state.dev, ...patch };
+    commit();
+  },
+
+  /** Forget part of what this device remembers: 'history', 'faves' or 'standalone'. */
+  forget(what) {
+    if (what === 'history') {
+      state.plays = {};
+      state.lastPlayed = {};
+    } else if (what === 'faves') {
+      state.faves = {};
+    } else if (what === 'standalone') {
+      state.standalone = {};
+    }
     commit();
   },
 
