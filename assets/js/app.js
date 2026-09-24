@@ -68,6 +68,7 @@ const stateKey = (state) =>
 /* --- views --------------------------------------------------------------- */
 
 const controls = createControls(document.getElementById('controls'), {
+  railsRoot: document.getElementById('filters'),
   onChange(patch) {
     if (patch.sort) store.setUi({ sort: patch.sort });
     router.setQuery(patch);

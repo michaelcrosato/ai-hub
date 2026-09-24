@@ -18,7 +18,13 @@ import { store } from '../store.js';
 /** Options a rail shows before folding the rest away. Chosen ones always show. */
 const RAIL_LIMIT = 8;
 
-export function createControls(root, { onChange, onSurprise, onDensity }) {
+/**
+ * @param root       the sticky strip: search, surprise, favourites, sort, density
+ * @param railsRoot  where the filter rails go — on the page, not in the sticky
+ *                   strip, because a library with five rails would otherwise
+ *                   pin a quarter of the screen
+ */
+export function createControls(root, { railsRoot = root, onChange, onSurprise, onDensity }) {
   const expanded = new Set();
   let last = null;
   const input = h('input', {
@@ -87,13 +93,13 @@ export function createControls(root, { onChange, onSurprise, onDensity }) {
 
   root.append(
     h('div', { class: 'hunt' }, input, clearButton),
-    rails,
     h('div', { class: 'controls__spacer' }),
     surprise,
     faves,
     sorter,
     density
   );
+  railsRoot.append(rails);
 
   const refold = (key, open) => {
     if (open) expanded.add(key);

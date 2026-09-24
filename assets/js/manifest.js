@@ -29,7 +29,7 @@ const MIN_COVERAGE = 2;
 /** Past a handful of values, a field whose values are nearly all different — a
  *  build id, an author URL — narrows nothing. It is searchable, never a rail. */
 const SMALL_RAIL = 8;
-const MAX_UNIQUE_SHARE = 0.75;
+const MAX_UNIQUE_SHARE = 0.6;
 
 /** Lowercase and accent-free, so "pokemon" finds "Pokémon". */
 export const fold = (text) =>
