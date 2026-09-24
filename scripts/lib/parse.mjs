@@ -196,17 +196,24 @@ export function parseHead(html) {
   }
 
   let icon = null;
+  let iconHref = null;
   for (const attrs of tagsOf(head, 'link')) {
     const rel = (attrs.rel || '').toLowerCase();
     if (!/\b(icon|shortcut icon|apple-touch-icon)\b/.test(rel)) continue;
-    const href = (attrs.href || '').trim();
-    // Only data: URIs travel. A relative href would resolve against the hub,
-    // not the game, and 404 on every tile.
+    const href = decodeEntities((attrs.href || '').trim());
+    // A data: URI travels anywhere. Anything else is kept as written and only
+    // used if scan.mjs can find the file next to the game — taken as-is it
+    // would resolve against the hub, not the game, and 404 on every tile.
     if (href.startsWith('data:')) {
-      icon = decodeEntities(href);
+      icon = href;
       break;
     }
+    if (href && !iconHref) iconHref = href;
   }
+
+  const image = decodeEntities(
+    (byName.get('og:image') || byName.get('twitter:image') || '').trim()
+  ) || null;
 
   return {
     title,
@@ -214,6 +221,8 @@ export function parseHead(html) {
     description: SQUISH(byName.get('description') || byName.get('og:description') || ''),
     themeColor: normalizeColor(byName.get('theme-color') || byName.get('msapplication-tilecolor')),
     icon,
+    iconHref: icon ? null : iconHref,
+    image,
     hub,
   };
 }
@@ -291,4 +300,32 @@ export function weightClass(bytes) {
   if (bytes < 1 * MB) return 'Lightweight';
   if (bytes < 4 * MB) return 'Middleweight';
   return 'Heavyweight';
+}
+
+// src="/assets/x.js", href='/style.css' — but not "//cdn…" or a bare "/".
+const ROOT_REF = /(\b(?:src|href|poster)\s*=\s*)(["'])\/(?![/"'])([^"'?#]*)([^"']*)\2/gi;
+
+/**
+ * Root-absolute references in a page (`/assets/index-3f2a.js`). A bundler
+ * configured for its own domain writes these, and inside the hub they resolve
+ * against the hub rather than the game's folder, so the game loads blank.
+ */
+export function rootAbsoluteRefs(html) {
+  const found = new Set();
+  for (const m of String(html || '').matchAll(ROOT_REF)) {
+    if (m[3]) found.add('/' + m[3]);
+  }
+  return [...found];
+}
+
+/**
+ * Rewrite root-absolute references to relative ones, for the paths `keep`
+ * says exist inside the project. `depth` is how many folders below the
+ * project root the page sits, so a nested page climbs back up correctly.
+ */
+export function relativizeRefs(html, keep, depth = 0) {
+  const up = depth > 0 ? '../'.repeat(depth) : './';
+  return String(html).replace(ROOT_REF, (whole, attr, quote, path, rest) =>
+    path && keep(path) ? `${attr}${quote}${up}${path}${rest}${quote}` : whole
+  );
 }

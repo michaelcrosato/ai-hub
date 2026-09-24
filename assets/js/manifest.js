@@ -13,14 +13,45 @@
 export const NOT_A_FACET = new Set([
   'slug', 'name', 'tagline', 'description', 'title', 'search', 'path', 'cover',
   'icon', 'themeColor', 'version', 'added', 'updated', 'bytes', 'buildCount',
-  'builds', 'lang', 'file', 'id', 'label', 'hub', 'hidden',
+  'builds', 'lang', 'file', 'id', 'label', 'hub', 'hidden', 'addedAt', 'updatedAt',
   // Reserved by the router's query string: a facet may not shadow these.
   'q', 'sort', 'fav',
 ]);
 
+/** Rails that exist are still found, never declared; these few just go first
+ *  when they do, because they are how people actually browse. A field nobody
+ *  fills in simply never shows up. */
+const LEAD = ['genre', 'collection', 'type', 'players'];
+
 /** A rail needs at least this many distinct values, and this many games covered. */
 const MIN_VALUES = 2;
 const MIN_COVERAGE = 2;
+/** Past a handful of values, a field whose values are nearly all different — a
+ *  build id, an author URL — narrows nothing. It is searchable, never a rail. */
+const SMALL_RAIL = 8;
+const MAX_UNIQUE_SHARE = 0.75;
+
+/** Lowercase and accent-free, so "pokemon" finds "Pokémon". */
+export const fold = (text) =>
+  String(text ?? '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+/**
+ * Everything a search should reach: the name and blurb, plus every field that
+ * classifies the game — model, collection, tags, or any field invented later.
+ */
+function haystack(game) {
+  const parts = [game.name, game.tagline, game.description, game.slug];
+  for (const [key, value] of Object.entries(game)) {
+    if (NOT_A_FACET.has(key)) continue;
+    for (const v of Array.isArray(value) ? value : [value]) {
+      if (typeof v === 'string') parts.push(v);
+    }
+  }
+  return fold(parts.filter(Boolean).join(' '));
+}
 
 export async function loadManifest(url = '/data/games.json') {
   const response = await fetch(url, { cache: 'no-cache' });
@@ -37,8 +68,8 @@ export async function loadManifest(url = '/data/games.json') {
   };
 }
 
-function normalize(game) {
-  return {
+export function normalize(game) {
+  const out = {
     ...game,
     name: game.name || game.slug,
     tagline: game.tagline || '',
@@ -47,10 +78,11 @@ function normalize(game) {
     builds: Array.isArray(game.builds) ? game.builds : [],
     buildCount: game.buildCount || (game.builds ? game.builds.length : 1),
     bytes: Number(game.bytes) || 0,
-    search: game.search || `${game.name} ${game.tagline} ${game.description}`.toLowerCase(),
     addedAt: Date.parse(game.added) || 0,
     updatedAt: Date.parse(game.updated || game.added) || 0,
   };
+  out.search = haystack(out);
+  return out;
 }
 
 const prettyLabel = (key) =>
@@ -86,17 +118,28 @@ export function deriveFacets(games) {
     if (counts.size < MIN_VALUES) continue;
     const coverage = [...counts.values()].reduce((a, b) => a + b, 0);
     if (coverage < MIN_COVERAGE) continue;
+    if (counts.size > SMALL_RAIL) {
+      const shared = [...counts.values()].filter((n) => n > 1).length;
+      if (!shared || counts.size / coverage > MAX_UNIQUE_SHARE) continue;
+    }
     facets.push({
       key,
       label: prettyLabel(key),
       coverage,
       options: [...counts.entries()]
         .map(([value, count]) => ({ value, count }))
-        .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value)),
+        // Natural order within a count, so "Batch 2" sits before "Batch 10".
+        .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value, 'en', { numeric: true })),
     });
   }
 
-  return facets.sort((a, b) => b.coverage - a.coverage || a.label.localeCompare(b.label));
+  const rank = (key) => {
+    const at = LEAD.indexOf(key);
+    return at === -1 ? LEAD.length : at;
+  };
+  return facets.sort(
+    (a, b) => rank(a.key) - rank(b.key) || b.coverage - a.coverage || a.label.localeCompare(b.label)
+  );
 }
 
 /** True when a game carries `value` in `key`, whether that field is a string or a list. */

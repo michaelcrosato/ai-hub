@@ -6,7 +6,7 @@
  * { isFave(slug), plays(slug), lastPlayed(slug) }.
  */
 
-import { matchesFacet } from './manifest.js';
+import { matchesFacet, fold } from './manifest.js';
 
 const byName = (a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' });
 
@@ -29,17 +29,13 @@ export const SORTS = [
 
 export const DEFAULT_SORT = SORTS[0].key;
 
-export const tokenize = (query) =>
-  String(query || '')
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean);
+export const tokenize = (query) => fold(query).split(/\s+/).filter(Boolean);
 
 const hasAllTokens = (game, tokens) => tokens.every((t) => game.search.includes(t));
 
 /** Name matches outrank blurb matches, so typing "orbit" surfaces Little Orbit first. */
 function relevance(game, tokens) {
-  const name = game.name.toLowerCase();
+  const name = fold(game.name);
   let score = 0;
   for (const token of tokens) {
     if (name.startsWith(token)) score += 4;
@@ -78,22 +74,23 @@ export function selectGames(games, state, stats) {
 /**
  * How many games each facet option would yield. Counted against everything
  * *except* that facet, so the other choices in a rail you are already using
- * still show what selecting them instead would give you.
+ * still show what selecting them instead would give you. One pass over the
+ * games per rail, however many options the rail has.
  */
 export function facetCounts(games, state, stats, facets) {
   const tokens = tokenize(state.query);
+  const pool = games.filter(
+    (game) => (!state.favesOnly || stats.isFave(game.slug)) && (!tokens.length || hasAllTokens(game, tokens))
+  );
   const counts = new Map();
 
   for (const facet of facets) {
-    const pool = games.filter(
-      (game) =>
-        (!state.favesOnly || stats.isFave(game.slug)) &&
-        passesFacets(game, state.facets, facet.key) &&
-        (!tokens.length || hasAllTokens(game, tokens))
-    );
-    const inner = new Map();
-    for (const option of facet.options) {
-      inner.set(option.value, pool.filter((game) => matchesFacet(game, facet.key, option.value)).length);
+    const inner = new Map(facet.options.map((option) => [option.value, 0]));
+    for (const game of pool) {
+      if (!passesFacets(game, state.facets, facet.key)) continue;
+      const held = game[facet.key];
+      const values = new Set((Array.isArray(held) ? held : [held]).map((v) => String(v ?? '').trim()));
+      for (const value of values) if (inner.has(value)) inner.set(value, inner.get(value) + 1);
     }
     counts.set(facet.key, inner);
   }

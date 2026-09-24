@@ -33,6 +33,7 @@ let games = [];
 let facets = [];
 let bySlug = new Map();
 let lastKey = '';
+let showing = [];
 let hops = 0;
 let scrollBeforePlay = 0;
 
@@ -71,6 +72,17 @@ const controls = createControls(document.getElementById('controls'), {
     if (patch.sort) store.setUi({ sort: patch.sort });
     router.setQuery(patch);
   },
+  // Drawn from what the filters leave showing, so "Surprise me" inside a
+  // collection stays inside it.
+  onDensity(next) {
+    store.setUi({ density: next });
+    applyDensity();
+  },
+  onSurprise() {
+    if (!showing.length) return;
+    const game = showing[Math.floor(Math.random() * showing.length)];
+    router.go(`/play/${game.slug}`);
+  },
 });
 
 const detail = createDetail(document.getElementById('detail'), {
@@ -94,8 +106,9 @@ function renderWall(state) {
   const key = stateKey(state);
   const changed = key !== lastKey;
   const visible = selectGames(games, state, stats);
+  showing = visible;
 
-  controls.render(state, { facets, counts: facetCounts(games, state, stats, facets) });
+  controls.render(state, { facets, counts: facetCounts(games, state, stats, facets), shown: visible.length });
   renderCount(visible.length);
 
   if (!changed) return;
@@ -127,6 +140,10 @@ function renderWall(state) {
   if (isRefine && wallEl.getBoundingClientRect().top < 0) {
     wallEl.scrollIntoView({ block: 'start', behavior: 'auto' });
   }
+}
+
+function applyDensity() {
+  wallEl.classList.toggle('is-compact', store.ui().density === 'compact');
 }
 
 const findBuild = (game, token) =>
@@ -183,6 +200,7 @@ addEventListener('keydown', (event) => {
 
 /* --- go ------------------------------------------------------------------ */
 
+applyDensity();
 grid.message('Loading the wall…');
 
 loadManifest()

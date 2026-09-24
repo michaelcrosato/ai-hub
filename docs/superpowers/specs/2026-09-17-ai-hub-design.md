@@ -29,7 +29,7 @@ front end is native ES modules with no bundler. `pnpm install` is a no-op; there
 nothing to keep up to date and nothing to break on a `pnpm audit`.
 
 ```
-games/          DROP ZONE. *.html, any naming. Subfolder = one game, many builds.
+games/          DROP ZONE. *.html, any naming. Folders: see "Revision: 400 games" below.
 covers/         Optional <slug>.png|jpg|webp — overrides the procedural art.
 data/
   overrides.json  Optional hand-edited metadata. Wins over scraped values.
@@ -105,3 +105,22 @@ the real site in a browser.
 
 Score reporting, save-state sync, per-game telemetry, comments, ratings, accounts,
 a database. The hub boots a game and gets out of the way.
+
+## Revision: 400 games (2026-09-23)
+
+The library is growing from four games to roughly 400 projects in one import:
+~370 single HTML files and ~25 zipped source packages. Reviewing the hub
+against that scale found these problems. Each one was fixed.
+
+| Problem at scale | Decision |
+|---|---|
+| Any subfolder was "one game, many builds", so `games/claude/*.html` would collapse 100 games into one tile | A folder names a game only when its files are bare versions (`v0.5.html`) or it holds an `index.html`. Any other folder is a **collection**: one tile per file, plus a derived `collection` field and rail. |
+| Multi-file projects (unpacked zips) had no representation, and every page inside one would become a tile | A folder with `index.html` is a **project**: one game, entry `index.html`, nothing inside it scanned further. Relative favicons and `og:image` resolve against it. |
+| Vite/webpack output uses root-absolute paths (`/assets/…`), which resolve against the hub | `pnpm ingest` rewrites them to relative on unpack. The scan warns about any project that still has them. |
+| Committing imports gives every game the same git date, and a first-seen date recorded in `added.json` was overwritten by the commit date | Recorded dates now win over git. Ingest records each file's own mtime. |
+| No bulk path from a pile of files and zips to `games/` | `scripts/ingest.mjs`: dedupe by hash, never overwrite, case-insensitive clash detection, zip unpacking via a built-in reader (`lib/zip.mjs`, zip64 aware), a junk/secret filter, and `sources/` for packages that carry more than a build (committed, `.vercelignore`d). |
+| Every string field became a rail; a field of unique values would render 400 chips | A rail with more than 8 values needs shared values and at most 75% distinct values. It shows its top 8 and folds the rest behind "+N more". |
+| Load-more sentinel could get pinned by scroll anchoring, stopping the wall at 72 tiles after a jump to the bottom | Sentinel is `overflow-anchor: none`, and the observer is re-armed after each batch. |
+| The dev server re-read 400 heads on every refresh | Parsed heads are cached per file (size + mtime). Heads are read 64 KB first, up to 512 KB only when needed. |
+| Oversized inline favicons would bloat the manifest every visitor downloads | Inline icons over 32 KB are dropped (reported), and builds no longer duplicate head data. |
+| Browsing 400 tiles | "Surprise me" (random from the current filter), a remembered compact density, a two-row control strip, and accent-insensitive search across every field. |

@@ -86,7 +86,8 @@ export function cabinet(game, index = 0) {
             { class: 'cab__info', href: `#/g/${game.slug}` },
             infoLabel
           ),
-          h('span', {}, bytes(game.bytes))
+          // Genre when the catalogue has one; size is the fallback fact.
+          h('span', {}, game.genre || bytes(game.bytes))
         )
       ),
       faveButton(game)

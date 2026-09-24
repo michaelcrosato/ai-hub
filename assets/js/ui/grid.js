@@ -44,7 +44,14 @@ export function createGrid(root) {
     if (shown >= games.length) {
       observer.unobserve(sentinel);
       sentinel.remove();
+      return;
     }
+    // Re-arm. An observer only reports *changes*, so if a jump to the bottom
+    // (End, a scrollbar drag, a hard flick) leaves the sentinel in view after
+    // this batch, it would never fire again and the wall would stop filling.
+    // Observing afresh always delivers the current state on the next frame.
+    observer.unobserve(sentinel);
+    observer.observe(sentinel);
   }
 
   return {
