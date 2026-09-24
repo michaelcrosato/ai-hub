@@ -1,0 +1,60 @@
+const $ = s => document.querySelector(s);
+const host = $('#game-host');
+const canvas = document.createElement('canvas'); host.appendChild(canvas);
+const gl = canvas.getContext('webgl', { antialias: true }) || canvas.getContext('experimental-webgl');
+const ui={badge:$('#renderer-badge'),healthBar:$('#health-bar'),healthText:$('#health-text'),boostBar:$('#boost-bar'),xpBar:$('#xp-bar'),levelText:$('#level-text'),objective:$('#objective'),modeText:$('#mode-text'),scrapText:$('#scrap-text'),weaponText:$('#weapon-text'),prompt:$('#prompt'),toast:$('#toast'),startCard:$('#start-card'),completeCard:$('#complete-card'),completeSummary:$('#complete-summary')};
+ui.badge.textContent='WEBGL1 · LEGACY';
+
+const vs=`attribute vec2 p;attribute vec3 c;varying vec3 v;void main(){v=c;gl_Position=vec4(p,0.,1.);}`;
+const fs=`precision mediump float;varying vec3 v;void main(){gl_FragColor=vec4(v,1.);}`;
+function shader(t,s){const x=gl.createShader(t);gl.shaderSource(x,s);gl.compileShader(x);return x;}
+const prog=gl.createProgram();gl.attachShader(prog,shader(gl.VERTEX_SHADER,vs));gl.attachShader(prog,shader(gl.FRAGMENT_SHADER,fs));gl.linkProgram(prog);gl.useProgram(prog);
+const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);const ap=gl.getAttribLocation(prog,'p'),ac=gl.getAttribLocation(prog,'c');gl.enableVertexAttribArray(ap);gl.enableVertexAttribArray(ac);
+let verts=[];
+function pushTri(a,b,c,col){for(const q of [a,b,c])verts.push(q[0],q[1],col[0],col[1],col[2]);}
+let cam={x:-12,y:0,zoom:15};
+function w2c(x,y){const asp=canvas.width/canvas.height;return[(x-cam.x)/(cam.zoom*asp),(y-cam.y)/cam.zoom];}
+function rect(x,y,w,h,col){const a=w2c(x-w/2,y-h/2),b=w2c(x+w/2,y-h/2),c=w2c(x+w/2,y+h/2),d=w2c(x-w/2,y+h/2);pushTri(a,b,c,col);pushTri(a,c,d,col);}
+function diamond(x,y,r,col){const a=w2c(x,y-r),b=w2c(x+r,y),c=w2c(x,y+r),d=w2c(x-r,y);pushTri(a,b,c,col);pushTri(a,c,d,col);}
+function draw(){verts=[];rect(cam.x,cam.y,40,30,[.05,.12,.13]);rect(0,0,34,16,[.17,.28,.17]);rect(0,-7.2,34,1.2,[.03,.33,.38]);rect(0,7.1,34,1.0,[.03,.25,.3]);
+  rect(-4,0,.8,16,[.16,.22,.23]); if(state.crystals>0){for(let i=0;i<5;i++)diamond(-4,(i-2)*.7,.38,[.9,.25,.72]);}
+  rect(8,0,.7,16,[.15,.2,.21]); if(!state.gate)rect(8,0,.22,4.5,[.1,.8,.9]);
+  rect(2,6,4,2,[.22,.29,.31]);rect(2,4.8,1.3,.4,[.2,.75,.8]);rect(4.4,-5,2,2,[.28,.32,.3]);
+  rect(13,0,8,8,[.12,.16,.17]);
+  for(const p of pickups)if(!p.dead)diamond(p.x,p.y,.28,p.type==='health'?[.5,1,.3]:[1,.55,.2]);
+  for(const e of enemies)if(!e.dead)diamond(e.x,e.y,e.boss?1.15:.48,e.boss?[.85,.15,.25]:[.82,.3,.2]);
+  for(const b of shots)diamond(b.x,b.y,.13,[.2,1,1]);for(const b of hostile)diamond(b.x,b.y,.13,[1,.25,.6]);
+  const pc=state.mode==='rover'?[.1,.8,.88]:[.95,.88,.68];rect(state.x,state.y,state.mode==='rover'?1.25:.55,state.mode==='rover'?1.65:.8,pc);
+  gl.clearColor(.02,.06,.08,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(verts),gl.DYNAMIC_DRAW);gl.vertexAttribPointer(ap,2,gl.FLOAT,false,20,0);gl.vertexAttribPointer(ac,3,gl.FLOAT,false,20,8);gl.drawArrays(gl.TRIANGLES,0,verts.length/5);
+}
+
+const state={x:-12,y:0,mode:'rover',area:'external',hp:100,max:100,boost:100,xp:0,next:35,level:1,scrap:0,crystals:48,gate:false,capacitor:false,weapon:false,stage:0,fireCd:0,inv:0,boss:false,started:false,deaths:0,start:0};
+const input={keys:new Set(),move:{x:0,y:0},aim:{x:1,y:0},fire:false,boost:false,action:false};
+const enemies=[[-1,-2],[1,1],[4,-2],[5,4]].map((p,i)=>({x:p[0],y:p[1],hp:i===3?44:30,dead:false,cd:Math.random()+.5,boss:false}));
+const shots=[],hostile=[],pickups=[{x:-9,y:-5,type:'scrap',n:4},{x:1,y:-5,type:'health',n:25},{x:5,y:5,type:'scrap',n:5}];
+let inside=[];let boss=null;let toastT=0;
+function toast(t){ui.toast.textContent=t;ui.toast.classList.add('show');toastT=1.2;}
+function obj(t){ui.objective.textContent=t;}
+function hud(){ui.healthBar.style.width=`${Math.max(0,state.hp/state.max*100)}%`;ui.healthText.textContent=Math.ceil(state.hp);ui.boostBar.style.width=`${state.boost}%`;ui.xpBar.style.width=`${state.xp/state.next*100}%`;ui.levelText.textContent=`L${state.level}`;ui.modeText.textContent=state.mode.toUpperCase();ui.scrapText.textContent=state.scrap;ui.weaponText.textContent=state.weapon?'COIL MK II':state.mode==='rover'?'SPARK CANNON':'PULSE TOOL';}
+function gain(n){state.xp+=n;if(state.xp>=state.next){state.xp-=state.next;state.level++;state.next=Math.round(state.next*1.5);state.max+=15;state.hp=Math.min(state.max,state.hp+25);toast(`LEVEL ${state.level}`);}}
+function damage(n){if(state.inv>0)return;state.hp-=n;state.inv=.35;if(state.hp<=0){state.deaths++;state.hp=state.max;state.x=-12;state.y=0;state.area='external';state.mode='rover';state.scrap=Math.max(0,state.scrap-2);toast('RECONSTRUCTED');}}
+function spawnBoss(){if(boss)return;boss={x:13,y:0,hp:300,dead:false,cd:1,boss:true};enemies.push(boss);state.boss=true;toast('M.O.L.E. ENGINE ONLINE');}
+function fire(){if(state.fireCd>0)return;state.fireCd=state.mode==='rover'?.2:.16;let a=input.aim;if(Math.hypot(a.x,a.y)<.1)a={x:1,y:0};const l=Math.hypot(a.x,a.y);shots.push({x:state.x,y:state.y,vx:a.x/l*14,vy:a.y/l*14,life:1.3,dmg:(state.mode==='rover'?18:11)*(state.weapon?1.24:1)*(1+(state.level-1)*.1)});}
+function interaction(){if(state.area==='interior'){state.area='external';state.x=2;state.y=4.1;toast('SURFACE LINK');return;}if(state.mode==='rover'){state.mode='pilot';toast('PILOT MODE');return;}if(Math.hypot(state.x-2,state.y-5)<2){state.area='interior';state.x=0;state.y=0;if(!inside.length){inside=[[-3,-2],[0,-3],[3,-2],[-3,2],[0,3],[3,2]].map(p=>({x:p[0],y:p[1],hp:28,dead:false,cd:.5+Math.random(),boss:false}));enemies.push(...inside);}obj('Clear Vault 03. Recover its capacitor.');return;}if(Math.hypot(state.x-7,state.y)<2&&state.capacitor){state.gate=true;state.stage=4;toast('PHASE GATE OPEN');obj('Cross the gate and destroy the M.O.L.E. engine.');return;}if(Math.hypot(state.x-4.4,state.y+5)<2){if(state.weapon)toast('COIL MK II FITTED');else if(state.scrap>=12){state.scrap-=12;state.weapon=true;toast('COIL MK II · +24% DAMAGE');}else toast('NEEDS 12 SCRAP');return;}state.mode='rover';toast('CRAWLER LINKED');}
+function bounds(){return state.area==='interior'?[-5,5,-4,4]:[-16,16,-7.2,7.2];}
+function update(dt){state.inv=Math.max(0,state.inv-dt);state.fireCd=Math.max(0,state.fireCd-dt);const k=input.keys;let mx=(k.has('KeyD')?1:0)-(k.has('KeyA')?1:0)+input.move.x,my=(k.has('KeyW')?1:0)-(k.has('KeyS')?1:0)+input.move.y;let ml=Math.hypot(mx,my);if(ml>1){mx/=ml;my/=ml;}const boost=(input.boost||k.has('Space'))&&state.boost>1;state.boost=Math.max(0,Math.min(100,state.boost+(boost?-35:22)*dt));let sp=(state.mode==='rover'?5.4:3.8)*(boost?1.55:1);let b=bounds();let nx=Math.max(b[0],Math.min(b[1],state.x+mx*sp*dt)),ny=Math.max(b[2],Math.min(b[3],state.y+my*sp*dt));if(state.area==='external'&&state.crystals>0&&nx>-4.7&&nx<-3.3&&Math.abs(ny)<2.8)nx=state.x;if(state.area==='external'&&!state.gate&&nx>7.5&&nx<8.5&&Math.abs(ny)<2.4)nx=state.x;state.x=nx;state.y=ny;if(input.fire||k.has('KeyF'))fire();if(input.action){input.action=false;interaction();}
+  const active=state.area==='interior'?inside:enemies.filter(e=>!inside.includes(e));for(const e of active){if(e.dead||(!e.boss&&state.area==='external'&&Math.abs(e.x)>10&&state.stage<4))continue;e.cd-=dt;let dx=state.x-e.x,dy=state.y-e.y,d=Math.hypot(dx,dy)||1;if(!e.boss&&d<7){e.x+=dx/d*1.2*dt;e.y+=dy/d*1.2*dt;}if(e.boss&&d<8){e.x+=dx/d*.8*dt;e.y+=dy/d*.8*dt;}if(d<8&&e.cd<=0){e.cd=e.boss?.75:1.5;hostile.push({x:e.x,y:e.y,vx:dx/d*(e.boss?7:5),vy:dy/d*(e.boss?7:5),life:2.2,dmg:e.boss?13:9});}if(d<.8)damage(e.boss?15:8);}
+  for(let i=shots.length-1;i>=0;i--){let s=shots[i];s.x+=s.vx*dt;s.y+=s.vy*dt;s.life-=dt;let rem=s.life<=0;if(state.area==='external'&&state.crystals>0&&Math.abs(s.x+4)<.7&&Math.abs(s.y)<2.8){state.crystals-=s.dmg;rem=true;if(state.crystals<=0){state.crystals=0;state.stage=1;toast('CRYSTAL NEST SHATTERED');obj('Find Vault 03 on the upper route. Enter on foot.');}}for(const e of active){if(!rem&&!e.dead&&Math.hypot(s.x-e.x,s.y-e.y)<(e.boss?1.3:.6)){e.hp-=s.dmg;rem=true;if(e.hp<=0){e.dead=true;gain(e.boss?60:10);state.scrap+=e.boss?0:2;if(e.boss)complete();}}}if(rem)shots.splice(i,1);}
+  for(let i=hostile.length-1;i>=0;i--){let s=hostile[i];s.x+=s.vx*dt;s.y+=s.vy*dt;s.life-=dt;if(Math.hypot(s.x-state.x,s.y-state.y)<.55){damage(s.dmg);s.life=0;}if(s.life<=0)hostile.splice(i,1);}
+  if(state.area==='interior'&&inside.length&&inside.every(e=>e.dead)&&!state.capacitor){state.capacitor=true;state.stage=3;toast('PHASE CAPACITOR ACQUIRED');obj('ACTION to return. Install the capacitor at the east gate.');}
+  for(const p of pickups){if(p.dead||state.area!=='external')continue;if(Math.hypot(p.x-state.x,p.y-state.y)<.8){p.dead=true;if(p.type==='health')state.hp=Math.min(state.max,state.hp+p.n);else state.scrap+=p.n;toast(p.type==='health'?`HULL +${p.n}`:`SALVAGE +${p.n}`);}}
+  if(state.gate&&state.area==='external'&&state.x>9)spawnBoss();cam.x+=(state.x-cam.x)*Math.min(1,dt*5);cam.y+=(state.y-cam.y)*Math.min(1,dt*5);hud();
+}
+function complete(){state.started=false;const s=Math.max(1,Math.floor((performance.now()-state.start)/1000));ui.completeSummary.textContent=`Legacy route cleared in ${Math.floor(s/60)}:${String(s%60).padStart(2,'0')} · Level ${state.level} · ${state.deaths} reconstructions.`;ui.completeCard.classList.add('show');obj('Mission complete. Core-lift route secured.');}
+function resize(){canvas.width=Math.max(1,innerWidth*(devicePixelRatio||1));canvas.height=Math.max(1,innerHeight*(devicePixelRatio||1));gl.viewport(0,0,canvas.width,canvas.height);}resize();addEventListener('resize',resize);
+let last=performance.now();function loop(t){const dt=Math.min(.033,(t-last)/1000);last=t;if(toastT>0){toastT-=dt;if(toastT<=0)ui.toast.classList.remove('show');}if(state.started)update(dt);draw();requestAnimationFrame(loop);}requestAnimationFrame(loop);
+addEventListener('keydown',e=>{input.keys.add(e.code);if(e.code==='KeyE'&&!e.repeat)input.action=true;});addEventListener('keyup',e=>input.keys.delete(e.code));canvas.addEventListener('pointermove',e=>{const x=e.clientX/innerWidth*2-1,y=-(e.clientY/innerHeight*2-1),asp=innerWidth/innerHeight;input.aim.x=x*cam.zoom*asp+cam.x-state.x;input.aim.y=y*cam.zoom+cam.y-state.y;});canvas.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse')input.fire=true;});addEventListener('pointerup',()=>input.fire=false);canvas.addEventListener('wheel',e=>{cam.zoom=Math.max(10,Math.min(20,cam.zoom+Math.sign(e.deltaY)));e.preventDefault();},{passive:false});
+function stick(el,target){const knob=el.querySelector('.pad-knob');let id=null;const mv=e=>{if(e.pointerId!==id)return;const r=el.getBoundingClientRect(),mx=r.left+r.width/2,my=r.top+r.height/2;let x=e.clientX-mx,y=e.clientY-my,max=r.width*.34,l=Math.hypot(x,y);if(l>max){x=x/l*max;y=y/l*max;}knob.style.transform=`translate(${x}px,${y}px)`;target.x=x/max;target.y=-y/max;};el.addEventListener('pointerdown',e=>{id=e.pointerId;el.setPointerCapture(id);mv(e);});el.addEventListener('pointermove',mv);const end=e=>{if(e.pointerId!==id)return;id=null;knob.style.transform='translate(0,0)';if(target===input.move){target.x=0;target.y=0;}};el.addEventListener('pointerup',end);el.addEventListener('pointercancel',end);}stick($('#move-pad'),input.move);stick($('#aim-pad'),input.aim);
+function hold(el,key){el.addEventListener('pointerdown',e=>{el.setPointerCapture(e.pointerId);el.classList.add('active');input[key]=true;});const end=e=>{el.classList.remove('active');input[key]=false;};el.addEventListener('pointerup',end);el.addEventListener('pointercancel',end);}hold($('#fire-button'),'fire');hold($('#boost-button'),'boost');$('#action-button').addEventListener('pointerdown',()=>input.action=true);
+$('#start-button').addEventListener('click',()=>{ui.startCard.classList.remove('show');state.started=true;state.start=performance.now();obj('Blast the magenta crystal nest blocking the east passage.');toast('LEGACY RENDER PATH');});$('#restart-button').addEventListener('click',()=>location.reload());
+hud();obj('Press DROP IN to start the mission.');

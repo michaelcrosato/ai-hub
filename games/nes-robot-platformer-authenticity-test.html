@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>NES Robot Platformer Authenticity Test</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; }
+  body { display: grid; place-items: center; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  #wrap { display: grid; place-items: center; width: 100%; height: 100%; }
+  canvas {
+    width: 256px;
+    height: 240px;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #000;
+    outline: none;
+    touch-action: none;
+  }
+  #help {
+    position: fixed;
+    left: 8px;
+    bottom: 6px;
+    padding: 3px 5px;
+    font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #b8b8b8;
+    background: rgba(0,0,0,.72);
+    user-select: none;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="256" height="240" tabindex="0" aria-label="NES-style platformer authenticity test"></canvas></div>
+<div id="help">← → move · X/K jump · Z/J shoot · Enter reset · ` diagnostics · F fullscreen</div>
+<script>
+'use strict';
+
+// ------------------------------------------------------------
+// NES-style rendering contract
+// ------------------------------------------------------------
+// Native framebuffer: 256x240.
+// All game art is drawn at native resolution. CSS only integer-scales it.
+// Background: 8x8 pattern tiles, one 4-entry subpalette per 16x16 metatile.
+// Sprites: 8x8 hardware-style units, 3 visible colors + transparency.
+// OAM simulation: 64 sprite units total, 8 sprite units per scanline.
+
+const W = 256, H = 240, TILE = 8, META = 16, FP = 16;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d', { alpha: false });
+ctx.imageSmoothingEnabled = false;
+
+// Common 2C02/NES RGB approximation. The real NES creates color as an analog
+// signal, so no single RGB table is physically definitive.
+const NES = [
+  '#666666','#002A88','#1412A7','#3B00A4','#5C007E','#6E0040','#6C0600','#561D00',
+  '#333500','#0B4800','#005200','#004F08','#00404D','#000000','#000000','#000000',
+  '#ADADAD','#155FD9','#4240FF','#7527FE','#A01ACC','#B71E7B','#B53120','#994E00',
+  '#6B6D00','#388700','#0C9300','#008F32','#007C8D','#000000','#000000','#000000',
+  '#FFFEFF','#64B0FF','#9290FF','#C676FF','#F36AFF','#FE6ECC','#FE8170','#EA9E22',
+  '#BCBE00','#88D800','#5CE430','#45E082','#48CDDE','#4F4F4F','#000000','#000000',
+  '#FFFEFF','#C0DFFF','#D3D2FF','#E8C8FF','#FBC2FF','#FEC4EA','#FECCC5','#F7D8A5',
+  '#E4E594','#CFEF96','#BDF4AB','#B3F3CC','#B5EBF2','#B8B8B8','#000000','#000000'
+];
+
+const BG_PALS = [
+  [0x0F, 0x01, 0x11, 0x21],
+  [0x0F, 0x0C, 0x1C, 0x2C],
+  [0x0F, 0x06, 0x16, 0x27],
+  [0x0F, 0x00, 0x10, 0x20]
+];
+const SPR_PALS = [
+  [null, 0x01, 0x11, 0x21],       // blue armor
+  [null, 0x01, 0x37, 0x30],       // face / highlight
+  [null, 0x06, 0x16, 0x26],       // enemy red
+  [null, 0x09, 0x19, 0x29]        // enemy green
+];
+
+function fitCanvas() {
+  const maxW = Math.max(256, innerWidth - 8);
+  const maxH = Math.max(240, innerHeight - 8);
+  const scale = Math.max(1, Math.floor(Math.min(maxW / W, maxH / H)));
+  canvas.style.width = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+}
+addEventListener('resize', fitCanvas);
+fitCanvas();
+canvas.focus();
+
+// ------------------------------------------------------------
+// Input
+// ------------------------------------------------------------
+const keys = Object.create(null);
+const pressed = Object.create(null);
+addEventListener('keydown', e => {
+  if (!keys[e.code]) pressed[e.code] = true;
+  keys[e.code] = true;
+  if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  if (e.code === 'KeyF') toggleFullscreen();
+  if (e.code === 'Backquote') diagnostics = !diagnostics;
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+function down(...codes) { return codes.some(c => !!keys[c]); }
+function hit(...codes) { return codes.some(c => !!pressed[c]); }
+function clearPressed() { for (const k in pressed) delete pressed[k]; }
+
+function padState() {
+  const p = navigator.getGamepads?.()[0];
+  if (!p) return {l:false,r:false,j:false,s:false};
+  return {
+    l: p.axes[0] < -0.35 || p.buttons[14]?.pressed,
+    r: p.axes[0] >  0.35 || p.buttons[15]?.pressed,
+    j: p.buttons[0]?.pressed || p.buttons[1]?.pressed,
+    s: p.buttons[2]?.pressed || p.buttons[3]?.pressed
+  };
+}
+
+async function toggleFullscreen() {
+  try {
+    if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+    else await document.exitFullscreen();
+    setTimeout(fitCanvas, 0);
+  } catch (_) {}
+}
+
+// ------------------------------------------------------------
+// Pattern table: 8x8, 2 bits per pixel (0..3)
+// ------------------------------------------------------------
+function pat(rows) {
+  const a = new Uint8Array(64);
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) a[y*8+x] = +rows[y][x];
+  return a;
+}
+const PAT = {
+  blank: pat(['00000000','00000000','00000000','00000000','00000000','00000000','00000000','00000000']),
+  metalA:pat(['11111111','12222222','12333332','12311132','12311132','12333332','12222222','11111111']),
+  metalB:pat(['11111111','22222222','33311333','33111133','33111133','33311333','22222222','11111111']),
+  beam:  pat(['11111111','12211221','12322321','11233211','11233211','12322321','12211221','11111111']),
+  floor: pat(['33333333','32222223','32111123','32122123','32122123','32111123','32222223','33333333']),
+  rivet: pat(['11111111','12222221','12300321','12000021','12000021','12300321','12222221','11111111']),
+  pipe:  pat(['00111100','01222210','12333321','12311321','12311321','12333321','01222210','00111100']),
+  hazard:pat(['00000000','00000000','00030000','00333000','03333300','33333330','11111111','22222222'])
+};
+
+const META_DEF = {
+  0: { pal:0, solid:false, hazard:false, tiles:['blank','blank','blank','blank'] },
+  1: { pal:0, solid:true,  hazard:false, tiles:['metalA','metalB','metalB','metalA'] },
+  2: { pal:1, solid:true,  hazard:false, tiles:['floor','rivet','rivet','floor'] },
+  3: { pal:1, solid:false, hazard:false, tiles:['pipe','pipe','pipe','pipe'] },
+  4: { pal:2, solid:false, hazard:true,  tiles:['blank','blank','hazard','hazard'] },
+  5: { pal:3, solid:true,  hazard:false, tiles:['beam','beam','beam','beam'] }
+};
+
+// ------------------------------------------------------------
+// Level: 64 x 15 metatiles = 1024 x 240 pixels.
+// ------------------------------------------------------------
+const MW = 64, MH = 15;
+const map = Array.from({length: MH}, () => new Uint8Array(MW));
+
+function fillRectMap(x,y,w,h,id) {
+  for (let yy=y; yy<y+h; yy++) for (let xx=x; xx<x+w; xx++) if (yy>=0&&yy<MH&&xx>=0&&xx<MW) map[yy][xx]=id;
+}
+function buildLevel() {
+  fillRectMap(0,13,64,2,2);
+  fillRectMap(0,0,2,13,1);
+  fillRectMap(62,0,2,13,1);
+
+  // Gaps and hazards.
+  fillRectMap(14,13,3,2,0);
+  fillRectMap(36,13,3,2,0);
+  fillRectMap(52,13,2,2,0);
+  fillRectMap(23,12,2,1,4);
+  fillRectMap(44,12,3,1,4);
+
+  // Platforms.
+  fillRectMap(6,10,6,1,1);
+  fillRectMap(18,9,7,1,5);
+  fillRectMap(27,11,6,1,1);
+  fillRectMap(40,9,8,1,5);
+  fillRectMap(55,10,5,1,1);
+  fillRectMap(31,6,5,1,1);
+  fillRectMap(48,6,5,1,1);
+
+  // Decorative non-solid pipes, kept in their own 16x16 palette regions.
+  for (let x=3;x<62;x+=9) { map[3][x]=3; map[4][x]=3; }
+}
+buildLevel();
+
+function metaAtPixel(px, py) {
+  const mx = Math.floor(px / META), my = Math.floor(py / META);
+  if (mx < 0 || mx >= MW || my < 0) return 1;
+  if (my >= MH) return 0;
+  return map[my][mx];
+}
+function solidAt(px,py) { return !!META_DEF[metaAtPixel(px,py)]?.solid; }
+function hazardAt(px,py) { return !!META_DEF[metaAtPixel(px,py)]?.hazard; }
+
+// ------------------------------------------------------------
+// Game state
+// ------------------------------------------------------------
+let diagnostics = false;
+let frame = 0;
+let cameraX = 0;
+let screenShake = 0;
+let deathFlash = 0;
+let lastPadJump = false, lastPadShoot = false;
+
+const player = {
+  x: 48*FP, y: 160*FP, vx:0, vy:0,
+  w:12, h:22, onGround:false, dir:1,
+  hp:16, inv:0, shootCd:0, runPhase:0,
+  spawnX:48*FP, spawnY:160*FP
+};
+
+const bullets = [];
+const enemies = [
+  {x:210,y:199,dir:-1,hp:3,alive:true,kind:2,phase:0},
+  {x:330,y:135,dir: 1,hp:3,alive:true,kind:3,phase:0},
+  {x:492,y:167,dir:-1,hp:3,alive:true,kind:2,phase:0},
+  {x:690,y:199,dir:-1,hp:3,alive:true,kind:3,phase:0},
+  {x:910,y:151,dir: 1,hp:3,alive:true,kind:2,phase:0}
+];
+
+function resetPlayer(full=true) {
+  player.x = player.spawnX; player.y = player.spawnY;
+  player.vx=0; player.vy=0; player.inv=90;
+  if (full) player.hp=16;
+  bullets.length=0;
+  cameraX = Math.max(0, (player.x/FP)-80);
+}
+
+// ------------------------------------------------------------
+// Fixed-point movement / collision
+// ------------------------------------------------------------
+function moveX(o) {
+  let target = o.x + o.vx;
+  const px = Math.floor(target/FP);
+  const py = Math.floor(o.y/FP);
+  if (o.vx > 0) {
+    const right = px + o.w;
+    if (solidAt(right, py+2) || solidAt(right, py+o.h-2)) {
+      target = (Math.floor(right/META)*META - o.w - 1) * FP;
+      o.vx = 0;
+    }
+  } else if (o.vx < 0) {
+    const left = px;
+    if (solidAt(left, py+2) || solidAt(left, py+o.h-2)) {
+      target = (Math.floor(left/META)*META + META) * FP;
+      o.vx = 0;
+    }
+  }
+  o.x = target;
+}
+function moveY(o) {
+  let target = o.y + o.vy;
+  const px = Math.floor(o.x/FP);
+  const py = Math.floor(target/FP);
+  o.onGround = false;
+  if (o.vy > 0) {
+    const bottom = py + o.h;
+    if (solidAt(px+2,bottom) || solidAt(px+o.w-2,bottom)) {
+      target = (Math.floor(bottom/META)*META - o.h - 1) * FP;
+      o.vy = 0; o.onGround = true;
+    }
+  } else if (o.vy < 0) {
+    const top = py;
+    if (solidAt(px+2,top) || solidAt(px+o.w-2,top)) {
+      target = (Math.floor(top/META)*META + META) * FP;
+      o.vy = 0;
+    }
+  }
+  o.y = target;
+}
+
+function damagePlayer(amount, fromX) {
+  if (player.inv > 0) return;
+  player.hp -= amount;
+  player.inv = 90;
+  player.vy = -38;
+  player.vx = (player.x/FP < fromX ? -28 : 28);
+  screenShake = 8;
+  if (player.hp <= 0) {
+    deathFlash = 25;
+    resetPlayer(true);
+  }
+}
+
+function rectsOverlap(ax,ay,aw,ah,bx,by,bw,bh) {
+  return ax < bx+bw && ax+aw > bx && ay < by+bh && ay+ah > by;
+}
+
+function update() {
+  frame++;
+  const pad = padState();
+  const left = down('ArrowLeft','KeyA') || pad.l;
+  const right= down('ArrowRight','KeyD') || pad.r;
+  const jumpDown = down('KeyX','KeyK') || pad.j;
+  const shootDown= down('KeyZ','KeyJ') || pad.s;
+  const jumpHit = hit('KeyX','KeyK') || (pad.j && !lastPadJump);
+  const shootHit= hit('KeyZ','KeyJ') || (pad.s && !lastPadShoot);
+  lastPadJump=jumpDown; lastPadShoot=shootDown;
+
+  if (hit('Enter')) resetPlayer(true);
+
+  // Deliberately quantized, NES-like movement.
+  const accel = player.onGround ? 5 : 3;
+  const maxRun = 21;
+  if (left && !right) { player.vx = Math.max(-maxRun, player.vx-accel); player.dir=-1; }
+  else if (right && !left) { player.vx = Math.min(maxRun, player.vx+accel); player.dir=1; }
+  else {
+    const drag = player.onGround ? 7 : 2;
+    if (player.vx > 0) player.vx = Math.max(0, player.vx-drag);
+    if (player.vx < 0) player.vx = Math.min(0, player.vx+drag);
+  }
+
+  if (jumpHit && player.onGround) { player.vy = -58; player.onGround=false; }
+  // Short-hop control.
+  if (!jumpDown && player.vy < -24) player.vy = -24;
+  player.vy = Math.min(64, player.vy + 4);
+
+  moveX(player); moveY(player);
+
+  if (Math.abs(player.vx) > 4 && player.onGround) player.runPhase = (player.runPhase + 1) % 24;
+  else player.runPhase = 0;
+
+  if (player.shootCd > 0) player.shootCd--;
+  if (shootHit && player.shootCd === 0 && bullets.length < 3) {
+    bullets.push({x:Math.floor(player.x/FP)+(player.dir>0?15:-3), y:Math.floor(player.y/FP)+8, vx:player.dir*4, life:80});
+    player.shootCd=13;
+  }
+
+  for (let i=bullets.length-1;i>=0;i--) {
+    const b=bullets[i]; b.x+=b.vx; b.life--;
+    if (solidAt(b.x,b.y) || b.life<=0) { bullets.splice(i,1); continue; }
+    let consumed=false;
+    for (const e of enemies) if (e.alive && rectsOverlap(b.x-2,b.y-2,5,5,e.x-7,e.y-7,14,14)) {
+      e.hp--; e.phase=8; consumed=true;
+      if (e.hp<=0) e.alive=false;
+      break;
+    }
+    if (consumed) bullets.splice(i,1);
+  }
+
+  for (const e of enemies) {
+    if (!e.alive) continue;
+    if (e.phase>0) e.phase--;
+    e.x += e.dir * 0.45;
+    const footX = e.x + e.dir*8, footY=e.y+9;
+    if (!solidAt(footX,footY) || solidAt(footX, e.y)) e.dir*=-1;
+    if (rectsOverlap(player.x/FP,player.y/FP,player.w,player.h,e.x-7,e.y-8,14,16)) damagePlayer(2,e.x);
+  }
+
+  const ppx=player.x/FP, ppy=player.y/FP;
+  if (hazardAt(ppx+2,ppy+player.h) || hazardAt(ppx+player.w-2,ppy+player.h)) damagePlayer(4,ppx);
+  if (ppy > H+32) { player.hp=Math.max(1,player.hp-4); resetPlayer(false); }
+  if (player.inv>0) player.inv--;
+  if (screenShake>0) screenShake--;
+  if (deathFlash>0) deathFlash--;
+
+  const targetCam = Math.max(0, Math.min(MW*META-W, ppx-96));
+  cameraX += (targetCam-cameraX)*0.18;
+  cameraX = Math.floor(cameraX);
+
+  clearPressed();
+}
+
+// ------------------------------------------------------------
+// Native-resolution background renderer
+// ------------------------------------------------------------
+function drawPattern(p, pal, dx, dy) {
+  for (let y=0;y<8;y++) for (let x=0;x<8;x++) {
+    const v=p[y*8+x];
+    ctx.fillStyle = NES[pal[v]];
+    ctx.fillRect(dx+x,dy+y,1,1);
+  }
+}
+function drawMeta(mx,my,id,camX) {
+  const d=META_DEF[id], pal=BG_PALS[d.pal], sx=mx*META-camX, sy=my*META;
+  if (sx<=-META || sx>=W) return;
+  drawPattern(PAT[d.tiles[0]],pal,sx,sy);
+  drawPattern(PAT[d.tiles[1]],pal,sx+8,sy);
+  drawPattern(PAT[d.tiles[2]],pal,sx,sy+8);
+  drawPattern(PAT[d.tiles[3]],pal,sx+8,sy+8);
+}
+function drawBackground(camX) {
+  ctx.fillStyle=NES[BG_PALS[0][0]]; ctx.fillRect(0,0,W,H);
+  const start=Math.max(0,Math.floor(camX/META));
+  const end=Math.min(MW-1,start+Math.ceil(W/META)+1);
+  for(let y=0;y<MH;y++) for(let x=start;x<=end;x++) drawMeta(x,y,map[y][x],camX);
+}
+
+// ------------------------------------------------------------
+// Hardware sprite simulation
+// ------------------------------------------------------------
+let OAM=[];
+let maxSpritesOnScanline=0;
+function oamPush(x,y,pixels,pal=0,flipX=false) {
+  if (OAM.length>=64) return;
+  OAM.push({x:Math.round(x),y:Math.round(y),pixels,pal,flipX});
+}
+function emptySprite() { return new Uint8Array(64); }
+function spriteFromCanvas(buf,w,h,tileX,tileY,paletteRoles) {
+  const s=new Uint8Array(64);
+  for(let y=0;y<8;y++) for(let x=0;x<8;x++) {
+    const gx=tileX*8+x, gy=tileY*8+y;
+    const role=(gx>=0&&gx<w&&gy>=0&&gy<h)?buf[gy*w+gx]:0;
+    s[y*8+x]=paletteRoles[role] ?? 0;
+  }
+  return s;
+}
+function renderOAM() {
+  // Rotate software OAM priority so scanline overflow becomes visible flicker,
+  // a common NES-era technique. The eight-sprite test itself is per scanline.
+  const order=OAM.map((_,i)=>i);
+  if (OAM.length) {
+    const rot=frame%OAM.length;
+    order.push(...order.splice(0,rot));
+  }
+
+  const visibleByLine=Array.from({length:H},()=>new Set());
+  maxSpritesOnScanline=0;
+  for(let sy=0;sy<H;sy++) {
+    let count=0;
+    for(const idx of order) {
+      const s=OAM[idx];
+      if(sy>=s.y && sy<s.y+8) {
+        if(count<8) visibleByLine[sy].add(idx);
+        count++;
+      }
+    }
+    maxSpritesOnScanline=Math.max(maxSpritesOnScanline,Math.min(8,count));
+  }
+
+  for(let idx=0;idx<OAM.length;idx++) {
+    const s=OAM[idx], pal=SPR_PALS[s.pal];
+    for(let y=0;y<8;y++) {
+      const gy=s.y+y;
+      if(gy<0 || gy>=H || !visibleByLine[gy].has(idx)) continue;
+      for(let x=0;x<8;x++) {
+        const sx=s.flipX?7-x:x, v=s.pixels[y*8+sx];
+        if(v===0) continue;
+        ctx.fillStyle=NES[pal[v]];
+        ctx.fillRect(s.x+x,gy,1,1);
+      }
+    }
+  }
+}
+
+// Build a 16x24 original robot metasprite from pixel rectangles.
+function makeRobotFrame(pose,phase,shooting) {
+  const w=16,h=24,b=new Uint8Array(w*h);
+  const R=(x,y,ww,hh,c)=>{for(let yy=y;yy<y+hh;yy++)for(let xx=x;xx<x+ww;xx++)if(xx>=0&&xx<w&&yy>=0&&yy<h)b[yy*w+xx]=c;};
+
+  // Palette roles are local to each 8x8 tile. Roles 1/2/3 map per tile later.
+  // Upper-left: helmet; upper-right: face; torso/legs: armor.
+  R(4,1,7,2,2); R(3,3,9,4,2); R(2,5,3,3,1); R(4,3,6,2,3);
+  // Face region is kept on the right 8x8 tile.
+  R(8,5,5,5,4); R(11,6,1,1,5); R(12,8,1,1,1);
+  // Neck and torso.
+  R(5,9,6,2,1); R(4,10,8,7,2); R(6,11,4,4,3); R(3,12,2,5,1);
+
+  // Arm / cannon.
+  if(shooting){ R(11,11,5,4,1); R(12,12,4,2,3); }
+  else { R(11,11,3,6,2); R(12,15,3,3,1); }
+
+  // Legs vary with run phase; jump tucks one leg.
+  if(pose==='jump') {
+    R(4,17,4,5,2); R(2,20,5,3,1); R(9,17,4,4,2); R(10,20,5,3,1);
+  } else if(pose==='run') {
+    if(phase<1){ R(4,17,4,5,2); R(1,21,7,3,1); R(9,17,4,4,2); R(10,20,5,3,1); }
+    else { R(4,17,4,4,2); R(1,20,6,3,1); R(9,17,4,5,2); R(9,21,7,3,1); }
+  } else {
+    R(4,17,4,5,2); R(3,21,5,3,1); R(9,17,4,5,2); R(9,21,5,3,1);
+  }
+  return b;
+}
+
+// Convert global role IDs into per-tile 2bpp indices without allowing >3 visible colors.
+function robotTile(frameBuf, tx,ty) {
+  const s=new Uint8Array(64);
+  // Upper-right tile uses face palette: global 1(dark)->1, 4(skin)->2, 5(white)->3.
+  const faceTile = (tx===1 && ty===0);
+  for(let y=0;y<8;y++) for(let x=0;x<8;x++) {
+    const role=frameBuf[(ty*8+y)*16+(tx*8+x)];
+    let v=0;
+    if(faceTile) {
+      if(role===1) v=1; else if(role===4) v=2; else if(role===5) v=3;
+      else if(role===2) v=1; else if(role===3) v=3; // palette-safe fallback at tile edge
+    } else {
+      if(role===1) v=1; else if(role===2) v=2; else if(role===3) v=3;
+      else if(role===4) v=2; else if(role===5) v=3;
+    }
+    s[y*8+x]=v;
+  }
+  return {pixels:s,pal:faceTile?1:0};
+}
+
+function enqueuePlayer(camX,shakeX,shakeY) {
+  if(player.inv>0 && (frame&2)) return; // hardware-era invulnerability blink
+  const pose=!player.onGround?'jump':(Math.abs(player.vx)>4?'run':'idle');
+  const phase=(Math.floor(player.runPhase/6)&1);
+  const b=makeRobotFrame(pose,phase,player.shootCd>7);
+  const px=Math.floor(player.x/FP)-2-camX+shakeX;
+  const py=Math.floor(player.y/FP)-1+shakeY;
+  for(let ty=0;ty<3;ty++) for(let tx=0;tx<2;tx++) {
+    const t=robotTile(b,tx,ty);
+    const drawTx=player.dir>0?tx:(1-tx);
+    oamPush(px+drawTx*8,py+ty*8,t.pixels,t.pal,player.dir<0);
+  }
+}
+
+function makeEnemySprite(kind,quadrant,flash=false) {
+  const s=new Uint8Array(64);
+  const qx=(quadrant&1)?8:0, qy=(quadrant&2)?8:0;
+  for(let y=0;y<8;y++) for(let x=0;x<8;x++) {
+    const gx=qx+x-8, gy=qy+y-8;
+    const r=Math.hypot(gx+.5,gy+.5);
+    let v=0;
+    if(r<7.3) v=1;
+    if(r<5.3) v=2;
+    if((Math.abs(gx)<2 || Math.abs(gy)<2) && r<6.5) v=3;
+    if(flash && ((x+y)&1)) v=3;
+    s[y*8+x]=v;
+  }
+  return s;
+}
+function enqueueEnemies(camX,shakeX,shakeY) {
+  for(const e of enemies) {
+    if(!e.alive) continue;
+    const sx=Math.round(e.x-8-camX)+shakeX, sy=Math.round(e.y-8)+shakeY;
+    if(sx<-16||sx>W+8) continue;
+    for(let q=0;q<4;q++) oamPush(sx+(q&1)*8,sy+(q>>1)*8,makeEnemySprite(e.kind,q,e.phase>0),e.kind===3?3:2,e.dir<0);
+  }
+}
+function enqueueBullets(camX,shakeX,shakeY) {
+  for(const b of bullets) {
+    const s=new Uint8Array(64);
+    // Only four active pixels inside one 8x8 hardware sprite.
+    s[3*8+2]=2; s[3*8+3]=3; s[4*8+2]=3; s[4*8+3]=2;
+    oamPush(Math.round(b.x-3-camX)+shakeX,Math.round(b.y-3)+shakeY,s,0,b.vx<0);
+  }
+}
+
+function drawHUD() {
+  // Kept to one background subpalette visually: dark blue, blue, light blue, black.
+  ctx.fillStyle=NES[0x01]; ctx.fillRect(8,8,6,36);
+  ctx.fillStyle=NES[0x0F]; ctx.fillRect(9,9,4,34);
+  const filled=Math.round(32*(player.hp/16));
+  ctx.fillStyle=NES[0x21]; ctx.fillRect(10,42-filled,2,filled);
+  ctx.fillStyle=NES[0x11]; ctx.fillRect(9,42-filled,1,filled);
+
+  // Minimal native-pixel progress indicator.
+  const progress=Math.max(0,Math.min(1,(player.x/FP)/(MW*META-W)));
+  ctx.fillStyle=NES[0x01]; ctx.fillRect(72,8,112,4);
+  ctx.fillStyle=NES[0x21]; ctx.fillRect(73,9,Math.floor(110*progress),2);
+}
+
+function drawDiagnostics() {
+  if(!diagnostics) return;
+  ctx.fillStyle='rgba(0,0,0,.86)'; ctx.fillRect(16,160,224,72);
+  ctx.font='8px monospace'; ctx.textBaseline='top'; ctx.fillStyle=NES[0x30];
+  const lines=[
+    'NES AUTHENTICITY DIAGNOSTICS',
+    'FRAMEBUFFER 256x240  |  SCALE '+Math.round(canvas.getBoundingClientRect().width/256)+'x',
+    'BG: 8x8 TILES / 16x16 PALETTE REGIONS',
+    'SPR: 8x8 / 3 COLORS + TRANSPARENT',
+    'OAM '+String(OAM.length).padStart(2,'0')+'/64  |  SCANLINE '+maxSpritesOnScanline+'/8',
+    'LOGIC 60 HZ  |  NEAREST-NEIGHBOR ONLY'
+  ];
+  lines.forEach((t,i)=>ctx.fillText(t,22,166+i*10));
+}
+
+function render() {
+  const shakeX=screenShake?((frame&1)?1:-1):0;
+  const shakeY=screenShake?((frame&2)?1:0):0;
+  drawBackground(cameraX-shakeX);
+  drawHUD();
+
+  OAM=[];
+  enqueueEnemies(cameraX,shakeX,shakeY);
+  enqueueBullets(cameraX,shakeX,shakeY);
+  enqueuePlayer(cameraX,shakeX,shakeY);
+  renderOAM();
+
+  if(deathFlash>0 && (deathFlash&2)) { ctx.fillStyle=NES[0x30]; ctx.fillRect(0,0,W,H); }
+  drawDiagnostics();
+}
+
+// ------------------------------------------------------------
+// Fixed 60 Hz simulation, independent of monitor refresh rate.
+// ------------------------------------------------------------
+const STEP=1000/60;
+let prev=performance.now(), acc=0;
+function loop(now) {
+  let dt=Math.min(100,now-prev); prev=now; acc+=dt;
+  while(acc>=STEP){ update(); acc-=STEP; }
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
