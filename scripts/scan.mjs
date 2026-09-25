@@ -40,6 +40,11 @@ const MAX_INLINE_ICON = 32 * 1024;
 const GAME_EXT = new Set(['.html', '.htm']);
 const IMAGE_EXT = new Set(['.png', '.webp', '.avif', '.jpg', '.jpeg', '.gif', '.svg', '.ico']);
 const COVER_EXT = ['.png', '.webp', '.avif', '.jpg', '.jpeg', '.gif', '.svg'];
+/**
+ * One encode for every strip. JPEG at the pilot's clearer 640×480 setting:
+ * baseline JPEG is the compatible choice, and every cabinet uses it.
+ */
+export const STRIP_ENCODE = { width: 640, height: 480, format: 'JPEG', quality: 58 };
 const MB = 1024 * 1024;
 /** GitHub warns at 50 MB and rejects a push containing a file over 100 MB. */
 const WARN_BYTES = 50 * MB;
@@ -180,6 +185,51 @@ async function gitAddedDates() {
   return dates;
 }
 
+/** Cabinet text for the shared strip encode: resolution, format, and quality. */
+export function encodeLabel({ width, height, format, quality }) {
+  return `${width}×${height} ${format} quality ${quality}`;
+}
+
+/**
+ * A complete strip is covers/<slug>/0.jpg, 1.jpg and 2.jpg. Frame 0 is the
+ * title. A folder missing any of the three is ignored, so a crashed capture
+ * cannot publish a half-written cabinet. Any other file in the folder is not
+ * a frame.
+ */
+export async function loadFrameStrips(dir = COVERS_DIR) {
+  const strips = new Map();
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return strips;
+  }
+  const label = encodeLabel(STRIP_ENCODE);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || skipName(entry.name)) continue;
+    const slug = entry.name;
+    const folder = path.join(dir, slug);
+    const frames = [];
+    let complete = true;
+    for (const index of [0, 1, 2]) {
+      const name = `${index}.jpg`;
+      try {
+        if (!(await stat(path.join(folder, name))).isFile()) {
+          complete = false;
+          break;
+        }
+      } catch {
+        complete = false;
+        break;
+      }
+      frames.push(urlPath(`/covers/${slug}/`, name));
+    }
+    if (!complete) continue;
+    strips.set(slug, { frames, frameLabel: label, cover: frames[0] });
+  }
+  return strips;
+}
+
 async function coverIndex() {
   const map = new Map();
   let entries;
@@ -227,9 +277,10 @@ async function localAsset(rel, href, extensions) {
 
 export async function scan({ quiet = false, list = false } = {}) {
   const entries = await walk(GAMES_DIR);
-  const [gitDates, covers, overridesRaw, addedRaw] = await Promise.all([
+  const [gitDates, covers, strips, overridesRaw, addedRaw] = await Promise.all([
     gitAddedDates(),
     coverIndex(),
+    loadFrameStrips(),
     readJson(OVERRIDES_FILE, {}),
     readJson(ADDED_FILE, {}),
   ]);
@@ -319,7 +370,14 @@ export async function scan({ quiet = false, list = false } = {}) {
       description: head.description,
       themeColor: head.themeColor,
       icon: head.icon,
-      cover: covers.has(slug) ? urlPath('/covers/', covers.get(slug).file) : head.image || null,
+      cover: strips.has(slug)
+        ? strips.get(slug).cover
+        : covers.has(slug)
+          ? urlPath('/covers/', covers.get(slug).file)
+          : head.image || null,
+      ...(strips.has(slug)
+        ? { frames: strips.get(slug).frames, frameLabel: strips.get(slug).frameLabel }
+        : {}),
       path: current.path,
       version: current.version,
       bytes: current.bytes,

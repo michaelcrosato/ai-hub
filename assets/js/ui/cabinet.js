@@ -10,6 +10,7 @@
 import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { screenArt } from '../art.js';
+import { frameAt, FRAME_MS } from '../frames.js';
 import { bytes, plural } from '../format.js';
 import { store } from '../store.js';
 
@@ -39,10 +40,37 @@ function faveButton(game) {
   return button;
 }
 
+/** Swap the still on a timer. The interval ends itself once the tile is gone. */
+function cycleFrames(img, frames) {
+  for (const url of frames) {
+    const preload = new Image();
+    preload.src = url;
+  }
+  let tick = 0;
+  const timer = setInterval(() => {
+    if (!img.isConnected) {
+      clearInterval(timer);
+      return;
+    }
+    tick += 1;
+    const next = frameAt(frames, tick);
+    if (next) img.src = next;
+  }, FRAME_MS);
+}
+
 function screen(game) {
-  const art = game.cover
-    ? h('img', { src: game.cover, alt: '', loading: 'lazy', decoding: 'async' })
-    : screenArt(game);
+  const frames = Array.isArray(game.frames) && game.frames.length > 1 ? game.frames : null;
+  const art = frames
+    ? h('img', {
+        src: frameAt(frames, 0),
+        alt: '',
+        decoding: 'async',
+        dataset: { frames: JSON.stringify(frames), frameMs: String(FRAME_MS) },
+      })
+    : game.cover
+      ? h('img', { src: game.cover, alt: '', loading: 'lazy', decoding: 'async' })
+      : screenArt(game);
+  if (frames) cycleFrames(art, frames);
 
   return h(
     'div',
@@ -51,7 +79,9 @@ function screen(game) {
     game.buildCount > 1 && h('span', { class: 'cab__badge' }, plural(game.buildCount, 'build')),
     // Only ever seen with dev settings showing everything.
     game.restricted === true && h('span', { class: 'cab__flag' }, 'Hidden'),
-    h('span', { class: 'cab__glass' })
+    h('span', { class: 'cab__glass' }),
+    // Sits above the glass so the encode settings stay readable as the stills change.
+    frames && game.frameLabel && h('span', { class: 'cab__encode' }, game.frameLabel)
   );
 }
 
