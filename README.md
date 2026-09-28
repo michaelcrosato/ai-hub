@@ -260,7 +260,8 @@ rest follow by how many games carry them. `docs/curation-2026-09-24.md`
 records how the library was curated: which file of each game was kept, and
 which older iterations it replaced. `docs/curation-2026-09-28.md` records the
 import from the source-named GPT-games folder and maps the old slugs to the
-current ones.
+current ones; `docs/curation-2026-09-28-new-ai-stuff.md` records the smaller
+import that followed it.
 
 Setting `"hidden": true` drops a game from the catalogue entirely.
 `"restricted": true` keeps it in the catalogue but off the wall, where only dev
