@@ -36,19 +36,42 @@ const keyOf = (dirs, name) => [...dirs, name].map((part) => slugify(part) || par
 
 const labelFor = (version, fallback) => (version ? `v${version}` : fallback);
 
+// The library's naming convention: Source-Title-YYYY-MM-DD-model.html. The date
+// and model say when and by what a file was made, not which game it is, so
+// they stay out of the key: a newer-dated file of the same Source-Title is a
+// newer build of that game, not a second tile.
+const STAMP = /^(.+)-(\d{4})-(\d{2})-(\d{2})-([A-Za-z].*)$/;
+
+/** Split `Source-Title-2026-09-15-model-unknown` into its name and made date. */
+function parseStamp(name) {
+  const text = String(name ?? '');
+  const m = text.match(STAMP);
+  if (!m || +m[3] < 1 || +m[3] > 12 || +m[4] < 1 || +m[4] > 31) return { base: text, made: null };
+  return { base: m[1], made: `${m[2]}-${m[3]}-${m[4]}` };
+}
+
 /**
  * @param {string} rel      posix path relative to games/
  * @param {object} [opts]
  * @param {boolean} [opts.project]  rel is the index.html of a project folder
- * @returns {{ key: string, family: string, version: string|null, label: string, collection: string|null }}
+ * @returns {{ key: string, family: string, version: string|null, label: string, collection: string|null, made: string|null }}
  *   key         groups builds of one game; case- and punctuation-insensitive
  *   family      the human name to fall back on when the game has no <title>
  *   collection  the top-level folder, when that folder is not the game itself
+ *   made        YYYY-MM-DD from a Source-Title-date-model name, else null
  */
 export function classify(rel, { project = false } = {}) {
   const dirs = String(rel).split('/').filter(Boolean);
   const file = dirs.pop() || '';
-  const stem = file.replace(/\.[^.]+$/, '');
+  let stem = file.replace(/\.[^.]+$/, '');
+  let named;
+  if (project && dirs.length) {
+    named = parseStamp(dirs[dirs.length - 1]);
+    dirs[dirs.length - 1] = named.base;
+  } else {
+    named = parseStamp(stem);
+    stem = named.base;
+  }
 
   // The segments that identify the game, and the folders that merely hold it.
   let owner;
@@ -91,6 +114,7 @@ export function classify(rel, { project = false } = {}) {
     version: version || null,
     label: labelFor(version, 'build'),
     collection: owner.length ? owner[0] : null,
+    made: named.made,
   };
 }
 

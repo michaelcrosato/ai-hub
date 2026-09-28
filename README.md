@@ -36,7 +36,7 @@ Nothing is typed in by hand. On every build, `scripts/scan.mjs` reads just the
 | `<meta name="theme-color">` | That cabinet's marquee colour and the light it throws |
 | `<link rel="icon" href="data:…">` | The emblem on its screen (a relative path works in a project folder) |
 | `<meta property="og:image">` | Its cover art, in a project folder that ships the image |
-| file size, date first seen | The Weight rail, the Newest sort |
+| file size, the date in its name (or the date first seen) | The Weight rail, the Newest sort |
 
 A game with none of these still works — it gets its filename as a name and a
 colour derived from its slug.
@@ -60,6 +60,27 @@ A version is only recognised when it is unmistakable: `-v2`, `-v0.4`, `-1.2`.
 A bare trailing number is left alone, so `snake-2.html` stays its own game
 rather than quietly becoming build 2 of `snake`. Hiding a game by accident is
 worse than showing one tile too many.
+
+### The library's naming convention
+
+Any name works, but the library names its files by source, so `games/` sorts
+into families:
+
+```
+games/Out-Run-SUPER-RUNOUT-The-coast-is-calling-2026-09-11-model-unknown.html
+      source  title                             made       model
+```
+
+The source is the classic a game riffs on, or `original` when there is none;
+`model-unknown` is used until the model is known (`GPT-6-Astra-Pro`).
+
+The scan reads the pattern. The date and model say when and by what a file was
+made, not which game it is, so they stay out of the slug
+(`out-run-super-runout-the-coast-is-calling`), and the date becomes the day the
+game joined the wall. A later file with the same source and title —
+`…-2026-10-02-model-unknown.html` — is a newer build of that game: one tile,
+the newest in front, the older file in its drawer. To keep only the newest,
+delete the older file.
 
 ### Folders: collections and projects
 
@@ -237,7 +258,9 @@ The library's own catalogue uses these fields, all in `data/overrides.json`:
 Genre, Collection, Type and Players lead the rail strip when they exist; the
 rest follow by how many games carry them. `docs/curation-2026-09-24.md`
 records how the library was curated: which file of each game was kept, and
-which older iterations it replaced.
+which older iterations it replaced. `docs/curation-2026-09-28.md` records the
+import from the source-named GPT-games folder and maps the old slugs to the
+current ones.
 
 Setting `"hidden": true` drops a game from the catalogue entirely.
 `"restricted": true` keeps it in the catalogue but off the wall, where only dev

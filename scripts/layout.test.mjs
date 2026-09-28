@@ -88,6 +88,35 @@ test('slugs fall back to a counter when even the qualified name is taken', () =>
   assert.equal(new Set(slugs.values()).size, 3);
 });
 
+test('a Source-Title-date-model name keys on Source-Title and keeps the date', () => {
+  const place = classify('Out-Run-SUPER-RUNOUT-The-coast-is-calling-2026-09-11-model-unknown.html');
+  assert.equal(place.key, 'out-run-super-runout-the-coast-is-calling');
+  assert.equal(place.made, '2026-09-11');
+  assert.equal(place.version, null);
+  assert.equal(
+    classify('FFT-The-Lion-s-Oath-2026-09-25-GPT-6-Astra-Pro.html').key,
+    classify('FFT-The-Lion-s-Oath-2026-09-30-GPT-6-Astra-Pro.html').key,
+  );
+  assert.equal(
+    classify('Desert-Strike-SKYSHIELD-2026-2026-08-23-model-unknown.html').key,
+    'desert-strike-skyshield-2026',
+  );
+  assert.notEqual(
+    classify('original-BLACKWELL-Attempt-02-2026-09-04-model-unknown.html').key,
+    classify('original-BLACKWELL-Below-the-surface-Attempt-01-2026-09-04-model-unknown.html').key,
+  );
+  assert.deepEqual(
+    pick(classify('Crystalis-Aetherfall-Windshard-2026-09-17-model-unknown/index.html', { project: true })),
+    {
+      key: 'crystalis-aetherfall-windshard',
+      version: null,
+      collection: null,
+    },
+  );
+  assert.equal(classify('snake.html').made, null);
+  assert.equal(classify('report-2026-13-01-draft.html').key, 'report-2026-13-01-draft');
+});
+
 test('prettify turns folder names into labels', () => {
   assert.equal(prettify('claude-opus_4'), 'Claude Opus 4');
   assert.equal(prettify('GPT 5'), 'GPT 5');

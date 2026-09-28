@@ -328,7 +328,7 @@ export async function scan({ quiet = false, list = false } = {}) {
       file: rel,
       path: urlPath('/games/', rel),
       bytes: stats.size,
-      added: added[rel] || gitDates.get(rel) || stats.mtime.toISOString(),
+      added: added[rel] || (place.made && `${place.made}T12:00:00.000Z`) || gitDates.get(rel) || stats.mtime.toISOString(),
       // Head details ride along only until the newest build is chosen.
       head: {
         name: titleName,
