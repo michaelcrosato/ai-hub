@@ -296,6 +296,19 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
 - `renderer.info.render.calls` still works for checking draw calls.
 - A transparent canvas needs `boot({ renderer: { alpha: true } })`; the kit
   defaults to opaque.
+- **Hand-edited projection matrices get overwritten.** three.js calls
+  `camera.updateProjectionMatrix()` itself the first time a camera renders on
+  the WebGPU backend (different clip-space depth) and with reversed depth, so
+  a tweak written straight into `camera.projectionMatrix.elements` after
+  your own update is lost on WebGPU only. Re-apply such tweaks every frame
+  before rendering, or express them another way. Mirroring a view (games
+  ported from left-handed software renderers) cannot use `camera.scale.x = -1`
+  (the view matrix ignores camera scale): flip the world or re-apply the
+  projection flip each frame, and check both backends.
+- Thin lines: `LineSegments` draw one device pixel wide on both backends (no
+  line width). Vector/wireframe games that need visible stroke width draw
+  screen-space quads per segment (or `lines/webgpu/Line2.js`), sized in CSS
+  pixels.
 - **Never dispose or null `light.shadow.map`** to resize a shadow map (a
   common WebGLRenderer trick). In r186 the shadow node owns its render target
   and re-sizes it from `light.shadow.mapSize` on the next frame; disposing it

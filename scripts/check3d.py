@@ -57,7 +57,9 @@ if(click){const t=document.elementFromPoint(X,Y)||document.body;const o={bubbles
 t.dispatchEvent(new PointerEvent('pointerdown',o));t.dispatchEvent(new MouseEvent('mousedown',o));await sleep(80);
 t.dispatchEvent(new PointerEvent('pointerup',{...o,buttons:0}));t.dispatchEvent(new MouseEvent('mouseup',{...o,buttons:0}));t.dispatchEvent(new MouseEvent('click',{...o,buttons:0}));await sleep(300)}
 for(const code of keys){const key=code==='Space'?' ':code.startsWith('Key')?code.slice(3).toLowerCase():code.startsWith('Digit')?code.slice(5):code;
-const tgt=document.activeElement||document.body;tgt.dispatchEvent(new KeyboardEvent('keydown',{code,key,bubbles:true,cancelable:true}));await sleep(600);
+const tgt=document.activeElement||document.body;
+if((code==='Enter'||code==='Space')&&tgt.closest&&tgt.closest('button,a[href],summary,[role=button],input[type=button],input[type=submit]')){tgt.click();await sleep(400);continue}
+tgt.dispatchEvent(new KeyboardEvent('keydown',{code,key,bubbles:true,cancelable:true}));await sleep(600);
 tgt.dispatchEvent(new KeyboardEvent('keyup',{code,key,bubbles:true,cancelable:true}));await sleep(200)}},__DELAY__);</script>"""
 
 
@@ -264,7 +266,7 @@ def run_windows(url_path, port, out, wait, keys=(), click=False):
         url += '&drive=' + urllib.parse.quote(','.join(keys))
     if click:
         url += '&click=1'
-    base = [CHROME, '--headless=new', '--no-first-run', '--no-default-browser-check', '--window-size=1280,720',
+    base = [CHROME, '--headless=new', '--no-first-run', '--no-default-browser-check', '--window-size=1280,720', '--hide-scrollbars',
             '--autoplay-policy=no-user-gesture-required', f'--user-data-dir={prof_win}']
     res = {}
     try:
