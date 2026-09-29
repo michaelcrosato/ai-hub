@@ -108,7 +108,7 @@ The kit object:
 | `kit.backend` | `'webgpu'` or `'webgl2'`; `kit.backendLabel` for a HUD |
 | `kit.tier` | `{ name, pixelRatio, msaa, shadowMapSize, post, detail, drawDistance }` |
 | `kit.onQuality(fn)` | the player changed quality: re-apply shadow sizes, counts, draw distance |
-| `kit.shadowSize(2048)` | the game's shadow-map size at *high*, scaled for the tier |
+| `kit.shadow(light, 2048)` | size a light's shadow map for the tier (2048 at *high*) and keep it sized when quality changes; `kit.shadowSize(2048)` gives just the number |
 | `kit.detail(count)` | a count (particles, props, crowd) scaled for the tier |
 | `kit.input`, `kit.touch` | §4 |
 | `kit.fitCamera(cam)`, `kit.onResize(fn)`, `kit.size` | sizing |
@@ -296,6 +296,10 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
 - `renderer.info.render.calls` still works for checking draw calls.
 - A transparent canvas needs `boot({ renderer: { alpha: true } })`; the kit
   defaults to opaque.
+- **Never dispose or null `light.shadow.map`** to resize a shadow map (a
+  common WebGLRenderer trick). In r186 the shadow node owns its render target
+  and re-sizes it from `light.shadow.mapSize` on the next frame; disposing it
+  breaks rendering. Just set `mapSize`, or use `kit.shadow(light, base)`.
 - `VSMShadowMap` on the WebGPU backend also renders receivers into the shadow
   map and can show moiré acne on slopes that WebGL2 does not; set
   `light.shadow.normalBias` to about 0.04 (and check both backends).
