@@ -209,6 +209,12 @@ The **standard bindings**, so every game feels familiar:
   or `kit.touch.placeTop('left', 60)`. The gear takes a corner the HUD does
   not use (`gear: 'tl'`), or `gear: 'none'` when the game's own pause menu has
   a Settings button calling `kit.menu.open()`.
+- **Keep the HUD clear of the controls with CSS, not guesses.** While touch
+  controls show, `<html>` has the class `kit-touch-on` and the variables
+  `--kit-touch-bottom`, `--kit-touch-left`, `--kit-touch-right` and
+  `--kit-touch-top` hold the space they take (0px when hidden). Lift
+  bottom HUD elements with `bottom: calc(12px + var(--kit-touch-bottom, 0px))`,
+  push top-centre text below the pills with `var(--kit-touch-top)`, and so on.
 - The idle stick ring is faint; if it still sits on a bottom-left HUD (radar,
   scanner), hide it with `boot({ touch: { hint: false } })` or
   `kit.touch.setHint(false)` — the stick still appears under the thumb.
