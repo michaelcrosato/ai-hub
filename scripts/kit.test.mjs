@@ -144,3 +144,8 @@ test('a tap inside one frame still counts once', () => {
   assert.equal(l.has('KeyW'), true, 'held keys survive a flush');
   assert.deepEqual([...l], ['KeyW']);
 });
+
+test('vector clamp can be turned off for independent axes', () => {
+  assert.equal(normalizeAction('move', { type: 'vector' }).clamp, true);
+  assert.equal(normalizeAction('steer', { type: 'vector', clamp: false }).clamp, false);
+});

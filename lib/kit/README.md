@@ -182,6 +182,9 @@ The **standard bindings**, so every game feels familiar:
 | pause / menu | Esc or P | Start | top pill |
 | camera zoom | wheel | RB/LB or right-stick click | pinch |
 
+- Vector actions are clamped to unit length so diagonal movement is not
+  faster. Flight-style controls, where x and y are separate axes (roll and
+  pitch), pass `clamp: false` so holding two keys keeps both at full rate.
 - Presses are latched: a tap that goes down and up between two frames still
   reports `pressed()` once. `kit.input.settle()` makes everything currently
   held count as already held (the kit calls it when its settings panel
