@@ -206,6 +206,9 @@ The **standard bindings**, so every game feels familiar:
   or `kit.touch.placeTop('left', 60)`. The gear takes a corner the HUD does
   not use (`gear: 'tl'`), or `gear: 'none'` when the game's own pause menu has
   a Settings button calling `kit.menu.open()`.
+- The idle stick ring is faint; if it still sits on a bottom-left HUD (radar,
+  scanner), hide it with `boot({ touch: { hint: false } })` or
+  `kit.touch.setHint(false)` — the stick still appears under the thumb.
 - Bright scenes: `boot({ touch: { theme: 'light' } })` (or `kit.touch.setTheme('light')`)
   draws dark controls. The kit's stylesheet is first in `<head>`, so a game
   can restyle `.kit-touch__*` with ordinary selectors if it must. Players
