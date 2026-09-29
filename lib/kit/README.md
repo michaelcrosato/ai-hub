@@ -182,10 +182,24 @@ The **standard bindings**, so every game feels familiar:
 | pause / menu | Esc or P | Start | top pill |
 | camera zoom | wheel | RB/LB or right-stick click | pinch |
 
+- Presses are latched: a tap that goes down and up between two frames still
+  reports `pressed()` once. `kit.input.settle()` makes everything currently
+  held count as already held (the kit calls it when its settings panel
+  closes, so the button that closed it does not also fire in the game; call
+  it yourself after the game's own modal UI).
+- Enter and Space on a focused DOM button or link are left to the button
+  (a native click), not reported as actions, so menus never double-fire.
 - `touch: 'stick'` gives a floating joystick that appears under the thumb;
   `'stick-right'` a second one for twin-stick aim; `touch: 'drag'` on a look
   action turns free screen area into a camera drag. Up to about five buttons
   fit the cluster; put rarer actions in the top row (`slot: 'top'`).
+- `kit.touch.suspend(true)` hides the controls for the game's own menus and
+  cutscenes (and `false` brings them back); it is tracked separately from
+  the kit's settings panel. The top row of pills defaults to top-centre;
+  move it clear of the HUD with `boot({ touch: { top: 'right', topOffset: 56 } })`
+  or `kit.touch.placeTop('left', 60)`. The gear takes a corner the HUD does
+  not use (`gear: 'tl'`), or `gear: 'none'` when the game's own pause menu has
+  a Settings button calling `kit.menu.open()`.
 - Touch controls appear on touch devices and hide as soon as a keyboard or
   gamepad is used. A pointer-driven game (tactics, strategy, city builders)
   needs no stick: taps arrive as `kit.input.pointer`, pinch and wheel as
@@ -276,6 +290,12 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
 - `renderer.info.render.calls` still works for checking draw calls.
 - A transparent canvas needs `boot({ renderer: { alpha: true } })`; the kit
   defaults to opaque.
+- `VSMShadowMap` on the WebGPU backend also renders receivers into the shadow
+  map and can show moiré acne on slopes that WebGL2 does not; set
+  `light.shadow.normalBias` to about 0.04 (and check both backends).
+- `createPost`'s `output(color, ctx)` runs again when the player changes
+  quality (the chain is rebuilt so FXAA and bloom size follow the tier), so
+  keep it free of side effects; `ctx.tier` is the new tier.
 
 ### Retro looks (PS1, N64, Super FX, pixelated modes)
 
@@ -287,6 +307,7 @@ import { vertexSnap, dither15 } from 'kit/retro.js';
 const kit = await boot({ pixelHeight: 360, renderer: { antialias: false } }); // 360 lines, upscaled with hard pixels
 kit.setPixelHeight(0);                       // back to native resolution (e.g. a "Retro" toggle in the game's menu)
 vertexSnap(material, { width: 320, height: 240 });   // wobbly PS1 vertices; works with instancing and skinning
+const grid = vertexSnap(first); vertexSnap(second, { grid }); // share one grid uniform across materials
 createPost(kit, scene, camera, { output: (c) => dither15(c) });  // ordered 15-bit colour dither
 ```
 
@@ -378,6 +399,8 @@ python3 scripts/check3d.py games/<Game>.html --keys KeyW,Space --click
 It serves the repo, loads the game in Linux Chromium forced to WebGL2 and in
 Windows Chrome on the real GPU (WebGPU), then in a Pixel 7 profile with touch,
 and reports `window.__kit`, console errors, a blank-screen check and
-screenshots. A game passes when all three paths boot, render frames, log no
+screenshots. `--keys` and `--click` are played on both desktop paths (on
+WebGPU as synthetic events once the game has booted, before its screenshot),
+so the screenshots can show gameplay rather than the title screen. A game passes when all three paths boot, render frames, log no
 errors, and the WebGPU and WebGL2 screenshots show the same scene as each
 other and as the pre-migration baseline.

@@ -15,7 +15,9 @@ Paths:
   webgl2  Playwright Chromium, forced WebGL2 (?kit-backend=webgl2). Screenshot, console errors,
           window.__kit diagnostics, blank-canvas check, optional key/click input.
   webgpu  Windows Chrome headless on the real RTX 3060 Ti via --dump-dom with an injected probe,
-          plus a --screenshot run. Reports the backend the kit chose, frames, errors.
+          plus a --screenshot run. Reports the backend the kit chose, frames, errors. --keys/--click
+          are replayed there too as synthetic events once the game has booted (the screenshot is
+          taken after them, so it shows gameplay if the keys start the game).
   mobile  Playwright Chromium with a Pixel 7 profile (touch, coarse pointer): checks the kit's touch
           controls appear and nothing throws.
 
@@ -45,6 +47,18 @@ const gc=HTMLCanvasElement.prototype.getContext;HTMLCanvasElement.prototype.getC
 if(navigator.gpu){const ra=navigator.gpu.requestAdapter.bind(navigator.gpu);navigator.gpu.requestAdapter=async(...a)=>{const ad=await ra(...a);P.gpu=ad?{vendor:ad.info&&ad.info.vendor,arch:ad.info&&ad.info.architecture}:'null';return ad}}
 setTimeout(()=>{const k=window.__kit||null;const pre=document.createElement('pre');pre.id='__probe_out';pre.textContent='@@PRO'+'BE@@'+JSON.stringify({...P,kit:k,title:document.title})+'@@E'+'ND@@';document.documentElement.append(pre)},__WAIT__);
 })();</script>"""
+
+
+# Input for the WebGPU path, where the page runs in Windows Chrome with no automation channel:
+# after the game has booted, click the middle of the screen, then hold each key for 0.6 s.
+DRIVE = r"""<script>addEventListener('load',()=>{},{once:true});setTimeout(async()=>{const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const keys=__KEYS__;const click=__CLICK__;const X=innerWidth/2,Y=innerHeight/2;
+if(click){const t=document.elementFromPoint(X,Y)||document.body;const o={bubbles:true,cancelable:true,clientX:X,clientY:Y,pointerId:1,pointerType:'mouse',button:0,buttons:1,isPrimary:true};
+t.dispatchEvent(new PointerEvent('pointerdown',o));t.dispatchEvent(new MouseEvent('mousedown',o));await sleep(80);
+t.dispatchEvent(new PointerEvent('pointerup',{...o,buttons:0}));t.dispatchEvent(new MouseEvent('mouseup',{...o,buttons:0}));t.dispatchEvent(new MouseEvent('click',{...o,buttons:0}));await sleep(300)}
+for(const code of keys){const key=code==='Space'?' ':code.startsWith('Key')?code.slice(3).toLowerCase():code.startsWith('Digit')?code.slice(5):code;
+const tgt=document.activeElement||document.body;tgt.dispatchEvent(new KeyboardEvent('keydown',{code,key,bubbles:true,cancelable:true}));await sleep(600);
+tgt.dispatchEvent(new KeyboardEvent('keyup',{code,key,bubbles:true,cancelable:true}));await sleep(200)}},__DELAY__);</script>"""
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -77,6 +91,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 wait = int(q.get('probe', ['9000'])[0])
                 html = fs.read_text(encoding='utf-8', errors='replace')
                 probe = PROBE.replace('__WAIT__', str(wait))
+                keys = [k for k in q.get('drive', [''])[0].split(',') if k]
+                clickq = q.get('click', ['0'])[0] == '1'
+                if keys or clickq:
+                    delay = max(1500, int(wait * 0.4))
+                    probe += DRIVE.replace('__KEYS__', json.dumps(keys)).replace('__CLICK__', 'true' if clickq else 'false').replace('__DELAY__', str(delay))
                 m = re.search(r'<head[^>]*>', html, re.I)
                 html = html[:m.end()] + probe + html[m.end():] if m else probe + html
                 slow = f'<img src="/__slow?ms={wait + 1500}" style="position:fixed;width:1px;height:1px;opacity:0" alt="">'
@@ -227,7 +246,7 @@ def run_playwright(url_path, port, out, wait, keys, click, mobile=False):
     return res
 
 
-def run_windows(url_path, port, out, wait):
+def run_windows(url_path, port, out, wait, keys=(), click=False):
     if not os.path.exists(CHROME):
         return {'skipped': 'Windows Chrome not found'}
     tag = f'kitcheck-{os.getpid()}-{random.randint(0, 99999)}'
@@ -235,6 +254,10 @@ def run_windows(url_path, port, out, wait):
     prof_win = WIN_TEMP + '\\' + tag
     sep = '&' if '?' in url_path else '?'
     url = f'http://localhost:{port}{url_path}{sep}probe={wait * 1000}'
+    if keys:
+        url += '&drive=' + urllib.parse.quote(','.join(keys))
+    if click:
+        url += '&click=1'
     base = [CHROME, '--headless=new', '--no-first-run', '--no-default-browser-check', '--window-size=1280,720',
             '--autoplay-policy=no-user-gesture-required', f'--user-data-dir={prof_win}']
     res = {}
@@ -347,7 +370,7 @@ def main():
         except Exception as e:
             report[name] = {'crash': str(e)[:500]}
     if 'webgpu' in only:
-        threads.append(threading.Thread(target=job, args=('webgpu', run_windows, url_path, port, out, a.wait)))
+        threads.append(threading.Thread(target=job, args=('webgpu', run_windows, url_path, port, out, a.wait, keys, a.click)))
     if 'webgl2' in only:
         threads.append(threading.Thread(target=job, args=('webgl2', run_playwright, url_path, port, out, a.wait + 6, keys, a.click)))
     for t in threads:

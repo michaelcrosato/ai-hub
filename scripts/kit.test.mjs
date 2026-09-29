@@ -13,7 +13,7 @@ import {
   FAILURE_MEMORY_MS,
   TIERS,
 } from '../lib/kit/settings.js';
-import { normalizeAction, deadzone, clampUnit } from '../lib/kit/input.js';
+import { normalizeAction, deadzone, clampUnit, Latch } from '../lib/kit/input.js';
 import { DynamicResolution, FpsCounter, skipForCap } from '../lib/kit/loop.js';
 import { fixedStep } from '../lib/kit/physics.js';
 
@@ -129,4 +129,18 @@ test('fixed step runs whole steps and returns the remainder', () => {
   steps = 0;
   fs.advance(10, () => steps++);
   assert.equal(steps, 5, 'a long stall cannot spiral');
+});
+
+test('a tap inside one frame still counts once', () => {
+  const l = new Latch();
+  l.add('Space');
+  l.delete('Space');
+  assert.equal(l.has('Space'), true, 'seen by the next update');
+  assert.equal(l.size, 0, 'not held');
+  l.flush();
+  assert.equal(l.has('Space'), false, 'gone after that update');
+  l.add('KeyW');
+  l.flush();
+  assert.equal(l.has('KeyW'), true, 'held keys survive a flush');
+  assert.deepEqual([...l], ['KeyW']);
 });
