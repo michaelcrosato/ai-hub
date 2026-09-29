@@ -414,3 +414,9 @@ WebGPU as synthetic events once the game has booted, before its screenshot),
 so the screenshots can show gameplay rather than the title screen. A game passes when all three paths boot, render frames, log no
 errors, and the WebGPU and WebGL2 screenshots show the same scene as each
 other and as the pre-migration baseline.
+
+Also switch quality while the game runs — in a Playwright script,
+`page.evaluate("__kitSettings.set({ quality: 'low' })")`, wait a second,
+then `'high'` — and confirm frames keep coming (`window.__kit.frames`
+rises) with no new errors. A game that reacts to `kit.onQuality` must
+survive it.
