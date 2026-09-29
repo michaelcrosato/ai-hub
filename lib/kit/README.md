@@ -163,7 +163,7 @@ if (kit.input.pressed('jump')) …          // went down this frame
 if (kit.input.down('fire')) …             // held
 kit.input.value('gas');                   // -1..1 (axes) or 0..1 (analog triggers)
 kit.input.zoom();                         // mouse wheel + pinch this frame, + is in
-kit.input.pointer;                        // {x, y, nx, ny, down, justDown, justUp, type} over the canvas
+kit.input.pointer;                        // {x, y, nx, ny, down, justDown, justUp, over, type} over the canvas
 kit.input.source;                         // 'keyboard' | 'gamepad' | 'touch' — for button prompts
 kit.input.rumble(0.5, 120);               // controller rumble / phone haptics
 kit.input.lockPointer();                  // call from a click to start mouse-look
@@ -187,8 +187,14 @@ The **standard bindings**, so every game feels familiar:
   held count as already held (the kit calls it when its settings panel
   closes, so the button that closed it does not also fire in the game; call
   it yourself after the game's own modal UI).
-- Enter and Space on a focused DOM button or link are left to the button
-  (a native click), not reported as actions, so menus never double-fire.
+- Enter and Space on a DOM button or link that has keyboard focus
+  (`:focus-visible`, i.e. reached with Tab, arrows or a gamepad) are left to
+  the button (a native click), not reported as actions, so menus never
+  double-fire. A button that only kept focus after a mouse click does not
+  swallow Space; the game still gets it.
+- `input.source` follows the last device used (keys, mouse, touch, pad), so
+  button prompts can switch. `input.pointer.over` says whether the pointer is
+  over the canvas (hover previews).
 - `touch: 'stick'` gives a floating joystick that appears under the thumb;
   `'stick-right'` a second one for twin-stick aim; `touch: 'drag'` on a look
   action turns free screen area into a camera drag. Up to about five buttons

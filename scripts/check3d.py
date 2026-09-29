@@ -279,6 +279,12 @@ def run_windows(url_path, port, out, wait, keys=(), click=False):
             time.sleep(1.5)
         dom = p.stdout.decode('utf-8', 'replace')
         m = re.search(r'@@PROBE@@(.*?)@@END@@', dom, re.S)
+        if m and '"kit":null' in m.group(1).replace(' ', '') and '"errors":[]' in m.group(1).replace(' ', ''):
+            # A busy GPU (another Chrome session) occasionally stalls the first boot; try once more.
+            p = subprocess.run(base + ['--dump-dom', url], capture_output=True, timeout=wait + 60)
+            dom = p.stdout.decode('utf-8', 'replace')
+            m = re.search(r'@@PROBE@@(.*?)@@END@@', dom, re.S)
+            res['retried'] = True
         if m:
             import html as H
             res['probe'] = json.loads(H.unescape(m.group(1)))
