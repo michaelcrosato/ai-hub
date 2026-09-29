@@ -309,11 +309,12 @@ const ROOT_REF = /(\b(?:src|href|poster)\s*=\s*)(["'])\/(?![/"'])([^"'?#]*)([^"'
  * Root-absolute references in a page (`/assets/index-3f2a.js`). A bundler
  * configured for its own domain writes these, and inside the hub they resolve
  * against the hub rather than the game's folder, so the game loads blank.
+ * `/lib/` is the exception: the shared 3D stack lives there on purpose.
  */
 export function rootAbsoluteRefs(html) {
   const found = new Set();
   for (const m of String(html || '').matchAll(ROOT_REF)) {
-    if (m[3]) found.add('/' + m[3]);
+    if (m[3] && !m[3].startsWith('lib/')) found.add('/' + m[3]);
   }
   return [...found];
 }

@@ -88,6 +88,7 @@ test('root-absolute references are found and made relative, and only those that 
   assert.deepEqual(rootAbsoluteRefs(VITE_BUILT + '<a href="/">home</a><img src="//cdn.x/y.png">'), [
     '/assets/index-a1b2.js',
   ]);
+  assert.deepEqual(rootAbsoluteRefs('<link rel="modulepreload" href="/lib/three/three.webgpu.js">'), [], 'the shared stack is meant to load from the root');
   const have = new Set(['assets/index-a1b2.js']);
   const out = relativizeRefs(VITE_BUILT + '<link href="/missing.css">', (p) => have.has(p));
   assert.match(out, /src="\.\/assets\/index-a1b2\.js"/);
