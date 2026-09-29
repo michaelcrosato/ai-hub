@@ -275,6 +275,12 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   intensities by `Math.PI`, and for point/spot lights also set `decay = 1`
   (the old default) and multiply by `Math.PI`. Then compare with the baseline
   screenshot and tune until it matches.
+- **Face culling from hand-written WebGL.** Many hand-written renderers never
+  enabled `CULL_FACE`, so every triangle drew from both sides and their
+  meshes rely on it (inconsistent winding, one-sided walls and roofs).
+  three.js culls back faces by default: use `side: THREE.DoubleSide` on those
+  materials (or fix the winding), and walk around the level to confirm no
+  faces vanish. The reverse holds too: if the old code culled, keep `FrontSide`.
 - Renamed or removed APIs: `outputEncoding` → `outputColorSpace`,
   `texture.encoding` → `texture.colorSpace`, `THREE.Math` → `THREE.MathUtils`,
   `PostProcessing` → `RenderPipeline`, `pass.setResolution` → `setResolutionScale`,
