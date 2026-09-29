@@ -2,39 +2,22 @@
 
 An original 2.5D low-poly browser platformer vertical slice inspired by the playful pacing and inhale/borrow loop of 8-bit dream platformers. It uses no Nintendo art, audio, level data, names, or other game assets.
 
-## Run it
+## Stack
 
-### Fast static-server path
-
-The checked-in import map pins Three.js r186 for the WebGPU/WebGL2 path and Three.js r162 for the WebGL1 legacy path. A network connection is required for the pinned jsDelivr module URLs.
-
-```bash
-python3 -m http.server 8080
-```
-
-Open `http://localhost:8080`.
-
-### Local npm/Vite path
-
-```bash
-npm install
-npm run dev
-```
-
-The package pins `three@0.186.0` and aliases `three@0.162.0` as `three-legacy` for the WebGL1 fallback.
-
-## Renderer strategy
-
-- Primary: `WebGPURenderer` from Three.js r186.
-- Automatic modern fallback: Three.js r186 WebGL2 backend.
-- Legacy fallback: Three.js r162 `WebGLRenderer` when WebGL2 is unavailable, because WebGL1 support was removed from current Three.js after r162.
-- Modern effects: Neutral tone mapping, VSM shadows, emissive materials, fog, adaptive pixel ratio, and the r186 `RenderPipeline` + TSL BloomNode path.
+Runs on the wall's shared 3D stack: three.js r186 `WebGPURenderer` (WebGPU, WebGL2 fallback) started by `/lib/kit/boot.js`, with the kit's quality tiers, settings panel (gear or F9), input actions and touch controls. Bloom comes from `kit/post.js`. Serve the repository root (the page loads `/lib/...`), for example `python3 -m http.server` from the repo, and open `/games/Kirbys-Adventure-Petalwind-Meadow-2026-09-17-model-unknown/`.
 
 ## Controls
 
-Desktop: A/D or arrow keys move, Space jumps. Release Space after a jump and hold it again to hover. J inhales. K uses a borrowed ability or a basic air puff. Mouse wheel zooms.
+| | Keyboard / mouse | Gamepad | Touch |
+|---|---|---|---|
+| Move | A/D or ←/→ | left stick or D-pad | floating stick |
+| Jump / hover | Space (release, then hold again in the air to hover) | A | JUMP |
+| Inhale | J or left click | X or RT | INHALE |
+| Borrowed ability | K, Shift or right click | B or LT | ABILITY |
+| Zoom | mouse wheel | LB / RB | pinch |
+| Pause | Esc or P | Start | II |
 
-Mobile: left virtual joystick, JUMP, IN, and A buttons. Two-finger pinch changes camera zoom. Controls support independent simultaneous pointers.
+Menus take Space/Enter or A to confirm, the stick or arrows to move between buttons, and B or Start to go back.
 
 ## Vertical slice
 
@@ -49,22 +32,19 @@ The mission is a single complete sequence through Petalwind Meadow:
 
 Normal exploration reaches level 2 before the boss and level 3 at completion. A minimal no-grind run can fight the boss at level 1 and still finish.
 
-## Tests used during refinement
+## Balance checks
 
 ```bash
 node tests/sim-test.mjs
 node tests/route-sim.mjs
 node tests/geometry-test.mjs
-node --check src/game.js
 ```
 
 The route simulations cover both causeway branches, XP/gear progression, boss action counts, and a minimal no-grind/no-borrowed-ability case. Geometry checks cover branch gaps, lower-route climb height, arena-gate placement, and goal reachability.
 
 ## Project structure
 
-- `src/main.js`: renderer capability selection.
-- `src/modern.js`: WebGPU/WebGL2 renderer and TSL bloom pipeline.
-- `src/legacy.js`: WebGL1 legacy renderer.
-- `src/game.js`: world, controls, gameplay, UI, physics, enemies, boss, particles, camera, audio, and completion loop.
+- `src/main.js`: boot through the kit, renderer settings, bloom, the frame loop.
+- `src/game.js`: world, gameplay, menus, HUD, enemies, boss, particles, camera and audio.
 - `src/balance.js`: progression and combat tuning.
-- `src/style.css`: responsive HUD and multitouch controls.
+- `src/style.css`: HUD and panels.
