@@ -206,6 +206,16 @@ The **standard bindings**, so every game feels familiar:
   or `kit.touch.placeTop('left', 60)`. The gear takes a corner the HUD does
   not use (`gear: 'tl'`), or `gear: 'none'` when the game's own pause menu has
   a Settings button calling `kit.menu.open()`.
+- Bright scenes: `boot({ touch: { theme: 'light' } })` (or `kit.touch.setTheme('light')`)
+  draws dark controls. The kit's stylesheet is first in `<head>`, so a game
+  can restyle `.kit-touch__*` with ordinary selectors if it must. Players
+  can mirror the layout (stick on the right) in the settings panel.
+  `kit.touch.setLabel(name, textOrNode)` and `kit.touch.button(name)` allow
+  icons or cooldown fills.
+- The settings panel is a modal `<dialog>` in the top layer, so it opens
+  above a game's own `showModal()` dialogs. Mapping Escape to an action
+  (pause/back) prevents a dialog's native Escape close: route Escape
+  through that action and close your dialog there.
 - Touch controls appear on touch devices and hide as soon as a keyboard or
   gamepad is used. A pointer-driven game (tactics, strategy, city builders)
   needs no stick: taps arrive as `kit.input.pointer`, pinch and wheel as
