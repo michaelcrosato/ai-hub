@@ -1,7 +1,7 @@
 import { GRAPHICS_CONTROLS, formatSetting } from '../engine/settings.js';
 
 /** Keep the panel and renderer on the same settings schema. */
-export function mountGraphicsPanel(container, getValues, onChange, signal) {
+export function mountGraphicsPanel(container, getValues, onChange, signal, getContext = () => ({})) {
   const entries = new Map(); let group = null, section;
   for (const control of GRAPHICS_CONTROLS) {
     if (control.group !== group) {
@@ -25,10 +25,11 @@ export function mountGraphicsPanel(container, getValues, onChange, signal) {
     section.append(label, input); entries.set(control.key, { control, input, output });
   }
   function sync() {
-    const values = getValues();
+    const values = getValues(), context = getContext();
     for (const [key, { control, input, output }] of entries) {
-      input.value = control.values ? control.values.indexOf(values[key]) : values[key];
-      const text = formatSetting(control, values[key]); output.textContent = text; input.setAttribute('aria-valuetext', text);
+      const index = control.values ? Math.max(0, control.values.indexOf(values[key])) : values[key];
+      input.value = index;
+      const text = formatSetting(control, values[key], context); output.textContent = text; input.setAttribute('aria-valuetext', text);
     }
   }
   sync(); return { sync };

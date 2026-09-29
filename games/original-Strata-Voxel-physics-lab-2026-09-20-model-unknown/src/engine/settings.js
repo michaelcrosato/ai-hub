@@ -1,8 +1,8 @@
 import { PROFILES } from './config.js';
 
 // The same schema drives the controls, validation, and saved settings.
+// Render scale moved to the shared Resolution setting (Display & controls, F9).
 export const GRAPHICS_CONTROLS = Object.freeze([
-  { key: 'renderScale', group: 'Image', label: 'Render scale', min: 0.25, max: 2, step: 0.05, unit: '%' },
   { key: 'drawDistance', group: 'Image', label: 'View distance', min: 16, max: 1000, step: 1, unit: 'm' },
   { key: 'fov', group: 'Image', label: 'Field of view', min: 25, max: 85, step: 1, unit: '°' },
   { key: 'exposure', group: 'Light', label: 'Exposure', min: 0.1, max: 3, step: 0.01 },
@@ -13,7 +13,7 @@ export const GRAPHICS_CONTROLS = Object.freeze([
   { key: 'environmentIntensity', group: 'Light', label: 'Environment light', min: 0, max: 3, step: 0.05 },
   { key: 'lampIntensity', group: 'Light', label: 'Lamp strength', min: 0, max: 30, step: 0.5 },
   { key: 'lampCount', group: 'Light', label: 'Local lamps', min: 0, max: 32, step: 1 },
-  { key: 'shadowSize', group: 'Shadows', label: 'Shadow map', values: [0, 256, 512, 1024, 2048, 4096, 8192] },
+  { key: 'shadowSize', group: 'Shadows', label: 'Shadow map', values: [-1, 0, 256, 512, 1024, 2048, 4096, 8192] },
   { key: 'shadowRange', group: 'Shadows', label: 'Shadow coverage', min: 8, max: 384, step: 1, unit: 'm' },
   { key: 'shadowStrength', group: 'Shadows', label: 'Shadow strength', min: 0, max: 1, step: 0.05 },
   { key: 'shadowSoftness', group: 'Shadows', label: 'Shadow softness', min: 0, max: 8, step: 0.1 },
@@ -51,17 +51,22 @@ export function sanitiseGraphics(name, source) {
   }
   return values;
 }
+/** profileChosen is true only when the player picked a profile; otherwise the kit's Quality tier picks it. */
 export function loadSettings(storage) {
   let saved;
   try { saved = JSON.parse(storage?.getItem(SETTINGS_KEY) || 'null'); } catch { saved = null; }
-  return { profile: Object.hasOwn(PROFILES, saved?.profile) ? saved.profile : 'mobile',
+  const chosen = Object.hasOwn(PROFILES, saved?.profile) && saved?.profileChosen === true;
+  return { profile: chosen ? saved.profile : null, profileChosen: chosen,
     graphics: Object.fromEntries(Object.keys(PROFILES).map(name => [name, sanitiseGraphics(name, saved?.graphics?.[name])])) };
 }
 export function saveSettings(storage, settings) {
   try { storage?.setItem(SETTINGS_KEY, JSON.stringify(settings)); return Boolean(storage); } catch { return false; }
 }
-export function formatSetting(control, value) {
-  if (control.key === 'shadowSize') return value === 0 ? 'Off' : `${value} × ${value}`;
+export function formatSetting(control, value, context = {}) {
+  if (control.key === 'shadowSize') {
+    if (value < 0) return context.autoShadow ? `Auto · ${context.autoShadow}` : 'Auto';
+    return value === 0 ? 'Off' : `${value} × ${value}`;
+  }
   if (control.unit === '%') return `${Math.round(value * 100)}%`;
   if (control.key === 'bloomStrength' && value === 0) return 'Off';
   if (control.key === 'fogDensity' && value === 0) return 'Off';

@@ -1,13 +1,15 @@
 import { createGarden } from './garden.js';
+import { buildYard } from './yard.js';
 import { MAT } from '../voxel/palette.js';
 import { VOXEL_SIZE } from '../engine/config.js';
 
 // Bounds include the gaps between islands. These are not solid terrain squares.
 export const AREAS = Object.freeze({
-  small: Object.freeze({ name: 'Small', title: 'The quiet ruin.', description: 'One garden. An arch, columns, and a pool.', size: 24, rings: [] }),
-  medium: Object.freeze({ name: 'Medium', title: 'The linked gardens.', description: 'Five gardens, stone paths, and an open court.', size: 64, rings: [22] }),
-  large: Object.freeze({ name: 'Large', title: 'The broken district.', description: 'Thirteen gardens with towers, courts, and bridges.', size: 128, rings: [24, 54] }),
-  massive: Object.freeze({ name: 'Massive', title: 'The stone archipelago.', description: 'Forty-one gardens across a wide field of ruins.', size: 256, rings: [24, 54, 86, 118] }),
+  small: Object.freeze({ name: 'Small', number: '01', label: 'PROCEDURAL TEST SCENE', title: 'The quiet ruin.', description: 'One garden. An arch, columns, and a pool.', size: 24, rings: [] }),
+  medium: Object.freeze({ name: 'Medium', number: '02', label: 'PROCEDURAL TEST SCENE', title: 'The linked gardens.', description: 'Five gardens, stone paths, and an open court.', size: 64, rings: [22] }),
+  large: Object.freeze({ name: 'Large', number: '03', label: 'PROCEDURAL TEST SCENE', title: 'The broken district.', description: 'Thirteen gardens with towers, courts, and bridges.', size: 128, rings: [24, 54] }),
+  massive: Object.freeze({ name: 'Massive', number: '04', label: 'PROCEDURAL TEST SCENE', title: 'The stone archipelago.', description: 'Forty-one gardens across a wide field of ruins.', size: 256, rings: [24, 54, 86, 118] }),
+  yard: Object.freeze({ name: 'Yard', number: '05', label: 'DEMOLITION TEST SCENE', title: 'The demolition yard.', description: 'A stacked tower, a span bridge, a copper wall and a column grove, built to come down.', size: 28, rings: [], custom: 'yard', steps: 16 }),
 });
 export function initialArea(search = globalThis.location?.search || '') {
   const requested = new URLSearchParams(search).get('area');
@@ -82,6 +84,12 @@ function pathSegment(world, x1, z1, x2, z2) {
 }
 function* buildSteps(world, id) {
   const plan = areaPlan(id), pools = [], lightCells = [], lights = [], landmarks = [];
+  const half = Math.round(plan.size / VOXEL_SIZE / 2);
+  const editBounds = { min: [-half, -24, -half], max: [half, 192, half] };
+  if (plan.custom === 'yard') {
+    const yard = yield* buildYard(world);
+    return { ...plan, ...yard, focus: yard.landmarks[0].focus, editBounds };
+  }
   // Make the paths first. The gardens then cut their own pools and open spaces.
   for (const [a, b] of plan.links) {
     const start = plan.sites[a], end = plan.sites[b];
@@ -100,9 +108,7 @@ function* buildSteps(world, id) {
     landmarks.push({ name: site.name, focus: [x - 0.5, 1.65, z - 0.4] });
     yield { phase: 'gardens' };
   }
-  const half = Math.round(plan.size / VOXEL_SIZE / 2);
-  return { ...plan, pools, lightCells, lights, landmarks, focus: landmarks[0].focus,
-    editBounds: { min: [-half, -24, -half], max: [half, 192, half] } };
+  return { ...plan, pools, lightCells, lights, landmarks, focus: landmarks[0].focus, editBounds };
 }
 export function createArea(world, id = 'small') {
   const steps = buildSteps(world, id); let result;
@@ -110,10 +116,10 @@ export function createArea(world, id = 'small') {
   return result.value;
 }
 export async function createAreaAsync(world, id = 'small', onProgress = () => {}) {
-  const plan = areaPlan(id), total = plan.links.length + plan.sites.length;
+  const plan = areaPlan(id), total = plan.steps || plan.links.length + plan.sites.length;
   const steps = buildSteps(world, id); let result, done = 0;
   while (!(result = steps.next()).done) {
-    onProgress(++done / total);
+    onProgress(Math.min(1, ++done / total));
     // Give input and the loading panel a turn between sites.
     await new Promise(resolve => setTimeout(resolve, 0));
   }
