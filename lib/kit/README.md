@@ -190,11 +190,11 @@ The **standard bindings**, so every game feels familiar:
   held count as already held (the kit calls it when its settings panel
   closes, so the button that closed it does not also fire in the game; call
   it yourself after the game's own modal UI).
-- Enter and Space on a DOM button or link that has keyboard focus
-  (`:focus-visible`, i.e. reached with Tab, arrows or a gamepad) are left to
-  the button (a native click), not reported as actions, so menus never
-  double-fire. A button that only kept focus after a mouse click does not
-  swallow Space; the game still gets it.
+- Enter and Space on a DOM button or link that was focused with Tab, arrows,
+  a gamepad menu or `.focus()` are left to the button (a native click), not
+  reported as actions, so menus never double-fire. A button that only has
+  focus because it was clicked or tapped does not swallow them: the game gets
+  the key and the button loses focus.
 - `input.source` follows the last device used (keys, mouse, touch, pad), so
   button prompts can switch. `input.pointer.over` says whether the pointer is
   over the canvas (hover previews).
