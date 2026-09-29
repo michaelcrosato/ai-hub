@@ -251,7 +251,7 @@ Everything below is **not** available and must be rewritten:
 | `ShaderMaterial`, `RawShaderMaterial` | a `*NodeMaterial` with TSL nodes (`colorNode`, `positionNode`, `emissiveNode`, `opacityNode`, `normalNode`, `fragmentNode`, `vertexNode`) |
 | `material.onBeforeCompile` | the same node slots on the node material |
 | `EffectComposer` + passes | `kit/post.js` (`createPost`) or `THREE.RenderPipeline` with TSL: `bloom`, `fxaa`, `smaa`, `ao` (GTAO), `ssao`, `outline`, `dof`, `film`, `rgbShift`, `chromaticAberration`, `afterImage`, `pixelationPass`, `lut3D`, `vignette`, `scanlines`, `sepia`, `dotScreen`, `gaussianBlur`, `godrays`, `ssr`, `traa` from `three/addons/tsl/display/*.js` |
-| `THREE.Points` with `size > 1` | `kit/points.js` (`createPoints`) — WebGPU draws `Points` at 1 px |
+| `THREE.Points` with `size > 1` | `kit/points.js` (`createPoints`) — WebGPU draws `Points` at 1 px. A background starfield stays opaque (`transparent: false`, `depthWrite: false`, `object.renderOrder = -1`) so it draws first; a transparent one lands in the transparent pass and draws over solid objects |
 | `PCFSoftShadowMap` | `PCFShadowMap` (set `light.shadow.radius` for softness) or `VSMShadowMap` |
 | `renderer.getContext()`, raw `gl.*` calls | not available; use three.js objects |
 | `readRenderTargetPixels` | `await renderer.readRenderTargetPixelsAsync(...)` |
