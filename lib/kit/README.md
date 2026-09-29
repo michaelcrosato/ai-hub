@@ -115,6 +115,7 @@ The kit object:
 | `kit.start(fn)`, `kit.stop()`, `kit.pause(bool)`, `kit.onPause(fn)` | the loop (pause audio in `onPause`) |
 | `kit.menu` | `open()`, `close()`, `toggle()`, `isOpen`, `setGear(corner)` |
 | `kit.RAPIER` | Rapier namespace when `physics: true` |
+| `kit.setPixelHeight(lines)` | fixed low-resolution rendering with hard pixels (0 = native), §5 |
 | `kit.toast(text)` | a small notice |
 
 ## 3. Quality tiers
@@ -275,6 +276,21 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
 - `renderer.info.render.calls` still works for checking draw calls.
 - A transparent canvas needs `boot({ renderer: { alpha: true } })`; the kit
   defaults to opaque.
+
+### Retro looks (PS1, N64, Super FX, pixelated modes)
+
+Many games render at a low internal resolution with hard pixels, snap
+vertices like a PlayStation, or dither colour. The kit does these one way:
+
+```js
+import { vertexSnap, dither15 } from 'kit/retro.js';
+const kit = await boot({ pixelHeight: 360, renderer: { antialias: false } }); // 360 lines, upscaled with hard pixels
+kit.setPixelHeight(0);                       // back to native resolution (e.g. a "Retro" toggle in the game's menu)
+vertexSnap(material, { width: 320, height: 240 });   // wobbly PS1 vertices; works with instancing and skinning
+createPost(kit, scene, camera, { output: (c) => dither15(c) });  // ordered 15-bit colour dither
+```
+
+Nearest-filtered textures: `tex.magFilter = tex.minFilter = THREE.NearestFilter; tex.generateMipmaps = false`.
 
 ## 6. WebGPU features: conservative by default
 
