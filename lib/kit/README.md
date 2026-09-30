@@ -333,6 +333,8 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   ported from left-handed software renderers) cannot use `camera.scale.x = -1`
   (the view matrix ignores camera scale): flip the world or re-apply the
   projection flip each frame, and check both backends.
+- `THREE.LineLoop` is not supported by WebGPURenderer (r186 logs an error
+  and draws nothing): use a `Line` and repeat the first point at the end.
 - Thin lines: `LineSegments` draw one device pixel wide on both backends (no
   line width). Vector/wireframe games that need visible stroke width draw
   screen-space quads per segment (or `lines/webgpu/Line2.js`), sized in CSS

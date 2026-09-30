@@ -33,6 +33,7 @@ export const RULES = [
   { id: 'data-url-module', test: (t) => /data:text\/javascript;base64,/.test(t), msg: 'inlines a module as a data: URL (a copy of three.js or a bundle)' },
   { id: 'embedded-three', test: (t) => /\bREVISION\s*=\s*["']1\d\d["']/.test(t), msg: 'embeds its own copy of three.js' },
   { id: 'shadow-map-dispose', test: (t) => /shadow\.map\s*(?:\?\.)?\s*\.?\s*dispose\s*\(|shadow\.map\s*=\s*null/.test(t), msg: 'disposes or nulls light.shadow.map (breaks r186; use kit.shadow)' },
+  { id: 'line-loop', test: (t) => /new\s+(?:THREE\.)?LineLoop\b/.test(t), msg: 'uses THREE.LineLoop, which WebGPURenderer does not draw (repeat the first point on a Line)' },
   { id: 'other-engine', test: (t) => /\bBABYLON\.|\bnew\s+pc\.Application\b|playcanvas-stable|babylon\.js['"]/i.test(t), msg: 'still loads Babylon.js or PlayCanvas' },
 ];
 
