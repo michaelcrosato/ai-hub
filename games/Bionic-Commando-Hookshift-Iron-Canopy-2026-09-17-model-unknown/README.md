@@ -1,87 +1,74 @@
 # Hookshift: Iron Canopy
 
-A finished browser-game vertical slice inspired by the grappling-first traversal rhythm and jungle-military tone of the NES era. All game names, geometry, characters, UI, sounds, and level content in this build are original/procedural; no source-game assets are included.
+A grappling-first side-scroller with the jungle-military tone of the NES era.
+Every name, model, sound and level in it is original and procedural; no
+source-game assets are included.
+
+There is **no normal jump**. Grappling, swinging, reeling, ledge movement and
+small automatic step-ups are the whole traversal model.
 
 ## Play
 
-Fastest path:
+It is a static page on the ai-hub wall. It loads three.js r186 and the shared
+kit from `/lib/` (see `lib/kit/README.md`), so serve the repository root
+(`pnpm dev`) and open `/games/Bionic-Commando-Hookshift-Iron-Canopy-2026-09-17-model-unknown/`.
+Nothing is downloaded from a CDN and there is no build step.
 
-```bash
-cd hookshift-iron-canopy
-python3 -m http.server 8080
-```
+## Missions
 
-Open `http://localhost:8080` in a current browser. The static build pins Three.js `0.186.0` from jsDelivr, so the first load requires internet access.
+- **01 Iron Canopy**: infiltrate Relay Spire 7. Cross two grappling gaps, pick
+  the high or low route through the jungle bunker, collect the gear caches,
+  secure the midpoint checkpoint, climb the relay structure and hold ACT at the
+  transmitter console.
+- **02 Storm Spillway**: a flooded dam valley in a thunderstorm. Cable-trolley
+  anchors slide along their lines, hover drones drop to your firing line, the
+  floodwater is lethal, and two checkpoints split the run. Jam the uplink at the
+  top of the floodgate tower.
 
-Optional Vite workflow:
-
-```bash
-npm install
-npm run dev
-```
-
-## Mission
-
-Infiltrate Relay Spire 7, cross two grappling gaps, choose high or low routes through a jungle bunker, collect equipment caches, disable patrols/turrets, secure the midpoint checkpoint, climb the relay structure, and hold ACT at the transmitter console.
-
-There is **no normal jump**. Grappling, swinging, reeling, ledge movement, and small automatic step-ups are the core traversal model.
+Each mission has three difficulties (Recruit, Regular, Veteran), a par time, a
+grade (S/A/B/C from time, field resets and accuracy) and a best time per
+difficulty. Reaching a checkpoint saves the run, and the briefing offers to
+continue it. All of this is kept in `localStorage`.
 
 ## Controls
 
-Desktop:
+| | Keyboard / mouse | Gamepad | Touch |
+|---|---|---|---|
+| Move / swing | A / D or arrows | left stick or D-pad | stick (left half) |
+| Reel in / out | W / S or arrows | stick up / down | stick up / down |
+| Grapple / release | Space or K, or click a ring | A | GRAPPLE, or tap a ring |
+| Fire | F / J or left click | X or RT | FIRE (hold) |
+| Act (console) | E | Y | ACT (appears at the console) |
+| Zoom | wheel, + / − | LB / RB | pinch |
+| Pause | Esc or P | Start | II |
 
-- `A / D` or arrows: move / add swing force
-- `W / S`: reel cable in / out
-- `Space` or `K`: attach/release grapple
-- `F` or `J`: fire
-- `E`: interact
-
-Mobile:
-
-- Left virtual stick: move and reel
-- GRAPPLE: attach/release nearest valid anchor
-- Tap a visible grapple ring: target that anchor directly
-- FIRE: hold for automatic fire
-- ACT: hold at the transmitter console
-- Two-finger pinch on the playfield: camera zoom
+Menus work with every device: the stick or arrows move between buttons, A /
+Space / Enter select, B or Start backs out of the pause menu.
 
 ## Rendering
 
-- Primary: Three.js r186 `WebGPURenderer` / WebGPU
-- First fallback: `WebGPURenderer` WebGL2 backend, with an explicit forced-WebGL2 retry if WebGPU initialization fails
-- Emergency fallback: custom raw WebGL1 low-detail renderer driven by the same mission state
-- AgX tone mapping
-- PBR/flat-shaded low-poly materials
-- dynamic sun shadows
-- exponential fog and layered depth scenery
-- emissive grapple/weapon/relay accents
-- Three.js `RenderPipeline` with TSL bloom when available
-- adaptive render-scale reduction if early frame rate is below 46 FPS
+- three.js r186 `WebGPURenderer` started by `kit/boot.js`: WebGPU, with WebGL2
+  as the fallback, quality tiers, dynamic resolution and the settings panel.
+- AgX tone mapping, flat-shaded PBR low-poly models, a sun shadow that follows
+  the camera, exponential fog, TSL bloom from `kit/post.js`.
+- Static level geometry is merged into one mesh per material; bullets come
+  from a pool; sparks are one instanced mesh; the storm's rain, floodwater and
+  spill gates are animated in TSL on the GPU.
 
-The target quality preset caps pixel ratio lower on coarse-pointer/mobile devices to control bandwidth and thermals.
+## Tuning
 
-## Gameplay and progression tuning
-
-- Base grapple range: 10.6 m
-- Largest consecutive anchor gap: about 10.24 m, so the critical route never requires grinding or an optional gear cache
-- Rank 2: 80 XP, +1 m cable range
-- Rank 3: 180 XP, +1 max vitality
-- Expected first six hostiles: 210 XP total, enough to reach Rank 3 without clearing the whole map
-- Gear caches: Mag-Clamp (+2 m grapple), Servo Reel (faster reel), Pulse Cell (faster fire)
-- Player starts with 5 vitality; Rank 3 raises it to 6
-- Two field patches are placed before the final tower
-- Mid-mission checkpoint prevents replaying the opening gorge after a late death
-
-## Validation performed
-
-`npm run test:smoke` checks the anchor chain, expected-route XP, rank thresholds, and required gear definitions. `node --check` was also run on the main game module and WebGL1 fallback module.
-
-The workspace used to assemble this slice cannot initialize EGL/SwiftShader in its headless Chromium, so a hardware-rendered automated browser playthrough could not be executed in this environment. The route and progression values were therefore refined with deterministic geometry/balance checks plus code-level collision/control review.
+- Base grapple range: 10.6 m. Every mandatory swing in both missions fits inside
+  it, so no gear cache or rank is required to finish.
+- Rank 2: 80 XP, +1 m cable range. Rank 3: 180 XP, +1 max vitality.
+- Gear caches: Mag-Clamp (+2 m grapple), Servo Reel (faster reel), Pulse Cell
+  (faster fire). Two field patches per mission.
+- Vitality 5 (Recruit 7, Veteran 4), +1 at Rank 3.
 
 ## Files
 
-- `src/main.js` — game loop, physics, rendering, controls, AI, combat, progression, level assembly
-- `src/data.js` — level layout and balance values
-- `src/webgl1Fallback.js` — emergency WebGL1 renderer
-- `src/style.css` — responsive/mobile-first HUD and controls
-- `scripts/smoke.mjs` — route/progression smoke checks
+- `index.html`: the page, HUD and the briefing, pause and results cards
+- `src/main.js`: game loop, movement and rope, enemies, combat, progression,
+  missions, menus, audio and level assembly
+- `src/data.js`: level layouts and balance values for both missions
+- `src/style.css`: HUD and cards, laid out around the kit's touch controls
+- `scripts/smoke.mjs`: route and progression checks for mission 01 (`node scripts/smoke.mjs`)
