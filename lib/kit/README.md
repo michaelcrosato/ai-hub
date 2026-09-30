@@ -461,3 +461,23 @@ Also switch quality while the game runs — in a Playwright script,
 then `'high'` — and confirm frames keep coming (`window.__kit.frames`
 rises) with no new errors. A game that reacts to `kit.onQuality` must
 survive it.
+
+## 11. QA and fixing (any model)
+
+Three tools, cheapest first:
+
+1. `node scripts/audit3d.mjs [games…]` — the static rules (import map, kit boot,
+   no WebGL-only APIs, no CDN or embedded three.js, no shadow-map disposal).
+   Seconds for the whole wall. Must pass after every change.
+2. `python3 scripts/sweep3d.py run [games…]` then `python3 scripts/sweep3d.py triage`
+   — boots games on WebGL2, WebGPU and a phone profile with the checker and
+   groups failures by error signature. One signature across many games is a
+   kit or pattern problem: fix it once, at the source, not per game. Triage
+   also marks games whose original already logged errors before migration,
+   so a pre-existing bug is not mistaken for a port regression.
+3. `python3 scripts/check3d.py <game> --keys … --click` — one game in depth
+   while fixing it.
+
+When fixing a game: change only that game's files, keep its content and
+look, re-run the checker and the audit, and commit one game per commit.
+Report kit problems instead of editing `lib/`.
