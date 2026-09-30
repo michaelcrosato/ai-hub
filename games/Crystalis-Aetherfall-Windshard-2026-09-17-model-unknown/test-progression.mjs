@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { BALANCE, levelFromXp, maxHpFor, attackFor, damageAfterArmor } from './src/balance.js';
+import { BALANCE, DIFFICULTY, DIFFICULTY_ORDER, levelFromXp, maxHpFor, attackFor, damageAfterArmor } from './src/balance.js';
 
 // Mandatory route: three spark carriers + Wind Core.
 const mandatoryXp = BALANCE.raider.xp * 3 + BALANCE.coreXp;
@@ -25,4 +25,17 @@ assert.ok(l3ArmorTouchHits > l2TouchHits, 'Optional armor must improve survivabi
 const meleeL2Boss = Math.max(1, Math.round(attackFor(2,2) * .55));
 assert.ok(Math.ceil(BALANCE.boss.hp / meleeL2Boss) > chargedHits * 2, 'Charged wind should be materially better against the boss.');
 
-console.log('progression: PASS', { mandatoryXp, optionalXp, chargedHits, l2TouchHits, l3ArmorTouchHits });
+// The Hollow side path: its one-time rewards (three bells, the vault) are a boost, not a new tier.
+const hollowXp = mandatoryXp + BALANCE.bellXp * 3 + BALANCE.vaultXp;
+assert.ok(levelFromXp(hollowXp) <= 3, 'The Hollow alone should not push the player past level 3 before the boss.');
+assert.ok(BALANCE.player.tempestSide > 0 && BALANCE.player.tempestSide < 1, 'Tempest side shots must be weaker than the main shot.');
+assert.ok(BALANCE.bellWindow >= 20, 'Bells must hum long enough to run between them.');
+
+// Difficulty scales foes in one direction only.
+const [easy, normal, hard] = DIFFICULTY_ORDER.map((k) => DIFFICULTY[k]);
+assert.ok(easy.damage < normal.damage && normal.damage < hard.damage, 'Damage must rise with difficulty.');
+assert.ok(easy.hp < normal.hp && normal.hp < hard.hp, 'Foe life must rise with difficulty.');
+assert.equal(normal.damage, 1);
+assert.equal(normal.hp, 1);
+
+console.log('progression: PASS', { mandatoryXp, optionalXp, hollowXp, chargedHits, l2TouchHits, l3ArmorTouchHits });

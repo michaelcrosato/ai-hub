@@ -2,7 +2,7 @@
 
 ## Mission and route pass
 
-Automated 2D collision/path checks use the same world measurements as the runtime scene.
+Automated 2D collision/path checks (`test-routes.py`) use the world measurements of the original progression gates.
 
 - Shrine start → Keeper Nilo: open, about 33 m.
 - Keeper → field raider: open, about 10.5 m.
@@ -13,7 +13,7 @@ Automated 2D collision/path checks use the same world measurements as the runtim
 - Wind Core → boss after charged-shot break: open, about 12.1 m.
 - Start → optional Ridge Guard: open, about 50.6 m.
 
-The ridge and rune-gate collision banks were added after the first route pass found long unintended bypasses around both progression blockers.
+The ridge and rune-gate collision banks were added after the first route pass found long unintended bypasses around both progression blockers. The Hollow sits west of the ridge line (`ridgeSouth`), so it opens no path around the grotto seal or the rune wall.
 
 ## Progression pass
 
@@ -21,16 +21,22 @@ The ridge and rune-gate collision banks were added after the first route pass fo
 - Charged wind damage at level 2: 27; Stone Gale takes 9 charged hits.
 - Stone Gale touch damage defeats an unarmored level-2 player in 8 hits.
 - A modest optional route reaches level 3; Ridge Guard raises boss-touch survival to 10 hits.
+- The Hollow's one-time rewards (3 bells + vault, 54 XP) stay within level 3 before the boss.
 - Boss stone armor reduces melee damage to 55%, so charged wind is clearly better without making melee impossible.
 - No enemy has a player-level immunity or hard level requirement.
 
 ## Input pass
 
-- Keyboard and touch use the same movement/combat state.
-- Dash input is cleared on release/cancel, so a dash pressed during cooldown is not queued unexpectedly.
-- Touch stick and action buttons use independent pointer IDs so movement + attack/dash/interact work at the same time.
-- Pinch zoom ignores active action-button touches to prevent accidental camera zoom while attacking.
+- All input goes through the shared kit's actions: keyboard/mouse, gamepad and touch drive the same movement and combat state.
+- A blade release during the attack cooldown is buffered for 0.2 s instead of being dropped; a dash pressed up to 0.12 s early still fires.
+- The touch ACT button only shows while something can be acted on.
+- Title, pause, death and results menus work with arrows or the stick and Enter / A.
 
-## Environment limitation
+## Upgrade pass (shared 3D stack) — not yet tested in a browser
 
-The project’s JavaScript syntax, state progression, balance, and route topology were tested in the build environment. A full rendered browser smoke test could not load the pinned CDN modules because outbound browser requests to the CDN are blocked in this environment. The runtime URLs and Three.js APIs were checked against current Three.js 0.186.0 documentation.
+Written without running the game; the QA pass should check first:
+
+- Boot on WebGPU and WebGL2, title screen renders behind the menu, no console errors.
+- New game, Continue after reload, death → shrine respawn, boss fight → results → Keep exploring.
+- The Hollow: burrowers surface and can be hit, the three bells ring, the vault opens, the Tempest Ring fires three shots.
+- Phone layout: touch controls clear of the HUD, the II pill under the objective card.
