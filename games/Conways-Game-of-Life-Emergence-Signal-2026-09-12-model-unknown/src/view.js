@@ -341,8 +341,9 @@ export class VoxelView {
       [h, 0.04, -h],
       [h, 0.04, h],
       [-h, 0.04, h],
+      [-h, 0.04, -h], // closed by hand: WebGPURenderer does not draw THREE.LineLoop
     ].map((p) => new THREE.Vector3(...p));
-    this.boardGroup.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(border), new THREE.LineBasicMaterial({ color: '#578f81', transparent: true, opacity: 0.65 })));
+    this.boardGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(border), new THREE.LineBasicMaterial({ color: '#578f81', transparent: true, opacity: 0.65 })));
     const corners = [];
     for (const sx of [-1, 1]) {
       for (const sz of [-1, 1]) {
