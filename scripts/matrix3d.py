@@ -161,7 +161,7 @@ def cmd_triage(a):
 
 LAYOUT_SIZES = [(390, 844), (800, 600), (960, 540), (1920, 1080), (2560, 1080)]
 CANVAS_RECT = """(() => {
-  const c = [...document.querySelectorAll('canvas')].sort((a, b) => b.width * b.height - a.width * a.height)[0];
+  const c = document.querySelector('canvas[data-kit-canvas]');
   if (!c) return null;
   const r = c.getBoundingClientRect();
   const vis = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
@@ -180,11 +180,26 @@ def layout_one(entry, port):
             page = browser.new_page(viewport={'width': w, 'height': h}, is_mobile=w < 500, has_touch=w < 500)
             try:
                 page.goto(url, wait_until='load', timeout=60000)
-                for _ in range(20):
-                    if page.evaluate('!!(window.__kit && window.__kit.ready)'):
+                has = lambda: page.evaluate('!!document.querySelector("canvas[data-kit-canvas]")')
+                for _ in range(16):
+                    if has():
                         break
                     time.sleep(0.5)
-                rows.append({'size': f'{w}x{h}', 'rect': page.evaluate(CANVAS_RECT)})
+                if not has():
+                    # Some games boot the kit only after their own title screen.
+                    page.evaluate(START_JS)
+                    for _ in range(30):
+                        if has():
+                            break
+                        time.sleep(0.5)
+                time.sleep(1)  # let the game's own layout settle
+                rect = page.evaluate(CANVAS_RECT)
+                if rect and (rect['w'] < 50 or rect['h'] < 50 or rect['share'] < 0.2):
+                    # A title screen may hide the 3D view until play starts: judge it in play.
+                    page.evaluate(START_JS)
+                    time.sleep(2)
+                    rect = page.evaluate(CANVAS_RECT)
+                rows.append({'size': f'{w}x{h}', 'rect': rect})
             except Exception as e:
                 rows.append({'size': f'{w}x{h}', 'error': str(e)[:200]})
             page.close()
@@ -199,7 +214,7 @@ def layout_problems(rows):
         if r.get('error'):
             out.append(f"{r['size']}: {r['error'][:80]}")
         elif not rect:
-            out.append(f"{r['size']}: no canvas")
+            out.append(f"{r['size']}: the kit's canvas never appeared")
         elif rect['w'] < 50 or rect['h'] < 50:
             out.append(f"{r['size']}: canvas collapsed to {rect['w']}x{rect['h']}")
         elif rect['share'] < 0.2:
