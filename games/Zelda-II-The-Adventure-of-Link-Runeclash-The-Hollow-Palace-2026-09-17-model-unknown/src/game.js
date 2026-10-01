@@ -1,132 +1,100 @@
+import { buildLevel, PALACE_ORDER } from './levels.js';
+
+export { buildLevel, PALACE_ORDER };
+
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const approach = (v, target, delta) => v < target ? Math.min(v + delta, target) : Math.max(v - delta, target);
 const signNonZero = (v, fallback = 1) => Math.abs(v) < 0.0001 ? fallback : Math.sign(v);
 
 export const GAME_TITLE = 'Runeclash: The Hollow Palace';
 
-function makeSolid(id, x, top, w, h = 1, kind = 'stone') {
-  return { id, x, y: top - h / 2, top, w, h, kind };
-}
+export const DIFFICULTIES = {
+  story: { id: 'story', label: 'Story', damageTaken: 0.6, enemyHp: 0.85 },
+  normal: { id: 'normal', label: 'Normal', damageTaken: 1, enemyHp: 1 },
+  hard: { id: 'hard', label: 'Hard', damageTaken: 1.4, enemyHp: 1.2 }
+};
 
-function makeStepRun(solids, prefix, startX, count, direction, startTop, stepW = 1, stepH = 0.5) {
-  for (let i = 0; i < count; i++) {
-    const x = startX + direction * (i + 0.5) * stepW;
-    const top = startTop + (i + 1) * stepH;
-    solids.push(makeSolid(`${prefix}-${i}`, x, top, stepW + 0.04, Math.max(1, top + 1), 'step'));
-  }
-}
+const DIMS = {
+  blob: [0.95, 0.8],
+  bone: [0.78, 1.7],
+  sentinel: [0.92, 1.95],
+  boss: [1.35, 2.65],
+  wisp: [0.8, 0.8],
+  caster: [0.8, 1.6],
+  golem: [1.6, 2.9]
+};
 
-export function buildLevel() {
-  const solids = [];
-  solids.push(makeSolid('approach', 10, 0, 20, 1.5, 'ground'));
-  makeStepRun(solids, 'rise', 20, 8, 1, 0, 1, 0.5);
-  solids.push(makeSolid('upper-gallery', 38, 4, 20, 1.5, 'gallery'));
+const STATS = {
+  blob: { hp: 20, damage: 7, speed: 1.7, xp: 18 },
+  bone: { hp: 32, damage: 10, speed: 2.15, xp: 26 },
+  sentinel: { hp: 48, damage: 12, speed: 1.7, xp: 36 },
+  boss: { hp: 138, damage: 14, speed: 2.05, xp: 120 },
+  wisp: { hp: 16, damage: 8, speed: 2.6, xp: 22 },
+  caster: { hp: 26, damage: 9, speed: 0, xp: 30 },
+  golem: { hp: 210, damage: 15, speed: 1.6, xp: 160 }
+};
 
-  // Descending stairs are boxes with lower and lower top surfaces.
-  for (let i = 0; i < 8; i++) {
-    const x = 48.5 + i;
-    const top = 3.5 - i * 0.5;
-    solids.push(makeSolid(`fall-${i}`, x, top, 1.04, Math.max(1, top + 1), 'step'));
-  }
-
-  solids.push(makeSolid('lower-hall', 77.75, 0, 43.5, 1.5, 'ground'));
-  solids.push(makeSolid('gear-step', 70, 2.15, 6.5, 0.28, 'balcony'));
-  solids.push(makeSolid('gear-ledge', 78.4, 4.3, 7.5, 0.28, 'balcony'));
-
-  // Long, readable stair climb to the boss catwalk.
-  makeStepRun(solids, 'boss-rise', 96, 6, 1, 0, 1, 0.5);
-  solids.push(makeSolid('boss-catwalk', 119.5, 3, 35, 1.5, 'boss'));
-
-  // Thin catch floor below the optional ledges prevents frustrating soft falls.
-  solids.push(makeSolid('catch-floor', 86, -2.5, 22, 0.8, 'catch'));
-
-  const boundaries = [
-    { id: 'left-bound', x: -1.5, y: 5, w: 1, h: 14, kind: 'wall' },
-    { id: 'right-bound', x: 138.5, y: 5, w: 1, h: 14, kind: 'wall' }
-  ];
-
+function makeEnemy(id, type, x, groundTop, opts = {}, hpScale = 1) {
+  const dims = DIMS[type];
+  const stats = STATS[type];
+  const hp = Math.max(1, Math.round(stats.hp * hpScale));
+  const flying = type === 'wisp';
+  const y = flying ? (opts.anchorY ?? groundTop + 2.6) : groundTop + dims[1] / 2;
   return {
-    minX: -1,
-    maxX: 138,
-    solids,
-    boundaries,
-    door: { id: 'sun-door', x: 58.3, y: 2.6, w: 1.25, h: 5.2, kind: 'door' },
-    bossBarrier: { id: 'boss-barrier', x: 104.4, y: 5.7, w: 0.8, h: 5.4, kind: 'barrier' },
-    railings: [
-      { x: 30, top: 4, w: 3.5 }, { x: 40, top: 4, w: 4 }, { x: 46, top: 4, w: 2 },
-      { x: 69.8, top: 2.15, w: 5 }, { x: 78.5, top: 4.3, w: 6 },
-      { x: 111, top: 3, w: 6 }, { x: 127, top: 3, w: 7 }
-    ],
-    columns: [12, 32, 43, 62, 72, 87, 108, 122, 134],
-    torches: [6, 28, 45, 64, 85, 101, 113, 129],
-    signs: [
-      { id: 'sign-controls', x: 4.2, y: 0.65, text: 'Carved slate: Guard from the front. Jump attacks are safest when a knight commits.' },
-      { id: 'sign-gate', x: 62.2, y: 0.65, text: 'Palace warning: The upper side ledge hides an old forge cache. It is optional.' }
-    ],
-    keyChest: { id: 'key-chest', x: 43.5, y: 4.45 },
-    gearChest: { id: 'gear-chest', x: 79.2, y: 4.75 },
-    altar: { id: 'altar', x: 133.4, y: 3.8 }
-  };
-}
-
-function makeEnemy(id, type, x, groundTop, opts = {}) {
-  const dims = {
-    blob: [0.95, 0.8],
-    bone: [0.78, 1.7],
-    sentinel: [0.92, 1.95],
-    boss: [1.35, 2.65]
-  }[type];
-  const stats = {
-    blob: { hp: 20, damage: 7, speed: 1.7, xp: 18 },
-    bone: { hp: 32, damage: 10, speed: 2.15, xp: 26 },
-    sentinel: { hp: 48, damage: 12, speed: 1.7, xp: 36 },
-    boss: { hp: 138, damage: 14, speed: 2.05, xp: 120 }
-  }[type];
-  return {
-    id, type, x, y: groundTop + dims[1] / 2, vx: 0, vy: 0,
-    w: dims[0], h: dims[1], hp: stats.hp, maxHp: stats.hp,
+    id, type, x, y, vx: 0, vy: 0,
+    w: dims[0], h: dims[1], hp, maxHp: hp,
     damage: stats.damage, speed: stats.speed, xp: stats.xp,
-    alive: true, grounded: true, facing: -1, hurtTimer: 0, invuln: 0,
+    alive: true, grounded: !flying, facing: -1, hurtTimer: 0, invuln: 0,
     attackTimer: 0, attackCooldown: opts.attackCooldown ?? 0.4,
     attackDidHit: false, aiTimer: opts.aiTimer ?? 0, phase: opts.phase ?? 0,
-    spawnX: x, patrolMin: opts.patrolMin ?? x - 2.5, patrolMax: opts.patrolMax ?? x + 2.5,
+    pattern: Math.round(opts.phase ?? 0),
+    spawnX: x, spawnY: y, patrolMin: opts.patrolMin ?? x - 2.5, patrolMax: opts.patrolMax ?? x + 2.5,
     patrolDir: opts.patrolDir ?? 1, guarding: false, bossMove: 0,
+    isBoss: type === 'boss' || type === 'golem', flying,
+    anchorY: y, mode: 'hover', diveTime: 0, leaping: false, airTime: 0,
     drop: opts.drop ?? null, lastHitAttackId: -1
   };
 }
 
-function makePlayer() {
+function makePlayer(start) {
   return {
-    id: 'player', type: 'player', x: 2.4, y: 0.86, vx: 0, vy: 0,
+    id: 'player', type: 'player', x: start.x, y: start.y, vx: 0, vy: 0,
     w: 0.72, h: 1.72, facing: 1, grounded: true,
     hp: 80, mana: 60, invuln: 0, hurtTimer: 0,
-    attackTimer: 0, attackCooldown: 0, spellCooldown: 0,
+    attackTimer: 0, attackCooldown: 0, spellCooldown: 0, attackBuffer: 0,
     coyote: 0.1, jumpBuffer: 0, guarding: false,
-    swordTier: 1, attackLevel: 0, vitalityLevel: 0, focusLevel: 0,
+    swordTier: 1, attackLevel: 0, vitalityLevel: 0, focusLevel: 0, vessels: 0,
     xp: 0, level: 1, attackId: 0, attackHitIds: new Set(),
     deaths: 0
   };
 }
 
+const CARRY_KEYS = ['level', 'xp', 'attackLevel', 'vitalityLevel', 'focusLevel', 'swordTier', 'vessels'];
+
 export class GameWorld {
-  constructor() {
-    this.level = buildLevel();
+  /**
+   * @param {object} [opts]
+   * @param {'hollow'|'undercroft'} [opts.palace]
+   * @param {'story'|'normal'|'hard'} [opts.difficulty]
+   * @param {object} [opts.carry]  player stats carried over from an earlier palace
+   */
+  constructor({ palace = 'hollow', difficulty = 'normal', carry = null } = {}) {
+    this.level = buildLevel(palace);
+    this.diff = DIFFICULTIES[difficulty] || DIFFICULTIES.normal;
+    this.carry = carry;
     this.reset();
   }
 
   reset() {
+    const l = this.level;
     this.time = 0;
-    this.player = makePlayer();
-    this.enemies = [
-      makeEnemy('blob-a', 'blob', 8.5, 0, { patrolMin: 6, patrolMax: 12, phase: 0.2 }),
-      makeEnemy('blob-b', 'blob', 16.0, 0, { patrolMin: 13, patrolMax: 19, phase: 1.1, drop: 'heal' }),
-      makeEnemy('bone-a', 'bone', 34.5, 4, { patrolMin: 30, patrolMax: 39, phase: 0.7, drop: 'mana' }),
-      makeEnemy('sentinel-a', 'sentinel', 45.0, 4, { patrolMin: 41, patrolMax: 47, phase: 1.7 }),
-      makeEnemy('blob-c', 'blob', 65.0, 0, { patrolMin: 61, patrolMax: 69, phase: 2.1 }),
-      makeEnemy('bone-b', 'bone', 84.5, 0, { patrolMin: 81, patrolMax: 89, phase: 2.8 }),
-      makeEnemy('sentinel-b', 'sentinel', 92.2, 0, { patrolMin: 89, patrolMax: 95, phase: 3.3, drop: 'heal' }),
-      makeEnemy('ash-warden', 'boss', 120.0, 3, { patrolMin: 108, patrolMax: 131, phase: 4.1, attackCooldown: 0.8 })
-    ];
+    this.player = makePlayer(l.start);
+    if (this.carry) {
+      for (const k of CARRY_KEYS) if (Number.isFinite(this.carry[k])) this.player[k] = this.carry[k];
+      this.player.hp = this.maxHp;
+      this.player.mana = this.maxMana;
+    }
+    this.enemies = l.spawns.map((s) => makeEnemy(s.id, s.type, s.x, s.ground, s.opts, this.diff.enemyHp));
     this.projectiles = [];
     this.pickups = [];
     this.nextProjectileId = 1;
@@ -134,32 +102,41 @@ export class GameWorld {
     this.keyCollected = false;
     this.doorUnlocked = false;
     this.gearCollected = false;
+    this.vesselCollected = false;
+    this.braziersLit = new Set();
     this.bossFight = false;
     this.bossDefeated = false;
     this.complete = false;
     this.pausedForUpgrade = false;
     this.pendingUpgradeCount = 0;
-    this.checkpoint = { x: 2.4, y: 0.86, name: 'Palace Approach' };
+    this.checkpoint = { x: l.start.x, y: l.start.y, name: l.start.name };
+    this.checkpointIndex = 0;
     this.events = [];
+    this._solidsKey = -1;
+    this._solidsList = null;
     this._objective = '';
     this._emitObjective(true);
   }
 
-  get maxHp() { return 80 + this.player.vitalityLevel * 20; }
+  get maxHp() { return 80 + this.player.vitalityLevel * 20 + this.player.vessels * 20; }
   get maxMana() { return 60 + this.player.focusLevel * 20; }
   get attackDamage() { return 12 + this.player.attackLevel * 3 + (this.player.swordTier - 1) * 4; }
   get magicDamage() { return 18 + this.player.focusLevel * 5 + (this.player.swordTier - 1) * 1; }
   get xpToNext() { return 100 + (this.player.level - 1) * 80; }
 
-  get boss() { return this.enemies.find(e => e.type === 'boss'); }
+  get boss() { return this.enemies.find(e => e.isBoss); }
+
+  get lockProgress() {
+    return this.level.lock === 'braziers' ? this.braziersLit.size : this.keyCollected ? 1 : 0;
+  }
 
   get objective() {
-    if (this.complete) return 'Hollow Palace cleared';
-    if (!this.keyCollected) return 'Find the Sun Key in the upper gallery';
-    if (!this.doorUnlocked) return 'Open the sun-locked gate';
-    if (!this.bossFight && !this.bossDefeated) return 'Reach the Ash Warden chamber';
-    if (!this.bossDefeated) return 'Defeat the Ash Warden';
-    return 'Claim the Ember Sigil at the altar';
+    const t = this.level.text;
+    if (this.complete) return t.cleared;
+    if (!this.doorUnlocked) return t.lock[Math.min(t.lock.length - 1, this.lockProgress)];
+    if (!this.bossFight && !this.bossDefeated) return t.approach;
+    if (!this.bossDefeated) return t.fight;
+    return t.claim;
   }
 
   _emitObjective(force = false) {
@@ -170,15 +147,22 @@ export class GameWorld {
     }
   }
 
+  /** The solid boxes right now. Cached: rebuilt only when the gate or the boss barrier changes. */
   get solids() {
-    const list = [...this.level.solids, ...this.level.boundaries];
-    if (!this.doorUnlocked) list.push(this.level.door);
-    if (this.bossFight && !this.bossDefeated) list.push(this.level.bossBarrier);
-    return list;
+    const barrier = this.bossFight && !this.bossDefeated;
+    const key = (this.doorUnlocked ? 1 : 0) | (barrier ? 2 : 0);
+    if (key !== this._solidsKey || !this._solidsList) {
+      const list = [...this.level.solids, ...this.level.boundaries];
+      if (!this.doorUnlocked) list.push(this.level.door);
+      if (barrier) list.push(this.level.bossBarrier);
+      this._solidsList = list;
+      this._solidsKey = key;
+    }
+    return this._solidsList;
   }
 
-  start() {
-    this.events.push({ type: 'toast', text: 'Enter the Hollow Palace. Find the Sun Key.' });
+  start(continued = false) {
+    this.events.push({ type: 'toast', text: continued ? `${this.level.name} — continuing at ${this.checkpoint.name}.` : this.level.text.intro });
     this.events.push({ type: 'sound', name: 'start' });
   }
 
@@ -208,6 +192,9 @@ export class GameWorld {
     if (input.jumpPressed) p.jumpBuffer = 0.12;
     else p.jumpBuffer = Math.max(0, p.jumpBuffer - dt);
     p.coyote = p.grounded ? 0.11 : Math.max(0, p.coyote - dt);
+    // A slash pressed a moment before the last one ends still comes out (input buffering).
+    if (input.attackPressed) p.attackBuffer = 0.14;
+    else p.attackBuffer = Math.max(0, p.attackBuffer - dt);
 
     const move = clamp(input.moveX ?? 0, -1, 1);
     const maxSpeed = p.guarding ? 2.35 : 5.1;
@@ -224,9 +211,10 @@ export class GameWorld {
       this.events.push({ type: 'sound', name: 'jump' });
     }
 
-    if (input.attackPressed && p.attackCooldown <= 0 && p.hurtTimer <= 0) {
+    if (p.attackBuffer > 0 && p.attackCooldown <= 0 && p.hurtTimer <= 0) {
       p.attackTimer = 0.34;
       p.attackCooldown = 0.42;
+      p.attackBuffer = 0;
       p.attackId += 1;
       p.attackHitIds.clear();
       p.guarding = false;
@@ -245,6 +233,7 @@ export class GameWorld {
       this.events.push({ type: 'burst', x: p.x + p.facing * 0.65, y: p.y + 0.2, color: '#73f3ff', count: 7 });
     } else if (input.magicPressed && p.mana < 12) {
       this.events.push({ type: 'toast', text: 'Not enough focus energy.' });
+      this.events.push({ type: 'sound', name: 'empty' });
     }
 
     if (input.interactPressed) this.interact();
@@ -254,6 +243,13 @@ export class GameWorld {
 
     p.vy -= 22 * dt;
     this._moveBody(p, dt, true);
+
+    for (const hz of this.level.hazards) {
+      if (this._overlap(p, hz)) {
+        this._burnPlayer(hz);
+        break;
+      }
+    }
 
     if (p.y < -6) this._respawn('You fell beneath the palace.');
   }
@@ -277,16 +273,25 @@ export class GameWorld {
         p.attackHitIds.add(e.id);
       }
     }
+    for (const b of this.level.braziers) {
+      if (this.braziersLit.has(b.id)) continue;
+      if (Math.abs(b.x - hitCenterX) <= 0.82 + b.w / 2 && Math.abs(b.y - p.y) <= 0.72 + b.h / 2) this._lightBrazier(b);
+    }
   }
 
   _damageEnemy(e, damage, knockback = 0) {
     if (!e.alive || e.invuln > 0) return;
     e.hp -= damage;
-    e.invuln = e.type === 'boss' ? 0.12 : 0.18;
+    e.invuln = e.isBoss ? 0.12 : 0.18;
     e.hurtTimer = 0.2;
     e.vx += knockback;
-    this.events.push({ type: 'sound', name: e.type === 'boss' ? 'bossHit' : 'hit' });
-    this.events.push({ type: 'burst', x: e.x, y: e.y + e.h * 0.12, color: '#ffcf6e', count: e.type === 'boss' ? 9 : 6 });
+    if (e.type === 'wisp' && e.mode === 'dive') {
+      e.mode = 'rise';
+      e.aiTimer = 1.2;
+    }
+    this.events.push({ type: 'sound', name: e.isBoss ? 'bossHit' : 'hit' });
+    this.events.push({ type: 'burst', x: e.x, y: e.y + e.h * 0.12, color: '#ffcf6e', count: e.isBoss ? 9 : 6 });
+    this.events.push({ type: 'impact', kind: 'hit', power: e.isBoss ? 0.55 : 0.35 });
     if (e.hp <= 0) this._killEnemy(e);
   }
 
@@ -296,14 +301,17 @@ export class GameWorld {
     e.vx = 0;
     e.vy = 0;
     this._grantXp(e.xp);
-    this.events.push({ type: 'sound', name: e.type === 'boss' ? 'bossDown' : 'enemyDown' });
-    this.events.push({ type: 'burst', x: e.x, y: e.y, color: e.type === 'boss' ? '#ff7a4d' : '#b8a7ff', count: e.type === 'boss' ? 24 : 10 });
+    this.events.push({ type: 'sound', name: e.isBoss ? 'bossDown' : 'enemyDown' });
+    this.events.push({ type: 'burst', x: e.x, y: e.y, color: e.isBoss ? '#ff7a4d' : '#b8a7ff', count: e.isBoss ? 24 : 10 });
     if (e.drop) this._spawnDrop(e.drop, e.x, e.y + 0.4);
-    if (e.type === 'boss') {
+    if (e.isBoss) {
       this.bossDefeated = true;
       this.bossFight = false;
-      this.events.push({ type: 'toast', text: 'The Ash Warden falls. The Ember Sigil is awake.' });
-      this.events.push({ type: 'checkpoint', text: 'Warden defeated' });
+      this.projectiles.length = 0;
+      this.events.push({ type: 'toast', text: this.level.boss.defeatText });
+      this.events.push({ type: 'checkpoint', text: `${this.level.boss.name.toLowerCase().replace(/(^|\s)\S/g, (c) => c.toUpperCase())} defeated` });
+      this.events.push({ type: 'shake', power: 0.9 });
+      this.events.push({ type: 'save' });
       this._emitObjective();
     }
   }
@@ -313,18 +321,20 @@ export class GameWorld {
   }
 
   _grantXp(amount) {
-    const p = this.player;
-    p.xp += amount;
+    this.player.xp += amount;
     this.events.push({ type: 'xp', amount });
-    while (p.xp >= this.xpToNext) {
-      p.xp -= this.xpToNext;
-      p.level += 1;
-      this.pendingUpgradeCount += 1;
-      this.pausedForUpgrade = true;
-      this.events.push({ type: 'levelup', level: p.level });
-      this.events.push({ type: 'sound', name: 'level' });
-      break;
-    }
+    this._checkLevelUp();
+  }
+
+  _checkLevelUp() {
+    const p = this.player;
+    if (this.pendingUpgradeCount > 0 || p.xp < this.xpToNext) return;
+    p.xp -= this.xpToNext;
+    p.level += 1;
+    this.pendingUpgradeCount += 1;
+    this.pausedForUpgrade = true;
+    this.events.push({ type: 'levelup', level: p.level });
+    this.events.push({ type: 'sound', name: 'level' });
   }
 
   chooseUpgrade(stat) {
@@ -343,6 +353,9 @@ export class GameWorld {
     this.pausedForUpgrade = this.pendingUpgradeCount > 0;
     this.events.push({ type: 'toast', text: `${stat[0].toUpperCase() + stat.slice(1)} improved.` });
     this.events.push({ type: 'sound', name: 'upgrade' });
+    // Enough experience banked for another level (a boss kill) offers the next choice right away.
+    this._checkLevelUp();
+    this.events.push({ type: 'save' });
     return true;
   }
 
@@ -356,19 +369,29 @@ export class GameWorld {
       e.aiTimer -= dt;
       const dx = p.x - e.x;
       const adx = Math.abs(dx);
-      if (adx < 9) e.facing = signNonZero(dx, e.facing);
+      if (adx < 9 && !(e.type === 'golem' && e.leaping)) e.facing = signNonZero(dx, e.facing);
 
+      if (e.type === 'wisp') {
+        this._updateWisp(e, dt, dx, adx);
+        continue; // flies: no gravity, no floor collision
+      }
       if (e.type === 'blob') this._updateBlob(e, dt, dx, adx);
       else if (e.type === 'bone') this._updateBone(e, dt, dx, adx);
       else if (e.type === 'sentinel') this._updateSentinel(e, dt, dx, adx);
       else if (e.type === 'boss') this._updateBoss(e, dt, dx, adx);
+      else if (e.type === 'caster') this._updateCaster(e, dt, dx, adx);
+      else if (e.type === 'golem') this._updateGolem(e, dt, dx, adx);
 
       e.vy -= 22 * dt;
       this._moveBody(e, dt, false);
 
-      if (e.y < -7 && e.type !== 'boss') {
+      let lost = e.y < -7;
+      if (!lost && !e.isBoss) {
+        for (const hz of this.level.hazards) if (this._overlap(e, hz)) { lost = true; break; }
+      }
+      if (lost && !e.isBoss) {
         e.x = e.spawnX;
-        e.y = 2;
+        e.y = e.spawnY;
         e.vx = 0;
         e.vy = 0;
       }
@@ -468,21 +491,16 @@ export class GameWorld {
         e.vx = 0;
         if (!e.attackDidHit && prev > 0.30 && e.attackTimer <= 0.30) {
           e.attackDidHit = true;
-          this.projectiles.push({
-            id: `ash-${this.nextProjectileId++}`, owner: 'enemy', type: 'ash',
-            x: e.x + e.facing * 0.9, y: e.y + 0.3, vx: e.facing * 6.8, vy: 0,
-            w: 0.42, h: 0.42, damage: 11, life: 2.2, alive: true
-          });
-          this.events.push({ type: 'sound', name: 'enemyMagic' });
+          this._spawnBolt(e, 6.8, 0, 11, 2.2);
         }
       }
       return;
     }
 
     if (e.attackCooldown <= 0) {
-      e.phase += 1;
+      e.pattern += 1;
       if (adx < 2.0) e.bossMove = 1;
-      else if (Math.round(e.phase) % 3 === 0) e.bossMove = 3;
+      else if (e.pattern % 3 === 0) e.bossMove = 3;
       else e.bossMove = 2;
       e.attackTimer = e.bossMove === 1 ? 0.76 : e.bossMove === 2 ? 0.60 : 0.74;
       e.attackCooldown = e.hp < e.maxHp * 0.5 ? 0.62 : 0.82;
@@ -493,33 +511,214 @@ export class GameWorld {
     e.vx = approach(e.vx, signNonZero(dx, e.facing) * e.speed, 7.5 * dt);
   }
 
-  _updateProjectiles(dt) {
-    for (const pr of this.projectiles) {
-      if (!pr.alive) continue;
-      pr.life -= dt;
-      if (pr.life <= 0) { pr.alive = false; continue; }
-      pr.x += pr.vx * dt;
-      pr.y += pr.vy * dt;
+  _spawnBolt(e, speed, vy, damage, life = 2.4) {
+    this.projectiles.push({
+      id: `ash-${this.nextProjectileId++}`, owner: 'enemy', type: 'ash',
+      x: e.x + e.facing * (e.w / 2 + 0.25), y: e.y + 0.3, vx: e.facing * speed, vy,
+      w: 0.42, h: 0.42, damage, life, alive: true
+    });
+    this.events.push({ type: 'sound', name: 'enemyMagic' });
+  }
 
-      if (this._overlapsAnySolid(pr)) {
-        pr.alive = false;
-        this.events.push({ type: 'burst', x: pr.x, y: pr.y, color: pr.owner === 'player' ? '#75f3ff' : '#ff8055', count: 4 });
-        continue;
+  /** Ember wisp: hovers above its post, shadows the player, then dives at them. */
+  _updateWisp(e, dt, dx, adx) {
+    const p = this.player;
+    const near = adx < 8 && Math.abs(p.y - e.anchorY) < 4.6;
+    if (e.mode === 'dive') {
+      e.diveTime -= dt;
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+      if (this._overlapsAnySolid(e)) {
+        e.x -= e.vx * dt;
+        e.y -= e.vy * dt;
+        e.diveTime = 0;
       }
-
-      if (pr.owner === 'player') {
-        for (const e of this.enemies) {
-          if (!e.alive || !this._overlap(pr, e)) continue;
-          this._damageEnemy(e, pr.damage, signNonZero(pr.vx) * 2.2);
-          pr.alive = false;
-          break;
-        }
-      } else if (this._overlap(pr, this.player)) {
-        this._hurtPlayer(pr.damage, pr.x, signNonZero(pr.vx) * 3.5);
-        pr.alive = false;
+      if (e.diveTime <= 0) {
+        e.mode = 'rise';
+        e.aiTimer = 1.5 + (e.phase % 1) * 0.6;
+      }
+    } else if (e.mode === 'windup') {
+      e.diveTime -= dt;
+      e.vx = approach(e.vx, 0, 10 * dt);
+      e.vy = approach(e.vy, 1.2, 10 * dt);
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+      if (e.diveTime <= 0) {
+        const tx = p.x - e.x;
+        const ty = p.y + 0.1 - e.y;
+        const len = Math.hypot(tx, ty) || 1;
+        e.vx = (tx / len) * 7.2;
+        e.vy = (ty / len) * 7.2;
+        e.mode = 'dive';
+        e.diveTime = 0.55;
+      }
+    } else {
+      const sway = Math.sin(this.time * 0.8 + e.phase);
+      const tx = near ? p.x + sway * 2.4 : clamp(e.spawnX + sway * (e.patrolMax - e.patrolMin) * 0.4, e.patrolMin, e.patrolMax);
+      const ty = e.anchorY + Math.sin(this.time * 2.1 + e.phase) * 0.3;
+      e.vx = approach(e.vx, clamp((tx - e.x) * 2.2, -e.speed, e.speed), 8 * dt);
+      e.vy = approach(e.vy, clamp((ty - e.y) * 2.6, -3, 3), 10 * dt);
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+      if (e.mode === 'rise' && Math.abs(e.y - e.anchorY) < 0.35) e.mode = 'hover';
+      if (e.mode === 'hover' && near && adx < 4.2 && e.aiTimer <= 0 && p.y < e.y) {
+        e.mode = 'windup';
+        e.diveTime = 0.38;
+        this.events.push({ type: 'sound', name: 'wisp' });
       }
     }
-    this.projectiles = this.projectiles.filter(p => p.alive);
+    e.x = clamp(e.x, e.patrolMin - 4, e.patrolMax + 4);
+
+    if (e.attackCooldown <= 0 && this._overlap(e, p)) {
+      e.attackCooldown = 1.0;
+      this._hurtPlayer(e.damage, e.x, 3.4);
+      if (e.mode === 'dive') {
+        e.mode = 'rise';
+        e.aiTimer = 1.6;
+      }
+    }
+  }
+
+  /** Ash caster: holds its ground and lobs ash bolts along its floor. */
+  _updateCaster(e, dt, dx, adx) {
+    e.vx = approach(e.vx, 0, 12 * dt);
+    if (e.attackTimer > 0) {
+      const prev = e.attackTimer;
+      e.attackTimer = Math.max(0, e.attackTimer - dt);
+      if (!e.attackDidHit && prev > 0.12 && e.attackTimer <= 0.12) {
+        e.attackDidHit = true;
+        this._spawnBolt(e, 5.6, 0, e.damage);
+      }
+      return;
+    }
+    if (e.attackCooldown <= 0 && adx < 9.5 && Math.abs(this.player.y - e.y) < 2.6) {
+      e.attackTimer = 0.62;
+      e.attackCooldown = 2.3;
+      e.attackDidHit = false;
+      this.events.push({ type: 'sound', name: 'cast' });
+    }
+  }
+
+  /** Cinder Golem: slams (shockwaves both ways), leaps onto the player, sprays ash. */
+  _updateGolem(e, dt, dx, adx) {
+    if (!this.bossFight) {
+      e.vx = 0;
+      return;
+    }
+    const enraged = e.hp < e.maxHp * 0.5;
+    if (e.leaping) {
+      e.airTime += dt;
+      if (e.airTime > 0.15 && e.grounded) {
+        e.leaping = false;
+        e.vx = 0;
+        e.attackCooldown = enraged ? 0.75 : 1.05;
+        if (adx < 1.7 && Math.abs(this.player.y - e.y) < 1.9) this._hurtPlayer(e.damage + 2, e.x, 6.8);
+        this._spawnShockwaves(e, enraged);
+      }
+      return;
+    }
+    if (e.attackTimer > 0) {
+      const prev = e.attackTimer;
+      e.attackTimer = Math.max(0, e.attackTimer - dt);
+      e.vx = approach(e.vx, 0, 24 * dt);
+      if (e.bossMove === 1) { // overhead slam
+        if (!e.attackDidHit && prev > 0.3 && e.attackTimer <= 0.3) {
+          e.attackDidHit = true;
+          if (adx < 2.3 && Math.abs(this.player.y - e.y) < 1.9) this._hurtPlayer(e.damage + 3, e.x, 6.6);
+          this._spawnShockwaves(e, enraged);
+        }
+      } else if (e.bossMove === 2) { // crouch, then leap
+        if (e.attackTimer <= 0) {
+          e.leaping = true;
+          e.airTime = 0;
+          e.vy = 9.6;
+          e.vx = clamp(dx / 0.87, -7.5, 7.5);
+          e.grounded = false;
+          this.events.push({ type: 'sound', name: 'leap' });
+        }
+      } else if (e.bossMove === 3) { // cinder spray
+        if (!e.attackDidHit && prev > 0.3 && e.attackTimer <= 0.3) {
+          e.attackDidHit = true;
+          this._spawnBolt(e, 6.4, 0, 11);
+          this._spawnBolt(e, 6.0, 1.5, 9);
+          this._spawnBolt(e, 6.0, -1.3, 9);
+        }
+      }
+      return;
+    }
+    if (e.attackCooldown <= 0) {
+      e.pattern += 1;
+      if (adx < 2.4) e.bossMove = 1;
+      else if (e.pattern % 3 === 0) e.bossMove = 3;
+      else e.bossMove = 2;
+      e.attackTimer = e.bossMove === 1 ? 0.85 : e.bossMove === 2 ? 0.45 : 0.7;
+      // Slam and spray: the gap after the move counts from its start. A leap sets its own on landing.
+      e.attackCooldown = e.bossMove === 2 ? 99 : e.attackTimer + (enraged ? 0.55 : 0.85);
+      e.attackDidHit = false;
+      if (e.bossMove !== 2) this.events.push({ type: 'sound', name: e.bossMove === 1 ? 'windup' : 'cast' });
+      return;
+    }
+    e.vx = approach(e.vx, signNonZero(dx, e.facing) * e.speed, 6 * dt);
+  }
+
+  _spawnShockwaves(e, enraged) {
+    const floor = e.y - e.h / 2;
+    const speed = enraged ? 7 : 6.1;
+    for (const dir of [-1, 1]) {
+      this.projectiles.push({
+        id: `wave-${this.nextProjectileId++}`, owner: 'enemy', type: 'wave',
+        x: e.x + dir * (e.w / 2 + 0.3), y: floor + 0.34, vx: dir * speed, vy: 0,
+        w: 0.55, h: 0.62, damage: 12, life: 2.6, alive: true
+      });
+    }
+    this.events.push({ type: 'sound', name: 'slam' });
+    this.events.push({ type: 'shake', power: 0.6 });
+    this.events.push({ type: 'burst', x: e.x, y: floor + 0.2, color: '#ff8a4d', count: 14 });
+  }
+
+  _updateProjectiles(dt) {
+    // Compacted in place (no new array per step). A hit can clear the list mid-loop
+    // (boss down, player respawn): stop there instead of writing stale entries back.
+    let keep = 0;
+    const list = this.projectiles;
+    for (let i = 0; i < list.length; i++) {
+      const pr = list[i];
+      if (pr.alive) this._stepProjectile(pr, dt);
+      if (list.length === 0) return;
+      if (pr.alive) list[keep++] = pr;
+    }
+    list.length = keep;
+  }
+
+  _stepProjectile(pr, dt) {
+    pr.life -= dt;
+    if (pr.life <= 0) { pr.alive = false; return; }
+    pr.x += pr.vx * dt;
+    pr.y += pr.vy * dt;
+
+    if (this._overlapsAnySolid(pr)) {
+      pr.alive = false;
+      this.events.push({ type: 'burst', x: pr.x, y: pr.y, color: pr.owner === 'player' ? '#75f3ff' : '#ff8055', count: 4 });
+      return;
+    }
+
+    if (pr.owner === 'player') {
+      for (const e of this.enemies) {
+        if (!e.alive || !this._overlap(pr, e)) continue;
+        this._damageEnemy(e, pr.damage, signNonZero(pr.vx) * 2.2);
+        pr.alive = false;
+        return;
+      }
+      for (const b of this.level.braziers) {
+        if (this.braziersLit.has(b.id) || !this._overlap(pr, b)) continue;
+        this._lightBrazier(b);
+        pr.alive = false;
+        return;
+      }
+    } else if (this._overlap(pr, this.player)) {
+      this._hurtPlayer(pr.damage, pr.x, signNonZero(pr.vx) * 3.5);
+      pr.alive = false;
+    }
   }
 
   _updatePickups(dt) {
@@ -540,25 +739,32 @@ export class GameWorld {
         this.events.push({ type: 'sound', name: 'pickup' });
       }
     }
+    if (this.pickups.length > 8) this.pickups = this.pickups.filter((item) => item.alive);
   }
 
   _updateMissionTriggers() {
     const p = this.player;
-    if (p.x > 60.5 && this.doorUnlocked && this.checkpoint.name !== 'Lower Hall' && this.checkpoint.name !== 'Warden Gate') {
-      this.checkpoint = { x: 62.5, y: 0.86, name: 'Lower Hall' };
-      p.hp = Math.min(this.maxHp, p.hp + 18);
-      p.mana = Math.min(this.maxMana, p.mana + 14);
-      this.events.push({ type: 'checkpoint', text: 'Checkpoint: Lower Hall' });
+    const l = this.level;
+    for (const cp of l.checkpoints) {
+      if (cp.index <= this.checkpointIndex || p.x <= cp.trigger) continue;
+      if (cp.needs === 'door' && !this.doorUnlocked) continue;
+      if (cp.needs === 'bossAlive' && this.bossDefeated) continue;
+      this.checkpointIndex = cp.index;
+      this.checkpoint = { x: cp.x, y: cp.y, name: cp.name };
+      if (cp.full) {
+        p.hp = this.maxHp;
+        p.mana = this.maxMana;
+      } else {
+        p.hp = Math.min(this.maxHp, p.hp + cp.hp);
+        p.mana = Math.min(this.maxMana, p.mana + cp.mana);
+      }
+      this.events.push({ type: 'checkpoint', text: cp.full ? `Checkpoint: ${cp.name} — restored` : `Checkpoint: ${cp.name}` });
+      this.events.push({ type: 'sound', name: 'checkpoint' });
+      this.events.push({ type: 'save' });
     }
-    if (p.x > 102 && !this.bossDefeated && this.checkpoint.name !== 'Warden Gate') {
-      this.checkpoint = { x: 102.2, y: 3.86, name: 'Warden Gate' };
-      p.hp = this.maxHp;
-      p.mana = this.maxMana;
-      this.events.push({ type: 'checkpoint', text: 'Checkpoint: Warden Gate — restored' });
-    }
-    if (p.x > 106.2 && !this.bossDefeated && !this.bossFight) {
+    if (p.x > l.boss.trigger && !this.bossDefeated && !this.bossFight) {
       this.bossFight = true;
-      this.events.push({ type: 'toast', text: 'ASH WARDEN — Palace Keeper' });
+      this.events.push({ type: 'toast', text: l.boss.title });
       this.events.push({ type: 'sound', name: 'bossStart' });
       this._emitObjective();
     }
@@ -567,10 +773,12 @@ export class GameWorld {
   _hurtPlayer(amount, sourceX, knockback = 4) {
     const p = this.player;
     if (p.invuln > 0) return;
+    amount = Math.max(1, Math.round(amount * this.diff.damageTaken));
     const sourceDir = signNonZero(sourceX - p.x, p.facing);
     const frontal = sourceDir === p.facing;
     let finalDamage = amount;
-    if (p.guarding && frontal) {
+    const guarded = p.guarding && frontal;
+    if (guarded) {
       finalDamage = Math.max(1, Math.round(amount * 0.28));
       knockback *= 0.32;
       this.events.push({ type: 'sound', name: 'block' });
@@ -584,12 +792,35 @@ export class GameWorld {
     p.vx = -sourceDir * knockback;
     p.vy = Math.max(p.vy, 3.2);
     this.events.push({ type: 'playerDamage', amount: finalDamage });
+    this.events.push({ type: 'impact', kind: guarded ? 'block' : 'hurt', power: guarded ? 0.25 : 0.7 });
     if (p.hp <= 0) this._respawn('The palace rejects you — checkpoint restored.');
   }
 
-  _respawn(message) {
+  /** Lava: always burns (invulnerability does not help), then sets the player back on the near bank. */
+  _burnPlayer(hz) {
     const p = this.player;
-    p.deaths += 1;
+    const damage = Math.max(1, Math.round(14 * this.diff.damageTaken));
+    p.hp -= damage;
+    this.events.push({ type: 'sound', name: 'burn' });
+    this.events.push({ type: 'burst', x: p.x, y: p.y - 0.4, color: '#ff6a2a', count: 12 });
+    this.events.push({ type: 'impact', kind: 'hurt', power: 0.7 });
+    this.events.push({ type: 'playerDamage', amount: damage });
+    if (p.hp <= 0) {
+      this._respawn('The lava claims you — checkpoint restored.');
+      return;
+    }
+    p.x = hz.returnX;
+    p.y = hz.returnY;
+    p.vx = 0;
+    p.vy = 0;
+    p.invuln = Math.max(p.invuln, 1.0);
+    p.attackTimer = 0;
+    this.events.push({ type: 'toast', text: `Scorched! −${damage} health.` });
+  }
+
+  _respawn(message, countDeath = true) {
+    const p = this.player;
+    if (countDeath) p.deaths += 1;
     p.hp = this.maxHp;
     p.mana = this.maxMana;
     p.x = this.checkpoint.x;
@@ -597,76 +828,120 @@ export class GameWorld {
     p.vx = 0;
     p.vy = 0;
     p.invuln = 1.2;
+    p.hurtTimer = 0;
     p.attackTimer = 0;
+    p.attackBuffer = 0;
+    p.jumpBuffer = 0;
     p.guarding = false;
+    // Bolts and shockwaves in flight would otherwise reach the checkpoint.
+    this.projectiles.length = 0;
     if (this.bossFight && !this.bossDefeated) {
       this.bossFight = false;
       const b = this.boss;
       if (b?.alive) {
-        b.x = 120;
-        b.y = 4.33;
+        b.x = this.level.boss.x;
+        b.y = this.level.boss.y;
         b.vx = b.vy = 0;
         b.attackTimer = 0;
         b.attackCooldown = 0.7;
+        b.leaping = false;
+        b.airTime = 0;
+        b.guarding = false;
       }
     }
     this.events.push({ type: 'toast', text: message });
     this.events.push({ type: 'sound', name: 'respawn' });
   }
 
-  interactionPrompt() {
+  /** Pause-menu retry: back to the last checkpoint without counting a death. */
+  restartFromCheckpoint() {
+    this._respawn(`Back at ${this.checkpoint.name}.`, false);
+  }
+
+  _near(x, y, radius = 1.45) {
     const p = this.player;
-    const near = (x, y, radius = 1.45) => Math.abs(p.x - x) <= radius && Math.abs(p.y - y) <= 1.8;
+    return Math.abs(p.x - x) <= radius && Math.abs(p.y - y) <= 1.8;
+  }
+
+  _doorY() {
+    const d = this.level.door;
+    return d.y - d.h / 2 + 1.2;
+  }
+
+  interactionPrompt() {
     const l = this.level;
-    if (!this.keyCollected && near(l.keyChest.x, l.keyChest.y, 1.5)) return 'Open Sun-Key chest';
-    if (!this.doorUnlocked && near(l.door.x, 1.2, 1.6)) return this.keyCollected ? 'Unlock sun gate' : 'Gate needs the Sun Key';
-    if (!this.gearCollected && near(l.gearChest.x, l.gearChest.y, 1.55)) return 'Open forge cache';
-    for (const sign of l.signs) if (near(sign.x, sign.y, 1.25)) return 'Read carved slate';
-    if (near(l.altar.x, l.altar.y, 1.65)) return this.bossDefeated ? 'Claim Ember Sigil' : 'Inspect sealed altar';
+    if (l.keyChest && !this.keyCollected && this._near(l.keyChest.x, l.keyChest.y, 1.5)) return 'Open Sun-Key chest';
+    if (!this.doorUnlocked && this._near(l.door.x, this._doorY(), 1.6)) {
+      if (l.lock === 'braziers') return `Ember Gate · ${this.braziersLit.size}/${l.braziers.length} braziers`;
+      return this.keyCollected ? 'Unlock sun gate' : 'Gate needs the Sun Key';
+    }
+    if (l.gearChest && !this.gearCollected && this._near(l.gearChest.x, l.gearChest.y, 1.55)) return 'Open forge cache';
+    if (l.vesselChest && !this.vesselCollected && this._near(l.vesselChest.x, l.vesselChest.y, 1.55)) return 'Open ember vessel chest';
+    for (const b of l.braziers) if (!this.braziersLit.has(b.id) && this._near(b.x, b.y, 1.3)) return 'Kindle brazier';
+    for (const sign of l.signs) if (this._near(sign.x, sign.y, 1.25)) return 'Read carved slate';
+    if (this._near(l.altar.x, l.altar.y, 1.65)) return this.bossDefeated ? `Claim ${l.relic}` : 'Inspect sealed altar';
     return '';
   }
 
   interact() {
     const p = this.player;
-    const near = (x, y, radius = 1.45) => Math.abs(p.x - x) <= radius && Math.abs(p.y - y) <= 1.8;
     const l = this.level;
-    if (!this.keyCollected && near(l.keyChest.x, l.keyChest.y, 1.5)) {
+    if (l.keyChest && !this.keyCollected && this._near(l.keyChest.x, l.keyChest.y, 1.5)) {
       this.keyCollected = true;
       this._grantXp(12);
       this.events.push({ type: 'toast', text: 'Sun Key acquired. The lower gate can now open.' });
       this.events.push({ type: 'sound', name: 'key' });
       this.events.push({ type: 'burst', x: l.keyChest.x, y: l.keyChest.y + 0.5, color: '#ffe06a', count: 16 });
+      this.events.push({ type: 'save' });
       this._emitObjective();
       return true;
     }
-    if (!this.doorUnlocked && near(l.door.x, 1.2, 1.65)) {
+    if (!this.doorUnlocked && this._near(l.door.x, this._doorY(), 1.65)) {
+      if (l.lock === 'braziers') {
+        this.events.push({ type: 'toast', text: `Three cinder braziers hold this gate. ${this.braziersLit.size} of ${l.braziers.length} burn.` });
+        return true;
+      }
       if (!this.keyCollected) {
         this.events.push({ type: 'toast', text: 'A sun-shaped lock. The key is somewhere above.' });
         return true;
       }
-      this.doorUnlocked = true;
-      this.events.push({ type: 'toast', text: 'Sun gate opened.' });
-      this.events.push({ type: 'sound', name: 'door' });
-      this._emitObjective();
+      this._openDoor('Sun gate opened.');
       return true;
     }
-    if (!this.gearCollected && near(l.gearChest.x, l.gearChest.y, 1.55)) {
+    if (l.gearChest && !this.gearCollected && this._near(l.gearChest.x, l.gearChest.y, 1.55)) {
       this.gearCollected = true;
-      p.swordTier = 2;
+      p.swordTier = Math.max(p.swordTier, 2);
       p.mana = this.maxMana;
       this.events.push({ type: 'toast', text: 'Forge cache: Ember Edge equipped. Sword damage increased.' });
       this.events.push({ type: 'sound', name: 'upgrade' });
       this.events.push({ type: 'burst', x: l.gearChest.x, y: l.gearChest.y + 0.5, color: '#ff9d55', count: 18 });
+      this.events.push({ type: 'save' });
       return true;
     }
+    if (l.vesselChest && !this.vesselCollected && this._near(l.vesselChest.x, l.vesselChest.y, 1.55)) {
+      this.vesselCollected = true;
+      p.vessels += 1;
+      p.hp = this.maxHp;
+      this.events.push({ type: 'toast', text: 'Vessel of Embers: maximum health +20, fully restored.' });
+      this.events.push({ type: 'sound', name: 'upgrade' });
+      this.events.push({ type: 'burst', x: l.vesselChest.x, y: l.vesselChest.y + 0.5, color: '#ff6b77', count: 18 });
+      this.events.push({ type: 'save' });
+      return true;
+    }
+    for (const b of l.braziers) {
+      if (!this.braziersLit.has(b.id) && this._near(b.x, b.y, 1.3)) {
+        this._lightBrazier(b);
+        return true;
+      }
+    }
     for (const sign of l.signs) {
-      if (near(sign.x, sign.y, 1.25)) {
+      if (this._near(sign.x, sign.y, 1.25)) {
         this.events.push({ type: 'toast', text: sign.text, long: true });
         this.events.push({ type: 'sound', name: 'text' });
         return true;
       }
     }
-    if (near(l.altar.x, l.altar.y, 1.65)) {
+    if (this._near(l.altar.x, l.altar.y, 1.65)) {
       if (!this.bossDefeated) {
         this.events.push({ type: 'toast', text: 'The altar is cold. A stronger presence still binds the palace.' });
         return true;
@@ -682,9 +957,33 @@ export class GameWorld {
     return false;
   }
 
+  _openDoor(text) {
+    this.doorUnlocked = true;
+    this.events.push({ type: 'toast', text });
+    this.events.push({ type: 'sound', name: 'door' });
+    this.events.push({ type: 'shake', power: 0.35 });
+    this.events.push({ type: 'save' });
+    this._emitObjective();
+  }
+
+  _lightBrazier(b) {
+    if (this.braziersLit.has(b.id)) return;
+    this.braziersLit.add(b.id);
+    const lit = this.braziersLit.size;
+    const total = this.level.braziers.length;
+    this.events.push({ type: 'sound', name: 'brazier' });
+    this.events.push({ type: 'burst', x: b.x, y: b.top + 1.0, color: '#ff9a4d', count: 14 });
+    if (lit >= total && !this.doorUnlocked) this._openDoor('All three braziers burn. The Ember Gate grinds open.');
+    else {
+      this.events.push({ type: 'toast', text: `Brazier kindled (${lit}/${total}).` });
+      this.events.push({ type: 'save' });
+      this._emitObjective();
+    }
+  }
+
   _moveBody(body, dt, allowStep) {
     body.grounded = false;
-    let solids = this.solids;
+    const solids = this.solids;
     const oldX = body.x;
     body.x += body.vx * dt;
     for (const s of solids) {
@@ -704,8 +1003,7 @@ export class GameWorld {
 
     const oldY = body.y;
     body.y += body.vy * dt;
-    solids = this.solids;
-    for (const s of solids) {
+    for (const s of this.solids) {
       if (!this._overlap(body, s)) continue;
       if (body.vy <= 0) {
         body.y = s.y + s.h / 2 + body.h / 2 + 0.001;
@@ -720,7 +1018,9 @@ export class GameWorld {
   }
 
   _overlapsAnySolid(body) {
-    return this.solids.some(s => this._overlap(body, s));
+    const solids = this.solids;
+    for (let i = 0; i < solids.length; i++) if (this._overlap(body, solids[i])) return true;
+    return false;
   }
 
   _overlap(a, b) {
@@ -737,5 +1037,76 @@ export class GameWorld {
     this.player.x = x;
     this.player.y = y;
     this.player.vx = this.player.vy = 0;
+  }
+
+  /** Player stats that carry into the next palace. */
+  carryStats() {
+    const out = {};
+    for (const k of CARRY_KEYS) out[k] = this.player[k];
+    return out;
+  }
+
+  /** Everything needed to continue this run later (checkpoint granularity). */
+  snapshot() {
+    const p = this.player;
+    return {
+      v: 1,
+      palace: this.level.id,
+      difficulty: this.diff.id,
+      time: this.time,
+      carry: this.carry,
+      player: { ...this.carryStats(), deaths: p.deaths },
+      pending: this.pendingUpgradeCount,
+      flags: {
+        keyCollected: this.keyCollected,
+        doorUnlocked: this.doorUnlocked,
+        gearCollected: this.gearCollected,
+        vesselCollected: this.vesselCollected,
+        bossDefeated: this.bossDefeated
+      },
+      braziers: [...this.braziersLit],
+      checkpoint: { ...this.checkpoint },
+      checkpointIndex: this.checkpointIndex,
+      dead: this.enemies.filter((e) => !e.alive).map((e) => e.id)
+    };
+  }
+
+  /** Rebuild a run from snapshot(); null when the data is unusable. */
+  static fromSnapshot(s) {
+    if (!s || s.v !== 1 || !PALACE_ORDER.includes(s.palace)) return null;
+    const world = new GameWorld({ palace: s.palace, difficulty: s.difficulty, carry: s.carry || null });
+    const p = world.player;
+    for (const k of CARRY_KEYS) if (Number.isFinite(s.player?.[k])) p[k] = s.player[k];
+    p.deaths = Number.isFinite(s.player?.deaths) ? s.player.deaths : 0;
+    const f = s.flags || {};
+    world.keyCollected = !!f.keyCollected;
+    world.doorUnlocked = !!f.doorUnlocked;
+    world.gearCollected = !!f.gearCollected;
+    world.vesselCollected = !!f.vesselCollected;
+    world.bossDefeated = !!f.bossDefeated;
+    const valid = new Set(world.level.braziers.map((b) => b.id));
+    for (const id of s.braziers || []) if (valid.has(id)) world.braziersLit.add(id);
+    if (s.checkpoint && Number.isFinite(s.checkpoint.x) && Number.isFinite(s.checkpoint.y)) {
+      world.checkpoint = { x: s.checkpoint.x, y: s.checkpoint.y, name: String(s.checkpoint.name || 'Checkpoint') };
+      world.checkpointIndex = Number.isFinite(s.checkpointIndex) ? s.checkpointIndex : 0;
+    }
+    const dead = new Set(s.dead || []);
+    for (const e of world.enemies) {
+      if (dead.has(e.id) || (e.isBoss && world.bossDefeated)) {
+        e.alive = false;
+        e.hp = 0;
+      }
+    }
+    world.time = Number.isFinite(s.time) ? s.time : 0;
+    p.x = world.checkpoint.x;
+    p.y = world.checkpoint.y;
+    p.hp = world.maxHp;
+    p.mana = world.maxMana;
+    const pending = Math.max(0, Math.min(3, s.pending | 0));
+    world.pendingUpgradeCount = pending;
+    world.pausedForUpgrade = pending > 0;
+    world.events = [];
+    world._emitObjective(true);
+    return world;
   }
 }
