@@ -224,7 +224,8 @@ export function createRenderLayer(kit, { waterY, moonDir }) {
    * Frustum culling is off: instances move and the old renderer drew them all too.
    */
   function batch(def, capacity, parent = scene, { layer = 0 } = {}) {
-    const m = new THREE.InstancedMesh(geometryFor(def), materialFor(def), Math.max(1, capacity));
+    // kit.instanced: ~95 prop batches share one shader instead of compiling one each (r186).
+    const m = kit.instanced(geometryFor(def), materialFor(def), Math.max(1, capacity));
     m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     m.count = 0;
     m.visible = false;
