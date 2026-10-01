@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { uniform, uv, vec2, vec3, vec4, float, sin, cos, pow, max, abs, length, mix, step, smoothstep, normalize, positionLocal, positionGeometry, positionWorld, materialColor, cameraViewMatrix } from 'three/tsl';
+import { uniform, uv, vec2, vec3, vec4, float, sin, cos, pow, max, abs, length, mix, step, smoothstep, normalize, positionLocal, positionGeometry, positionWorld, materialColor, cameraViewMatrix, pass } from 'three/tsl';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { CSMShadowNode } from 'three/addons/csm/CSMShadowNode.js';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
@@ -72,7 +72,10 @@ export class RenderingSystem {
     let rgb = color.rgb;
     if (this.aoWanted(ctx.tier)) {
       if (!this.aoNode) {
-        this.aoNode = ao(ctx.scenePass.getTextureNode('depth'), null, this.camera);
+        // GTAO can't gather from the multisampled scene depth on WebGPU (MSAA on high and ultra), so
+        // it reads a single-sampled depth pass of its own; AO is an Advanced extra, so only then.
+        this.aoDepthPass = pass(this.scene, this.camera, { samples: 0 });
+        this.aoNode = ao(this.aoDepthPass.getTextureNode('depth'), null, this.camera);
         this.aoNode.resolutionScale = 0.5; this.aoNode.radius.value = 2.3; this.aoNode.distanceExponent.value = 1.7; this.aoNode.thickness.value = 1.2; this.aoNode.samples.value = 8;
       }
       rgb = rgb.mul(mix(1.0, this.aoNode.getTextureNode().r, 0.7));
