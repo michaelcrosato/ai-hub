@@ -8,6 +8,7 @@ dependency) and, for the WebGPU path, Windows Chrome reachable from WSL.
   check3d.py games/Foo.html                 # WebGL2 path (Linux headless Chromium) + WebGPU path (Windows Chrome, real GPU)
   check3d.py games/Foo.html --only webgl2   # just one path: webgl2 | webgpu | mobile
   check3d.py games/Foo.html --keys KeyW,Space --click   # also drive input on the WebGL2 path
+  check3d.py games/Foo.html --start --keys KeyW        # press the game's own start button(s) first
   check3d.py games/Foo.html --wait 12       # seconds to let it boot (default 9)
   check3d.py games/Foo.html --out /tmp/x    # where screenshots + report.json go
 
@@ -45,7 +46,8 @@ addEventListener('error',e=>P.errors.push('error: '+(e.message||e.error)));
 addEventListener('unhandledrejection',e=>P.errors.push('rejection: '+(e.reason&&e.reason.message||e.reason)));
 const gc=HTMLCanvasElement.prototype.getContext;HTMLCanvasElement.prototype.getContext=function(t,...r){P.contexts.push(t);return gc.call(this,t,...r)};
 if(navigator.gpu){const ra=navigator.gpu.requestAdapter.bind(navigator.gpu);navigator.gpu.requestAdapter=async(...a)=>{const ad=await ra(...a);P.gpu=ad?{vendor:ad.info&&ad.info.vendor,arch:ad.info&&ad.info.architecture}:'null';return ad}}
-setTimeout(()=>{const k=window.__kit||null;const pre=document.createElement('pre');pre.id='__probe_out';pre.textContent='@@PRO'+'BE@@'+JSON.stringify({...P,kit:k,title:document.title})+'@@E'+'ND@@';document.documentElement.append(pre)},__WAIT__);
+let rafN=0,rafN0=0;const rafTick=()=>{rafN++;requestAnimationFrame(rafTick)};requestAnimationFrame(rafTick);setTimeout(()=>{rafN0=rafN},__WAIT__-2000);
+setTimeout(()=>{P.rafFps=Math.round((rafN-rafN0)/2);const k=window.__kit||null;const pre=document.createElement('pre');pre.id='__probe_out';pre.textContent='@@PRO'+'BE@@'+JSON.stringify({...P,kit:k,title:document.title,started:window.__started||null})+'@@E'+'ND@@';document.documentElement.append(pre)},__WAIT__);
 })();</script>"""
 
 
@@ -53,6 +55,7 @@ setTimeout(()=>{const k=window.__kit||null;const pre=document.createElement('pre
 # after the game has booted, click the middle of the screen, then hold each key for 0.6 s.
 DRIVE = r"""<script>addEventListener('load',()=>{},{once:true});setTimeout(async()=>{const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const keys=__KEYS__;const click=__CLICK__;const X=innerWidth/2,Y=innerHeight/2;
+if(__START__){try{await(__STARTJS__)()}catch(e){window.__started=['error: '+e.message]}}
 if(click){const t=document.elementFromPoint(X,Y)||document.body;const o={bubbles:true,cancelable:true,clientX:X,clientY:Y,pointerId:1,pointerType:'mouse',button:0,buttons:1,isPrimary:true};
 t.dispatchEvent(new PointerEvent('pointerdown',o));t.dispatchEvent(new MouseEvent('mousedown',o));await sleep(80);
 t.dispatchEvent(new PointerEvent('pointerup',{...o,buttons:0}));t.dispatchEvent(new MouseEvent('mouseup',{...o,buttons:0}));t.dispatchEvent(new MouseEvent('click',{...o,buttons:0}));await sleep(300)}
@@ -61,6 +64,26 @@ const tgt=document.activeElement||document.body;
 if((code==='Enter'||code==='Space')&&tgt.closest&&tgt.closest('button,a[href],summary,[role=button],input[type=button],input[type=submit]')){tgt.click();await sleep(400);continue}
 tgt.dispatchEvent(new KeyboardEvent('keydown',{code,key,bubbles:true,cancelable:true}));await sleep(600);
 tgt.dispatchEvent(new KeyboardEvent('keyup',{code,key,bubbles:true,cancelable:true}));await sleep(200)}},__DELAY__);</script>"""
+
+
+# --start: press the game's own start button, through up to three menus (title → mode → level).
+# Picks the largest visible, uncovered button whose label reads like "start/play/begin/enter…",
+# never links that leave the page or settings/help/credits buttons. Returns the labels pressed.
+START_JS = r"""async()=>{const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const GO=/^[^A-Za-z0-9]*(start|play|begin|enter|new (game|run)|continue|resume|take the|let.?s|launch|go\b|ride|drive|fly|explore|dive|deploy|race|tap to|click to|press|first|level 1|mission 1|chapter 1|1\b)/i;
+const NO=/settings|options|credits|how to|help|guide|tutorial|sound|music|audio|quality|graphics|back|close|menu|quit|reset|delete|share|fullscreen|casebook|×|←/i;
+const label=e=>(e.innerText||e.textContent||e.getAttribute('aria-label')||'').trim().replace(/\s+/g,' ');
+const picked=[];
+for(let round=0;round<3;round++){
+ const els=[...document.querySelectorAll('button,a[href^="#"],[role=button],[data-start],[class*=mission],[class*=level-card]')].filter(e=>{
+  const r=e.getBoundingClientRect();if(r.width<30||r.height<16||e.disabled)return false;
+  if(e.closest('[hidden],[inert],.kit-menu,.kit-card,.kit-touch'))return false;
+  const t=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);if(!t||!(e===t||e.contains(t)))return false;
+  const s=label(e);return s&&GO.test(s)&&!NO.test(s)});
+ if(!els.length)break;
+ els.sort((x,y)=>{const a=x.getBoundingClientRect(),b=y.getBoundingClientRect();return b.width*b.height-a.width*a.height});
+ const e=els[0];picked.push(label(e).slice(0,40));e.click();await sleep(1200)}
+window.__started=picked;return picked}"""
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -95,9 +118,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 probe = PROBE.replace('__WAIT__', str(wait))
                 keys = [k for k in q.get('drive', [''])[0].split(',') if k]
                 clickq = q.get('click', ['0'])[0] == '1'
-                if keys or clickq:
+                startq = q.get('start', ['0'])[0] == '1'
+                if keys or clickq or startq:
                     delay = max(1500, int(wait * 0.4))
-                    probe += DRIVE.replace('__KEYS__', json.dumps(keys)).replace('__CLICK__', 'true' if clickq else 'false').replace('__DELAY__', str(delay))
+                    probe += (DRIVE.replace('__KEYS__', json.dumps(keys)).replace('__CLICK__', 'true' if clickq else 'false')
+                              .replace('__START__', 'true' if startq else 'false').replace('__STARTJS__', START_JS).replace('__DELAY__', str(delay)))
                 m = re.search(r'<head[^>]*>', html, re.I)
                 html = html[:m.end()] + probe + html[m.end():] if m else probe + html
                 slow = f'<img src="/__slow?ms={wait + 1500}" style="position:fixed;width:1px;height:1px;opacity:0" alt="">'
@@ -195,7 +220,7 @@ def canvas_stats(page):
         return {'error': str(e)}
 
 
-def run_playwright(url_path, port, out, wait, keys, click, mobile=False):
+def run_playwright(url_path, port, out, wait, keys, click, mobile=False, start=False):
     from playwright.sync_api import sync_playwright
     res = {'console': [], 'pageErrors': []}
     with sync_playwright() as pw:
@@ -224,6 +249,12 @@ def run_playwright(url_path, port, out, wait, keys, click, mobile=False):
             except Exception:
                 pass
             time.sleep(0.5)
+        if start:
+            try:
+                res['framesBeforeStart'] = page.evaluate('window.__kit && window.__kit.frames')
+                res['started'] = page.evaluate(START_JS)
+            except Exception as e:
+                res['started'] = ['error: ' + str(e)[:200]]
         if click:
             try:
                 page.mouse.click(640, 360)
@@ -254,7 +285,7 @@ def run_playwright(url_path, port, out, wait, keys, click, mobile=False):
     return res
 
 
-def run_windows(url_path, port, out, wait, keys=(), click=False):
+def run_windows(url_path, port, out, wait, keys=(), click=False, start=False):
     if not os.path.exists(CHROME):
         return {'skipped': 'Windows Chrome not found'}
     tag = f'kitcheck-{os.getpid()}-{random.randint(0, 99999)}'
@@ -266,6 +297,8 @@ def run_windows(url_path, port, out, wait, keys=(), click=False):
         url += '&drive=' + urllib.parse.quote(','.join(keys))
     if click:
         url += '&click=1'
+    if start:
+        url += '&start=1'
     base = [CHROME, '--headless=new', '--no-first-run', '--no-default-browser-check', '--window-size=1280,720', '--hide-scrollbars',
             '--autoplay-policy=no-user-gesture-required', f'--user-data-dir={prof_win}']
     res = {}
@@ -310,6 +343,10 @@ def run_windows(url_path, port, out, wait, keys=(), click=False):
 IGNORABLE = re.compile(r'favicon|AudioContext was not allowed|The AudioContext|autoplay|Download the React DevTools|\[kit\] WebGPU start failed|DevTools|GPU stall due to ReadPixels|Automatic fallback to software WebGL|WebGL: CONTEXT_LOST|GroupMarkerNotSet|swiftshader', re.I)
 
 
+# A healthy game builds its pipelines while loading and stays in the tens to low hundreds.
+PIPELINE_CHURN = 250
+
+
 def verdict(report):
     problems = []
     w = report.get('webgl2')
@@ -344,6 +381,10 @@ def verdict(report):
                 problems.append(f"webgpu: only {k.get('frames')} frames")
             if k.get('errors'):
                 problems.append(f"webgpu: kit errors {k['errors'][:3]}")
+            if (k.get('pipelines') or 0) > PIPELINE_CHURN:
+                problems.append(f"webgpu: {k['pipelines']} pipelines (shader churn? see __kit.pipelineLog)")
+            if (k.get('frames') or 0) >= 5 and pr.get('rafFps') is not None and pr['rafFps'] < 30:
+                problems.append(f"webgpu: {pr['rafFps']} fps on the real GPU")
         perr = [e for e in pr.get('errors', []) if not IGNORABLE.search(e)]
         if perr:
             problems.append(f'webgpu: console errors {perr[:4]}')
@@ -367,6 +408,7 @@ def main():
     ap.add_argument('--wait', type=int, default=9)
     ap.add_argument('--keys', default='')
     ap.add_argument('--click', action='store_true')
+    ap.add_argument('--start', action='store_true', help="press the game's own start button(s) before the keys")
     ap.add_argument('--out', default='')
     a = ap.parse_args()
     only = set(a.only.split(','))
@@ -384,15 +426,15 @@ def main():
         except Exception as e:
             report[name] = {'crash': str(e)[:500]}
     if 'webgpu' in only:
-        threads.append(threading.Thread(target=job, args=('webgpu', run_windows, url_path, port, out, a.wait, keys, a.click)))
+        threads.append(threading.Thread(target=job, args=('webgpu', run_windows, url_path, port, out, a.wait, keys, a.click, a.start)))
     if 'webgl2' in only:
-        threads.append(threading.Thread(target=job, args=('webgl2', run_playwright, url_path, port, out, a.wait + 6, keys, a.click)))
+        threads.append(threading.Thread(target=job, args=('webgl2', run_playwright, url_path, port, out, a.wait + 6, keys, a.click, False, a.start)))
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     if 'mobile' in only:
-        job('mobile', run_playwright, url_path, port, out, a.wait + 6, [], False, True)
+        job('mobile', run_playwright, url_path, port, out, a.wait + 6, [], False, True, a.start)
     srv.shutdown()
     report['problems'] = verdict(report)
     report['ok'] = not report['problems']

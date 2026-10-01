@@ -97,8 +97,9 @@ What `boot()` does, so games don't:
   pause menu). Opening it pauses the loop.
 - Runs the loop with `setAnimationLoop`. Never call `requestAnimationFrame` for
   the game loop yourself.
-- Publishes `window.__kit` (`backend`, `tier`, `frames`, `fps`, `errors`,
-  `ready`, `bootMs`) for automated checks.
+- Publishes `window.__kit` (`backend`, `tier`, `frames`, `fps`, `errors` with
+  a `count` on repeats, `ready`, `bootMs`, `pipelines`, `pipelineLog`) for
+  automated checks.
 
 The kit object:
 
@@ -335,6 +336,15 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   projection flip each frame, and check both backends.
 - `THREE.LineLoop` is not supported by WebGPURenderer (r186 logs an error
   and draws nothing): use a `Line` and repeat the first point at the end.
+- **One InstancedMesh per chunk, tile or creature compiles shaders every
+  time.** In r186 each InstancedMesh puts its uuid into the shader cache key
+  and names its matrix buffer after a node id, so every one gets its own
+  shader programs (and pipelines). A streaming world that builds one per
+  chunk stalls on compiles (Verdant went from 54 to 2 fps). Merge each chunk's
+  boxes into one geometry with vertex colours (plain meshes sharing a material
+  share a shader), or keep a few long-lived InstancedMeshes and change their
+  `count`. `__kit.pipelines` counts pipelines: a healthy game stays in the
+  tens, and `__kit.pipelineLog` names the material and object of the last 30.
 - Transmission (glass with `transmission > 0`) and `viewport*Texture` nodes
   copy the framebuffer into one shared texture. Rendering them into a second
   target of another size in the same frame (a puddle reflection, a mirror, a
@@ -453,17 +463,26 @@ Whenever a game is touched, also take the cheap wins:
 Run the checker on both backends and the phone profile:
 
 ```
-python3 scripts/check3d.py games/<Game>.html --keys KeyW,Space --click
+python3 scripts/check3d.py games/<Game>.html --start --keys KeyW,Space
 ```
 
 It serves the repo, loads the game in Linux Chromium forced to WebGL2 and in
 Windows Chrome on the real GPU (WebGPU), then in a Pixel 7 profile with touch,
 and reports `window.__kit`, console errors, a blank-screen check and
-screenshots. `--keys` and `--click` are played on both desktop paths (on
-WebGPU as synthetic events once the game has booted, before its screenshot),
-so the screenshots can show gameplay rather than the title screen. A game passes when all three paths boot, render frames, log no
-errors, and the WebGPU and WebGL2 screenshots show the same scene as each
-other and as the pre-migration baseline.
+screenshots. `--start` presses the game's own start button (through up to
+three menus: title, mode, level), then `--keys` and `--click` are played on
+both desktop paths (on WebGPU as synthetic events once the game has booted,
+before its screenshot), so the screenshots show gameplay rather than the
+title screen. It also flags shader churn (more than 250 pipelines) and a
+frame rate under 30 on the real GPU. A game passes when all three paths
+boot, render frames, log no errors, and the WebGPU and WebGL2 screenshots
+show the same scene as each other and as the pre-migration baseline.
+
+Linux Chromium can also run WebGPU on SwiftShader (slow, but WebGPU
+validation errors reproduce there): launch it with `--enable-unsafe-webgpu
+--enable-features=Vulkan --use-vulkan=swiftshader
+--use-webgpu-adapter=swiftshader` and open the game with
+`?kit-backend=webgpu`.
 
 Also switch quality while the game runs — in a Playwright script,
 `page.evaluate("__kitSettings.set({ quality: 'low' })")`, wait a second,
@@ -484,7 +503,7 @@ Three tools, cheapest first:
    kit or pattern problem: fix it once, at the source, not per game. Triage
    also marks games whose original already logged errors before migration,
    so a pre-existing bug is not mistaken for a port regression.
-3. `python3 scripts/check3d.py <game> --keys … --click` — one game in depth
+3. `python3 scripts/check3d.py <game> --start --keys …` — one game in depth
    while fixing it.
 
 When fixing a game: change only that game's files, keep its content and

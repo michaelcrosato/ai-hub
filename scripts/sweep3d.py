@@ -3,7 +3,8 @@
 sweep3d.py — run scripts/check3d.py over many games and group what breaks.
 
   python3 scripts/sweep3d.py run [games...] [--jobs 4] [--out DIR] [--force]
-      Every game that loads the kit (or the given games), 4 at a time. Resumable:
+      Every game that loads the kit (or the given games), 4 at a time: boot, press the
+      game's start button, play W and Space, read errors, pipelines and fps. Resumable:
       a game with a report in DIR is skipped unless --force. Costs no model
       tokens: headless browsers do the work.
   python3 scripts/sweep3d.py triage [--out DIR]
@@ -16,6 +17,7 @@ sweep3d.py — run scripts/check3d.py over many games and group what breaks.
 Defaults: DIR = ~/dev/ai-hub-migration/sweep, baselines in ~/dev/ai-hub-migration/baseline.
 """
 import argparse, json, re, subprocess, time
+from check3d import PIPELINE_CHURN
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -44,7 +46,7 @@ def run_one(entry, out, force):
     d.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     try:
-        subprocess.run(['python3', 'scripts/check3d.py', entry, '--out', str(d), '--click', '--keys', 'Enter', '--wait', '9'],
+        subprocess.run(['python3', 'scripts/check3d.py', entry, '--out', str(d), '--start', '--keys', 'KeyW,Space', '--wait', '14'],
                        cwd=REPO, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
         rep.write_text(json.dumps({'game': entry, 'ok': False, 'problems': ['sweep: check3d timed out (300 s)']}))
@@ -116,6 +118,15 @@ def problems_of(report):
                 out.append((path, 'fell-back', signature(kit.get('fellBack') or 'webgl2')))
             for e in (kit.get('errors') or [])[:3]:
                 out.append((path, 'kit-error', signature(e.get('message'))))
+            if (kit.get('pipelines') or 0) > PIPELINE_CHURN:
+                log = kit.get('pipelineLog') or []
+                top = max(set(e['material'] for e in log), key=lambda m: sum(e['material'] == m for e in log)) if log else '?'
+                out.append((path, 'shader-churn', f"{kit['pipelines']} pipelines, most recent mostly {top}"))
+            if path == 'webgpu' and (kit.get('frames') or 0) >= 5 and (r.get('probe') or {}).get('rafFps') is not None and r['probe']['rafFps'] < 30:
+                out.append((path, 'slow', f"{r['probe']['rafFps']} fps on the real GPU"))
+        started = (r.get('probe') or {}).get('started') if path == 'webgpu' else r.get('started')
+        if started == [] and kit and (kit.get('frames') or 0) < 5:
+            out.append((path, 'no-start', 'no start button found and no frames (the title may need a key or a click)'))
         for e in errs[:3]:
             out.append((path, 'page-error', signature(e)))
         if (r.get('canvas') or {}).get('blank'):
