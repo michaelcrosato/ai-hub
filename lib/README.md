@@ -24,6 +24,18 @@ Then run `python3 scripts/check3d.py lib/kit/example.html` and a sample of
 games on both backends, read the three.js migration notes for the revisions
 you skipped, and update `kit/README.md` if an API moved.
 
+### Local patches
+
+`rsync --delete` above overwrites these; re-apply each one unless the new
+release fixes the problem upstream (check with the pipeline count in
+`window.__kit.pipelines`):
+
+- `addons/csm/CSMShadowNode.js`: `_setupFade()` and `_setupStandard()` build
+  their `cameraNear`, `cascades` and `shadowFar` nodes once (`??=` on the
+  instance) instead of on every setup. Otherwise each material build gets a
+  differently named uniform buffer, and every InstancedMesh under cascaded
+  shadows compiles its own shader (Verdant Frontier: 119 pipelines → 27).
+
 ## Upgrading Rapier
 
 Copy `dist/rapier.mjs` from the `-simd-compat` and `-compat` packages of the
