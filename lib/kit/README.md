@@ -348,6 +348,17 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   built: `bakeInstances(mesh)` from `kit/instancing.js` merges one into a
   plain mesh (instance colours become vertex colours). `__kit.pipelines` counts pipelines: a healthy game stays in the
   tens, and `__kit.pipelineLog` names the material and object of the last 30.
+- three's `SkyMesh` (r186) draws clouds by default (`cloudCoverage` 0.4).
+  A port of the old WebGL `Sky` had none: set `sky.cloudCoverage.value = 0`,
+  or the sky (and an environment map built from it) comes out whiter.
+- **Layout: keep the 3D view large at every window size.** Check each
+  `@media` rule around the canvas. A `grid-template-columns` left with one
+  track (`265px` instead of `265px minmax(0,1fr)`) dropped one game's stage
+  below the fold at 0 px tall at every width but 1201–1599 px. Check with
+  `python3 scripts/matrix3d.py layout <game>` (phone portrait to ultrawide).
+- Start screens: the button that starts play is a real `<button>` whose
+  label begins with a plain verb (Start, Play, Begin, Enter, Continue,
+  Launch…). Players find it, and so does `check3d.py --start`.
 - **Don't turn `light.castShadow` off and on again at runtime.** r186 shares
   one light node across materials; when the shadow turns off, the first
   material to rebuild disposes the light's shadow node while the others
