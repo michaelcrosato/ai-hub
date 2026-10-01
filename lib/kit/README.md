@@ -335,6 +335,13 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   projection flip each frame, and check both backends.
 - `THREE.LineLoop` is not supported by WebGPURenderer (r186 logs an error
   and draws nothing): use a `Line` and repeat the first point at the end.
+- Transmission (glass with `transmission > 0`) and `viewport*Texture` nodes
+  copy the framebuffer into one shared texture. Rendering them into a second
+  target of another size in the same frame (a puddle reflection, a mirror, a
+  minimap) resizes that copy twice a frame, and on WebGPU the resize destroys
+  a texture a pass still uses ("Destroyed texture … used in a submit" every
+  frame). In the extra pass, hide those objects or swap in a plain
+  see-through stand-in material.
 - Thin lines: `LineSegments` draw one device pixel wide on both backends (no
   line width). Vector/wireframe games that need visible stroke width draw
   screen-space quads per segment (or `lines/webgpu/Line2.js`), sized in CSS
