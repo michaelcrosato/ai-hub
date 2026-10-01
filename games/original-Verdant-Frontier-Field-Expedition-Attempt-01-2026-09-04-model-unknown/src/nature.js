@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { createInstanced } from 'kit/instancing.js';
 import { WORLD, CAIRNS } from './config.js';
 
 const moveGeo = (g, x, y, z) => { g.translate(x, y, z); return g; };
@@ -147,7 +148,8 @@ export class NatureSystem {
       if (type) { const s = 0.65 + r * 0.7; add(type, x, h, z, s, s, s, r * 15); if (name) entities.push({ id: `plant:${id}:${i}`, name, category: 'flora', x, z, height: h + (type === 'reed' ? 1.6 : type === 'edelweiss' ? 0.3 : 0.6), radius: type === 'reed' ? 1 : 0.65, biome: b, description: type === 'edelweiss' ? 'Woolly alpine flower. Record the habitat and location.' : 'Plant specimen. Record the habitat and location.' }); }
     }
     for (const [type, items] of Object.entries(buckets)) {
-      if (!items.length) continue; const mesh = new THREE.InstancedMesh(this.geometries[type], this.materials[type], items.length);
+      // createInstanced: every cell's plant batches share one shader instead of compiling their own (r186).
+      if (!items.length) continue; const mesh = createInstanced(this.geometries[type], this.materials[type], items.length);
       for (let i = 0; i < items.length; i++) {
         const v = items[i]; this.dummy.position.set(v.x, v.y, v.z); this.dummy.scale.set(v.sx, v.sy, v.sz); this.dummy.rotation.set(0, v.angle, 0); this.dummy.updateMatrix(); mesh.setMatrixAt(i, this.dummy.matrix); if (v.color) mesh.setColorAt(i, v.color);
       }
