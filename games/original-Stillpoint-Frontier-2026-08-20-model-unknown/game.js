@@ -2,6 +2,8 @@
 // with its WebGL2 fallback) through kit/boot.js. React draws the interface;
 // vendor-react.js is the game's own React 19 build.
 import * as THREE from "three/webgpu";
+// Every InstancedMesh comes from createInstanced: in r186 each one otherwise compiles its own shaders.
+import { createInstanced } from "kit/instancing.js";
 import {
   Fn,
   uniform,
@@ -7257,7 +7259,7 @@ function x3(t, e = !1) {
       );
     },
     h = (L, O, G) => {
-      let F = new THREE.InstancedMesh(
+      let F = createInstanced(
         new THREE.BoxGeometry(1, 1, 1),
         c[G].clone(),
         O.length,
@@ -7661,7 +7663,7 @@ function T3(t, e) {
   return [...new Set(l)].sort((u, h) => u - h);
 }
 function Mf(t, e, n, i, r = {}) {
-  let a = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), i, n.length);
+  let a = createInstanced(new THREE.BoxGeometry(1, 1, 1), i, n.length);
   ((a.name = `ten-story-building:${e}`),
     (a.castShadow = r.castShadow ?? !1),
     (a.receiveShadow = r.receiveShadow ?? !1),
@@ -12247,7 +12249,7 @@ var CitizenCrowd = class {
       s = (a?.source === "settlement" ? Or(a.sourceId) : null)?.tier ?? "road",
       l = null;
     if (r.length > 0) {
-      ((l = new THREE.InstancedMesh(this.geometry, this.material, r.length)),
+      ((l = createInstanced(this.geometry, this.material, r.length)),
         (l.name = `ambient-citizens:${i}`),
         l.instanceMatrix.setUsage(THREE.DynamicDrawUsage),
         (l.frustumCulled = !0),
@@ -12729,7 +12731,7 @@ var AnimalPopulation = class {
     let r = Math.max(...QUALITY_ORDER.map((a) => Q_[a]));
     for (let a of Object.values(so)) {
       let o = G6(a),
-        s = new THREE.InstancedMesh(o, this.material, r);
+        s = createInstanced(o, this.material, r);
       ((s.name = `ambient-animals:${a.id}`),
         (s.count = 0),
         s.instanceMatrix.setUsage(THREE.DynamicDrawUsage),
@@ -18891,7 +18893,7 @@ var WorldStreamer = class {
             wetReflectionBoost: 0.4,
           },
         ),
-        S = new THREE.InstancedMesh(p, f, h);
+        S = createInstanced(p, f, h);
       ((S.name = `settlement:${l.id}:${r}`),
         (S.castShadow = qualityHasShadows(this.quality)),
         (S.receiveShadow = !0));
@@ -18920,7 +18922,7 @@ var WorldStreamer = class {
           polygonOffsetFactor: -1,
           polygonOffsetUnits: -1,
         }),
-        b = new THREE.InstancedMesh(M, _, h * E * 4);
+        b = createInstanced(M, _, h * E * 4);
       (markBloom(b),
         (b.name = `city-windows:${l.id}:${r}`),
         (b.castShadow = !1),
@@ -19101,7 +19103,7 @@ var WorldStreamer = class {
   addRockField(e, n, i, r, a, o, s, l) {
     let c = kt(`${ot}:chunk:${r}:rocks:v1`),
       u = Math.max(3, Math.floor(4 + a * 13 + c() * 4)),
-      h = new THREE.InstancedMesh(
+      h = createInstanced(
         new THREE.DodecahedronGeometry(1, 0),
         ln(
           new THREE.MeshStandardNodeMaterial({
@@ -19238,7 +19240,7 @@ var WorldStreamer = class {
     let f = new Map();
     for (let y of p.values()) {
       let x = y[0].species,
-        g = new THREE.InstancedMesh(tm(x), sw(), y.length);
+        g = createInstanced(tm(x), sw(), y.length);
       ((g.name = `forest:${r}:${x.id}`),
         (g.userData.vegetationLayer = "woody"),
         (g.userData.speciesId = x.id),
@@ -19290,7 +19292,7 @@ var WorldStreamer = class {
       m = ow(a, 0.52);
     if (v > 0) {
       let y = kt(`${ot}:chunk:${r}:groundcover:v1:${S.groundcover}`),
-        x = new THREE.InstancedMesh(Gx(S), sw("groundcover"), v);
+        x = createInstanced(Gx(S), sw("groundcover"), v);
       ((x.name = `groundcover:${r}:${S.groundcover}`),
         (x.userData.vegetationLayer = "decorative"),
         (x.userData.groundcoverKind = S.groundcover),
@@ -19353,7 +19355,7 @@ var WorldStreamer = class {
     let o = kt(`${ot}:chunk:${r}:ruins:v1`),
       s = o() > 0.58 ? 3 + Math.floor(o() * 3) : 0;
     if (s === 0) return;
-    let l = new THREE.InstancedMesh(
+    let l = createInstanced(
       new THREE.BoxGeometry(0.65, 5, 2.2),
       ln(
         new THREE.MeshStandardNodeMaterial({
@@ -20370,7 +20372,7 @@ var HorizonSystem = class {
       s = new THREE.Vector3(),
       l = new THREE.Color(),
       c = (h, d, p) => {
-        let f = new THREE.InstancedMesh(d, this.sceneryMaterial, p);
+        let f = createInstanced(d, this.sceneryMaterial, p);
         return (
           (f.name = h),
           (f.castShadow = !1),
@@ -20443,7 +20445,7 @@ var HorizonSystem = class {
       s = new THREE.Color();
     for (let [l, c] of n.entries()) {
       if (c.length === 0) continue;
-      let u = new THREE.InstancedMesh(
+      let u = createInstanced(
         this.settlementGeometry,
         this.settlementMaterial,
         c.length,
@@ -20917,7 +20919,7 @@ var ForestStressLab = class {
   }
   addInstancedPoints(e, n, i, r, a, o, s, l, c = 0) {
     if (n.length === 0) return null;
-    let u = new THREE.InstancedMesh(i, r, n.length);
+    let u = createInstanced(i, r, n.length);
     ((u.name = `benchmark:${a.key}:${s}`),
       (u.userData.benchmarkFixture = !0),
       (u.userData.shadowCandidate = l),
@@ -20950,7 +20952,7 @@ var ForestStressLab = class {
   }
   addReeds(e, n) {
     if (n.length === 0) return;
-    let i = new THREE.InstancedMesh(
+    let i = createInstanced(
       this.reedGeometry,
       this.reedMaterial,
       n.length,
