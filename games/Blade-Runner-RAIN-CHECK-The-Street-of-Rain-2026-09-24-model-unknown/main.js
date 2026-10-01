@@ -11,6 +11,7 @@ import * as THREE from 'three/webgpu';
 import { float, fract, instanceIndex, mix, positionLocal, positionWorld, texture, time, uv, vec3 } from 'three/tsl';
 import { boot } from 'kit/boot.js';
 import { createPost } from 'kit/post.js';
+import { bakeInstances } from 'kit/instancing.js';
 import { activate, adjust, createRepeater, focusEl, focusKey, focusables, neighbour } from './nav.js';
 import {
   CASES,
@@ -765,7 +766,10 @@ class WorldView {
         m = c.instanceMatrix.array;
       o.forEach((u, d) => writeMatrix(m, d * 16, u.x, u.y, u.z, 0, u.w, u.h, u.d));
       c.instanceMatrix.needsUpdate = true;
-      ((c.castShadow = a.h > 0.25 && !a.emissive), (c.receiveShadow = true), c.computeBoundingSphere(), this.group.add(c));
+      c.castShadow = a.h > 0.25 && !a.emissive;
+      c.receiveShadow = true;
+      // Static: one merged mesh per colour, so the street shares shaders instead of compiling per batch.
+      this.group.add(bakeInstances(c));
     }
     for (let o of i.values()) {
       let a = new THREE.MeshBasicNodeMaterial({ color: o.color, transparent: true, depthWrite: false });
@@ -775,8 +779,7 @@ class WorldView {
       (o.objects.forEach((h, u) => {
         (c.position.set(h.x, 0.056, h.z), (c.rotation.x = -Math.PI / 2), c.scale.set(h.w * 2, h.d * 2, 1), c.updateMatrix(), l.setMatrixAt(u, c.matrix));
       }),
-        l.computeBoundingSphere(),
-        this.group.add(l));
+        this.group.add(bakeInstances(l)));
     }
     (this.buildLivingBatches(), (this.taskMeshes = []));
     for (let o of this.tasks) {
