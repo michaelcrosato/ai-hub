@@ -83,9 +83,10 @@ const candidates=()=>[...document.querySelectorAll('button,a[href^="#"],[role=bu
 const uncovered=e=>{const r=e.getBoundingClientRect();const t=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return t&&(e===t||e.contains(t))};
 const picked=[],pressed=new Set();
 for(let round=0;round<4;round++){
- // A menu may still be fading in: look for up to 3 s. Buttons below the fold are scrolled to.
+ // A menu may still be fading in (or the title still loading): look for up to 8 s on the first
+ // step, 3 s after. Buttons below the fold are scrolled to.
  let hit=null;
- for(let t=0;t<10&&!hit;t++){
+ for(let t=0;t<(round?10:27)&&!hit;t++){
   for(const e of candidates()){if(pressed.has(e)||pressed.has(label(e)))continue;if(!uncovered(e)){e.scrollIntoView({block:'center'});await sleep(60)}if(uncovered(e)){hit=e;break}}
   if(!hit)await sleep(300)}
  if(!hit)break;
