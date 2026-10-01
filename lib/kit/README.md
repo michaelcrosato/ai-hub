@@ -340,10 +340,11 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   time.** In r186 each InstancedMesh puts its uuid into the shader cache key
   and names its matrix buffer after a node id, so every one gets its own
   shader programs (and pipelines). A streaming world that builds one per
-  chunk stalls on compiles (Verdant went from 54 to 2 fps). Merge each chunk's
-  boxes into one geometry with vertex colours (plain meshes sharing a material
-  share a shader), or keep a few long-lived InstancedMeshes and change their
-  `count`. `__kit.pipelines` counts pipelines: a healthy game stays in the
+  chunk stalls on compiles (Verdant went from 54 to 2 fps). Batches that
+  never move after they are built: `bakeInstances(mesh)` from
+  `kit/instancing.js` merges one into a plain mesh (instance colours become
+  vertex colours; plain meshes sharing a material type share a shader). Keep
+  InstancedMesh for the few batches you animate, long-lived, changing `count`. `__kit.pipelines` counts pipelines: a healthy game stays in the
   tens, and `__kit.pipelineLog` names the material and object of the last 30.
 - Transmission (glass with `transmission > 0`) and `viewport*Texture` nodes
   copy the framebuffer into one shared texture. Rendering them into a second
