@@ -1,20 +1,27 @@
 # Pennywing: Vault of the Gilded Moon
 
-A finished mobile-first browser-game vertical slice inspired by the treasure-platforming rhythm of classic 8-bit adventure games. It uses original characters, names, level geometry, audio, and art assets.
+A mobile-first browser-game vertical slice inspired by the treasure-platforming rhythm of classic 8-bit adventure games. It uses original characters, names, level geometry, audio, and art assets.
 
 ## Play
 
-1. Run `npm start` (there are no npm dependencies), or serve this folder with any static HTTP server.
-2. Open `http://localhost:4173`.
-3. The game loads Three.js from jsDelivr, so the first load needs internet access.
+Serve the hub's repository root (the game needs `/lib/three/` and `/lib/kit/`) and open `/games/DuckTales-Pennywing-Vault-of-the-Gilded-Moon-2026-09-17-model-unknown/`. Nothing loads from the network beyond the game's own files and `/lib/`.
 
 ### Controls
 
-- Mobile: left joystick to move; `JUMP`; hold `BOUNCE` to springstaff-pogo; `USE` at the Springsmith; two-finger pinch on the playfield to zoom.
-- Desktop: `A/D` or arrow keys; `Space` jump; `X`, `K`, or Shift bounce; `E` use; mouse wheel zoom.
-- Debug renderer selection: add `?webgl2=1` to force the r186 WebGL2 backend, or `?legacy=1` to force the r162 WebGL1 fallback.
+| | Keyboard / mouse | Controller | Touch |
+|---|---|---|---|
+| Move | A/D or ←/→ | left stick or D-pad | floating stick, left half |
+| Jump | Space, W, ↑ or Z | A | JUMP |
+| Bounce (springstaff pogo) | hold X, K, J, Shift or the mouse button | hold X, B or RT | hold BOUNCE |
+| Use (Springsmith) | E or Enter | Y | USE (shown at the shrine) |
+| Zoom | wheel or +/− | LB / RB | pinch |
+| Pause | Esc or P | Start | II |
 
-## Mission loop
+Menus work with the mouse, arrows/WASD + Enter, a controller (D-pad/stick + A, B to go back) or touch. Settings (quality, touch layout, vibration) sit in the title and pause menus; F9 opens them anywhere.
+
+## Expeditions
+
+**Vault I — the Vault of the Gilded Moon** (the original mission)
 
 1. Explore the main path, fast high road, or risky lower treasure detour.
 2. Recover the **Moon Gear** from the upper route.
@@ -23,37 +30,38 @@ A finished mobile-first browser-game vertical slice inspired by the treasure-pla
 5. Claim the **Gilded Moon**.
 6. Escape to the entrance before the vault timer expires while masonry falls around the route.
 
-The stock springstaff defeats the guardian in five clean bounces. The 70-coin Springstaff Coil upgrade reduces this to three. The upgrade is optional. Explorer XP can grant extra health during the first run, and upgrades persist through `localStorage`.
+**Vault II — the Sunken Orrery** (new)
+
+A flooded clockwork observatory: stepping-stone pillars over the overflow, optional high arches, a drained cistern under the aqueduct that hides the **Star Key** (and a cracked cache), scalding steam vents on a cycle, Gearbats, a sliding carriage and a piston lift over the flood, and the **Orrery Warden** — a six-hit guardian that charges, hops, and sends sparks along the dome floor when it lands. Then a 70-second escape.
+
+The stock springstaff defeats the Sentinel in five clean bounces and the Warden in six; the 70-coin Springstaff Coil upgrade cuts both to three. Upgrades are optional. Explorer XP grants extra hearts, and upgrades and XP persist through `localStorage`.
+
+## Features
+
+- Three difficulties (Explorer, Adventurer — the original balance — and Daredevil), with best time, best treasure and clears kept per vault and difficulty, and an S/A/B/C rank on the results screen.
+- Checkpoints along each vault, autosave, and **Continue expedition** from the title.
+- Pause menu (resume, restart, save and quit, settings, sound), the Springsmith's Heart Tonic, buffered jumps and coyote time, a guardian health bar, camera shake, particles and controller rumble.
 
 ## Rendering stack
 
-- Primary: Three.js r186 `WebGPURenderer` using WebGPU.
-- First fallback: the same r186 renderer with its WebGL2 backend.
-- Legacy fallback: Three.js r162 `WebGLRenderer` with an explicit WebGL1 context, because modern Three.js removed WebGL1 support after r162.
-- Modern effects: AgX tone mapping, dynamic directional shadows, fog, emissive low-poly materials, r186 TSL `RenderPipeline` bloom, MSAA, mobile pixel-ratio limits, lower-bandwidth mobile output buffers, and instanced background masonry.
-- Legacy effects: reduced lights, no shadow map, no post-processing, lower pixel ratio, and simplified background masonry.
+- Three.js r186 `WebGPURenderer` through the hub kit: WebGPU, or WebGL2 where WebGPU is missing. Quality tiers scale resolution, shadows, MSAA/FXAA and particle counts.
+- AgX tone mapping, a camera-following directional shadow, fog, emissive low-poly materials, TSL bloom, a TSL caustic shimmer on the water.
+- Static geometry merged per material, coins and gems instanced, shared geometry and materials: a vault draws in a few dozen calls.
 
 All playable geometry is generated at runtime from Three.js primitives. No copied sprites, maps, character models, music, or textures are included.
 
 ## Tests
 
-Run:
-
 ```bash
-npm test
-node tests/routes.test.mjs
-node tests/autoplay.mjs
+npm run test:all
 ```
 
-The tests cover XP thresholds, permanent upgrades, five-hit and three-hit boss balance, completion state, the full objective loop, high-road jump reachability, and the lower treasure route rejoin.
+The tests cover XP thresholds, permanent upgrades, five-hit and three-hit boss balance, completion state, the full objective loop, high-road jump reachability, the lower treasure route rejoin, and for Vault II every required jump in both directions, the cistern drop, vents, Gearbats, the Warden (six/three hits, hops and sparks), a scripted clear, and save/continue.
 
 ## Project layout
 
-- `src/game/core.js` — deterministic gameplay, collision, enemies, boss, progression, mission state.
-- `src/game/level.js` — level collision and content data.
-- `src/game/sceneFactory.js` — low-poly runtime scene construction and animation.
-- `src/game/modernRenderer.js` — WebGPU/WebGL2 r186 path and TSL bloom.
-- `src/game/legacyRenderer.js` — WebGL1 r162 path.
-- `src/game/input.js` — keyboard, mobile joystick, multitouch buttons, pinch zoom.
-- `src/game/audio.js` — original procedural Web Audio effects and chiptune-style ambience.
-- `src/main.js` — HUD, renderer selection, upgrade UI, mission feedback, save data.
+- `src/game/core.js` — deterministic gameplay, collision, enemies, guardians, difficulty, progression, mission state, run export/import.
+- `src/game/level.js`, `src/game/level2.js`, `src/game/levels.js` — the vaults' collision and content data.
+- `src/game/sceneFactory.js` — low-poly runtime scene construction, pools, particles and animation.
+- `src/game/audio.js` — original procedural Web Audio effects and chiptune-style music.
+- `src/main.js` — kit boot, input actions, menus, camera, HUD, saves.

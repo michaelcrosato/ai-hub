@@ -1,6 +1,14 @@
+// Vault I — the Vault of the Gilded Moon. Collision and content data; the
+// named exports are the original layout, VAULT_I bundles them with the
+// per-level settings the simulation and the scene read.
+
 export const LEVEL_LENGTH = 90;
+/** Underside of the cavern ceiling: nothing climbs above it (no pogo over a gate). */
+export const CEILING_Y = 9.8;
 
 const P = (id, x, y, w, h, extra = {}) => ({ id, x, y, w, h, ...extra });
+/** A portcullis from its floor up to the ceiling. */
+const gate = (x, bottom, w) => ({ x, y: (bottom + CEILING_Y) / 2, w, h: CEILING_Y - bottom });
 
 export const platforms = [
   P('start-floor', 5.5, -0.6, 11, 1.2),
@@ -69,7 +77,7 @@ export const coins = [
   [40.5, 1.5], [43.4, 1.5], [47.4, 2.4], [50.5, 3.1], [54.8, 1.1],
   [57.0, 1.1], [60.7, 1.1], [66.8, 1.25], [69.4, 1.25], [74.5, 1.25],
   [79.5, 1.65], [82.4, 2.0], [84.0, 2.0], [86.0, 2.0], [87.7, 2.0],
-].map(([x,y], i) => ({ id: `coin-${i}`, x, y, value: 5, xp: 1, kind: 'coin' }));
+].map(([x, y], i) => ({ id: `coin-${i}`, x, y, value: 5, xp: 1, kind: 'coin' }));
 
 export const gems = [
   { id: 'gem-secret-1', x: 14.0, y: -2.7, value: 20, xp: 10, kind: 'gem' },
@@ -80,7 +88,7 @@ export const gems = [
 ];
 
 export const relics = [
-  { id: 'moon-gear', x: 33.0, y: 6.25, kind: 'relic', xp: 20, name: 'Moon Gear' }
+  { id: 'moon-gear', x: 33.0, y: 6.25, kind: 'relic', xp: 20, name: 'Moon Gear' },
 ];
 
 export const enemies = [
@@ -93,14 +101,79 @@ export const enemies = [
 export const scenery = {
   pillars: [3, 9, 17, 24, 31, 39, 46, 54, 62, 68, 75, 82, 88],
   torches: [6.5, 19.5, 36.5, 44.5, 57.5, 66.2, 77.0, 85.7],
-  studs: [4,5,6,7,22,23,24,37,38,39,41,42,43,55,56,57,69,70,71,72,73,84,85,86],
+  rings: [],
 };
 
 export const shrine = { x: 41.4, y: 1.15, radius: 1.45 };
-export const keyGate = { x: 63.25, y: 1.2, w: 0.7, h: 3.8 };
-export const arenaLeftGate = { x: 64.7, y: 1.2, w: 0.7, h: 3.8 };
-export const vaultGate = { x: 78.2, y: 1.65, w: 0.8, h: 4.6 };
+// The gates reach the ceiling: with the Springstaff Coil a pogo used to clear the
+// original 3.8-tall bars and skip the Moon Gear, which stranded the run.
+export const keyGate = gate(63.25, -0.7, 0.7);
+export const arenaLeftGate = gate(64.7, -0.7, 0.7);
+export const vaultGate = gate(78.2, -0.65, 0.8);
 export const crown = { id: 'gilded-moon', x: 85.2, y: 2.25, kind: 'crown' };
-export const exit = { x: 2.2, y: 1.0, radius: 1.3 };
+export const exit = { x: 2.2, y: 1.0, radius: 1.3, maxY: 2.4 };
 
-export const totalTreasureValue = [...coins, ...gems].reduce((sum, item) => sum + item.value, 0) + 15; // includes the cracked cache
+export const CACHE_VALUE = 15;
+export const totalTreasureValue = [...coins, ...gems].reduce((sum, item) => sum + item.value, 0) + CACHE_VALUE; // includes the cracked cache
+
+export const VAULT_I = {
+  id: 'vault-1',
+  index: 0,
+  name: 'Vault of the Gilded Moon',
+  short: 'Vault I',
+  blurb: 'Clockwork ruin, three routes, the Brassback Sentinel.',
+  length: LEVEL_LENGTH,
+  start: { x: 2.2, y: 0.68 },
+  bounds: { minX: 0.45, maxX: 89.4, killY: -7.2, ceilingY: CEILING_Y },
+  platforms, railings, signs, hazards, coins, gems, relics, enemies, scenery, shrine,
+  keyGate, arenaLeftGate, vaultGate, crown, exit,
+  cacheValue: CACHE_VALUE,
+  totalTreasureValue,
+  // Touching the named floor makes it the respawn point (first touch shows a toast).
+  checkpoints: [
+    { id: 'lower-hall', ground: 'main-floor-1a', x: 22.2, y: 0.7, label: 'Lower Hall' },
+    { id: 'springsmith', ground: 'shrine-floor', x: 38.9, y: 1.2, label: 'Springsmith' },
+    { id: 'gatehouse', ground: 'gate-approach', x: 56.2, y: 0.7, label: 'Gatehouse' },
+  ],
+  gateHintX: 60.7,
+  boss: {
+    name: 'Brassback Sentinel',
+    model: 'brassback',
+    x: 71.6, y: 0.82, w: 1.8, h: 1.55, hp: 5,
+    minX: 67.0, maxX: 76.0,
+    idleSpeed: 1.35, chargeSpeed: 5.0, tellTime: 0.55, chargeTime: 0.9,
+    hop: null,
+    trigger: 65.15,
+    // Clear of the gate and of the Sentinel's reach at the left end of its patrol.
+    checkpoint: { x: 65.6, y: 0.68 },
+    focus: { x: 71.2, y: 2.7 },
+    arena: { minX: 63.4, maxX: 78.6, floor: 0 },
+    reward: { coins: 25, xp: 40 },
+  },
+  escape: { time: 55, start: { x: 83.7, y: 1.65 }, rockMinX: 3, rockMaxX: 87, rockY: 8.5 },
+  camera: { minX: 4.4, maxX: 86.3, minY: 0.7, maxY: 6.4 },
+  theme: {
+    background: 0x07131e, fog: 0x0b1b27, fogDensity: 0.016,
+    stone: 0x35576a, stoneDark: 0x203b4c, stoneLight: 0x557a83,
+    water: 0x155f72, waterGlow: 0x2a9fb0, hemiSky: 0x9dd9ea, hemiGround: 0x10212c,
+    music: 0,
+    wallRows: [0, 6],
+  },
+  text: {
+    relic: 'Moon Gear',
+    treasure: 'Gilded Moon',
+    findRelic: 'Find the Moon Gear',
+    reachBoss: 'Reach the Sentinel Chamber',
+    bossVerb: 'Bounce the Brassback Sentinel',
+    claim: 'Claim the Gilded Moon',
+    intro: { kicker: 'Moon-Vault Expedition', title: 'Find the Moon Gear', sub: 'High road for speed. Low route for enough treasure to buy upgrades early.' },
+    relicToast: 'Moon Gear recovered. The lower gate is open.',
+    relicObjective: { kicker: 'Gear Acquired', title: 'Reach the Sentinel Chamber', sub: 'Hold BOUNCE to turn the springstaff into a pogo weapon.' },
+    gateHint: 'The gate needs the Moon Gear. Look above the old stairs.',
+    bossObjective: { kicker: 'Sentinel Chamber', title: 'Crack the Brassback Sentinel', sub: 'Side hits hurt. Bounce on its shell after its charge.' },
+    bossHit: 'Sentinel shell cracked',
+    bossDown: { toast: 'Brassback down · +25 coins', kicker: 'Sentinel Defeated', title: 'Claim the Gilded Moon', sub: 'The inner vault is open. The treasure is almost yours.' },
+    crown: { kicker: 'Vault Alarm', title: 'Escape with the Gilded Moon', sub: 'Return to the entrance. Falling masonry now tracks your route.', toast: 'The vault is coming down. Move!' },
+    complete: 'The Gilded Moon is yours.',
+  },
+};
