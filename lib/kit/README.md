@@ -348,6 +348,14 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   built: `bakeInstances(mesh)` from `kit/instancing.js` merges one into a
   plain mesh (instance colours become vertex colours). `__kit.pipelines` counts pipelines: a healthy game stays in the
   tens, and `__kit.pipelineLog` names the material and object of the last 30.
+- **Don't turn `light.castShadow` off and on again at runtime.** r186 shares
+  one light node across materials; when the shadow turns off, the first
+  material to rebuild disposes the light's shadow node while the others
+  still update it, and turning it back on crashes ("reading 'depthTexture'
+  of null", then render-pass usage errors). Decide shadow casters at load
+  (a quality change applies them on the next load), or keep `castShadow` on
+  and change `mapSize` instead. Rebuilding every material afterwards does
+  not help.
 - **GTAO (and anything that gathers from depth) needs single-sampled depth.**
   A `pass()` inherits the renderer's MSAA (high and ultra), and WebGPU can't
   `textureGather` from a multisampled depth texture: the GTAO pipeline fails
