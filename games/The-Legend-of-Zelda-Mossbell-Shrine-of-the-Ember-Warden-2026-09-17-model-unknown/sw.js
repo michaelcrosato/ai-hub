@@ -1,11 +1,16 @@
-const CACHE='mossbell-shell-v2';
-const SHELL=['./','./index.html','./styles.css','./bootstrap.js','./game.js','./legacy.js','./manifest.json'];
-self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)).then(()=>self.skipWaiting())));
-self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
-self.addEventListener('fetch',e=>{
-  if(e.request.method!=='GET')return;
-  e.respondWith(caches.match(e.request).then(hit=>hit||fetch(e.request).then(r=>{
-    if(r.ok||r.type==='opaque'){const copy=r.clone();caches.open(CACHE).then(c=>c.put(e.request,copy)).catch(()=>{});}
-    return r;
-  })));
+// Earlier builds of Mossbell cached themselves with a cache-first service worker,
+// which kept returning players on old files. The game no longer registers one.
+// This replacement only cleans up for browsers that still have the old worker:
+// it deletes the old caches, unregisters itself and reloads open pages once.
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(keys.filter((k) => k.startsWith('mossbell-shell')).map((k) => caches.delete(k)));
+      await self.registration.unregister();
+      const pages = await self.clients.matchAll({ type: 'window' });
+      for (const page of pages) page.navigate(page.url).catch(() => {});
+    })()
+  );
 });
