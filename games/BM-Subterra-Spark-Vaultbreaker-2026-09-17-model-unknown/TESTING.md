@@ -1,8 +1,9 @@
 # Verification notes
 
-- `node --check` passes for `bootstrap.js`, `game.js`, and `legacy-webgl1.js`.
-- Balance simulation passes for both the mandatory route and a combat-heavy route.
-- Mandatory route result: Level 2, 115 max hull, 12 salvage, one Mk II upgrade affordable, 40 armored-only stock rover shots to the 360-HP boss (actual fight is shorter when the core opens).
-- Combat-heavy route result: Level 3, 130 max hull, 24 salvage, Mk II upgrade affordable.
-- Route refinements include collision rails on the bridge, a destructible choke point, a dismount-only vault entrance, readable signs, an optional Tinker Pad branch, a checkpoint after the gate, and explicit completion feedback.
-- This execution container cannot initialize a Chromium GPU/EGL context, so an end-to-end GPU screenshot was not available here. The main WebGPU/WebGL2 path uses current Three.js r186 APIs verified against the official documentation; a raw WebGL1 safety path is included and can be forced with `?legacy=1`.
+- `node --check` passes for every module in `src/`.
+- `node scripts/audit3d.mjs games/BM-Subterra-Spark-Vaultbreaker-2026-09-17-model-unknown` (from the repo root) reports no broken rules.
+- `node tests/balance-sim.mjs` replays the XP/salvage economy over the real area layouts:
+  - Area 01 mandatory route (vault only): level 2, Coil Barrel Mk II affordable, about 32 armoured-only shots to the 360-HP M.O.L.E.
+  - Area 01 combat-heavy route: level 3 with both fittings.
+  - Area 02 from the standard loadout (vault waves only): both fittings affordable, about 21 exposed-head shots to the 600-HP burrower.
+- Browser checks (WebGPU, WebGL2, phone profile, layout sweep) run in the hub's QA pipeline (`scripts/check3d.py`, `sweep3d.py`, `matrix3d.py`).
