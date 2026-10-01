@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { float, mix, positionLocal, smoothstep, uv, uniform, materialColor } from 'three/tsl';
 import { createPost } from 'kit/post.js';
+import { bakeInstances } from 'kit/instancing.js';
 import { SHIP } from './content.js';
 import { rng, clamp } from './core.js';
 import { PORT, SCAN } from './sim.js';
@@ -188,6 +189,8 @@ export class View {
   }
   compactGroup(root) {
     // Batch identical bricks within each moving model. Ships remain independently transformable.
+    // The batches never move inside the model, so they are baked into plain meshes: in r186
+    // every InstancedMesh compiles its own shaders, and each ship would add a set.
     root.updateMatrixWorld(true);
     const inverse = root.matrixWorld.clone().invert(),
       groups = new Map(),
@@ -205,10 +208,8 @@ export class View {
       batch.castShadow = first.castShadow;
       batch.receiveShadow = first.receiveShadow;
       items.forEach((mesh, index) => batch.setMatrixAt(index, m4.multiplyMatrices(inverse, mesh.matrixWorld)));
-      batch.instanceMatrix.needsUpdate = true;
-      batch.computeBoundingSphere();
       for (const mesh of items) mesh.removeFromParent();
-      root.add(batch);
+      root.add(bakeInstances(batch));
     }
   }
   async init() {
