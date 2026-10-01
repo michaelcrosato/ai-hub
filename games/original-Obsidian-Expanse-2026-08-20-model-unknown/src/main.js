@@ -246,7 +246,10 @@ scene.add(new THREE.HemisphereLight(0x678bc2, 0x100b16, 1.7));
 const sun = new THREE.DirectionalLight(0xb8d7ff, 3.6);
 sun.position.set(-72, 118, 44);
 sun.castShadow = true;
-kit.shadow(sun, 2048);
+// Sized once at load, not on every quality change: this shadow renders on demand
+// (autoUpdate off), and in r186 resizing such a map leaves the scene sampling the
+// destroyed old texture on WebGPU. A new quality's shadow size applies on the next load.
+sun.shadow.mapSize.setScalar(kit.shadowSize(2048));
 Object.assign(sun.shadow.camera, { left: -180, right: 180, top: 180, bottom: -180, near: 10, far: 390 });
 sun.shadow.camera.updateProjectionMatrix();
 sun.shadow.bias = -0.00035;

@@ -359,6 +359,13 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
 - Start screens: the button that starts play is a real `<button>` whose
   label begins with a plain verb (Start, Play, Begin, Enter, Continue,
   Launch…). Players find it, and so does `check3d.py --start`.
+- **A shadow rendered on demand (`shadow.autoUpdate = false`) must keep its
+  size.** Resizing its map after the first render (which `kit.shadow()`
+  does on a quality change) leaves the scene sampling the destroyed old
+  depth texture on WebGPU, every frame ("Destroyed texture
+  ShadowDepthTexture used in a submit"); a `needsUpdate` or a few frames of
+  auto-update don't cure it. Size such shadows once at load
+  (`shadow.mapSize.setScalar(kit.shadowSize(base))`), or let them auto-update.
 - **Don't turn `light.castShadow` off and on again at runtime.** r186 shares
   one light node across materials; when the shadow turns off, the first
   material to rebuild disposes the light's shadow node while the others
