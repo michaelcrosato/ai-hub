@@ -285,8 +285,11 @@ export class LightDirector {
       s.autoUpdate = false;
       s.radius = q.softness * (0.72 + (d.sourceRadius ?? 0.2));
       if (directional || d.light.isSpotLight) applySoftShadow(s, this.quality, d.sourceRadius);
-      // r186 resizes the shadow map from mapSize on the next frame; never dispose it.
-      if (s.mapSize.x !== size || s.mapSize.y !== size) s.mapSize.set(size, size);
+      // Only size a shadow before its map exists. These shadows render on demand (autoUpdate
+      // off), and in r186 resizing one after its first render leaves the scene sampling the
+      // destroyed old texture on WebGPU. CSM cascades appear on the first render at the sun's
+      // size, so they keep it; a quality change resizes maps created later (or on reload).
+      if (!s.map && (s.mapSize.x !== size || s.mapSize.y !== size)) s.mapSize.set(size, size);
       if (d.shadowDistance !== undefined) {
         s.camera.far = d.shadowDistance;
         s.camera.updateProjectionMatrix();
