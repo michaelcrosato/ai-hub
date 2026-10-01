@@ -1,72 +1,52 @@
 # Dustshot: Red Mesa
 
-A finished browser-game vertical slice inspired by the pace, three-direction gunplay, scrolling western town, hidden wanted-poster progression, and upgrade economy of the NES version of *Gun.Smoke*. All code, models, UI, names, audio, level layout, and visual assets in this project are original/procedural.
+A browser-game vertical slice inspired by the pace, directional gunplay, scrolling western town, hidden wanted-poster progression and upgrade economy of the NES version of *Gun.Smoke*. All code, models, UI, names, audio, level layout and visual assets in this project are original/procedural.
 
 ## Play
 
-Run a local web server from this folder:
+The game runs on the hub's shared 3D stack (`/lib/three/`, `/lib/kit/`), so serve the repository root, not this folder:
 
 ```bash
-python3 -m http.server 8080
+python3 -m http.server 8080   # from the repo root
 ```
 
-Open `http://localhost:8080` in a modern browser. A network connection is required on the first load because the Three.js runtime is pinned to jsDelivr. The included service worker caches successfully fetched modules and local game files for later visits.
-
-For a renderer-independent emergency test, add `?fallback=1` to the URL. Add `?legacy=1` to request the WebGL1 compatibility path.
+Open `http://localhost:8080/games/GS-Dustshot-Red-Mesa-2026-09-17-model-unknown/`. Nothing loads from the network except the game's own files and `/lib/`.
 
 ## Controls
 
-**Mobile:** left virtual joystick moves. Right virtual joystick aims and fires. Use two fingers on the world view to pinch-zoom. Multitouch input keeps both joysticks independent. Move near the gunsmith and tap **TRADE** to buy upgrades.
+| | Keyboard and mouse | Controller | Touch |
+|---|---|---|---|
+| Move | WASD / arrows | left stick, D-pad | left thumb (floating stick) |
+| Aim | mouse | right stick | right thumb |
+| Fire | left click, Space, J | RT, X, or push the right stick | right thumb (aims and fires) |
+| Trade at the shop | E | Y | TRADE button (appears at the shop) |
+| Zoom | wheel, + / - | LB / RB | pinch |
+| Pause | Esc, P | Start | II pill |
+| Menus | arrows + Enter | stick / D-pad + A, B backs out | tap |
 
-**Desktop:** WASD or arrow keys move. Mouse aims. Hold the primary mouse button or Space to fire. Mouse wheel zooms. Press **E** near the gunsmith to trade.
+Settings (quality, resolution, touch layout, vibration) are on the title screen and in the pause menu (also **F9**).
 
-## Mission loop
+## Campaign
 
-1. Fight north through Cinder Creek.
-2. Break suspicious crates and recover the hidden WANTED poster.
-3. Pick up optional equipment: Spurred Boots and Silver Rounds.
-4. Buy one or two meaningful upgrades at the gunsmith. The economy is tuned so the player must choose rather than buy the full shop at the midpoint.
-5. The poster opens the stockade fight with Marshal Vex.
-6. Beat the boss to complete the slice. Completion gives score, accuracy, time, level, damage-taken feedback, and career XP.
+1. **Cinder Creek.** Fight north through town, break suspicious crates for the hidden WANTED poster, pick up the Spurred Boots and Silver Rounds, buy one or two upgrades at the gunsmith, then take the stockade from Marshal Vex.
+2. **Red Mesa Pass.** Your level, cash, upgrades and equipment ride on into a red-rock canyon held by Iron Mae Calloway's gang. Dynamiters lob fused sticks (watch the red landing rings), powder kegs blow up anything near them when shot, and the trading post sells the Scattergun Load and Snake-Oil Tonic. Iron Mae sweeps the claim with a gatling wagon and lights the fuses once she is hurt.
 
-Career Renown adds only `$10` starting cash per rank. It does not add direct combat power. The base kit is tuned to beat the boss without grinding.
+Clearing Cinder Creek saves a checkpoint, so **Continue** on the title screen starts Red Mesa Pass with the kit you finished with. Each stage keeps a best score and best time per difficulty (Greenhorn, Gunslinger, Desperado). Career Renown adds only `$10` starting cash per rank and no combat power.
 
 ## Rendering stack
 
-- Three.js **r186 / 0.186.0** modern path.
-- `WebGPURenderer` is the primary renderer. It selects WebGPU where available and uses its WebGL2 backend when WebGPU is unavailable.
-- Three.js `RenderPipeline` plus TSL bloom on the modern path when the post-effect module loads.
-- ACES filmic tone mapping, directional shadows, hemisphere fill light, exponential fog, procedural dust, low-poly geometry, generated canvas signs, and dynamic camera shake.
-- Mobile pixel-ratio caps and a low-quality shadow toggle reduce bandwidth and fill cost.
-- WebGL1 backup uses Three.js **r162 / 0.162.0** because Three.js removed WebGL1 support from `WebGLRenderer` in r163.
-- Canvas2D is an emergency last fallback if a Three.js CDN import cannot load.
+- three.js r186 `WebGPURenderer` through the hub kit (`kit/boot.js`): WebGPU where available, WebGL2 otherwise, quality tiers and dynamic resolution.
+- The kit's TSL post chain (faint bloom, FXAA on medium), ACES filmic tone mapping, a PCF sun shadow sized by tier, exponential fog, `kit/points.js` dust.
+- Each stage's scenery is merged into one mesh per material; every shop sign shares one canvas atlas. Characters, crates and pickups are merged templates recycled per kind; bullets, dynamite, rings and sparks are instanced pools. Nothing is created or disposed during play.
 
-Current Three.js references used during implementation:
-- https://threejs.org/docs/pages/WebGPURenderer.html
-- https://threejs.org/docs/pages/RenderPipeline.html
-- https://github.com/mrdoob/three.js/wiki/Migration-Guide
-- https://www.npmjs.com/package/three
+## Balance
 
-## Balance and refinement notes
+Base weapon: two projectiles, 12 damage each, 0.17 s fire interval. Marshal Vex has 1120 HP, spread fire and a half-health reinforcement phase, and is beatable at level 1 with no paid upgrades when the player dodges. Iron Mae has 1900 HP and is beatable with a level-4 kit and no upgrades. Mid-run upgrade prices are `$210–$320`.
 
-The route uses a wide central lane, edge-biased obstacles, sliding circle-vs-AABB collision, visible porches, stairs, rails, town signs, a gated objective, and a reversible camera route so a missed poster can be recovered. An early fence was moved to the street edge after route simulation showed it could trap a direct path toward the poster.
-
-Base weapon: two projectiles, 12 damage each, 0.17 s fire interval. Standard enemies need about two to four clean volleys. The boss has 1120 HP, spread fire, a half-health reinforcement phase, and is beatable at level 1 with no paid upgrades when the player dodges. Normal full-stage play lands near level 5.
-
-Mid-run upgrade prices are `$210–$290`. Typical midpoint income supports about two purchases. Optional equipment and XP improve comfort but are not required for completion.
-
-## Validation
-
-Run:
+## Tests
 
 ```bash
-npm test
+npm test   # node tests/sim.test.mjs
 ```
 
-The deterministic simulation checks verify:
-- the central path and warrant gate;
-- breakable poster recovery;
-- a level-1, no-upgrade boss clear;
-- upgrade economy constraints.
-
-The project also includes an emergency 2D path so gameplay can still initialize if external Three.js modules are unavailable. The sandbox used to build this package blocks headless-browser navigation, so the renderer path was statically checked and the gameplay loop was exercised through deterministic simulation tests rather than a WebGPU browser run in the build environment.
+The deterministic simulation checks cover both stages' routes and warrant gates, poster recovery, boss clears at the base and mid kits, dynamite and keg blasts, carry-over between stages, the shop economy, and that no spawn, pickup or shop spot sits inside a collider.
