@@ -502,7 +502,7 @@ survive it.
 
 ## 11. QA and fixing (any model)
 
-Three tools, cheapest first:
+Four tools, cheapest first:
 
 1. `node scripts/audit3d.mjs [games…]` — the static rules (import map, kit boot,
    no WebGL-only APIs, no CDN or embedded three.js, no shadow-map disposal).
@@ -513,7 +513,12 @@ Three tools, cheapest first:
    kit or pattern problem: fix it once, at the source, not per game. Triage
    also marks games whose original already logged errors before migration,
    so a pre-existing bug is not mistaken for a port regression.
-3. `python3 scripts/check3d.py <game> --start --keys …` — one game in depth
+3. `python3 scripts/matrix3d.py run [games…]` then `python3 scripts/matrix3d.py triage`
+   — the settings paths the sweep skips: WebGPU and WebGL2 at low and at
+   ultra with Advanced on, plus a quality switch while playing. Linux
+   Chromium only (WebGPU on SwiftShader), so it runs alongside other work;
+   it finds errors, not slowness.
+4. `python3 scripts/check3d.py <game> --start --keys …` — one game in depth
    while fixing it.
 
 When fixing a game: change only that game's files, keep its content and
