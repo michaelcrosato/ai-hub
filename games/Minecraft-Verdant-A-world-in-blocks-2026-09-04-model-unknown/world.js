@@ -356,24 +356,22 @@ export function buildTerrain(world, cx, cz, step, material) {
 /* ------------------------------------------------------------ block batches */
 
 const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
-const _matrix = new THREE.Matrix4();
-const _quat = new THREE.Quaternion();
-const _pos = new THREE.Vector3();
-const _scale = new THREE.Vector3();
 const _color = new THREE.Color();
 
-/**
- * Free a mesh's GPU buffers. The geometry goes first: on the WebGPU backend
- * the instance buffers of an InstancedMesh are released with its geometry,
- * which is why every batch owns its (tiny) box geometry instead of sharing one.
- */
+/** Free a mesh's GPU buffers (each batch owns its geometry). */
 export function disposeMesh(mesh) {
   if (!mesh?.isMesh) return;
   mesh.geometry.dispose();
   if (mesh.isInstancedMesh) mesh.dispose();
 }
 
-/** Axis-aligned coloured boxes, drawn as one InstancedMesh. */
+/**
+ * Axis-aligned coloured boxes, merged into one mesh with vertex colours.
+ * Not an InstancedMesh: in r186 every InstancedMesh compiles its own shaders
+ * (its uuid is part of the shader cache key), so one per chunk, cloud bank and
+ * animal stalled the frame on compiles while the world streamed. Plain meshes
+ * that share a material share one shader.
+ */
 export class BoxBatch {
   constructor() {
     this.items = [];
@@ -391,20 +389,46 @@ export class BoxBatch {
     const n = this.count;
     if (!n) return null;
     const it = this.items;
-    const mesh = new THREE.InstancedMesh(UNIT_BOX.clone(), material, n);
+    const bp = UNIT_BOX.attributes.position.array;
+    const bn = UNIT_BOX.attributes.normal.array;
+    const bi = UNIT_BOX.index.array;
+    const per = bp.length; // floats per box (24 vertices × 3)
+    const pos = new Float32Array(n * per);
+    const nor = new Float32Array(n * per);
+    const col = new Float32Array(n * per);
+    const index = new ((n * per) / 3 > 65535 ? Uint32Array : Uint16Array)(n * bi.length);
     for (let i = 0; i < n; i++) {
       const k = i * 7;
-      _pos.set(it[k], it[k + 1], it[k + 2]);
-      _scale.set(it[k + 3], it[k + 4], it[k + 5]);
-      _matrix.compose(_pos, _quat, _scale);
-      mesh.setMatrixAt(i, _matrix);
-      mesh.setColorAt(i, _color.set(it[k + 6]));
+      const o = i * per;
+      _color.set(it[k + 6]);
+      for (let v = 0; v < per; v += 3) {
+        pos[o + v] = it[k] + bp[v] * it[k + 3];
+        pos[o + v + 1] = it[k + 1] + bp[v + 1] * it[k + 4];
+        pos[o + v + 2] = it[k + 2] + bp[v + 2] * it[k + 5];
+        nor[o + v] = bn[v];
+        nor[o + v + 1] = bn[v + 1];
+        nor[o + v + 2] = bn[v + 2];
+        col[o + v] = _color.r;
+        col[o + v + 1] = _color.g;
+        col[o + v + 2] = _color.b;
+      }
+      const base = (i * per) / 3;
+      const io = i * bi.length;
+      for (let j = 0; j < bi.length; j++) index[io + j] = base + bi[j];
     }
-    mesh.instanceMatrix.needsUpdate = true;
-    mesh.instanceColor.needsUpdate = true;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geometry.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geometry.setIndex(new THREE.BufferAttribute(index, 1));
+    geometry.computeBoundingSphere();
+    if (!material.vertexColors) {
+      material.vertexColors = true;
+      material.needsUpdate = true;
+    }
+    const mesh = new THREE.Mesh(geometry, material);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
-    mesh.computeBoundingSphere();
     return mesh;
   }
 }
