@@ -28,7 +28,9 @@ export class PostPipeline {
     normalMaterial.fragmentNode = vec4(normalFlat, 1);
     normalMaterial.fog = false;
     normalMaterial.side = THREE.DoubleSide;
-    this.geometryPass = pass(scene, camera);
+    // Single-sampled: GTAO gathers from the depth texture, which WebGPU can't do on a
+    // multisampled one (the renderer is MSAA on high and ultra).
+    this.geometryPass = pass(scene, camera, { samples: 0 });
     this.geometryPass.overrideMaterial = normalMaterial;
     this.geometryPass.transparent = false;
     const depth = this.geometryPass.getTextureNode('depth');

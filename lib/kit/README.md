@@ -348,6 +348,13 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   built: `bakeInstances(mesh)` from `kit/instancing.js` merges one into a
   plain mesh (instance colours become vertex colours). `__kit.pipelines` counts pipelines: a healthy game stays in the
   tens, and `__kit.pipelineLog` names the material and object of the last 30.
+- **GTAO (and anything that gathers from depth) needs single-sampled depth.**
+  A `pass()` inherits the renderer's MSAA (high and ultra), and WebGPU can't
+  `textureGather` from a multisampled depth texture: the GTAO pipeline fails
+  to compile and the frame stops ("no matching call to textureGather(
+  texture_depth_multisampled_2d…)"). Feed AO from `pass(scene, camera,
+  { samples: 0 })`, either a separate depth pass or the scene pass with FXAA
+  taking over the anti-aliasing. Test AO with `?kit-quality=ultra&kit-advanced=1`.
 - Transmission (glass with `transmission > 0`) and `viewport*Texture` nodes
   copy the framebuffer into one shared texture. Rendering them into a second
   target of another size in the same frame (a puddle reflection, a mirror, a
