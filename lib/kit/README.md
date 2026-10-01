@@ -473,7 +473,7 @@ It serves the repo, loads the game in Linux Chromium forced to WebGL2 and in
 Windows Chrome on the real GPU (WebGPU), then in a Pixel 7 profile with touch,
 and reports `window.__kit`, console errors, a blank-screen check and
 screenshots. `--start` presses the game's own start button (through up to
-three menus: title, mode, level), then `--keys` and `--click` are played on
+four menus: title, mode, level, go), then `--keys` and `--click` are played on
 both desktop paths (on WebGPU as synthetic events once the game has booted,
 before its screenshot), so the screenshots show gameplay rather than the
 title screen. It also flags shader churn (more than 250 pipelines) and a

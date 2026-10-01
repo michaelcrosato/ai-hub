@@ -66,23 +66,30 @@ tgt.dispatchEvent(new KeyboardEvent('keydown',{code,key,bubbles:true,cancelable:
 tgt.dispatchEvent(new KeyboardEvent('keyup',{code,key,bubbles:true,cancelable:true}));await sleep(200)}},__DELAY__);</script>"""
 
 
-# --start: press the game's own start button, through up to three menus (title → mode → level).
+# --start: press the game's own start button, through up to four menus (title → mode → level → go).
 # Picks the largest visible, uncovered button whose label reads like "start/play/begin/enter…",
 # never links that leave the page or settings/help/credits buttons. Returns the labels pressed.
 START_JS = r"""async()=>{const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const GO=/^[^A-Za-z0-9]*(start|play|begin|enter|new (game|run)|continue|resume|take the|let.?s|launch|go\b|ride|drive|fly|explore|dive|deploy|race|tap to|click to|press|first|level 1|mission 1|chapter 1|1\b)/i;
-const NO=/settings|options|credits|how to|help|guide|tutorial|sound|music|audio|quality|graphics|back|close|menu|quit|reset|delete|share|fullscreen|casebook|×|←/i;
+const GO=/^[^A-Za-z0-9]*(start|play|begin|enter|new (game|run)|continue|resume|take|let.?s|launch|go\b|ride|drive|fly|explore|dive|deploy|race|tap to|click to|press|first|level 1|mission 1|chapter 1|1\b|choose|select|confirm|accept|ready|board)/i;
+// Strong verbs anywhere in a label win over mere choices (select, choose, a level card).
+const GO_ANY=/\b(start|play|begin|launch|enter|continue|resume|let.?s|depart|undock|take ?off)\b/i;
+const NO=/settings|options|credits|how to|help|guide|tutorial|sound|music|audio|quality|graphics|back|close|menu|quit|reset|delete|share|fullscreen|casebook|return|×|←/i;
 const label=e=>(e.innerText||e.textContent||e.getAttribute('aria-label')||'').trim().replace(/\s+/g,' ');
-const picked=[];
-for(let round=0;round<3;round++){
- const els=[...document.querySelectorAll('button,a[href^="#"],[role=button],[data-start],[class*=mission],[class*=level-card]')].filter(e=>{
+const candidates=()=>[...document.querySelectorAll('button,a[href^="#"],[role=button],[data-start],[class*=mission],[class*=level-card]')].filter(e=>{
   const r=e.getBoundingClientRect();if(r.width<30||r.height<16||e.disabled)return false;
   if(e.closest('[hidden],[inert],.kit-menu,.kit-card,.kit-touch'))return false;
-  const t=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);if(!t||!(e===t||e.contains(t)))return false;
-  const s=label(e);return s&&GO.test(s)&&!NO.test(s)});
- if(!els.length)break;
- els.sort((x,y)=>{const a=x.getBoundingClientRect(),b=y.getBoundingClientRect();return b.width*b.height-a.width*a.height});
- const e=els[0];picked.push(label(e).slice(0,40));e.click();await sleep(1200)}
+  const cs=getComputedStyle(e);if(cs.visibility==='hidden'||+cs.opacity<0.1)return false;
+  const s=label(e);return s&&(GO.test(s)||GO_ANY.test(s))&&!NO.test(s)}).sort((x,y)=>{const w=e=>GO_ANY.test(label(e))?0:1;if(w(x)!==w(y))return w(x)-w(y);const a=x.getBoundingClientRect(),b=y.getBoundingClientRect();return b.width*b.height-a.width*a.height});
+const uncovered=e=>{const r=e.getBoundingClientRect();const t=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return t&&(e===t||e.contains(t))};
+const picked=[],pressed=new Set();
+for(let round=0;round<4;round++){
+ // A menu may still be fading in: look for up to 3 s. Buttons below the fold are scrolled to.
+ let hit=null;
+ for(let t=0;t<10&&!hit;t++){
+  for(const e of candidates()){if(pressed.has(e)||pressed.has(label(e)))continue;if(!uncovered(e)){e.scrollIntoView({block:'center'});await sleep(60)}if(uncovered(e)){hit=e;break}}
+  if(!hit)await sleep(300)}
+ if(!hit)break;
+ pressed.add(hit);pressed.add(label(hit));picked.push(label(hit).slice(0,40));hit.click();await sleep(1200)}
 window.__started=picked;return picked}"""
 
 
