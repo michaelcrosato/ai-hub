@@ -517,7 +517,10 @@ Four tools, cheapest first:
    — the settings paths the sweep skips: WebGPU and WebGL2 at low and at
    ultra with Advanced on, plus a quality switch while playing. Linux
    Chromium only (WebGPU on SwiftShader), so it runs alongside other work;
-   it finds errors, not slowness.
+   it finds errors, not slowness. `matrix3d.py layout` loads each game at
+   five window sizes (phone portrait to ultrawide) and flags a 3D canvas that
+   collapses or leaves the window: responsive-layout bugs at sizes the sweep
+   never opens.
 4. `python3 scripts/check3d.py <game> --start --keys …` — one game in depth
    while fixing it.
 

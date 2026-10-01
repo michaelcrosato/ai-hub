@@ -10,6 +10,10 @@ Windows browser or GPU and costs no model tokens. It does not measure speed.
 
   python3 scripts/matrix3d.py run [games...] [--profiles a,b] [--jobs 3] [--out DIR] [--force]
   python3 scripts/matrix3d.py triage [--out DIR]
+  python3 scripts/matrix3d.py layout [games...] [--jobs 6] [--out DIR]
+      Where the 3D canvas lands at five window sizes (phone portrait to ultrawide). Flags a
+      canvas that collapses, leaves the window, or covers under a fifth of it: layout bugs
+      that hide the game at sizes the sweep never opens. Seconds per game.
 
 Profiles (default: all):
   gpu-ultra-adv   WebGPU, ultra, Advanced on (MSAA, AO and the other opt-in extras)
@@ -155,7 +159,84 @@ def cmd_triage(a):
             print('         ' + ', '.join(g[:50] for g in c['games']))
 
 
+LAYOUT_SIZES = [(390, 844), (800, 600), (960, 540), (1920, 1080), (2560, 1080)]
+CANVAS_RECT = """(() => {
+  const c = [...document.querySelectorAll('canvas')].sort((a, b) => b.width * b.height - a.width * a.height)[0];
+  if (!c) return null;
+  const r = c.getBoundingClientRect();
+  const vis = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), share: +(vis / (innerWidth * innerHeight)).toFixed(2) };
+})()"""
+
+
+def layout_one(entry, port):
+    from playwright.sync_api import sync_playwright
+    path = game_url(entry)
+    url = f'http://127.0.0.1:{port}{path}{"&" if "?" in path else "?"}kit-backend=webgl2&kit-quality=low'
+    rows = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(args=GL_ARGS)
+        for w, h in LAYOUT_SIZES:
+            page = browser.new_page(viewport={'width': w, 'height': h}, is_mobile=w < 500, has_touch=w < 500)
+            try:
+                page.goto(url, wait_until='load', timeout=60000)
+                for _ in range(20):
+                    if page.evaluate('!!(window.__kit && window.__kit.ready)'):
+                        break
+                    time.sleep(0.5)
+                rows.append({'size': f'{w}x{h}', 'rect': page.evaluate(CANVAS_RECT)})
+            except Exception as e:
+                rows.append({'size': f'{w}x{h}', 'error': str(e)[:200]})
+            page.close()
+        browser.close()
+    return rows
+
+
+def layout_problems(rows):
+    out = []
+    for r in rows:
+        rect = r.get('rect')
+        if r.get('error'):
+            out.append(f"{r['size']}: {r['error'][:80]}")
+        elif not rect:
+            out.append(f"{r['size']}: no canvas")
+        elif rect['w'] < 50 or rect['h'] < 50:
+            out.append(f"{r['size']}: canvas collapsed to {rect['w']}x{rect['h']}")
+        elif rect['share'] < 0.2:
+            out.append(f"{r['size']}: canvas covers {int(rect['share'] * 100)}% of the window at {rect['x']},{rect['y']}")
+    return out
+
+
+def cmd_layout(a):
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    games = a.games or kit_games()
+    srv, port = start_server()
+
+    def job(g):
+        try:
+            r = subprocess.run([sys.executable, __file__, 'layout-one', g, str(port)], cwd=REPO, timeout=300,
+                               capture_output=True, text=True)
+            return g, json.loads(r.stdout.strip().splitlines()[-1])
+        except Exception as e:
+            return g, [{'size': '?', 'error': str(e)[:200]}]
+    results = {}
+    with ThreadPoolExecutor(a.jobs) as pool:
+        for g, rows in pool.map(job, games):
+            results[stem_of(g)] = rows
+            probs = layout_problems(rows)
+            if probs:
+                print(f'{stem_of(g)[:70]}\n    ' + '\n    '.join(probs), flush=True)
+    srv.shutdown()
+    (out / 'layout.json').write_text(json.dumps(results, indent=1))
+    bad = [k for k, v in results.items() if layout_problems(v)]
+    print(f'\n{len(results)} game(s), {len(bad)} with a hidden or collapsed canvas at some size')
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'layout-one':
+        print(json.dumps(layout_one(sys.argv[2], int(sys.argv[3]))))
+        return
     if len(sys.argv) > 1 and sys.argv[1] == 'one':
         _, _, entry, profile, port, out = sys.argv
         run_one(entry, profile, int(port), Path(out))
@@ -171,8 +252,12 @@ def main():
     t = sub.add_parser('triage')
     t.add_argument('--out', default=str(DEFAULT_OUT))
     t.add_argument('--top', type=int, default=30)
+    lay = sub.add_parser('layout')
+    lay.add_argument('games', nargs='*')
+    lay.add_argument('--jobs', type=int, default=6)
+    lay.add_argument('--out', default=str(DEFAULT_OUT))
     a = ap.parse_args()
-    cmd_run(a) if a.cmd == 'run' else cmd_triage(a)
+    {'run': cmd_run, 'triage': cmd_triage, 'layout': cmd_layout}[a.cmd](a)
 
 
 if __name__ == '__main__':
