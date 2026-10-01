@@ -16962,7 +16962,8 @@ var {
           (h.has(u) || h.set(u, { mat: g, objects: [] }), h.get(u).objects.push(f));
         }
         for (let f of h.values()) {
-          let g = new l.InstancedMesh(this.geom, f.mat, f.objects.length),
+          // kit.instanced: every batch shares one shader instead of compiling its own (r186).
+          let g = this.kit.instanced(this.geom, f.mat, f.objects.length),
             u = f.objects.some((p) => p.dynamic);
           // Per-instance colour: the box's own colour on the shared materials, its brightness
           // (lifeDim) everywhere else.
