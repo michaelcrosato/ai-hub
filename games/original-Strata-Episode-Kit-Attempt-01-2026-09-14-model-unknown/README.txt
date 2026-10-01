@@ -1,8 +1,17 @@
-CDN PREVIEW: internet is required for Three.js and Rapier. The DOM pages work without those libraries. This preview is transpiled, not a substitute for a dependency-aware build.
+STRATA / EPISODE KIT
 
-Serve this directory with HTTP. For example:
-  python -m http.server 8000 --bind 127.0.0.1
-Then open http://localhost:8000/
-Do not use file://.
-Each episode is an HTML entry under episodes/.
-Build report bytes are raw module bytes, plus per-file gzip estimates. They exclude CDN packages in preview mode.
+One story in four episodes, each with its own rules:
+  01 Loading Bay      first person, Rapier rigid bodies, local sentry AI
+  02 Coast Road       arcade car on a local collision model (no Rapier)
+  03 Breakwater Light first person, built from the starter's signal blocks
+  04 The Handoff      reads the run contract; no scene of its own
+
+The page runs on the wall's shared 3D stack: three.js r186 (WebGPU with a
+WebGL2 fallback) and Rapier 0.20 from /lib, booted through /lib/kit. Each
+episode is a separate module under src/episodes/, loaded when it starts.
+Only JSON crosses from one episode to the next (src/campaign/).
+
+Serve the repository root over HTTP (the import map points at /lib/...):
+  python3 -m http.server 8000 --bind 127.0.0.1
+then open http://localhost:8000/games/<this folder>/
+Add #yard, #drive, #breakwater or #debrief to open an episode directly.
