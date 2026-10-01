@@ -6,6 +6,8 @@ import * as THREE from 'three/webgpu';
 import { Fn, vec3, vec4, float, dot, sqrt, max, mix as tslMix, texture, screenUV } from 'three/tsl';
 import { boot } from 'kit/boot.js';
 import { createPost } from 'kit/post.js';
+// Static block batches are baked: in r186 every InstancedMesh compiles its own shaders.
+import { bakeInstances } from 'kit/instancing.js';
 
 const $=id=>document.getElementById(id), clamp=(n,a,b)=>Math.max(a,Math.min(b,n)), mix=(a,b,t)=>a+(b-a)*t;
 const PI=Math.PI, TAU=PI*2;
@@ -129,7 +131,7 @@ function meshBox(parent,x,y,z,w,h,d,color,bevel=false){const m=new THREE.Mesh(be
 function group(parent=scene){const g=new THREE.Group();parent.add(g);return g;}
 const batches=new Map(),dummy=new THREE.Object3D();
 function block(x,y,z,w,h,d,color,rx=0,ry=0,rz=0,geo='box',cast=true){const key=geo+'|'+color+'|'+cast;if(!batches.has(key))batches.set(key,{geo,color,cast,items:[]});batches.get(key).items.push([x,y,z,w,h,d,rx,ry,rz]);}
-function flushBlocks(){for(const b of batches.values()){const m=new THREE.InstancedMesh(geometries[b.geo],mat(b.color),b.items.length);b.items.forEach((a,i)=>{dummy.position.set(a[0],a[1],a[2]);dummy.scale.set(a[3],a[4],a[5]);dummy.rotation.set(a[6],a[7],a[8]);dummy.updateMatrix();m.setMatrixAt(i,dummy.matrix);});m.castShadow=b.cast;m.receiveShadow=true;m.frustumCulled=false;scene.add(m);}batches.clear();}
+function flushBlocks(){for(const b of batches.values()){const m=new THREE.InstancedMesh(geometries[b.geo],mat(b.color),b.items.length);b.items.forEach((a,i)=>{dummy.position.set(a[0],a[1],a[2]);dummy.scale.set(a[3],a[4],a[5]);dummy.rotation.set(a[6],a[7],a[8]);dummy.updateMatrix();m.setMatrixAt(i,dummy.matrix);});m.castShadow=b.cast;m.receiveShadow=true;m.frustumCulled=false;scene.add(bakeInstances(m));}batches.clear();}
 
 // Signs were printed straight to the screen, past tone mapping. r186 tone-maps the whole frame, so each
 // sign colour first goes through the inverse of that ACES curve and reaches the screen as it was painted.
@@ -768,7 +770,7 @@ const Racing=(() => {
  function project(x,z,hint=-1){const n=track.segs.length;pBest=Infinity;if(hint>=0&&hint<n)for(let k=-24;k<=24;k++)projTest(mod(hint+k,n),x,z);if(hint<0||hint>=n||pBest>(track.hw+2.5)**2){pBest=Infinity;for(let i=0;i<n;i++)projTest(i,x,z);}const a=track.segs[pI],px=a.x+a.dx*pT,pz=a.z+a.dz*pT,dx=x-px,dz=z-pz;return {x:px,z:pz,s:a.s+a.l*pT,lane:dx*-a.tz+dz*a.tx,tx:a.tx,tz:a.tz,i:pI,d:Math.sqrt(pBest)};}
  function box(parent,x,y,z,w,h,d,color,bevel=false){return meshBox(parent,x,y,z,w,h,d,color,bevel);}
  function batch(x,y,z,w,h,d,color,ry=0,geo='box',cast=true,rx=0){const key=geo+'|'+color+'|'+cast;if(!staticBatch.has(key))staticBatch.set(key,{geo,color,cast,list:[]});staticBatch.get(key).list.push([x,y,z,w,h,d,ry,rx]);}
- function flush(){for(const b of staticBatch.values()){const m=new THREE.InstancedMesh(geometries[b.geo],mat(b.color),b.list.length);b.list.forEach((v,i)=>{dummy.position.set(v[0],v[1],v[2]);dummy.scale.set(v[3],v[4],v[5]);dummy.rotation.set(v[7],v[6],0);dummy.updateMatrix();m.setMatrixAt(i,dummy.matrix);});m.castShadow=b.cast;m.receiveShadow=true;rcScene.add(m);}staticBatch.clear();}
+ function flush(){for(const b of staticBatch.values()){const m=new THREE.InstancedMesh(geometries[b.geo],mat(b.color),b.list.length);b.list.forEach((v,i)=>{dummy.position.set(v[0],v[1],v[2]);dummy.scale.set(v[3],v[4],v[5]);dummy.rotation.set(v[7],v[6],0);dummy.updateMatrix();m.setMatrixAt(i,dummy.matrix);});m.castShadow=b.cast;m.receiveShadow=true;rcScene.add(bakeInstances(m));}staticBatch.clear();}
  function ownGeo(g){resources.push(g);return g;}
  function signRC(text,x,y,z,w,h,bg='#17353d',fg='#fff0d0',ry=0,sub=''){const c=document.createElement('canvas');c.width=signWidth(w,768);c.height=Math.max(16,Math.round(c.width*h/w));const k=c.width/768,a=c.getContext('2d');a.fillStyle=bg;a.fillRect(0,0,c.width,c.height);a.strokeStyle=fg;a.globalAlpha=.3;a.lineWidth=3*k;a.strokeRect(8*k,6*k,c.width-16*k,c.height-12*k);a.globalAlpha=1;a.textAlign='center';a.textBaseline='middle';a.fillStyle=fg;let fs=c.height*(sub?.5:.7);a.font=`900 ${fs}px "Arial Black",Arial,sans-serif`;while(a.measureText(text).width>c.width-34*k&&fs>4){fs-=2*k;a.font=`900 ${fs}px "Arial Black",Arial,sans-serif`;}a.fillText(text,c.width/2,c.height*(sub?.4:.53));if(sub){a.font=`700 ${c.height*.16}px Courier New`;a.fillText(sub,c.width/2,c.height*.81);}const tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;tex.anisotropy=4;resources.push(tex);const material=printedMaterial(tex,{side:THREE.DoubleSide});resources.push(material);const m=new THREE.Mesh(ownGeo(new THREE.PlaneGeometry(w,h)),material);m.position.set(x,y,z);m.rotation.y=ry;rcScene.add(m);return m;}
  // Combine fixed parts by material. Wheels and all moving joints remain separate.
