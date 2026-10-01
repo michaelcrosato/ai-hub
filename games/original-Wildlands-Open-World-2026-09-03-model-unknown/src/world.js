@@ -2,6 +2,7 @@
 // workers builds them, the main thread only uploads geometry and places props.
 import * as THREE from 'three/webgpu';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { createInstanced } from 'kit/instancing.js';
 import { CONFIG, buildChunk } from './terrain.js';
 
 /**
@@ -184,7 +185,8 @@ class Vegetation {
     const filled = {};
     for (const k of this.kinds) {
       if (!counts[k]) continue;
-      const mesh = new THREE.InstancedMesh(this.geometries[k], propMaterial, counts[k]);
+      // createInstanced: every chunk's batches share one shader instead of compiling their own (r186).
+      const mesh = createInstanced(this.geometries[k], propMaterial, counts[k]);
       mesh.name = k;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
