@@ -13851,13 +13851,15 @@ var FrontierRenderPipeline = class {
         (e.gradingStrength > 0 ||
           e.vignetteStrength > 0 ||
           e.ditherStrength > 0),
-      o = !n.msaa && n.name !== "low",
+      // With AO the scene pass is single-sampled (GTAO can't gather from multisampled depth on
+      // WebGPU), so FXAA takes over the anti-aliasing.
+      o = (r || !n.msaa) && n.name !== "low",
       s = [i, r, a, o, n.post].join(":");
     if (this.pipeline && s === this.pipelineKey) return;
     (this.disposePipeline(), (this.pipelineKey = s));
     let { scene: l, camera: c } = this.options,
       u = new THREE.RenderPipeline(this.renderer),
-      h = pass(l, c);
+      h = pass(l, c, r ? { samples: 0 } : {});
     i && h.setMRT(mrt({ output, bloomIntensity: float(0) }));
     let d = h.getTextureNode("output"),
       p = d;
