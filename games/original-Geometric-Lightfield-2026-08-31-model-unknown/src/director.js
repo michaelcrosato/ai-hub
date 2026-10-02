@@ -129,7 +129,9 @@ export class LightDirector {
       for (const s of shadows) s.needsUpdate = false;
       if (!this.isShadowEligible(f) || !f.enabled || f.descriptor.light.intensity <= 1e-4 || !f.dirty) continue;
       if (!this.isDue(f)) continue;
-      if (f.descriptor.light.isDirectionalLight) this.queue(f);
+      // A shadow's first render skips the budget: in r186 a map sampled before its first
+      // render is re-created by that render, and materials keep the destroyed texture.
+      if (f.descriptor.light.isDirectionalLight || f.fresh) this.queue(f);
       else due.push(f);
     }
     if (due.length > 1) due.sort(this.byPriority);
@@ -151,6 +153,7 @@ export class LightDirector {
       else this.localShadowUpdates += 1;
       f.dirty = false;
       f.urgent = false;
+      f.fresh = false;
       f.elapsed = 0;
     }
   }
@@ -275,6 +278,7 @@ export class LightDirector {
     const eligible = this.isShadowEligible(f);
     d.light.castShadow = eligible;
     if (!eligible) return;
+    if (this.getShadows(f).some((s) => !s.map)) f.fresh = true;
     const q = SHADOW_QUALITY[this.quality];
     const shadows = this.getShadows(f);
     const directional = d.light.isDirectionalLight;
