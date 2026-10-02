@@ -2,31 +2,25 @@
 
 ## Automated checks
 
-Run:
-
 ```bash
-node tests/smoke.cjs
+node tests/smoke.mjs                 # from this folder
+node scripts/audit3d.mjs games/punchout-RopeBurn-Rumble-Neon-Circuit-2026-09-17-model-unknown   # from the repo root
 ```
 
-The smoke test executes the real game state machine with deterministic input policies. It also checks guard cancellation, pinch zoom, and the equipment purchase/equip flow.
+`tests/smoke.mjs` drives the real fight rules (`sim.js`) with seeded bot policies, 120 bouts per policy and opponent, and asserts the balance guard rails and the progression flow (guard release, the fight clock, gear purchase and circuit gear, old and damaged saves, unlocks, bests, 10-point scoring).
 
-Current balance sample, 120 seeded bouts per policy:
+Win rates at Pro difficulty with the default level-1 loadout:
 
-- Blind mash policy: 0% wins.
-- Rough novice policy: about 31% wins.
-- Competent read/counter policy: 100% wins with the default level-1 loadout.
+| | Gus Granite | Vera Voltage | Duke Dynamo |
+|---|---|---|---|
+| Blind mash | 0% | 0% | 0% |
+| Rough novice | ~30% | ~22% | ~10% |
+| Competent read/counter | 100% | ~99% | ~97% |
 
-These policies are synthetic. They are not a prediction of human win rates. They are used to verify that progression is not required to beat the bout and that neutral button-mashing is not an effective strategy.
+Novice win rate by difficulty (Sparring / Pro / Brutal): Gus ~68 / 32 / 17%, Vera ~62 / 20 / 6%, Duke ~28 / 9 / 2%.
 
-## Static checks
+These policies are synthetic. They are not a prediction of human win rates; they check that progression is not required to win, that the circuit gets harder, and that mashing does not work.
 
-- `node --check game.js` passes.
-- All JavaScript UI element IDs exist in `index.html`.
-- `serve.py` compiles with Python 3.
-- The source does not contain Nintendo boxer names, sprites, audio, or other copied game assets.
+## Browser checks
 
-## Browser test limitation in this build environment
-
-The installed headless Chromium process does not start correctly in this container, including for a one-line `data:` page. It fails before page execution because its system graphics/session dependencies do not initialize. For that reason, the graphical renderer could not be captured in this environment.
-
-The Three.js path uses APIs documented for Three.js r186. The local WebGL 1 compatibility path uses small GLSL shaders and the same gameplay state machine.
+The wall's checkers (`scripts/check3d.py`, `sweep3d.py`, `matrix3d.py`) boot the game on WebGPU, WebGL2 and a phone profile. The start flow is two buttons: ENTER THE RING, then START THE BOUT.

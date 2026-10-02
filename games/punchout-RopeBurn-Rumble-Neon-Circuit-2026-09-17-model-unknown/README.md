@@ -1,38 +1,57 @@
 # RopeBurn Rumble — Neon Circuit
 
-An original, mobile-first arcade boxing vertical slice inspired by the read-and-react rhythm of 8-bit console boxing games. It uses no copied characters, sprites, music, names, or game data.
+An original, mobile-first arcade boxing game inspired by the read-and-react rhythm of 8-bit console boxing games. It uses no copied characters, sprites, music, names, or game data.
 
 ## Run
 
-Serve this folder over HTTP. For example:
+The game runs on the wall's shared 3D stack (three.js r186 `WebGPURenderer` with automatic WebGL2 fallback, booted by `/lib/kit/`), so serve the repository root, not this folder:
 
 ```bash
-python3 serve.py
+python3 -m http.server 8000   # from the repo root
 ```
 
-Then open `http://localhost:8765`. You can set a different port with `PORT=9000 python3 serve.py`.
+Then open `http://localhost:8000/games/punchout-RopeBurn-Rumble-Neon-Circuit-2026-09-17-model-unknown/`.
 
-The game dynamically loads Three.js r186 (`three@0.186.0`) from cdnjs. `WebGPURenderer` uses WebGPU first and WebGL2 as its built-in fallback. If the modern module cannot load or initialize, the same fight simulation continues with a local raw-WebGL1 compatibility renderer. A Canvas safe mode is included only for devices with no WebGL context at all.
+## Files
+
+- `index.html` — the page, its cards and the HUD.
+- `sim.js` — the fight rules: attacks, the three opponents, difficulty, gear, scoring and progress. No DOM, no three.js.
+- `ring.js` — the arena, the fighters and their animation on `kit.renderer`.
+- `game.js` — boot, input actions, cards, HUD, sound.
+- `tests/smoke.mjs` — bot bouts and progression checks (`node tests/smoke.mjs`).
 
 ## Controls
 
-- Mobile: left joystick = slip/duck; L/R = punch; hold Guard; Rush when the meter is full; pinch the arena to zoom.
-- Keyboard: A/D = slip; S = duck/body modifier; J/K = punches; L = guard; Space = Rush.
+| | Keyboard / mouse | Controller | Touch |
+|---|---|---|---|
+| Slip | A / D (arrows) | left stick / D-pad ← → | stick ← → |
+| Duck (hold for body shots) | S | stick ↓ | stick ↓ |
+| Punch left / right | J / K, left / right click | X / A (LB / RB) | L / R |
+| Guard (hold) | L or Shift | B or LT | GUARD |
+| Rush (full meter) | Space | Y or RT | RUSH |
+| Pause | Esc or P | Start | II |
+| Zoom | wheel | — | pinch |
+| Sound on / off | M | pause menu | pause menu |
 
-## Vertical slice
+Menus work with the stick, D-pad or arrows, A / Enter to choose and B / Esc to go back.
 
-- Three 60-second rounds, score decision if no TKO.
-- Telegraphed enemy jab, cross, hook, and uppercut patterns.
-- Late-windup counters, stamina/guard break, momentum special, knockdowns, get-up sequence.
-- Between-round temporary corner boosts.
-- Persistent XP, credits, equipment unlocks, and modest stat progression in local storage.
-- Procedural Web Audio effects.
-- Low-poly arena and fighters, PBR lighting, shadows, ACES tone mapping, fog, hit flashes, impact meshes, camera shake, and dynamic pixel ratio on the Three.js path.
+## The Neon Circuit
 
-## Rendering compatibility
+- **Bout 01 — Gus Granite**, Southside Breaker: the original bout. Jabs, crosses, hooks and uppercuts.
+- **Bout 02 — Vera Voltage**, Neon Southpaw: fast tells, fake jabs she blocks your swing on (the glove never flashes on a fake), and a quick 1-2.
+- **Title bout — Duke Dynamo**, Circuit Champion: a tight shell, a heavy hand and the haymaker, which can only be ducked and leaves him wide open.
 
-Current Three.js does not support WebGL 1. Support ended after r162. This project therefore keeps the current Three.js renderer for WebGPU/WebGL2 and implements the last-resort WebGL1 path directly with small GLSL shaders, while sharing all gameplay/state logic.
+Beat an opponent to open the next. Three difficulties (Sparring, Pro, Brutal) change tell speed, damage and rewards.
+
+## Rules
+
+- Three 60-second rounds. Three knockdowns is a TKO; two of yours stops the bout; otherwise the judges score it (10-point must: the busier round wins 10-9, each knockdown costs a point).
+- Every enemy punch is telegraphed by a sign over the ring and a glowing glove. Punch while the glove flashes bright, late in the windup, to counter.
+- Stamina feeds punches and guard; a guard can break. Momentum fills the Rush meter.
+- Between rounds you pick one temporary corner boost.
+- XP, levels, credits, gear, the circuit, best scores and fastest knockouts are saved in local storage.
+- Procedural Web Audio: punches, bell, crowd ambience that swells on big moments.
 
 ## Test
 
-Run `node tests/smoke.cjs` for the deterministic combat and input smoke test. See `QA.md` for the current test results.
+`node tests/smoke.mjs` plays seeded bot bouts against every opponent and difficulty and checks progression. See `QA.md`.
