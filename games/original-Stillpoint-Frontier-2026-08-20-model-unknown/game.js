@@ -13681,10 +13681,21 @@ var EnvironmentMapGenerator = class {
 // pixels feed the bloom. Everything else writes the pass default (0).
 var BLOOM_LAYER = 1;
 var BLOOM_MRT = mrt({ bloomIntensity: float(1) });
+// The MRT only goes on while a bloom pass is drawing: rendered straight to the
+// canvas (low, or bloom off), an MRT naming only bloomIntensity leaves the
+// fragment shader with no outputs and the pipeline fails (empty OutputType).
+var BLOOM_MATERIALS = new Set();
+var bloomTarget = false;
 function markBloomMaterial(e) {
   if (!e) return;
   let n = Array.isArray(e) ? e : [e];
-  for (let i of n) i && i.isNodeMaterial && (i.mrtNode = BLOOM_MRT);
+  for (let i of n)
+    i && i.isNodeMaterial && (BLOOM_MATERIALS.add(i), (i.mrtNode = bloomTarget ? BLOOM_MRT : null));
+}
+function setBloomTarget(on) {
+  if (on === bloomTarget) return;
+  bloomTarget = on;
+  for (let m of BLOOM_MATERIALS) ((m.mrtNode = on ? BLOOM_MRT : null), (m.needsUpdate = !0));
 }
 function markBloom(t) {
   return (
@@ -13828,9 +13839,10 @@ var FrontierRenderPipeline = class {
             (this.postProcessingFallback = !0),
             (this.postProcessingFailureCount += 1),
             this.renderer.setRenderTarget(null),
+            setBloomTarget(!1),
             this.renderer.render(this.options.scene, this.options.camera));
         }
-      else this.renderer.render(this.options.scene, this.options.camera);
+      else (setBloomTarget(!1), this.renderer.render(this.options.scene, this.options.camera));
     } finally {
       this.lastCpuRenderMilliseconds = performance.now() - s;
     }
@@ -13855,6 +13867,7 @@ var FrontierRenderPipeline = class {
       // WebGPU), so FXAA takes over the anti-aliasing.
       o = (r || !n.msaa) && n.name !== "low",
       s = [i, r, a, o, n.post].join(":");
+    setBloomTarget(i);
     if (this.pipeline && s === this.pipelineKey) return;
     (this.disposePipeline(), (this.pipelineKey = s));
     let { scene: l, camera: c } = this.options,
