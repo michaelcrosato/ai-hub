@@ -366,6 +366,19 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   ShadowDepthTexture used in a submit"); a `needsUpdate` or a few frames of
   auto-update don't cure it. Size such shadows once at load
   (`shadow.mapSize.setScalar(kit.shadowSize(base))`), or let them auto-update.
+  The same error appears when a material samples an on-demand shadow before
+  that shadow's first render: the first render re-creates the depth texture.
+  A refresh budget (N shadow maps per frame) must still render every new
+  shadow on its first frame (Geometric Lightfield on low).
+- **An MRT on a material needs a target that has its outputs.**
+  `material.mrtNode = mrt({ bloomIntensity: … })` for selective bloom is fine
+  while a `pass()` with that MRT draws, but rendered straight to the canvas
+  (bloom off, or the low tier without post) it leaves the fragment shader
+  with no outputs and the pipeline fails on WebGPU ("structures must have at
+  least one member", `struct OutputType {}`). Set `mrtNode` only while the
+  bloom pass is active, and `needsUpdate` the materials when it changes.
+- `RoundedBoxGeometry` is non-indexed in r186 (`geometry.index` is null);
+  code copying its arrays must not read `index.array` unguarded.
 - **Don't turn `light.castShadow` off and on again at runtime.** r186 shares
   one light node across materials; when the shadow turns off, the first
   material to rebuild disposes the light's shadow node while the others
@@ -549,6 +562,14 @@ Four tools, cheapest first:
    never opens.
 4. `python3 scripts/check3d.py <game> --start --keys …` — one game in depth
    while fixing it.
+
+To find the code behind a WebGPU error, reproduce it in Linux Chromium on
+SwiftShader (the flags in §10) with a Playwright init script that wraps
+`console.error` and records `new Error().stack` for the matching message;
+for "Destroyed texture" errors, also wrap `GPUTexture.prototype.destroy` the
+same way to see who destroyed it. `window.__kit.pipelineLog` names the
+object and material behind the last 30 pipelines (the id in a failing
+`renderPipeline_<Material>_<id>` label is the material id).
 
 When fixing a game: change only that game's files, keep its content and
 look, re-run the checker and the audit, and commit one game per commit.

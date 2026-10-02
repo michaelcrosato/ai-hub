@@ -309,7 +309,22 @@ scripts/
   lib/layout.mjs  what a path is: game, build, project, collection
   lib/intake.mjs  what a package holds, and what never to import
   lib/zip.mjs     a small zip reader, so the project stays dependency-free
+  audit3d.mjs     static rules every 3D game must pass (seconds)
+  check3d.py      one 3D game in headless browsers, WebGL2 and WebGPU
+  sweep3d.py      check3d over many games, grouped by error signature
+  matrix3d.py     quality settings, a quality switch, and window sizes
+lib/
+  three/          three.js r186, the one copy every 3D game imports
+  rapier/         Rapier 0.20 physics
+  kit/            the shared 3D kit: boot, input, touch, post, physics
 ```
+
+Every 3D game runs on the same stack: three.js r186 with `WebGPURenderer`
+(WebGL2 when WebGPU is missing), loaded once from `lib/three` through an
+import map, and the kit in `lib/kit` for boot, quality tiers and keyboard,
+gamepad and touch input. `lib/kit/README.md` is the guide for porting or
+fixing a game, including the traps found so far; `lib/README.md` covers
+upgrading three.js and Rapier and the local patches to re-apply.
 
 Vercel runs `node scripts/scan.mjs` as the build command and serves the
 repository. There is no framework and nothing is compiled.
