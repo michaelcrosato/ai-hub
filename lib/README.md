@@ -35,6 +35,13 @@ release fixes the problem upstream (check with the pipeline count in
   instance) instead of on every setup. Otherwise each material build gets a
   differently named uniform buffer, and every InstancedMesh under cascaded
   shadows compiles its own shader (Verdant Frontier: 119 pipelines → 27).
+- `three.webgpu.js`, `ViewportTextureNode.getTextureForReference()`: each
+  per-render-target clone of the framebuffer texture gets its own `Source`
+  (`r.source=new t.source.constructor({width:0,height:0})`). Clones shared
+  one image, so a new render target of the same size never re-created its
+  copy texture in the target's format, and transmission or viewport
+  textures failed with "copyFramebufferToTexture: Source and destination
+  formats do not match" after a quality switch (Golden Hour).
 
 ## Upgrading Rapier
 
