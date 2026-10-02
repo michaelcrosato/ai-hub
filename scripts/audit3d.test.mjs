@@ -28,3 +28,9 @@ test('comments that mention old APIs do not count', () => {
   assert.match(stripComments('x = "https://example.com"; // note'), /https:\/\/example\.com/);
   assert.match(stripComments('<input accept="audio/*"> new WebGLRenderer() /* end */'), /WebGLRenderer/, 'a MIME glob is not a comment');
 });
+
+test('a requestAnimationFrame loop warns only when the kit loop is missing', () => {
+  const warns = (t) => auditText(GOOD + t).warnings.map((w) => w.id);
+  assert.deepEqual(warns('<script>requestAnimationFrame(tick)</script>'), ['raf-loop']);
+  assert.deepEqual(warns('<script>kit.start(step); requestAnimationFrame(tick)</script>'), []);
+});

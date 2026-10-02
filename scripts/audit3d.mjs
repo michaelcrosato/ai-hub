@@ -41,7 +41,7 @@ export const RULES = [
 export const WARNINGS = [
   { id: 'raw-webgl-context', test: (t) => /getContext\(\s*['"](?:webgl2?|experimental-webgl)['"]/.test(t), msg: 'asks a canvas for a WebGL context itself (fine for a 2D overlay test, suspicious otherwise)' },
   { id: 'points-material', test: (t) => /\bPointsMaterial\b/.test(t), msg: 'uses PointsMaterial: sizes above 1 px draw as 1 px on WebGPU (kit/points.js)' },
-  { id: 'raf-loop', test: (t) => /requestAnimationFrame\s*\(\s*(?:loop|animate|tick|frame|update|render)\b/.test(t), msg: 'runs its own requestAnimationFrame loop (the kit loop is kit.start)' },
+  { id: 'raf-loop', test: (t) => /requestAnimationFrame\s*\(\s*(?:loop|animate|tick|frame|update|render)\b/.test(t) && !/\bkit\.start\s*\(/.test(t), msg: 'runs its own requestAnimationFrame loop (the kit loop is kit.start)' },
 ];
 
 /** Remove comments so documentation that mentions an old API doesn't trip a rule. */

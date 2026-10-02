@@ -316,7 +316,11 @@ and write `u.value`. Swapping textures: `const t = texture(tex)` then
   `useLegacyLights` gone.
 - The first frames compile pipelines. Call `await kit.renderer.compileAsync(scene, camera)`
   after building the scene, and pre-warm materials that appear later (hidden
-  meshes in the scene) so the first explosion does not stutter.
+  meshes in the scene) so the first explosion does not stutter. Each pipeline
+  costs real time on Windows Chrome (D3D12): around 80 of them took Stillpoint,
+  Golden Hour and Geometric Lightfield 11–13 s to boot on an RTX 3060 Ti
+  (`window.__kit.bootMs`, `pipelines`), so keep the count of distinct
+  material and shader variants low.
 - Changing material structure (adding a map, toggling `transparent`) rebuilds
   the pipeline. Prefer uniforms and visibility over creating materials mid-game.
 - Many materials cost more than many meshes: share materials, use
