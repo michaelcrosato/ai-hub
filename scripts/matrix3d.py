@@ -22,7 +22,7 @@ Profiles (default: all):
   gl-low          WebGL2, low
   gpu-switch      WebGPU, starts on high, then low, then ultra + Advanced while playing
 
-Default DIR: ~/dev/ai-hub-migration/matrix
+Default DIR: /tmp/ai-hub-qa/matrix
 """
 import argparse, json, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +33,7 @@ from check3d import START_JS, IGNORABLE, start_server, game_url  # noqa: E402
 from sweep3d import signature, stem_of, kit_games  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_OUT = Path.home() / 'dev/ai-hub-migration/matrix'
+DEFAULT_OUT = Path('/tmp/ai-hub-qa/matrix')
 GPU_ARGS = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=swiftshader',
             '--use-webgpu-adapter=swiftshader', '--use-angle=swiftshader', '--enable-unsafe-swiftshader']
 GL_ARGS = ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']

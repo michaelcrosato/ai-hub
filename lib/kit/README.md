@@ -553,9 +553,8 @@ Four tools, cheapest first:
 2. `python3 scripts/sweep3d.py run [games…]` then `python3 scripts/sweep3d.py triage`
    — boots games on WebGL2, WebGPU and a phone profile with the checker and
    groups failures by error signature. One signature across many games is a
-   kit or pattern problem: fix it once, at the source, not per game. Triage
-   also marks games whose original already logged errors before migration,
-   so a pre-existing bug is not mistaken for a port regression.
+   kit or pattern problem: fix it once, at the source, not per game.
+   Results go to `/tmp/ai-hub-qa/` unless `--out` says otherwise.
 3. `python3 scripts/matrix3d.py run [games…]` then `python3 scripts/matrix3d.py triage`
    — the settings paths the sweep skips: WebGPU and WebGL2 at low and at
    ultra with Advanced on, plus a quality switch while playing. Linux

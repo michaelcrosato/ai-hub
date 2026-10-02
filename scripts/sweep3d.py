@@ -9,12 +9,10 @@ sweep3d.py — run scripts/check3d.py over many games and group what breaks.
       tokens: headless browsers do the work.
   python3 scripts/sweep3d.py triage [--out DIR]
       Sort every report into ok / broken, group the problems by a normalised
-      signature (so one kit bug shows up as one line with many games), and note
-      when the original game (the pre-migration baseline run) already had
-      errors, so pre-existing bugs are not mistaken for port regressions.
+      signature (so one kit bug shows up as one line with many games).
       Writes DIR/triage.json and prints a compact summary.
 
-Defaults: DIR = ~/dev/ai-hub-migration/sweep, baselines in ~/dev/ai-hub-migration/baseline.
+Default DIR: /tmp/ai-hub-qa/sweep (results are disposable; never inside the repo).
 """
 import argparse, json, re, subprocess, time
 from check3d import PIPELINE_CHURN
@@ -22,9 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-HOME = Path.home()
-DEFAULT_OUT = HOME / 'dev/ai-hub-migration/sweep'
-BASELINE = HOME / 'dev/ai-hub-migration/baseline'
+DEFAULT_OUT = Path('/tmp/ai-hub-qa/sweep')
 
 
 def stem_of(entry):
@@ -134,18 +130,6 @@ def problems_of(report):
     return out
 
 
-def baseline_errors(stem):
-    f = BASELINE / f'{stem}.json'
-    if not f.exists():
-        return None
-    try:
-        b = json.loads(f.read_text())
-    except Exception:
-        return None
-    w = b.get('webgl2') or {}
-    return len(w.get('pageErrors', [])) + sum(1 for c in w.get('console', []) if c.startswith('error'))
-
-
 def cmd_triage(a):
     out = Path(a.out)
     games, clusters = [], {}
@@ -156,8 +140,7 @@ def cmd_triage(a):
         except Exception:
             report = {'problems': ['unreadable report']}
         probs = problems_of(report) if 'webgl2' in report or 'webgpu' in report else [('sweep', 'sweep', p) for p in report.get('problems', [])]
-        base = baseline_errors(stem)
-        games.append({'stem': stem, 'game': report.get('game'), 'problems': probs, 'originalErrors': base})
+        games.append({'stem': stem, 'game': report.get('game'), 'problems': probs})
         for path, kind, detail in probs:
             key = f'{kind} | {detail}'
             c = clusters.setdefault(key, {'kind': kind, 'detail': detail, 'games': set(), 'paths': set()})
@@ -175,8 +158,6 @@ def cmd_triage(a):
     print('\ntop signatures (games, paths, signature):')
     for c in serial[: a.top]:
         print(f"  {c['count']:3d}  {'/'.join(c['paths']):20s} {c['kind']}: {c['detail'][:110]}")
-    pre = [g['stem'] for g in broken if g['originalErrors']]
-    print(f'\n{len(pre)} broken game(s) whose original already logged errors before migration (likely pre-existing): ' + ', '.join(p[:40] for p in pre[:12]) + (' …' if len(pre) > 12 else ''))
 
 
 def main():
