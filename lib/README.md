@@ -1,7 +1,7 @@
 # lib/ — the shared 3D stack
 
-Loaded by every 3D game from the site root (`/lib/...`), so one upgrade here
-moves the whole wall. Games reach it through the import map in their `<head>`
+Loaded by games using the shared kit from the site root (`/lib/...`), so one
+upgrade here moves those games together. They reach it through the import map in their `<head>`
 (see `kit/README.md`).
 
 | Folder | What | Source |
@@ -9,6 +9,12 @@ moves the whole wall. Games reach it through the import map in their `<head>`
 | `three/` | three.js r186 (0.186.1): `three.core.js`, `three.webgpu.js`, `three.tsl.js`, minified; `addons/` = `examples/jsm/` unminified, minus WebGL-only and tooling folders | npm `three@0.186.1` |
 | `rapier/` | Rapier 0.20.0: `rapier-simd.mjs` (from `@dimforge/rapier3d-simd-compat`) and `rapier.mjs` (from `@dimforge/rapier3d-compat`), wasm inlined | npm |
 | `kit/` | our foundation: boot, renderer, settings and quality tiers, input and touch controls, physics loader, post-processing, sized points, the settings panel | this repo |
+| `vendor/` | immutable versioned package shelf: Three.js 0.180.0–0.186.1 and all 12 official Rapier variants at 0.19.3, 0.20.0 and 0.21.0 | npm, with integrity-checked downloads; see `vendor/README.md` |
+
+The versioned shelf supports importing older games without migrating their
+renderer or physics. `pnpm ingest` localizes recognized engine URLs and bare
+imports; copying a game manually still requires its own correct import map.
+The shared `three/`, `rapier/` and `kit/` paths remain independent of the shelf.
 
 ## Upgrading three.js
 

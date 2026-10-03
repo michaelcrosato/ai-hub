@@ -1,0 +1,1739 @@
+/* tslint:disable */
+/* eslint-disable */
+
+export class RawBroadPhase {
+    free(): void;
+    [Symbol.dispose](): void;
+    castRayAndGetNormal(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, rayOrig: RawVector, rayDir: RawVector, maxToi: number, solid: boolean, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): RawRayColliderIntersection | undefined;
+    castRay(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, rayOrig: RawVector, rayDir: RawVector, maxToi: number, solid: boolean, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): RawRayColliderHit | undefined;
+    castShape(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, shapePos: RawVector, shapeRot: RawRotation, shapeVel: RawVector, shape: RawShape, target_distance: number, maxToi: number, stop_at_penetration: boolean, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): RawColliderShapeCastHit | undefined;
+    collidersWithAabbIntersectingAabb(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, aabbCenter: RawVector, aabbHalfExtents: RawVector, callback: Function): void;
+    intersectionWithShape(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, shapePos: RawVector, shapeRot: RawRotation, shape: RawShape, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): number | undefined;
+    intersectionsWithPoint(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, point: RawVector, callback: Function, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): void;
+    intersectionsWithRay(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, rayOrig: RawVector, rayDir: RawVector, maxToi: number, solid: boolean, callback: Function, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): void;
+    intersectionsWithShape(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, shapePos: RawVector, shapeRot: RawRotation, shape: RawShape, callback: Function, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): void;
+    constructor();
+    projectPointAndGetFeature(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, point: RawVector, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): RawPointColliderProjection | undefined;
+    projectPoint(narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, point: RawVector, solid: boolean, filter_flags: number, filter_groups: number | null | undefined, filter_exclude_collider: number | null | undefined, filter_exclude_rigid_body: number | null | undefined, filter_predicate: Function): RawPointColliderProjection | undefined;
+}
+
+export class RawCCDSolver {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor();
+}
+
+export class RawCharacterCollision {
+    free(): void;
+    [Symbol.dispose](): void;
+    handle(): number;
+    constructor();
+    toi(): number;
+    translationDeltaApplied(scratch_buffer: Float32Array): void;
+    translationDeltaRemaining(scratch_buffer: Float32Array): void;
+    worldNormal1(scratch_buffer: Float32Array): void;
+    worldNormal2(scratch_buffer: Float32Array): void;
+    worldWitness1(scratch_buffer: Float32Array): void;
+    worldWitness2(scratch_buffer: Float32Array): void;
+}
+
+export class RawColliderSet {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * The collision types enabled for this collider.
+     */
+    coActiveCollisionTypes(handle: number): number;
+    /**
+     * The events enabled for this collider.
+     */
+    coActiveEvents(handle: number): number;
+    /**
+     * The physics hooks enabled for this collider.
+     */
+    coActiveHooks(handle: number): number;
+    coCastCollider(handle: number, collider1Vel: RawVector, collider2handle: number, collider2Vel: RawVector, target_distance: number, max_toi: number, stop_at_penetration: boolean): RawColliderShapeCastHit | undefined;
+    coCastRayAndGetNormal(handle: number, rayOrig: RawVector, rayDir: RawVector, maxToi: number, solid: boolean): RawRayIntersection | undefined;
+    coCastRay(handle: number, rayOrig: RawVector, rayDir: RawVector, maxToi: number, solid: boolean): number;
+    coCastShape(handle: number, colliderVel: RawVector, shape2: RawShape, shape2Pos: RawVector, shape2Rot: RawRotation, shape2Vel: RawVector, target_distance: number, maxToi: number, stop_at_penetration: boolean): RawShapeCastHit | undefined;
+    /**
+     * The collision groups of this collider.
+     */
+    coCollisionGroups(handle: number): number;
+    coCombineVoxelStates(handle1: number, handle2: number, shift_x: number, shift_y: number): void;
+    coCompoundFlags(handle: number): number | undefined;
+    coContactCollider(handle: number, collider2handle: number, prediction: number): RawShapeContact | undefined;
+    /**
+     * The total force magnitude beyond which a contact force event can be emitted.
+     */
+    coContactForceEventThreshold(handle: number): number;
+    coContactShape(handle: number, shape2: RawShape, shapePos2: RawVector, shapeRot2: RawRotation, prediction: number): RawShapeContact | undefined;
+    coContactSkin(handle: number): number;
+    coContainsPoint(handle: number, point: RawVector): boolean;
+    /**
+     * The density of this collider.
+     */
+    coDensity(handle: number): number;
+    coFrictionCombineRule(handle: number): number;
+    /**
+     * The friction coefficient of this collider.
+     */
+    coFriction(handle: number): number;
+    /**
+     * The half-extents of this collider if it has a cuboid shape.
+     *
+     * Returns `false` if it doesn’t have a cuboid shape.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    coHalfExtents(handle: number, scratch_buffer: Float32Array): boolean;
+    /**
+     * The half height of this collider if it is a capsule, cylinder, or cone shape.
+     */
+    coHalfHeight(handle: number): number | undefined;
+    /**
+     * The outward normal of this collider if it has a half-space shape.
+     *
+     * Returns `false` if it doesn’t have a half-space shape.
+     */
+    coHalfspaceNormal(handle: number, scratch_buffer: Float32Array): boolean;
+    /**
+     * The height of this heightfield if it is one.
+     */
+    coHeightfieldHeights(handle: number): Float32Array | undefined;
+    /**
+     * The scaling factor applied to this heightfield if it is one.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    coHeightfieldScale(handle: number, scratch_buffer: Float32Array): boolean;
+    /**
+     * The indices of this triangle mesh, polyline, or convex polyhedron, if it is one.
+     *
+     * For convex polyhedra, the indices refer to the convex hull recomputed with
+     * `try_convex_hull` (matching `coVertices`), not to the original input mesh.
+     */
+    coIndices(handle: number): Uint32Array | undefined;
+    coIntersectsRay(handle: number, rayOrig: RawVector, rayDir: RawVector, maxToi: number): boolean;
+    coIntersectsShape(handle: number, shape2: RawShape, shapePos2: RawVector, shapeRot2: RawRotation): boolean;
+    /**
+     * Does this collider hold a soft body's deformable collision mesh?
+     */
+    coIsDeformable(handle: number): boolean;
+    coIsEnabled(handle: number): boolean;
+    /**
+     * Is this collider a sensor?
+     */
+    coIsSensor(handle: number): boolean;
+    /**
+     * The mass of this collider.
+     */
+    coMass(handle: number): number;
+    /**
+     * The unique integer identifier of the collider this collider is attached to.
+     */
+    coParent(handle: number): number | undefined;
+    coPolylineFlags(handle: number): number | undefined;
+    coProjectPoint(handle: number, point: RawVector, solid: boolean): RawPointProjection;
+    coPropagateVoxelChange(handle1: number, handle2: number, ix: number, iy: number, shift_x: number, shift_y: number): void;
+    /**
+     * The radius of this collider if it is a ball, capsule, cylinder, or cone shape.
+     */
+    coRadius(handle: number): number | undefined;
+    coRestitutionCombineRule(handle: number): number;
+    /**
+     * The restitution coefficient of this collider.
+     */
+    coRestitution(handle: number): number;
+    /**
+     * The orientation of this collider relative to its parent rigid-body.
+     *
+     * Returns `NAN` if it doesn’t have a parent.
+     */
+    coRotationWrtParent(handle: number): number;
+    /**
+     * The world-space orientation of this collider.
+     */
+    coRotation(handle: number): number;
+    /**
+     * The radius of the round edges of this collider.
+     */
+    coRoundRadius(handle: number): number | undefined;
+    coSetActiveCollisionTypes(handle: number, types: number): void;
+    coSetActiveEvents(handle: number, events: number): void;
+    coSetActiveHooks(handle: number, hooks: number): void;
+    coSetCollisionGroups(handle: number, groups: number): void;
+    coSetContactForceEventThreshold(handle: number, threshold: number): void;
+    coSetContactSkin(handle: number, contact_skin: number): void;
+    coSetDensity(handle: number, density: number): void;
+    coSetEnabled(handle: number, enabled: boolean): void;
+    coSetFrictionCombineRule(handle: number, rule: number): void;
+    coSetFriction(handle: number, friction: number): void;
+    /**
+     * Set the half-extents of this collider if it has a cuboid shape.
+     */
+    coSetHalfExtents(handle: number, newHalfExtents: RawVector): void;
+    /**
+     * Set the half height of this collider if it is a capsule, cylinder, or cone shape.
+     */
+    coSetHalfHeight(handle: number, newHalfheight: number): void;
+    coSetMassProperties(handle: number, mass: number, centerOfMass: RawVector, principalAngularInertia: number): void;
+    coSetMass(handle: number, mass: number): void;
+    /**
+     * Set the radius of this collider if it is a ball, capsule, cylinder, or cone shape.
+     */
+    coSetRadius(handle: number, newRadius: number): void;
+    coSetRestitutionCombineRule(handle: number, rule: number): void;
+    coSetRestitution(handle: number, restitution: number): void;
+    coSetRotationWrtParent(handle: number, angle: number): void;
+    /**
+     * Sets the rotation angle of this collider.
+     *
+     * # Parameters
+     * - `angle`: the rotation angle, in radians.
+     * - `wakeUp`: forces the collider to wake-up so it is properly affected by forces if it
+     * wasn't moving before modifying its position.
+     */
+    coSetRotation(handle: number, angle: number): void;
+    /**
+     * Set the radius of the round edges of this collider.
+     */
+    coSetRoundRadius(handle: number, newBorderRadius: number): void;
+    coSetSensor(handle: number, is_sensor: boolean): void;
+    coSetShape(handle: number, shape: RawShape): void;
+    coSetSolverGroups(handle: number, groups: number): void;
+    coSetTranslationWrtParent(handle: number, x: number, y: number): void;
+    /**
+     * Sets the translation of this collider.
+     *
+     * # Parameters
+     * - `x`: the world-space position of the collider along the `x` axis.
+     * - `y`: the world-space position of the collider along the `y` axis.
+     * - `wakeUp`: forces the collider to wake-up so it is properly affected by forces if it
+     * wasn't moving before modifying its position.
+     */
+    coSetTranslation(handle: number, x: number, y: number): void;
+    coSetVoxel(handle: number, ix: number, iy: number, filled: boolean): void;
+    /**
+     * The type of the shape of this collider.
+     */
+    coShapeType(handle: number): RawShapeType;
+    coShape(handle: number): RawShape;
+    /**
+     * The soft body whose deformable collision mesh this collider holds, if any.
+     */
+    coSoftBody(handle: number): number | undefined;
+    /**
+     * The solver groups of this collider.
+     */
+    coSolverGroups(handle: number): number;
+    /**
+     * The translation of this collider relative to its parent rigid-body.
+     *
+     * Returns `false` if it doesn’t have a parent.
+     */
+    coTranslationWrtParent(handle: number, scratch_buffer: Float32Array): boolean;
+    /**
+     * The world-space translation of this collider.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    coTranslation(handle: number, scratch_buffer: Float32Array): void;
+    coTriMeshFlags(handle: number): number | undefined;
+    /**
+     * The vertices of this triangle mesh, polyline, convex polyhedron, segment, triangle or convex polyhedron, if it is one.
+     *
+     * For convex polyhedra, this returns the vertices of a convex hull recomputed with
+     * `try_convex_hull`, so they may differ in count and order from the points the shape
+     * was built from. This guarantees the result can be used to reconstruct the shape.
+     */
+    coVertices(handle: number): Float32Array | undefined;
+    /**
+     * The volume of this collider.
+     */
+    coVolume(handle: number): number;
+    coVoxelData(handle: number): Int32Array | undefined;
+    coVoxelSize(handle: number): RawVector | undefined;
+    contains(handle: number): boolean;
+    createCollider(enabled: boolean, shape: RawShape, translation: RawVector, rotation: RawRotation, massPropsMode: number, mass: number, centerOfMass: RawVector, principalAngularInertia: number, density: number, friction: number, restitution: number, frictionCombineRule: number, restitutionCombineRule: number, isSensor: boolean, collisionGroups: number, solverGroups: number, activeCollisionTypes: number, activeHooks: number, activeEvents: number, contactForceEventThreshold: number, contactSkin: number, hasParent: boolean, parent: number, bodies: RawRigidBodySet): number | undefined;
+    createDeformableCollider(enabled: boolean, shape: RawShape, translation: RawVector, rotation: RawRotation, massPropsMode: number, mass: number, centerOfMass: RawVector, principalAngularInertia: number, density: number, friction: number, restitution: number, frictionCombineRule: number, restitutionCombineRule: number, isSensor: boolean, collisionGroups: number, solverGroups: number, activeCollisionTypes: number, activeHooks: number, activeEvents: number, contactForceEventThreshold: number, contactSkin: number, bindingMode: RawSoftMeshBindingMode, bindingParticles: Uint32Array, bindingEps: number, bindingSelfContacts: boolean, parent: number, bodies: RawRigidBodySet, softBodies: RawSoftBodySet): number | undefined;
+    /**
+     * Applies the given JavaScript function to the integer handle of each collider managed by this collider set.
+     *
+     * # Parameters
+     * - `f(handle)`: the function to apply to the integer handle of each collider managed by this collider set. Called as `f(handle)`.
+     */
+    forEachColliderHandle(f: Function): void;
+    /**
+     * Checks if a collider with the given integer handle exists.
+     */
+    isHandleValid(handle: number): boolean;
+    len(): number;
+    constructor();
+    /**
+     * Removes a collider from this set and wake-up the rigid-body it is attached to.
+     */
+    remove(handle: number, islands: RawIslandManager, bodies: RawRigidBodySet, softBodies: RawSoftBodySet, wakeUp: boolean): void;
+}
+
+export class RawColliderShapeCastHit {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    colliderHandle(): number;
+    getComponents(scratch_buffer: Float32Array): void;
+}
+
+export class RawContactForceEvent {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * The first collider involved in the contact.
+     */
+    collider1(): number;
+    /**
+     * The second collider involved in the contact.
+     */
+    collider2(): number;
+    /**
+     * The world-space (unit) direction of the force with strongest magnitude.
+     */
+    max_force_direction(scratch_buffer: Float32Array): void;
+    /**
+     * The magnitude of the largest force at a contact point of this contact pair.
+     */
+    max_force_magnitude(): number;
+    /**
+     * The sum of all the forces between the two colliders.
+     */
+    total_force(scratch_buffer: Float32Array): void;
+    /**
+     * The sum of the magnitudes of each force between the two colliders.
+     *
+     * Note that this is **not** the same as the magnitude of `self.total_force`.
+     * Here we are summing the magnitude of all the forces, instead of taking
+     * the magnitude of their sum.
+     */
+    total_force_magnitude(): number;
+}
+
+export class RawContactManifold {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    contact_dist(i: number): number;
+    contact_fid1(i: number): number;
+    contact_fid2(i: number): number;
+    contact_impulse(i: number): number;
+    contact_local_p1(i: number, scratch_buffer: Float32Array): boolean;
+    contact_local_p2(i: number, scratch_buffer: Float32Array): boolean;
+    contact_tangent_impulse(i: number): number;
+    friction(): number;
+    local_n1(scratch_buffer: Float32Array): void;
+    local_n2(scratch_buffer: Float32Array): void;
+    normal(scratch_buffer: Float32Array): void;
+    num_contacts(): number;
+    num_solver_contacts(): number;
+    restitution(): number;
+    solver_contact_dist(i: number): number;
+    solver_contact_point(bodies: RawRigidBodySet, i: number, scratch_buffer: Float32Array): boolean;
+    solver_contact_tangent_velocity(i: number, scratch_buffer: Float32Array): void;
+    subshape1(): number;
+    subshape2(): number;
+}
+
+export class RawContactPair {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    collider1(): number;
+    collider2(): number;
+    contactManifold(i: number): RawContactManifold | undefined;
+    numContactManifolds(): number;
+}
+
+export class RawDebugRenderPipeline {
+    free(): void;
+    [Symbol.dispose](): void;
+    colors(): Float32Array;
+    constructor();
+    render(bodies: RawRigidBodySet, colliders: RawColliderSet, soft_bodies: RawSoftBodySet, impulse_joints: RawImpulseJointSet, multibody_joints: RawMultibodyJointSet, narrow_phase: RawNarrowPhase, filter_flags: number, filter_predicate: Function): void;
+    vertices(): Float32Array;
+}
+
+export class RawDeserializedWorld {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    takeBodies(): RawRigidBodySet | undefined;
+    takeBroadPhase(): RawBroadPhase | undefined;
+    takeColliders(): RawColliderSet | undefined;
+    takeGravity(): RawVector | undefined;
+    takeImpulseJoints(): RawImpulseJointSet | undefined;
+    takeIntegrationParameters(): RawIntegrationParameters | undefined;
+    takeIslandManager(): RawIslandManager | undefined;
+    takeMultibodyJoints(): RawMultibodyJointSet | undefined;
+    takeNarrowPhase(): RawNarrowPhase | undefined;
+    takeSoftBodies(): RawSoftBodySet | undefined;
+}
+
+/**
+ * A structure responsible for collecting events generated
+ * by the physics engine.
+ */
+export class RawEventQueue {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Removes all events contained by this collector.
+     */
+    clear(): void;
+    /**
+     * Applies the given javascript closure on each collision event of this collector, then clear
+     * the internal collision event buffer.
+     *
+     * # Parameters
+     * - `f(handle1, handle2, started)`:  JavaScript closure applied to each collision event. The
+     * closure should take three arguments: two integers representing the handles of the colliders
+     * involved in the collision, and a boolean indicating if the collision started (true) or stopped
+     * (false).
+     */
+    drainCollisionEvents(f: Function): void;
+    drainContactForceEvents(f: Function): void;
+    /**
+     * Applies the given javascript closure on each soft-body tear event of this collector,
+     * then clears the internal tear event buffer.
+     */
+    drainSoftBodyTearEvents(f: Function): void;
+    /**
+     * Creates a new event collector.
+     *
+     * # Parameters
+     * - `autoDrain`: setting this to `true` is strongly recommended. If true, the collector will
+     * be automatically drained before each `world.step(collector)`. If false, the collector will
+     * keep all events in memory unless it is manually drained/cleared; this may lead to unbounded use of
+     * RAM if no drain is performed.
+     */
+    constructor(autoDrain: boolean);
+}
+
+export enum RawFeatureType {
+    Vertex = 0,
+    Face = 1,
+    Unknown = 2,
+}
+
+export class RawGenericJoint {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Creates a new joint descriptor that builds a Fixed joint.
+     *
+     * A fixed joint removes all the degrees of freedom between the affected bodies.
+     */
+    static fixed(anchor1: RawVector, axes1: RawRotation, anchor2: RawVector, axes2: RawRotation): RawGenericJoint;
+    /**
+     * Creates a new joint descriptor that builds a Prismatic joint.
+     *
+     * A prismatic joint removes all the degrees of freedom between the
+     * affected bodies, except for the translation along one axis.
+     *
+     * Returns `None` if any of the provided axes cannot be normalized.
+     */
+    static prismatic(anchor1: RawVector, anchor2: RawVector, axis: RawVector, limitsEnabled: boolean, limitsMin: number, limitsMax: number): RawGenericJoint | undefined;
+    /**
+     * Create a new joint descriptor that builds Revolute joints.
+     *
+     * A revolute joint removes all degrees of freedom between the affected
+     * bodies except for the rotation.
+     */
+    static revolute(anchor1: RawVector, anchor2: RawVector): RawGenericJoint | undefined;
+    static rope(length: number, anchor1: RawVector, anchor2: RawVector): RawGenericJoint;
+    static spring(rest_length: number, stiffness: number, damping: number, anchor1: RawVector, anchor2: RawVector): RawGenericJoint;
+}
+
+export class RawImpulseJointSet {
+    free(): void;
+    [Symbol.dispose](): void;
+    contains(handle: number): boolean;
+    createJoint(params: RawGenericJoint, parent1: number, parent2: number, wake_up: boolean): number;
+    /**
+     * Applies the given JavaScript function to the integer handle of each joint attached to the given rigid-body.
+     *
+     * # Parameters
+     * - `f(handle)`: the function to apply to the integer handle of each joint attached to the rigid-body. Called as `f(collider)`.
+     */
+    forEachJointAttachedToRigidBody(body: number, f: Function): void;
+    /**
+     * Applies the given JavaScript function to the integer handle of each joint managed by this physics world.
+     *
+     * # Parameters
+     * - `f(handle)`: the function to apply to the integer handle of each joint managed by this set. Called as `f(collider)`.
+     */
+    forEachJointHandle(f: Function): void;
+    /**
+     * The position of the first anchor of this joint.
+     *
+     * The first anchor gives the position of the points application point on the
+     * local frame of the first rigid-body it is attached to.
+     */
+    jointAnchor1(handle: number, scratch_buffer: Float32Array): void;
+    /**
+     * The position of the second anchor of this joint.
+     *
+     * The second anchor gives the position of the points application point on the
+     * local frame of the second rigid-body it is attached to.
+     */
+    jointAnchor2(handle: number, scratch_buffer: Float32Array): void;
+    /**
+     * The unique integer identifier of the first rigid-body this joint it attached to.
+     */
+    jointBodyHandle1(handle: number): number;
+    /**
+     * The unique integer identifier of the second rigid-body this joint is attached to.
+     */
+    jointBodyHandle2(handle: number): number;
+    jointConfigureMotorModel(handle: number, axis: RawJointAxis, model: RawMotorModel): void;
+    jointConfigureMotorPosition(handle: number, axis: RawJointAxis, targetPos: number, stiffness: number, damping: number): void;
+    jointConfigureMotorVelocity(handle: number, axis: RawJointAxis, targetVel: number, factor: number): void;
+    jointConfigureMotor(handle: number, axis: RawJointAxis, targetPos: number, targetVel: number, stiffness: number, damping: number): void;
+    /**
+     * Are contacts between the rigid-bodies attached by this joint enabled?
+     */
+    jointContactsEnabled(handle: number): boolean;
+    /**
+     * Are the limits for this joint enabled?
+     */
+    jointLimitsEnabled(handle: number, axis: RawJointAxis): boolean;
+    /**
+     * If this is a prismatic joint, returns its upper limit.
+     */
+    jointLimitsMax(handle: number, axis: RawJointAxis): number;
+    /**
+     * Return the lower limit along the given joint axis.
+     */
+    jointLimitsMin(handle: number, axis: RawJointAxis): number;
+    /**
+     * Sets the position of the first local anchor
+     */
+    jointSetAnchor1(handle: number, newPos: RawVector): void;
+    /**
+     * Sets the position of the second local anchor
+     */
+    jointSetAnchor2(handle: number, newPos: RawVector): void;
+    /**
+     * Sets whether contacts are enabled between the rigid-bodies attached by this joint.
+     */
+    jointSetContactsEnabled(handle: number, enabled: boolean): void;
+    /**
+     * Sets the angular part of the joint's local frame relative to the first rigid-body.
+     */
+    jointSetFrameX1(handle: number, newRot: RawRotation): void;
+    /**
+     * Sets the angular part of the joint's local frame relative to the second rigid-body.
+     */
+    jointSetFrameX2(handle: number, newRot: RawRotation): void;
+    /**
+     * Enables and sets the joint limits
+     */
+    jointSetLimits(handle: number, axis: RawJointAxis, min: number, max: number): void;
+    /**
+     * Sets the full local frame (anchor + rotation) for the first rigid-body attachment.
+     */
+    jointSetLocalFrame1(handle: number, anchor: RawVector, rot: RawRotation): void;
+    /**
+     * Sets the full local frame (anchor + rotation) for the second rigid-body attachment.
+     */
+    jointSetLocalFrame2(handle: number, anchor: RawVector, rot: RawRotation): void;
+    jointSetMotorMaxForce(handle: number, axis: RawJointAxis, maxForce: number): void;
+    /**
+     * The type of this joint.
+     */
+    jointType(handle: number): RawJointType;
+    len(): number;
+    constructor();
+    remove(handle: number, wakeUp: boolean): void;
+}
+
+export class RawIntegrationParameters {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor();
+    readonly contact_erp: number;
+    dt: number;
+    lengthUnit: number;
+    maxCcdSubsteps: number;
+    normalizedAllowedLinearError: number;
+    normalizedPredictionDistance: number;
+    numInternalPgsIterations: number;
+    numSolverIterations: number;
+    set contact_natural_frequency(value: number);
+    softBodiesContactStiffening: number;
+    softBodiesFemLinearTolerance: number;
+    softBodiesFemMaxDenseDofs: number;
+    softBodiesFemMaxLinearIterations: number;
+    softBodiesMaxExtraSubsteps: number;
+    softBodiesRecovery: RawSoftRecoverySettings;
+    softBodiesResweepStrain: number;
+}
+
+export class RawIslandManager {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Applies the given JavaScript function to the integer handle of each active rigid-body
+     * managed by this island manager.
+     *
+     * After a short time of inactivity, a rigid-body is automatically deactivated ("asleep") by
+     * the physics engine in order to save computational power. A sleeping rigid-body never moves
+     * unless it is moved manually by the user.
+     *
+     * # Parameters
+     * - `f(handle)`: the function to apply to the integer handle of each active rigid-body managed by this
+     *   set. Called as `f(collider)`.
+     */
+    forEachActiveRigidBodyHandle(f: Function): void;
+    constructor();
+}
+
+export enum RawJointAxis {
+    LinX = 0,
+    LinY = 1,
+    AngX = 2,
+}
+
+export enum RawJointType {
+    Revolute = 0,
+    Fixed = 1,
+    Prismatic = 2,
+    Rope = 3,
+    Spring = 4,
+    Generic = 5,
+}
+
+export class RawKinematicCharacterController {
+    free(): void;
+    [Symbol.dispose](): void;
+    autostepEnabled(): boolean;
+    autostepIncludesDynamicBodies(): boolean | undefined;
+    autostepMaxHeight(): number | undefined;
+    autostepMinWidth(): number | undefined;
+    computeColliderMovement(dt: number, broad_phase: RawBroadPhase, narrow_phase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, collider_handle: number, desired_translation_delta: RawVector, apply_impulses_to_dynamic_bodies: boolean, character_mass: number | null | undefined, filter_flags: number, filter_groups: number | null | undefined, filter_predicate: Function): void;
+    computedCollision(i: number, collision: RawCharacterCollision): boolean;
+    computedGrounded(): boolean;
+    computedMovement(scratch_buffer: Float32Array): void;
+    disableAutostep(): void;
+    disableSnapToGround(): void;
+    enableAutostep(maxHeight: number, minWidth: number, includeDynamicBodies: boolean): void;
+    enableSnapToGround(distance: number): void;
+    maxSlopeClimbAngle(): number;
+    minSlopeSlideAngle(): number;
+    constructor(offset: number);
+    normalNudgeFactor(): number;
+    numComputedCollisions(): number;
+    offset(): number;
+    setMaxSlopeClimbAngle(angle: number): void;
+    setMinSlopeSlideAngle(angle: number): void;
+    setNormalNudgeFactor(value: number): void;
+    setOffset(value: number): void;
+    setSlideEnabled(enabled: boolean): void;
+    setUp(vector: RawVector): void;
+    slideEnabled(): boolean;
+    snapToGroundDistance(): number | undefined;
+    snapToGroundEnabled(): boolean;
+    up(): RawVector;
+}
+
+export enum RawMotorModel {
+    AccelerationBased = 0,
+    ForceBased = 1,
+}
+
+export class RawMultibodyJointSet {
+    free(): void;
+    [Symbol.dispose](): void;
+    contains(handle: number): boolean;
+    createJoint(params: RawGenericJoint, parent1: number, parent2: number, wakeUp: boolean): number;
+    /**
+     * Applies the given JavaScript function to the integer handle of each joint attached to the given rigid-body.
+     *
+     * # Parameters
+     * - `f(handle)`: the function to apply to the integer handle of each joint attached to the rigid-body. Called as `f(collider)`.
+     */
+    forEachJointAttachedToRigidBody(body: number, f: Function): void;
+    /**
+     * Applies the given JavaScript function to the integer handle of each joint managed by this physics world.
+     *
+     * # Parameters
+     * - `f(handle)`: the function to apply to the integer handle of each joint managed by this set. Called as `f(collider)`.
+     */
+    forEachJointHandle(f: Function): void;
+    /**
+     * The position of the first anchor of this joint.
+     *
+     * The first anchor gives the position of the points application point on the
+     * local frame of the first rigid-body it is attached to.
+     */
+    jointAnchor1(handle: number): RawVector;
+    /**
+     * The position of the second anchor of this joint.
+     *
+     * The second anchor gives the position of the points application point on the
+     * local frame of the second rigid-body it is attached to.
+     */
+    jointAnchor2(handle: number): RawVector;
+    /**
+     * Are contacts between the rigid-bodies attached by this joint enabled?
+     */
+    jointContactsEnabled(handle: number): boolean;
+    /**
+     * The angular part of the joint’s local frame relative to the first rigid-body it is attached to.
+     */
+    jointFrameX1(handle: number): RawRotation;
+    /**
+     * The angular part of the joint’s local frame relative to the second rigid-body it is attached to.
+     */
+    jointFrameX2(handle: number): RawRotation;
+    /**
+     * Are the limits for this joint enabled?
+     */
+    jointLimitsEnabled(handle: number, axis: RawJointAxis): boolean;
+    /**
+     * If this is a prismatic joint, returns its upper limit.
+     */
+    jointLimitsMax(handle: number, axis: RawJointAxis): number;
+    /**
+     * Return the lower limit along the given joint axis.
+     */
+    jointLimitsMin(handle: number, axis: RawJointAxis): number;
+    /**
+     * Sets whether contacts are enabled between the rigid-bodies attached by this joint.
+     */
+    jointSetContactsEnabled(handle: number, enabled: boolean): void;
+    /**
+     * The type of this joint.
+     */
+    jointType(handle: number): RawJointType;
+    constructor();
+    remove(handle: number, wakeUp: boolean): void;
+}
+
+export class RawNarrowPhase {
+    free(): void;
+    [Symbol.dispose](): void;
+    contact_pair(handle1: number, handle2: number): RawContactPair | undefined;
+    contact_pairs_with(handle1: number, f: Function): void;
+    intersection_pair(handle1: number, handle2: number): boolean;
+    intersection_pairs_with(handle1: number, f: Function): void;
+    constructor();
+}
+
+export class RawPhysicsPipeline {
+    free(): void;
+    [Symbol.dispose](): void;
+    is_profiler_enabled(): boolean;
+    constructor();
+    set_profiler_enabled(enabled: boolean): void;
+    stepWithEvents(gravity: RawVector, integrationParameters: RawIntegrationParameters, islands: RawIslandManager, broadPhase: RawBroadPhase, narrowPhase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, softBodies: RawSoftBodySet, joints: RawImpulseJointSet, articulations: RawMultibodyJointSet, ccd_solver: RawCCDSolver, eventQueue: RawEventQueue, hookObject: object, hookFilterContactPair: Function, hookFilterIntersectionPair: Function): void;
+    step(gravity: RawVector, integrationParameters: RawIntegrationParameters, islands: RawIslandManager, broadPhase: RawBroadPhase, narrowPhase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, softBodies: RawSoftBodySet, joints: RawImpulseJointSet, articulations: RawMultibodyJointSet, ccd_solver: RawCCDSolver): void;
+    timing_broad_phase(): number;
+    timing_ccd(): number;
+    timing_ccd_broad_phase(): number;
+    timing_ccd_narrow_phase(): number;
+    timing_ccd_solver(): number;
+    timing_ccd_toi_computation(): number;
+    timing_collision_detection(): number;
+    timing_island_construction(): number;
+    timing_narrow_phase(): number;
+    timing_solver(): number;
+    timing_step(): number;
+    timing_user_changes(): number;
+    timing_velocity_assembly(): number;
+    timing_velocity_resolution(): number;
+    timing_velocity_update(): number;
+    timing_velocity_writeback(): number;
+}
+
+export class RawPidController {
+    free(): void;
+    [Symbol.dispose](): void;
+    angular_correction(dt: number, bodies: RawRigidBodySet, rb_handle: number, target_rotation: number, target_angvel: number): number;
+    apply_angular_correction(dt: number, bodies: RawRigidBodySet, rb_handle: number, target_rotation: number, target_angvel: number): void;
+    apply_linear_correction(dt: number, bodies: RawRigidBodySet, rb_handle: number, target_translation: RawVector, target_linvel: RawVector): void;
+    linear_correction(dt: number, bodies: RawRigidBodySet, rb_handle: number, target_translation: RawVector, target_linvel: RawVector, scratch_buffer: Float32Array): void;
+    constructor(kp: number, ki: number, kd: number, axes_mask: number);
+    reset_integrals(): void;
+    set_axes_mask(axes_mask: number): void;
+    set_kd(kd: number, axes: number): void;
+    set_ki(ki: number, axes: number): void;
+    set_kp(kp: number, axes: number): void;
+}
+
+export class RawPointColliderProjection {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    colliderHandle(): number;
+    featureId(): number | undefined;
+    featureType(): RawFeatureType;
+    isInside(): boolean;
+    /**
+     * Writes the projected point components into the given scratch buffer.
+     */
+    point(scratch_buffer: Float32Array): void;
+}
+
+export class RawPointProjection {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    isInside(): boolean;
+    /**
+     * Writes the projected point components into the given scratch buffer.
+     */
+    point(scratch_buffer: Float32Array): void;
+}
+
+export class RawRayColliderHit {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    colliderHandle(): number;
+    timeOfImpact(): number;
+}
+
+export class RawRayColliderIntersection {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    colliderHandle(): number;
+    featureId(): number | undefined;
+    featureType(): RawFeatureType;
+    /**
+     * Writes the hit normal components into the given scratch buffer.
+     */
+    normal(scratch_buffer: Float32Array): void;
+    time_of_impact(): number;
+}
+
+export class RawRayIntersection {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    featureId(): number | undefined;
+    featureType(): RawFeatureType;
+    /**
+     * Writes the hit normal components into the given scratch buffer.
+     */
+    normal(scratch_buffer: Float32Array): void;
+    time_of_impact(): number;
+}
+
+export class RawRigidBodySet {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Checks if a rigid-body with the given integer handle exists.
+     */
+    contains(handle: number): boolean;
+    createRigidBody(enabled: boolean, translation: RawVector, rotation: RawRotation, gravityScale: number, mass: number, massOnly: boolean, centerOfMass: RawVector, linvel: RawVector, angvel: number, principalAngularInertia: number, translationEnabledX: boolean, translationEnabledY: boolean, rotationsEnabled: boolean, linearDamping: number, angularDamping: number, rb_type: RawRigidBodyType, canSleep: boolean, sleeping: boolean, softCcdPrediction: number, ccdEnabled: boolean, dominanceGroup: number, additional_solver_iterations: number, additional_pgs_iterations: number): number;
+    /**
+     * Applies the given JavaScript function to the integer handle of each rigid-body managed by this set.
+     *
+     * # Parameters
+     * - `f(handle)`: the function to apply to the integer handle of each rigid-body managed by this set. Called as `f(collider)`.
+     */
+    forEachRigidBodyHandle(f: Function): void;
+    /**
+     * The number of rigid-bodies on this set.
+     */
+    len(): number;
+    constructor();
+    propagateModifiedBodyPositionsToColliders(colliders: RawColliderSet): void;
+    /**
+     * Adds a force at the given world-space point of this rigid-body.
+     *
+     * # Parameters
+     * - `force`: the world-space force to apply on the rigid-body.
+     * - `point`: the world-space point where the impulse is to be applied on the rigid-body.
+     * - `wakeUp`: should the rigid-body be automatically woken-up?
+     */
+    rbAddForceAtPoint(handle: number, force: RawVector, point: RawVector, wakeUp: boolean): void;
+    /**
+     * Adds a force at the center-of-mass of this rigid-body.
+     *
+     * # Parameters
+     * - `force`: the world-space force to apply on the rigid-body.
+     * - `wakeUp`: should the rigid-body be automatically woken-up?
+     */
+    rbAddForce(handle: number, force: RawVector, wakeUp: boolean): void;
+    /**
+     * Adds a torque at the center-of-mass of this rigid-body.
+     *
+     * # Parameters
+     * - `torque`: the torque to apply on the rigid-body.
+     * - `wakeUp`: should the rigid-body be automatically woken-up?
+     */
+    rbAddTorque(handle: number, torque: number, wakeUp: boolean): void;
+    rbAdditionalPgsIterations(handle: number): number;
+    rbAdditionalSolverIterations(handle: number): number;
+    /**
+     * The angular damping coefficient of this rigid-body.
+     */
+    rbAngularDamping(handle: number): number;
+    /**
+     * The angular velocity of this rigid-body.
+     */
+    rbAngvel(handle: number): number;
+    /**
+     * Applies an impulse at the given world-space point of this rigid-body.
+     *
+     * # Parameters
+     * - `impulse`: the world-space impulse to apply on the rigid-body.
+     * - `point`: the world-space point where the impulse is to be applied on the rigid-body.
+     * - `wakeUp`: should the rigid-body be automatically woken-up?
+     */
+    rbApplyImpulseAtPoint(handle: number, impulse: RawVector, point: RawVector, wakeUp: boolean): void;
+    /**
+     * Applies an impulse at the center-of-mass of this rigid-body.
+     *
+     * # Parameters
+     * - `impulse`: the world-space impulse to apply on the rigid-body.
+     * - `wakeUp`: should the rigid-body be automatically woken-up?
+     */
+    rbApplyImpulse(handle: number, impulse: RawVector, wakeUp: boolean): void;
+    /**
+     * Applies an impulsive torque at the center-of-mass of this rigid-body.
+     *
+     * # Parameters
+     * - `torque impulse`: the torque impulse to apply on the rigid-body.
+     * - `wakeUp`: should the rigid-body be automatically woken-up?
+     */
+    rbApplyTorqueImpulse(handle: number, torque_impulse: number, wakeUp: boolean): void;
+    /**
+     * The status of this rigid-body: fixed, dynamic, or kinematic.
+     */
+    rbBodyType(handle: number): RawRigidBodyType;
+    /**
+     * Retrieves the `i-th` collider attached to this rigid-body.
+     *
+     * # Parameters
+     * - `at`: The index of the collider to retrieve. Must be a number in `[0, this.numColliders()[`.
+     *         This index is **not** the same as the unique identifier of the collider.
+     */
+    rbCollider(handle: number, at: number): number;
+    rbDominanceGroup(handle: number): number;
+    /**
+     * The effective world-space angular inertia (that takes the potential rotation locking into account) of
+     * this rigid-body.
+     */
+    rbEffectiveAngularInertia(handle: number): number;
+    /**
+     * The inverse mass taking into account translation locking.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbEffectiveInvMass(handle: number, scratch_buffer: Float32Array): void;
+    /**
+     * The world-space inverse angular inertia tensor of the rigid-body,
+     * taking into account rotation locking.
+     */
+    rbEffectiveWorldInvInertia(handle: number): number;
+    rbEnableCcd(handle: number, enabled: boolean): void;
+    rbGravityScale(handle: number): number;
+    /**
+     * The inverse of the mass of a rigid-body.
+     *
+     * If this is zero, the rigid-body is assumed to have infinite mass.
+     */
+    rbInvMass(handle: number): number;
+    /**
+     * The inverse of the principal angular inertia of the rigid-body.
+     *
+     * Components set to zero are assumed to be infinite along the corresponding principal axis.
+     */
+    rbInvPrincipalInertia(handle: number): number;
+    /**
+     * Is Continuous Collision Detection enabled for this rigid-body?
+     */
+    rbIsCcdEnabled(handle: number): boolean;
+    /**
+     * Is this rigid-body dynamic?
+     */
+    rbIsDynamic(handle: number): boolean;
+    rbIsEnabled(handle: number): boolean;
+    /**
+     * Is this rigid-body fixed?
+     */
+    rbIsFixed(handle: number): boolean;
+    /**
+     * Is this rigid-body kinematic?
+     */
+    rbIsKinematic(handle: number): boolean;
+    /**
+     * Is the velocity of this rigid-body not zero?
+     */
+    rbIsMoving(handle: number): boolean;
+    /**
+     * Is this rigid-body sleeping?
+     */
+    rbIsSleeping(handle: number): boolean;
+    /**
+     * Is this rigid-body the proxy of a soft-body cluster?
+     */
+    rbIsSoftFrame(handle: number): boolean;
+    /**
+     * The linear damping coefficient of this rigid-body.
+     */
+    rbLinearDamping(handle: number): number;
+    /**
+     * The linear velocity of this rigid-body.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbLinvel(handle: number, scratch_buffer: Float32Array): void;
+    /**
+     * The center of mass of a rigid-body expressed in its local-space.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbLocalCom(handle: number, scratch_buffer: Float32Array): void;
+    rbLockRotations(handle: number, locked: boolean, wake_up: boolean): void;
+    rbLockTranslations(handle: number, locked: boolean, wake_up: boolean): void;
+    /**
+     * The mass of this rigid-body.
+     */
+    rbMass(handle: number): number;
+    /**
+     * The world-space predicted orientation of this rigid-body.
+     *
+     * If this rigid-body is kinematic this value is set by the `setNextKinematicRotation`
+     * method and is used for estimating the kinematic body velocity at the next timestep.
+     * For non-kinematic bodies, this value is currently unspecified.
+     */
+    rbNextRotation(handle: number): number;
+    /**
+     * The world-space predicted translation of this rigid-body.
+     *
+     * If this rigid-body is kinematic this value is set by the `setNextKinematicTranslation`
+     * method and is used for estimating the kinematic body velocity at the next timestep.
+     * For non-kinematic bodies, this value is currently unspecified.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbNextTranslation(handle: number, scratch_buffer: Float32Array): void;
+    /**
+     * The number of colliders attached to this rigid-body.
+     */
+    rbNumColliders(handle: number): number;
+    /**
+     * The angular inertia along the principal inertia axes of the rigid-body.
+     */
+    rbPrincipalInertia(handle: number): number;
+    rbRecomputeMassPropertiesFromColliders(handle: number, colliders: RawColliderSet): void;
+    /**
+     * Resets to zero all user-added forces added to this rigid-body.
+     */
+    rbResetForces(handle: number, wakeUp: boolean): void;
+    /**
+     * Resets to zero all user-added torques added to this rigid-body.
+     */
+    rbResetTorques(handle: number, wakeUp: boolean): void;
+    /**
+     * The world-space orientation of this rigid-body.
+     */
+    rbRotation(handle: number): number;
+    rbSetAdditionalMassProperties(handle: number, mass: number, centerOfMass: RawVector, principalAngularInertia: number, wake_up: boolean): void;
+    rbSetAdditionalMass(handle: number, mass: number, wake_up: boolean): void;
+    rbSetAdditionalPgsIterations(handle: number, iters: number): void;
+    rbSetAdditionalSolverIterations(handle: number, iters: number): void;
+    rbSetAngularDamping(handle: number, factor: number): void;
+    /**
+     * Sets the angular velocity of this rigid-body.
+     */
+    rbSetAngvel(handle: number, angvel: number, wakeUp: boolean): void;
+    /**
+     * Set a new status for this rigid-body: fixed, dynamic, or kinematic.
+     */
+    rbSetBodyType(handle: number, status: RawRigidBodyType, wake_up: boolean): void;
+    rbSetDominanceGroup(handle: number, group: number): void;
+    rbSetEnabledTranslations(handle: number, allow_x: boolean, allow_y: boolean, wake_up: boolean): void;
+    rbSetEnabled(handle: number, enabled: boolean): void;
+    rbSetGravityScale(handle: number, factor: number, wakeUp: boolean): void;
+    rbSetLinearDamping(handle: number, factor: number): void;
+    /**
+     * Sets the linear velocity of this rigid-body.
+     */
+    rbSetLinvel(handle: number, linvel: RawVector, wakeUp: boolean): void;
+    /**
+     * If this rigid body is kinematic, sets its future rotation after the next timestep integration.
+     *
+     * This should be used instead of `rigidBody.setRotation` to make the dynamic object
+     * interacting with this kinematic body behave as expected. Internally, Rapier will compute
+     * an artificial velocity for this rigid-body from its current position and its next kinematic
+     * position. This velocity will be used to compute forces on dynamic bodies interacting with
+     * this body.
+     *
+     * # Parameters
+     * - `angle`: the rotation angle, in radians.
+     */
+    rbSetNextKinematicRotation(handle: number, angle: number): void;
+    /**
+     * If this rigid body is kinematic, sets its future translation after the next timestep integration.
+     *
+     * This should be used instead of `rigidBody.setTranslation` to make the dynamic object
+     * interacting with this kinematic body behave as expected. Internally, Rapier will compute
+     * an artificial velocity for this rigid-body from its current position and its next kinematic
+     * position. This velocity will be used to compute forces on dynamic bodies interacting with
+     * this body.
+     *
+     * # Parameters
+     * - `x`: the world-space position of the rigid-body along the `x` axis.
+     * - `y`: the world-space position of the rigid-body along the `y` axis.
+     */
+    rbSetNextKinematicTranslation(handle: number, x: number, y: number): void;
+    /**
+     * Sets the rotation angle of this rigid-body.
+     *
+     * # Parameters
+     * - `angle`: the rotation angle, in radians.
+     * - `wakeUp`: forces the rigid-body to wake-up so it is properly affected by forces if it
+     * wasn't moving before modifying its position.
+     */
+    rbSetRotation(handle: number, angle: number, wakeUp: boolean): void;
+    rbSetSoftCcdPrediction(handle: number, prediction: number): void;
+    /**
+     * Sets the translation of this rigid-body.
+     *
+     * # Parameters
+     * - `x`: the world-space position of the rigid-body along the `x` axis.
+     * - `y`: the world-space position of the rigid-body along the `y` axis.
+     * - `wakeUp`: forces the rigid-body to wake-up so it is properly affected by forces if it
+     * wasn't moving before modifying its position.
+     */
+    rbSetTranslation(handle: number, x: number, y: number, wakeUp: boolean): void;
+    /**
+     * Sets the user-defined 32-bit integer of this rigid-body.
+     *
+     * # Parameters
+     * - `data`: an arbitrary user-defined 32-bit integer.
+     */
+    rbSetUserData(handle: number, data: number): void;
+    /**
+     * Put the given rigid-body to sleep.
+     */
+    rbSleep(handle: number): void;
+    /**
+     * The soft body this rigid-body is a cluster proxy of, if any.
+     */
+    rbSoftBody(handle: number): number | undefined;
+    rbSoftCcdPrediction(handle: number): number;
+    /**
+     * The index of the cluster this proxy stands for in its soft body, if any.
+     */
+    rbSoftCluster(handle: number): number | undefined;
+    /**
+     * The world-space translation of this rigid-body.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbTranslation(handle: number, scratch_buffer: Float32Array): void;
+    /**
+     * An arbitrary user-defined 32-bit integer
+     */
+    rbUserData(handle: number): number;
+    /**
+     * Retrieves the constant force(s) the user added to this rigid-body.
+     * Returns zero if the rigid-body is not dynamic.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbUserForce(handle: number, scratch_buffer: Float32Array): void;
+    /**
+     * Retrieves the constant torque(s) the user added to this rigid-body.
+     * Returns zero if the rigid-body is not dynamic.
+     */
+    rbUserTorque(handle: number): number;
+    /**
+     * The velocity of the given world-space point on this rigid-body.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbVelocityAtPoint(handle: number, point: RawVector, scratch_buffer: Float32Array): void;
+    /**
+     * Wakes this rigid-body up.
+     *
+     * A dynamic rigid-body that does not move during several consecutive frames will
+     * be put to sleep by the physics engine, i.e., it will stop being simulated in order
+     * to avoid useless computations.
+     * This method forces a sleeping rigid-body to wake-up. This is useful, e.g., before modifying
+     * the position of a dynamic body so that it is properly simulated afterwards.
+     */
+    rbWakeUp(handle: number): void;
+    /**
+     * The world-space center of mass of the rigid-body.
+     *
+     * # Parameters
+     * - `scratch_buffer`: The array to be populated.
+     */
+    rbWorldCom(handle: number, scratch_buffer: Float32Array): void;
+    remove(handle: number, islands: RawIslandManager, colliders: RawColliderSet, softBodies: RawSoftBodySet, joints: RawImpulseJointSet, articulations: RawMultibodyJointSet): void;
+}
+
+export enum RawRigidBodyType {
+    Dynamic = 0,
+    Fixed = 1,
+    KinematicPositionBased = 2,
+    KinematicVelocityBased = 3,
+    SoftFrame = 4,
+}
+
+/**
+ * A rotation quaternion.
+ */
+export class RawRotation {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * The rotation with thegiven angle.
+     */
+    static fromAngle(angle: number): RawRotation;
+    /**
+     * The identity rotation.
+     */
+    static identity(): RawRotation;
+    /**
+     * The rotation angle in radians.
+     */
+    readonly angle: number;
+    /**
+     * The imaginary part of this complex number.
+     */
+    readonly im: number;
+    /**
+     * The real part of this complex number.
+     */
+    readonly re: number;
+}
+
+export class RawSerializationPipeline {
+    free(): void;
+    [Symbol.dispose](): void;
+    deserializeAll(data: Uint8Array): RawDeserializedWorld | undefined;
+    constructor();
+    serializeAll(gravity: RawVector, integrationParameters: RawIntegrationParameters, islands: RawIslandManager, broadPhase: RawBroadPhase, narrowPhase: RawNarrowPhase, bodies: RawRigidBodySet, colliders: RawColliderSet, soft_bodies: RawSoftBodySet, impulse_joints: RawImpulseJointSet, multibody_joints: RawMultibodyJointSet): Uint8Array | undefined;
+}
+
+export class RawShape {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    static ball(radius: number): RawShape;
+    static capsule(halfHeight: number, radius: number): RawShape;
+    castRayAndGetNormal(shapePos: RawVector, shapeRot: RawRotation, rayOrig: RawVector, rayDir: RawVector, maxToi: number, solid: boolean): RawRayIntersection | undefined;
+    castRay(shapePos: RawVector, shapeRot: RawRotation, rayOrig: RawVector, rayDir: RawVector, maxToi: number, solid: boolean): number;
+    castShape(shapePos1: RawVector, shapeRot1: RawRotation, shapeVel1: RawVector, shape2: RawShape, shapePos2: RawVector, shapeRot2: RawRotation, shapeVel2: RawVector, target_distance: number, maxToi: number, stop_at_penetration: boolean): RawShapeCastHit | undefined;
+    compoundFlags(): number | undefined;
+    compoundLen(): number | undefined;
+    compoundRotation(index: number): RawRotation | undefined;
+    compoundShape(index: number): RawShape | undefined;
+    compoundTranslation(index: number): RawVector | undefined;
+    static compound(shapes: RawShape[], positions: Float32Array, rotations: Float32Array, flags: number): RawShape;
+    contactShape(shapePos1: RawVector, shapeRot1: RawRotation, shape2: RawShape, shapePos2: RawVector, shapeRot2: RawRotation, prediction: number): RawShapeContact | undefined;
+    containsPoint(shapePos: RawVector, shapeRot: RawRotation, point: RawVector): boolean;
+    static convexDecompositionWithParams(vertices: Float32Array, indices: Uint32Array, params: RawVHACDParameters, flags: number): RawShape | undefined;
+    static convexDecomposition(vertices: Float32Array, indices: Uint32Array, flags: number): RawShape | undefined;
+    static convexHull(points: Float32Array): RawShape | undefined;
+    static convexPolyline(vertices: Float32Array): RawShape | undefined;
+    static cuboid(hx: number, hy: number): RawShape;
+    halfExtents(): RawVector | undefined;
+    halfHeight(): number | undefined;
+    halfspaceNormal(): RawVector | undefined;
+    static halfspace(normal: RawVector): RawShape;
+    heightfieldHeights(): Float32Array | undefined;
+    heightfieldScale(): RawVector | undefined;
+    static heightfield(heights: Float32Array, scale: RawVector): RawShape;
+    indices(): Uint32Array | undefined;
+    intersectsRay(shapePos: RawVector, shapeRot: RawRotation, rayOrig: RawVector, rayDir: RawVector, maxToi: number): boolean;
+    intersectsShape(shapePos1: RawVector, shapeRot1: RawRotation, shape2: RawShape, shapePos2: RawVector, shapeRot2: RawRotation): boolean;
+    polylineFlags(): number | undefined;
+    static polyline(vertices: Float32Array, indices: Uint32Array, flags: number): RawShape;
+    projectPoint(shapePos: RawVector, shapeRot: RawRotation, point: RawVector, solid: boolean): RawPointProjection;
+    radius(): number | undefined;
+    static roundConvexHull(points: Float32Array, borderRadius: number): RawShape | undefined;
+    static roundConvexPolyline(vertices: Float32Array, borderRadius: number): RawShape | undefined;
+    static roundCuboid(hx: number, hy: number, borderRadius: number): RawShape;
+    roundRadius(): number | undefined;
+    static roundTriangle(p1: RawVector, p2: RawVector, p3: RawVector, borderRadius: number): RawShape;
+    static segment(p1: RawVector, p2: RawVector): RawShape;
+    shapeType(): RawShapeType;
+    triMeshFlags(): number | undefined;
+    static triangle(p1: RawVector, p2: RawVector, p3: RawVector): RawShape;
+    static trimesh(vertices: Float32Array, indices: Uint32Array, flags: number): RawShape | undefined;
+    /**
+     * The vertices of this shape, if it is vertex-based.
+     *
+     * For convex polyhedra, this returns the vertices of a convex hull recomputed with
+     * `try_convex_hull` (so they may differ in count and order from the points the shape
+     * was built from), ensuring the result can be fed back to `RawShape::convexMesh`.
+     * If both `vertices` and `indices` are needed, prefer `convexMeshData` which computes
+     * the convex hull only once.
+     */
+    vertices(): Float32Array | undefined;
+    voxelData(): Int32Array | undefined;
+    voxelSize(): RawVector | undefined;
+    static voxelsFromPoints(voxel_size: RawVector, points: Float32Array): RawShape;
+    static voxels(voxel_size: RawVector, grid_coords: Int32Array): RawShape;
+}
+
+export class RawShapeCastHit {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    getComponents(scratch_buffer: Float32Array): void;
+}
+
+export class RawShapeContact {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Writes the contact components into the given scratch buffer.
+     *
+     * Layout: `[distance, point1, point2, normal1, normal2]`.
+     */
+    getComponents(scratch_buffer: Float32Array): void;
+}
+
+export enum RawShapeType {
+    Ball = 0,
+    Cuboid = 1,
+    Capsule = 2,
+    Segment = 3,
+    Polyline = 4,
+    Triangle = 5,
+    TriMesh = 6,
+    HeightField = 7,
+    Compound = 8,
+    ConvexPolygon = 9,
+    RoundCuboid = 10,
+    RoundTriangle = 11,
+    RoundConvexPolygon = 12,
+    HalfSpace = 13,
+    Voxels = 14,
+}
+
+export class RawSoftBodyBuilder {
+    free(): void;
+    [Symbol.dispose](): void;
+    addEdges(edges: Uint32Array): void;
+    append(other: RawSoftBodyBuilder): void;
+    cellEdges(): Uint32Array;
+    static disk(center: RawVector, radius: number, num_particles: number): RawSoftBodyBuilder;
+    static grid(center: RawVector, half_extents: RawVector, nx: number, ny: number): RawSoftBodyBuilder;
+    material(): RawSoftBodyMaterial;
+    /**
+     * A builder over the given world-space particle positions (`DIM` floats per particle), with
+     * no element.
+     */
+    constructor(positions: Float32Array);
+    numParticles(): number;
+    particlePositions(): Float32Array;
+    static polygon(points: Float32Array): RawSoftBodyBuilder;
+    static polyline(vertices: Float32Array, indices: Uint32Array): RawSoftBodyBuilder | undefined;
+    static rope(start: RawVector, end: RawVector, num_particles: number): RawSoftBodyBuilder;
+    setAdditionalPgsIterations(iterations: number): void;
+    setAdditionalSolverIterations(iterations: number): void;
+    setBendEdges(edges: Uint32Array): void;
+    setCanSleep(can_sleep: boolean): void;
+    setCellModel(model: RawSoftBodyCellModel): void;
+    setCells(cells: Uint32Array): void;
+    setDominanceGroup(group: number): void;
+    setEdgeSoftness(edges: Uint32Array, frequencies: Float32Array, dampings: Float32Array): void;
+    setEdgeTearResistance(edges: Uint32Array, resistances: Float32Array): void;
+    setEdges(edges: Uint32Array): void;
+    setGravityScale(scale: number): void;
+    setLinearDamping(damping: number): void;
+    setMass(mass: number): void;
+    setMasses(masses: Float32Array): void;
+    setMaterial(material: RawSoftBodyMaterial): void;
+    setNoSurfaceCollider(): void;
+    setOriented(oriented: boolean): void;
+    setParticleMass(mass: number): void;
+    setParticleRadius(radius: number): void;
+    setPinnedParticles(pinned: Uint32Array): void;
+    setPositions(positions: Float32Array): void;
+    setSelfContacts(enabled: boolean): void;
+    setShapeMatching(enabled: boolean): void;
+    setSkinCollision(enabled: boolean): void;
+    setSkin(vertices: Float32Array, indices: Uint32Array): void;
+    setSoftness(natural_frequency: number, damping_ratio: number): void;
+    setSolver(solver: RawSoftBodySolver): void;
+    /**
+     * The template of the body's colliders: its shape is replaced by the deformable surface,
+     * or by a ball of `particleRadius` for a body colliding through its particles.
+     */
+    setSurfaceCollider(friction: number, restitution: number, frictionCombineRule: number, restitutionCombineRule: number, isSensor: boolean, collisionGroups: number, solverGroups: number, activeCollisionTypes: number, activeHooks: number, activeEvents: number, contactForceEventThreshold: number, contactSkin: number): void;
+    setSurface(surface: Uint32Array): void;
+    setTensionOnly(): void;
+    setVolumeFactor(factor: number): void;
+    setVolumePreservation(enabled: boolean): void;
+    surfaceEdges(): Uint32Array;
+    translated(translation: RawVector): void;
+    /**
+     * A volumetric body filling the closed surface (segments in 2D, triangles in 3D) with
+     * cells of the given size.
+     */
+    static volumetric(vertices: Float32Array, indices: Uint32Array, cell_size: number, skinned: boolean): RawSoftBodyBuilder | undefined;
+}
+
+export enum RawSoftBodyCellModel {
+    Volume = 0,
+    Corotational = 1,
+    NeoHookean = 2,
+}
+
+export class RawSoftBodyMaterial {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor();
+    tears(): boolean;
+    static uniform(natural_frequency: number, damping_ratio: number): RawSoftBodyMaterial;
+    bendDampingRatio: number;
+    bendFrequency: number;
+    deformationDamping: number;
+    edgeDampingRatio: number;
+    edgeFrequency: number;
+    edgePlasticCreep: number;
+    edgePlasticFlow: RawSoftEdgePlasticFlow;
+    edgePlasticMax: number;
+    edgePlasticYield: number;
+    elasticDampingRatio: number;
+    interiorStrength: number;
+    maxTearsPerStep: number;
+    get minPiece(): number | undefined;
+    set minPiece(value: number | null | undefined);
+    plasticCreep: number;
+    plasticMax: number;
+    plasticYield: number;
+    poissonRatio: number;
+    shapeMatchingDampingRatio: number;
+    shapeMatchingFrequency: number;
+    get tearForce(): number | undefined;
+    set tearForce(value: number | null | undefined);
+    tearSmoothing: number;
+    get tearStrain(): number | undefined;
+    set tearStrain(value: number | null | undefined);
+    volumeDampingRatio: number;
+    volumeFrequency: number;
+    youngModulus: number;
+}
+
+export class RawSoftBodySet {
+    free(): void;
+    [Symbol.dispose](): void;
+    addCluster(handle: number, particles: Uint32Array, bodies: RawRigidBodySet, colliders: RawColliderSet): number | undefined;
+    /**
+     * Checks if a soft body with the given integer handle exists.
+     */
+    contains(handle: number): boolean;
+    /**
+     * Cuts a soft body along a blade: a segment (two points) in 2D, a triangle (three points)
+     * in 3D, given as `DIM` floats per point.
+     */
+    cut(handle: number, blade: Float32Array, islands: RawIslandManager, bodies: RawRigidBodySet, colliders: RawColliderSet, joints: RawImpulseJointSet, articulations: RawMultibodyJointSet): RawSoftBodyTearEvent | undefined;
+    /**
+     * Applies the given JavaScript function to the integer handle of each soft body managed by
+     * this set.
+     */
+    forEachSoftBodyHandle(f: Function): void;
+    /**
+     * Inserts the soft body described by the builder, creating its hidden root rigid body and
+     * its colliders.
+     */
+    insert(builder: RawSoftBodyBuilder, bodies: RawRigidBodySet, colliders: RawColliderSet): number;
+    /**
+     * The number of soft bodies on this set.
+     */
+    len(): number;
+    constructor();
+    removeCluster(handle: number, cluster: number, islands: RawIslandManager, bodies: RawRigidBodySet, colliders: RawColliderSet, joints: RawImpulseJointSet, articulations: RawMultibodyJointSet): boolean;
+    remove(handle: number, islands: RawIslandManager, bodies: RawRigidBodySet, colliders: RawColliderSet, joints: RawImpulseJointSet, articulations: RawMultibodyJointSet): void;
+    sbAddForce(handle: number, force: RawVector, wake_up: boolean): void;
+    sbAddParticleForce(handle: number, i: number, force: RawVector, wake_up: boolean): void;
+    sbApplyImpulseAtPoint(handle: number, impulse: RawVector, point: RawVector, falloff_radius: number, wake_up: boolean): void;
+    sbApplyImpulse(handle: number, impulse: RawVector, wake_up: boolean): void;
+    sbApplyParticleImpulse(handle: number, i: number, impulse: RawVector, wake_up: boolean): void;
+    sbApplyRadialImpulse(handle: number, center: RawVector, magnitude: number, falloff_radius: number, wake_up: boolean): void;
+    sbAttachParticle(handle: number, i: number, body: number, bodies: RawRigidBodySet): void;
+    sbAttachmentBody(handle: number, i: number): number;
+    sbAttachmentParticle(handle: number, i: number): number;
+    /**
+     * The boundary elements of the body (segments in 2D, triangles in 3D), `DIM` particle
+     * indices per element.
+     */
+    sbBoundary(handle: number): Uint32Array;
+    sbCellModel(handle: number): RawSoftBodyCellModel;
+    sbCellRestVolume(handle: number, i: number): number;
+    sbCellStiffnessScale(handle: number, i: number): number;
+    sbCellStress(handle: number, i: number): number;
+    sbCellTearResistance(handle: number, i: number): number;
+    /**
+     * The particles of every cell, `DIM + 1` indices per cell.
+     */
+    sbCells(handle: number): Uint32Array;
+    sbCenterOfMass(handle: number, scratch_buffer: Float32Array): void;
+    sbClusterParticles(handle: number, i: number): Uint32Array;
+    sbClusterProxy(handle: number, i: number): number | undefined;
+    sbClusterShapeMatchingEnabled(handle: number, i: number): boolean;
+    sbDetachParticle(handle: number, i: number): boolean;
+    sbEdgeImpulse(handle: number, i: number): number;
+    sbEdgeIsBend(handle: number, i: number): boolean;
+    sbEdgePlasticStrain(handle: number, i: number): number;
+    sbEdgeRestLength(handle: number, i: number): number;
+    sbEdgeStress(handle: number, i: number): number;
+    sbEdgeTearResistance(handle: number, i: number): number;
+    /**
+     * The particle pairs of every edge, two indices per edge.
+     */
+    sbEdges(handle: number): Uint32Array;
+    sbEnableClusterShapeMatching(handle: number, i: number, enabled: boolean): void;
+    sbEnableVolumePreservation(handle: number, enabled: boolean): void;
+    sbGravityScale(handle: number): number;
+    sbHasPendingTears(handle: number): boolean;
+    sbIsClusterLive(handle: number, i: number): boolean;
+    sbIsEnabled(handle: number): boolean;
+    sbIsParticleDamaged(handle: number, i: number): boolean;
+    sbIsParticleOnSurface(handle: number, i: number): boolean;
+    sbIsParticlePinned(handle: number, i: number): boolean;
+    sbIsSleeping(handle: number): boolean;
+    sbLinearDamping(handle: number): number;
+    sbMass(handle: number): number;
+    sbMaterial(handle: number): RawSoftBodyMaterial;
+    sbMeshCluster(handle: number, i: number): number | undefined;
+    sbMeshCollider(handle: number, i: number): number | undefined;
+    sbMeshCollisionEnabled(handle: number, i: number): boolean;
+    /**
+     * The elements of a collision mesh, `DIM` vertex indices per element.
+     */
+    sbMeshIndices(handle: number, i: number): Uint32Array;
+    sbMeshIsOriented(handle: number, i: number): boolean;
+    sbMeshIsSkinned(handle: number, i: number): boolean;
+    /**
+     * The index, in the body's mesh list, of the mesh a deformable collider holds.
+     */
+    sbMeshOfCollider(handle: number, collider: number): number | undefined;
+    /**
+     * The world-space vertex positions of a collision mesh, `DIM` floats per vertex.
+     */
+    sbMeshVertices(handle: number, i: number): Float32Array;
+    sbNumAttachments(handle: number): number;
+    sbNumCells(handle: number): number;
+    sbNumClusters(handle: number): number;
+    sbNumEdges(handle: number): number;
+    sbNumMeshes(handle: number): number;
+    sbNumParticles(handle: number): number;
+    sbOrigin(handle: number): number | undefined;
+    sbParticleMass(handle: number, i: number): number;
+    sbParticlePosition(handle: number, i: number, scratch_buffer: Float32Array): void;
+    sbParticlePositions(handle: number): Float32Array;
+    sbParticleRadius(handle: number): number;
+    sbParticleRestPosition(handle: number, i: number, scratch_buffer: Float32Array): void;
+    sbParticleVelocities(handle: number): Float32Array;
+    sbParticleVelocity(handle: number, i: number, scratch_buffer: Float32Array): void;
+    sbPieces(handle: number): Float64Array;
+    sbResetForces(handle: number, wake_up: boolean): void;
+    sbResetPlasticity(handle: number): void;
+    sbRestVolume(handle: number): number;
+    sbRootBody(handle: number): number;
+    sbSetAdditionalPgsIterations(handle: number, iterations: number): void;
+    sbSetClusterEdgeSoftness(handle: number, i: number, natural_frequency?: number | null, damping_ratio?: number | null): void;
+    sbSetClusterKinematicTarget(handle: number, i: number, translation: RawVector, rotation: RawRotation): void;
+    sbSetClusterPinned(handle: number, i: number, pinned: boolean): void;
+    sbSetClusterStiffnessScale(handle: number, i: number, scale: number): void;
+    sbSetClusterTearResistance(handle: number, i: number, resistance: number): void;
+    sbSetEnabled(handle: number, enabled: boolean): void;
+    sbSetMaterial(handle: number, material: RawSoftBodyMaterial): void;
+    sbSetParticleKinematicTarget(handle: number, i: number, position: RawVector): void;
+    sbSetParticlePinned(handle: number, i: number, pinned: boolean): void;
+    sbSetParticlePosition(handle: number, i: number, position: RawVector): void;
+    sbSetParticleVelocity(handle: number, i: number, velocity: RawVector): void;
+    sbSetSolver(handle: number, solver: RawSoftBodySolver): void;
+    sbSetUserData(handle: number, data: number): void;
+    sbSetVolumeFactor(handle: number, factor: number): void;
+    sbSolver(handle: number): RawSoftBodySolver;
+    sbTearCell(handle: number, i: number): void;
+    sbTearEdge(handle: number, i: number): void;
+    sbTopologyVersion(handle: number): number;
+    sbUserData(handle: number): number;
+    sbVolumeFactor(handle: number): number;
+    sbVolumePreservationEnabled(handle: number): boolean;
+    sbVolume(handle: number): number;
+    sbWakeUp(handle: number): void;
+    tear(handle: number, edges: Uint32Array, cells: Uint32Array, islands: RawIslandManager, bodies: RawRigidBodySet, colliders: RawColliderSet, joints: RawImpulseJointSet, articulations: RawMultibodyJointSet): RawSoftBodyTearEvent | undefined;
+    wakeUp(handle: number, bodies: RawRigidBodySet, strong: boolean): void;
+}
+
+/**
+ * Which soft-body solver holds the cells of a body together.
+ */
+export enum RawSoftBodySolver {
+    Constraints = 0,
+    Fem = 1,
+}
+
+export class RawSoftBodyTearEvent {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    clusterSplitCluster(i: number): number;
+    clusterSplitKeepsProxy(i: number): boolean;
+    clusterSplitProxy(i: number): number;
+    clusterSplitSoftBody(i: number): number;
+    clusterSplitSource(i: number): number;
+    insertedParticles(): Uint32Array;
+    movedJointFrom(i: number): number;
+    movedJointTo(i: number): number;
+    movedJoint(i: number): number;
+    numClusterSplits(): number;
+    numMovedJoints(): number;
+    numPieces(): number;
+    particleDestinationBody(particle: number): number | undefined;
+    particleDestinationIndex(particle: number): number | undefined;
+    pieceClusters(i: number): Uint32Array;
+    pieceParticles(i: number): Uint32Array;
+    pieceSoftBody(i: number): number;
+    removedEdges(): Uint32Array;
+    seeds(): Uint32Array;
+    softBody(): number;
+    splitParticles(): Uint32Array;
+    tornCells(): Uint32Array;
+    tornEdges(): Uint32Array;
+}
+
+export enum RawSoftEdgePlasticFlow {
+    Both = 0,
+    Compression = 1,
+    Tension = 2,
+}
+
+/**
+ * How a deformable collider's vertices follow the particles of its cluster.
+ */
+export enum RawSoftMeshBindingMode {
+    Direct = 0,
+    DirectByPosition = 1,
+    Skinned = 2,
+}
+
+/**
+ * What the per-point constraints of the features a volume constraint acts on do.
+ */
+export enum RawSoftPatchConstraints {
+    Keep = 0,
+    StandDown = 1,
+    AlongNormal = 2,
+}
+
+export class RawSoftRecoverySettings {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor();
+    authoredVelocityMargin: boolean;
+    crossBodyDetection: boolean;
+    crossBodyExpelGate: boolean;
+    crossingRepulsionGuide: boolean;
+    crossingRepulsionSelfGuide: boolean;
+    crossingRepulsion: boolean;
+    detectionMotionGating: boolean;
+    edgeSpeculation: boolean;
+    edgeStandDown: boolean;
+    invertedCellDetection: boolean;
+    overlapConstraintPace: number;
+    overlapConstraints: boolean;
+    overlapEdgeStandDown: boolean;
+    overlapKeptDepth: number;
+    overlapMultiVolume: boolean;
+    overlapNormalPush: boolean;
+    overlapPatchConstraints: RawSoftPatchConstraints;
+    overlapPatience: number;
+    overlapProgressMargin: number;
+    overlapRigid: boolean;
+    overlapSelfRegions: boolean;
+    overlapSkinVolume: boolean;
+    overlapSkipSelfTangled: boolean;
+    overlapSplit: number;
+    recoveryPace: number;
+    selfCrossingDetection: boolean;
+    selfStandDown: boolean;
+}
+
+/**
+ * Parameters for VHACD convex decomposition algorithm
+ */
+export class RawVHACDParameters {
+    free(): void;
+    [Symbol.dispose](): void;
+    constructor();
+    alpha: number;
+    beta: number;
+    concavity: number;
+    convex_hull_approximation: boolean;
+    convex_hull_downsampling: number;
+    max_convex_hulls: number;
+    plane_downsampling: number;
+    resolution: number;
+}
+
+/**
+ * A vector.
+ */
+export class RawVector {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Creates a new 2D vector from its two components.
+     *
+     * # Parameters
+     * - `x`: the `x` component of this 2D vector.
+     * - `y`: the `y` component of this 2D vector.
+     */
+    constructor(x: number, y: number);
+    /**
+     * Create a new 2D vector from this vector with its components rearranged as `{x, y}`.
+     */
+    xy(): RawVector;
+    /**
+     * Create a new 2D vector from this vector with its components rearranged as `{y, x}`.
+     */
+    yx(): RawVector;
+    /**
+     * Creates a new vector filled with zeros.
+     */
+    static zero(): RawVector;
+    /**
+     * The `x` component of this vector.
+     */
+    x: number;
+    /**
+     * The `y` component of this vector.
+     */
+    y: number;
+}
+
+export function reserve_memory(extra_bytes_count: number): void;
+
+export function version(): string;

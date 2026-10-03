@@ -1,7 +1,8 @@
 # AI Hub
 
-An arcade wall for games built by AI models. Every game is one self-contained
-HTML file; the hub finds them, dresses them, and gets out of the way.
+An arcade wall for games built by AI models. Games can be single HTML pages
+or project folders with their own code and assets; the hub finds them, dresses
+them, and gets out of the way. Shared engines live in `lib/`.
 
 **Live:** <https://crosato-arcade.vercel.app> — public, no sign-in. This repo
 stays private; only the built site is reachable.
@@ -144,6 +145,22 @@ What it does, so you do not have to:
 Afterwards it rescans and lists titles shared by more than one tile — often
 the same game saved under different filenames. Those are never merged for you;
 move them into one folder as `v1.html`, `v2.html` if they are builds of one game.
+
+**Local engine dependencies.** The importer also recognizes Three.js and
+Rapier references from jsDelivr, unpkg, esm.sh, Skypack and JSPM, and rewrites
+them to the exact version on the local library shelf. It handles both inline
+HTML and separate JavaScript modules, adds the import maps needed by addons,
+and leaves embedded engines and supplied local mappings alone. Unmapped bare
+`three` and `@dimforge/rapier…` imports use the game's detected version, or the
+latest version on the shelf when none is specified.
+Unsupported versions or missing package files are reported and their references
+are preserved. Games copied by hand must supply their own correct import map;
+use `pnpm ingest` to apply the localization automatically.
+
+The shelf includes all 13 Three.js releases from `0.180.0` through `0.186.1`
+and all 12 official Rapier variants at `0.19.3`, `0.20.0` and `0.21.0`: 2D/3D,
+standard/SIMD/deterministic, each with ordinary and compatibility packages.
+See `lib/vendor/README.md` for paths, import maps and verification commands.
 
 **Size.** GitHub refuses any single file over 100 MB and warns above 50 MB;
 the scan flags both. A source zip over 95 MB is not kept. For the whole wall,
@@ -317,14 +334,18 @@ lib/
   three/          three.js r186, the one copy every 3D game imports
   rapier/         Rapier 0.20 physics
   kit/            the shared 3D kit: boot, input, touch, post, physics
+  vendor/         versioned Three.js and Rapier packages for imported games
 ```
 
-Every 3D game runs on the same stack: three.js r186 with `WebGPURenderer`
+The games on the shared kit run on the same stack: three.js r186 with `WebGPURenderer`
 (WebGL2 when WebGPU is missing), loaded once from `lib/three` through an
 import map, and the kit in `lib/kit` for boot, quality tiers and keyboard,
 gamepad and touch input. `lib/kit/README.md` is the guide for porting or
 fixing a game, including the traps found so far; `lib/README.md` covers
 upgrading three.js and Rapier and the local patches to re-apply.
+
+Imported games can instead keep their original engine version and renderer
+through `lib/vendor/`. Those packages do not replace the patched shared stack.
 
 Vercel runs `node scripts/scan.mjs` as the build command and serves the
 repository. There is no framework and nothing is compiled.

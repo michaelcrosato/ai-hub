@@ -34,10 +34,12 @@ import { openZip } from './lib/zip.mjs';
 import { isJunk, isSecret, isContainer, HTML, chooseWebRoot, packageName, UNINFORMATIVE_NAME } from './lib/intake.mjs';
 import { INDEX_FILE } from './lib/layout.mjs';
 import { parseHead, splitTitle, slugify, parseVersion, relativizeRefs } from './lib/parse.mjs';
+import { readLibraryManifest, localizeGameLibraries } from './lib/libraries.mjs';
 
 const SOURCES_DIR = path.join(ROOT, 'sources');
 const MAX_SOURCE_BYTES = 95 * 1024 * 1024;
 const BUILT_DIR = /^(dist|build|out|www|public_html)$/i;
+const libraries = readLibraryManifest();
 
 /* --- arguments ------------------------------------------------------------ */
 
@@ -80,6 +82,8 @@ const report = {
   leftovers: [],
   secrets: [],
   ignored: 0,
+  libraries: [],
+  dependencies: [],
 };
 const hashes = new Map(); // sha1 of a page → where it lives in games/
 // games/-relative paths already used, lowercased: two files that differ only
@@ -186,6 +190,10 @@ async function duplicateOf(data) {
 /* --- single pages ---------------------------------------------------------- */
 
 async function importPage({ data, name, modified, from, subdir, qualifier }) {
+  const localized = localizeGameLibraries(new Map([[name, data.toString('utf8')]]), libraries);
+  data = Buffer.from(localized.files.get(name));
+  if (localized.libraries.length) report.libraries.push({ from, libraries: localized.libraries });
+  if (localized.warnings.length) report.dependencies.push({ from, warnings: localized.warnings });
   const { hash, same } = await duplicateOf(data);
   if (same) {
     report.duplicates.push({ from, same });
@@ -247,6 +255,14 @@ async function importProject({ name, files, from, subdir, entry = null }) {
     if (after !== before) fixed++;
     pages.set(f.rel, Buffer.from(after, 'utf8'));
   }
+  const sources = new Map();
+  for (const f of files) {
+    if (/\.(html?|m?js|css)$/i.test(f.rel)) sources.set(f.rel, (pages.get(f.rel) ?? await f.read()).toString('utf8'));
+  }
+  const localized = localizeGameLibraries(sources, libraries);
+  for (const [rel, source] of localized.files) pages.set(rel, Buffer.from(source, 'utf8'));
+  if (localized.libraries.length) report.libraries.push({ from, libraries: localized.libraries });
+  if (localized.warnings.length) report.dependencies.push({ from, warnings: localized.warnings });
   const entryKey = entry || files.find((f) => INDEX_FILE.test(f.rel))?.rel;
   const entryData = pages.get(entryKey);
   const { hash, same } = await duplicateOf(entryData);
@@ -569,6 +585,8 @@ function printReport() {
   section('projects unpacked', r.projects.map((p) => `games/${p.rel}  ${p.files} files${p.fixed ? `, ${p.fixed} page${p.fixed === 1 ? '' : 's'} given relative paths` : ''}  ← ${p.from}`));
   section('skipped, already on the wall (identical bytes)', r.duplicates.map((d) => `${d.from}  = games/${d.same}`));
   section('renamed so nothing is overwritten', r.renamed.map((x) => `${x.from}  → games/${x.rel}`));
+  section('dependencies served from the local library shelf', r.libraries.map((x) => `${x.from}  → ${x.libraries.join(', ')}`));
+  section('dependencies needing attention (references preserved)', r.dependencies.flatMap((x) => x.warnings.map((w) => `${x.from}  — ${w}`)));
   section(
     'need a build before they can be played — build them, then import the output folder',
     r.needsBuild.map((x) => `${x.from}  (source ${x.root ? `in ${x.root}/` : 'at its top level'})`)

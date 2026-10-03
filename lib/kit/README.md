@@ -1,6 +1,7 @@
 # The 3D kit
 
-Every 3D game on the wall runs on one foundation:
+Games using the shared kit run on one foundation. Imported games that retain
+their own engine version use the separate shelf in `../vendor/README.md`.
 
 | Piece | Version | Where |
 |---|---|---|
