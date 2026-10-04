@@ -81,8 +81,8 @@ for (const record of fixtures) {
   const label = `${record.name}@${record.version}`;
   try {
     if (record.name === "three") {
-      await render(record, false);
-      const pixel = await render(record, true);
+      let pixel = await render(record, false);
+      if (record.nodeRenderer !== false) pixel = await render(record, true);
       for (const addon of [
         "controls/OrbitControls.js",
         "postprocessing/EffectComposer.js",
@@ -96,7 +96,12 @@ for (const record of fixtures) {
         if (addon === "objects/GaussianSplat.js" && Number(record.version.split(".")[1]) < 186) continue;
         await import(`${record.base}examples/jsm/${addon}`);
       }
-      row(label, true, `WebGLRenderer + node renderer (${report.backend}), TSL and addons`, pixel);
+      row(
+        label,
+        true,
+        record.nodeRenderer === false ? "WebGLRenderer and addons" : `WebGLRenderer + node renderer (${report.backend}), TSL and addons`,
+        pixel,
+      );
     } else {
       const R = (await import(record.base + (record.browserEntry || record.entry))).default;
       if (!record.browserEntry) await R.init();

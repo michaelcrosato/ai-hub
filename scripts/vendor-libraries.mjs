@@ -16,6 +16,8 @@ const RAPIER_PACKAGES = ["2d", "3d"].flatMap((dimension) =>
   ["", "-simd", "-deterministic"].flatMap((flavor) => ["", "-compat"].map((compat) => `@dimforge/rapier${dimension}${flavor}${compat}`)),
 );
 const MINIMUM = { three: "0.180.0", rapier: "0.19.3" };
+// Exact older releases needed by imported games; retain these on every sync.
+const PINNED = { three: ["0.160.0"], "@dimforge/rapier3d-compat": ["0.19.0"] };
 const versionParts = (v) => v.split(".").map(Number);
 const compare = (a, b) => {
   const x = versionParts(a),
@@ -89,7 +91,7 @@ async function main() {
     const latest = meta["dist-tags"].latest;
     const minimum = name === "three" ? MINIMUM.three : MINIMUM.rapier;
     const versions = Object.keys(meta.versions)
-      .filter((v) => /^\d+\.\d+\.\d+$/.test(v) && compare(v, minimum) >= 0 && compare(v, latest) <= 0)
+      .filter((v) => (PINNED[name] || []).includes(v) || (/^\d+\.\d+\.\d+$/.test(v) && compare(v, minimum) >= 0 && compare(v, latest) <= 0))
       .sort(compare);
     if (!versions.length) throw new Error(`No releases in range for ${name}`);
     manifest.latest[name] = latest;
@@ -184,6 +186,6 @@ async function main() {
 
 if (process.argv.includes("--help"))
   console.log(
-    "node scripts/vendor-libraries.mjs [--refresh]\nDownload all stable Three.js releases >=0.180.0 and all 12 official Rapier variants >=0.19.3. --refresh checks npm again; otherwise cached metadata pins the release set.",
+    "node scripts/vendor-libraries.mjs [--refresh]\nDownload all stable Three.js releases >=0.180.0, all 12 official Rapier variants >=0.19.3, and the pinned older releases required by imported games. --refresh checks npm again; otherwise cached metadata pins the release set.",
   );
 else await main();

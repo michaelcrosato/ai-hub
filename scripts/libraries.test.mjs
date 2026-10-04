@@ -15,6 +15,8 @@ const mapOf = (html) => JSON.parse(/<script type="importmap">([\s\S]*?)<\/script
 
 test("exact versions stay pinned; ranges select only a compatible local patch", () => {
   assert.equal(libraryVersion(manifest, "three", "0.181.0"), "0.181.0");
+  assert.equal(libraryVersion(manifest, "three", "0.160.0"), "0.160.0");
+  assert.equal(libraryVersion(manifest, "@dimforge/rapier3d-compat", "0.19.0"), "0.19.0");
   assert.equal(libraryVersion(manifest, "three", "^0.181.0"), "0.181.2");
   assert.equal(libraryVersion(manifest, "three", "r186.1"), "0.186.1");
   assert.equal(libraryVersion(manifest, "three", "0.179.0"), null);
@@ -47,6 +49,11 @@ test("CDN references resolve to the matching local package, including addons and
   assert.match(libraryURL(manifest, "@dimforge/rapier3d", "0.19.3", "rapier_wasm3d_bg.wasm").url, /rapier_wasm3d_bg\.wasm$/);
   assert.match(libraryURL(manifest, "three", "0.180.0", "build/three.min.js").warning, /does not ship/);
   assert.match(libraryURL(manifest, "three", "0.180.0", "../secret").warning, /Invalid/);
+  assert.equal(resolveLibraryReference("https://esm.sh/three@0.160.0", manifest).url, "/lib/vendor/three/0.160.0/build/three.module.js");
+  assert.equal(
+    resolveLibraryReference("https://esm.sh/@dimforge/rapier3d-compat@0.19.0", manifest).url,
+    "/lib/vendor/rapier/0.19.0/rapier3d-compat/rapier.mjs",
+  );
 });
 
 test("a project receives scoped addon imports and keeps each explicitly requested version", () => {

@@ -10,6 +10,7 @@ import { localizeGameLibraries, readLibraryManifest, threeImports } from "./lib/
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
 const manifest = readLibraryManifest();
 const threeVersions = [
+  "0.160.0",
   "0.180.0",
   "0.181.0",
   "0.181.1",
@@ -31,7 +32,12 @@ const rapierNames = ["2d", "3d"].flatMap((dimension) =>
   ["", "-simd", "-deterministic"].flatMap((flavor) => ["", "-compat"].map((compat) => `@dimforge/rapier${dimension}${flavor}${compat}`)),
 );
 assert.deepEqual(Object.keys(manifest.packages).sort(), ["three", ...rapierNames].sort());
-for (const name of rapierNames) assert.deepEqual(Object.keys(manifest.packages[name]), rapierVersions, name);
+for (const name of rapierNames)
+  assert.deepEqual(
+    Object.keys(manifest.packages[name]),
+    name === "@dimforge/rapier3d-compat" ? ["0.19.0", ...rapierVersions] : rapierVersions,
+    name,
+  );
 
 const records = Object.values(manifest.packages).flatMap(Object.values);
 let files = 0;
@@ -67,14 +73,21 @@ for (const record of [...records, ...Object.values(manifest.externalImports)]) {
   }
 }
 console.log(
-  `Verified ${records.length} packages, ${files} file hashes, every WASM binary, and physics in all 36 Rapier variants/releases.`,
+  `Verified ${records.length} packages, ${files} file hashes, every WASM binary, and physics in all ${records.filter((r) => r.name.startsWith("@dimforge/")).length} Rapier variants/releases.`,
 );
 
 if (process.argv.includes("--browser-fixture")) {
   const scopes = Object.fromEntries(
     Object.values(manifest.packages.three).map((r) => [r.base, threeImports(r, undefined, manifest.externalImports)]),
   );
-  const fixtures = records.map(({ name, version, base, entry, browserEntry }) => ({ name, version, base, entry, browserEntry }));
+  const fixtures = records.map(({ name, version, base, entry, browserEntry, files }) => ({
+    name,
+    version,
+    base,
+    entry,
+    browserEntry,
+    nodeRenderer: name === "three" && !!files["build/three.webgpu.js"],
+  }));
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Local library verification</title><script type="importmap">${JSON.stringify({ scopes })}</script><style>body{font:16px system-ui;background:#151820;color:#e9eef5;margin:32px}td{padding:6px 16px;border-bottom:1px solid #444}canvas{width:48px;height:48px;vertical-align:middle}.pass{color:#71e0a4}.fail{color:#ff9999}</style></head><body><h1>Local library verification</h1><p id="status">Checking every release and variant…</p><table><tbody id="results"></tbody></table><script id="fixtures" type="application/json">${JSON.stringify(fixtures)}</script><script type="module" src="/scripts/library-browser.mjs"></script></body></html>`;
   await mkdir(path.join(ROOT, ".cache/libraries"), { recursive: true });
   await writeFile(path.join(ROOT, ".cache/libraries/browser-check.html"), html);
