@@ -35,7 +35,7 @@ assert.deepEqual(Object.keys(manifest.packages).sort(), ["three", ...rapierNames
 for (const name of rapierNames)
   assert.deepEqual(
     Object.keys(manifest.packages[name]),
-    name === "@dimforge/rapier3d-compat" ? ["0.19.0", ...rapierVersions] : rapierVersions,
+    name === "@dimforge/rapier3d-compat" ? ["0.14.0", "0.19.0", ...rapierVersions] : rapierVersions,
     name,
   );
 

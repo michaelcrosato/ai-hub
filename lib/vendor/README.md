@@ -16,9 +16,10 @@ all addons, source modules, fonts, Draco and Basis decoders, and the license.
 The versioned packages are upstream distributions, without the shared stack's
 local patches or WebGL-only exclusions.
 
-The shelf also pins **Three.js 0.160.0** and **Rapier 3D compat 0.19.0** for
-Ashbound: The Sleeper’s Oath. These are full official packages, preserved on
-every sync so the game retains its original WebGL renderer and physics.
+The shelf also pins **Three.js 0.160.0** and older **Rapier 3D compat** releases:
+**0.14.0** for The Ash-Bound Prophecy and **0.19.0** for Ashbound: The Sleeper’s
+Oath. These are full official packages, preserved on every sync so the games
+retain their original WebGL renderer and physics.
 The r160 browser fixture exercises classic WebGL and addons; newer releases
 also exercise the modern WebGPU build and TSL.
 

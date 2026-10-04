@@ -17,7 +17,7 @@ const RAPIER_PACKAGES = ["2d", "3d"].flatMap((dimension) =>
 );
 const MINIMUM = { three: "0.180.0", rapier: "0.19.3" };
 // Exact older releases needed by imported games; retain these on every sync.
-const PINNED = { three: ["0.160.0"], "@dimforge/rapier3d-compat": ["0.19.0"] };
+const PINNED = { three: ["0.160.0"], "@dimforge/rapier3d-compat": ["0.14.0", "0.19.0"] };
 const versionParts = (v) => v.split(".").map(Number);
 const compare = (a, b) => {
   const x = versionParts(a),
