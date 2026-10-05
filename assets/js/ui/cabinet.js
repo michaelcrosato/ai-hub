@@ -96,6 +96,7 @@ function screen(game) {
  * Several attempts at one thing, as one cabinet with the others stacked behind
  * it. It shows its first game, the one the sort put in front, and the whole
  * tile opens the stack: the wall narrowed to that series, or to that game.
+ * Details still opens the drawer for the game in front.
  */
 export function stackCabinet(stack, index = 0, href = '#/') {
   const [front] = stack.games;
@@ -140,7 +141,10 @@ export function stackCabinet(stack, index = 0, href = '#/') {
         h(
           'div',
           { class: 'cab__meta' },
-          h('span', { class: 'cab__open' }, stack.level === 'series' ? 'Open series' : 'Open stack'),
+          // The whole tile opens the stack; Details is the game in front, which
+          // a stack would otherwise hide.
+          h('span', { class: 'cab__open' }, 'More like this'),
+          h('a', { class: 'cab__info', href: `#/g/${front.slug}` }, 'Details'),
           h('span', {}, front.genre || bytes(front.bytes))
         )
       )
