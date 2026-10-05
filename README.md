@@ -218,28 +218,35 @@ websites together). The shelf comes from each game's `type` in
 showing (stacked or not, it picks a game). The search box sits in the sign's
 top corner.
 
-The filters are one sticky strip, worked out per shelf: each is a chip that
-drops a menu (*Genre*, *Tags*, *File size*, *Model*…), one pick at a time, and
-the chip names the pick once there is one. Players is *Single player* beside a
-*Multiplayer* menu of head counts. Chips carry no counts: an option that would
-empty the wall is greyed out instead.
+Under the shelves, one sticky toolbar, in the order people reach for it:
+**All | Original | Inspired**, then **Filters**, then **Sort** and **View** on
+the right. View holds the layout (Comfortable or Compact) and *Group attempts
+at the same game* (the stacks). Whatever is filtering the wall shows under the
+toolbar as chips with a ×, plus *Clear all*.
+
+**Filters** opens a panel (a sheet from the bottom on a phone), worked out per
+shelf and grouped into Game (Genre, Players, Tags), Provenance (Model,
+Collection) and Technical (File size); a field nobody grouped yet lands under
+More. Choices apply as you tap. Several in one filter widen the wall (Racing
+or Flight); different filters narrow it. Players is *Single player* or
+*Multiplayer*, and Multiplayer opens head counts beneath it (*4 players* finds
+every game that seats four). Nothing shows a count: an option that would empty
+the wall is greyed out instead. The groups live in `FACET_UI` in
+`assets/js/manifest.js`.
 
 ### Sources and stacks
 
 Many games are attempts at the same classic: nine at Dragon Quest, seven at
 Final Fantasy Tactics. Every game is **Original** (no source) or **Inspired**
-(it has one), and the first two chips in the strip toggle between them.
+(it has one), and the toolbar's first control picks All, Original or Inspired.
 
-The wall then sorts them when **Stacks** is on (the default, and remembered
+The wall then sorts them when grouping is on in View (the default, and remembered
 per device). Each series is one stacked cabinet; originals that share a name
 (six Stratas) stack together. Open a series and each game in it is a stack.
 Open one of those and every attempt is laid out. A series with only one game
 skips the middle step, and a stack of one is just the game. Each step is a
 link, so Back climbs out again. The trail at the top of the wall shows where
 you are, and each game's drawer links to *All N attempts* at the same game.
-
-The grid button beside the sort switches to a compact wall with twice the
-cabinets per row (remembered per device).
 
 ## Optional extras
 

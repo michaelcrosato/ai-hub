@@ -65,14 +65,17 @@ export const ICONS = {
   star: 'M12 3.6l2.5 5.3 5.5.8-4 4.1 1 5.9-5-2.8-5 2.8 1-5.9-4-4.1 5.5-.8z',
   back: 'M15 5l-7 7 7 7',
   caret: 'M6 9l6 6 6-6',
+  search: 'M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM15.2 15.2L20 20',
+  // A funnel: what lets fewer games through.
+  filter: 'M4 5h16l-6 7.5V19l-4-2v-4.5z',
+  // Two arrows, up and down: the order of the wall.
+  sort: 'M7 4v16M3.5 7.5L7 4l3.5 3.5M17 20V4M13.5 16.5L17 20l3.5-3.5',
   close: 'M6 6l12 12M18 6L6 18',
   play: 'M7 4.5v15l13-7.5z',
   external: 'M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
-  // Four big squares, then nine small ones: the two wall densities.
+  // Four squares: the wall's layout.
   roomy: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
-  dense: 'M4 4h4v4H4zM10 4h4v4h-4zM16 4h4v4h-4zM4 10h4v4H4zM10 10h4v4h-4zM16 10h4v4h-4zM4 16h4v4H4zM10 16h4v4h-4zM16 16h4v4h-4z',
   // Three cards fanned on top of each other: a stack of attempts.
   stack: 'M8 4h11a1 1 0 0 1 1 1v11M5 7h11a1 1 0 0 1 1 1v11M3 10h10a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z',
   // A die showing five; the pips are zero-length strokes drawn by round caps.
-  dice: 'M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM8.5 8.5h.01M15.5 8.5h.01M12 12h.01M8.5 15.5h.01M15.5 15.5h.01',
 };

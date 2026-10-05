@@ -85,10 +85,26 @@ const UNDER = {
   players: (value) => (SEATS.test(value) ? MULTI : null),
 };
 
-/** Rails that exist are still found, never declared; these few just go first
- *  when they do, because they are how people actually browse. A field nobody
- *  fills in simply never shows up. */
-const LEAD = ['genre', 'collection', 'players'];
+/**
+ * Filters are still found, never declared; this only says where the known
+ * ones sit in the filter panel. A field nobody fills in never shows up, and a
+ * field invented tomorrow lands under More by itself.
+ */
+export const GROUPS = [
+  { key: 'game', label: 'Game' },
+  { key: 'provenance', label: 'Provenance' },
+  { key: 'technical', label: 'Technical' },
+  { key: 'more', label: 'More' },
+];
+const FACET_UI = {
+  genre: { group: 'game', order: 10 },
+  players: { group: 'game', order: 20 },
+  tags: { group: 'game', order: 30 },
+  model: { group: 'provenance', order: 10 },
+  collection: { group: 'provenance', order: 20 },
+  fileSize: { group: 'technical', order: 10 },
+};
+const facetUi = (key) => FACET_UI[key] ?? { group: 'more', order: 100 };
 
 /** A rail needs at least this many distinct values, and this many games covered. */
 const MIN_VALUES = 2;
@@ -239,6 +255,7 @@ export function deriveFacets(games) {
     };
     facets.push({
       key,
+      ...facetUi(key),
       label: prettyLabel(key),
       coverage,
       options: [...counts.entries()]
@@ -251,12 +268,9 @@ export function deriveFacets(games) {
     });
   }
 
-  const rank = (key) => {
-    const at = LEAD.indexOf(key);
-    return at === -1 ? LEAD.length : at;
-  };
+  const group = (facet) => GROUPS.findIndex((g) => g.key === facet.group);
   return facets.sort(
-    (a, b) => rank(a.key) - rank(b.key) || b.coverage - a.coverage || a.label.localeCompare(b.label)
+    (a, b) => group(a) - group(b) || a.order - b.order || b.coverage - a.coverage || a.label.localeCompare(b.label)
   );
 }
 

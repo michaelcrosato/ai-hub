@@ -276,6 +276,7 @@ function renderWall(state) {
     facets,
     counts: facetCounts(games, state, stats, facets),
     sources,
+    shown: visible.length,
   });
   renderCount(state, visible.length);
 
