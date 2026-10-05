@@ -8,12 +8,16 @@
  */
 
 import { h, clear } from '../dom.js';
-import { cabinet } from './cabinet.js';
+import { cabinet, stackCabinet } from './cabinet.js';
 
 const CHUNK = 36;
 
-export function createGrid(root) {
+/**
+ * @param stackHref  where pressing a stack goes: the wall narrowed to it
+ */
+export function createGrid(root, { stackHref = () => '#/' } = {}) {
   let games = [];
+  let caption = () => null;
   let shown = 0;
   let firstPaint = true;
 
@@ -34,8 +38,10 @@ export function createGrid(root) {
     }
     const next = games.slice(shown, shown + CHUNK);
     const batch = document.createDocumentFragment();
-    next.forEach((game, i) => {
-      const tile = cabinet(game, shown + i);
+    next.forEach((item, i) => {
+      const tile = item.stack
+        ? stackCabinet(item, shown + i, stackHref(item))
+        : cabinet(item, shown + i, caption(item));
       if (firstPaint) tile.classList.add('is-fresh');
       batch.append(tile);
     });
@@ -55,10 +61,16 @@ export function createGrid(root) {
   }
 
   return {
-    render(list) {
+    /**
+     * `list` holds games and stacks of games; `lead` sits above them, full
+     * width; `label(game)` can name something other than the genre on a tile.
+     */
+    render(list, { lead = null, label = () => null } = {}) {
       games = list;
+      caption = label;
       shown = 0;
       clear(root);
+      if (lead) root.append(lead);
       root.append(sentinel);
       observer.observe(sentinel);
       grow();
@@ -78,6 +90,9 @@ export function createGrid(root) {
       root.append(h('p', { class: 'wall__status' }, ...content));
     },
 
-    tile: (slug) => root.querySelector(`.cab[data-slug="${CSS.escape(slug)}"]`),
+    // A game folded into a stack comes home to the stack.
+    tile: (slug) =>
+      root.querySelector(`.cab[data-slug="${CSS.escape(slug)}"]`) ||
+      root.querySelector(`.cab[data-members~="${CSS.escape(slug)}"]`),
   };
 }

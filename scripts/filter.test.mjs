@@ -3,8 +3,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { normalize, deriveFacets, matchesFacet } from '../assets/js/manifest.js';
-import { selectGames, facetCounts, shelfOf } from '../assets/js/filter.js';
+import { readFileSync } from 'node:fs';
+
+import { normalize, deriveFacets, matchesFacet, lineageOf } from '../assets/js/manifest.js';
+import { selectGames, facetCounts, shelfOf, sourceCounts, stackGames } from '../assets/js/filter.js';
 
 const stats = { isFave: () => false, plays: () => 0, lastPlayed: () => 0 };
 const state = (patch = {}) => ({ query: '', sort: 'name', favesOnly: false, facets: {}, ...patch });
@@ -71,4 +73,101 @@ test('shelves split by type, uncatalogued games are games, restricted ones stay 
   assert.deepEqual(slugs({ shelf: null }), ['a', 'b', 'c', 'd', 'e']);
   const genreless = facetCounts(lib, state({ shelf: 'demos' }), stats, []);
   assert.equal(genreless.size, 0);
+});
+
+// Shaped like the real wall: a series with several games, a game with several
+// attempts, originals that share a name, and ones that stand alone.
+const lineup = [
+  { slug: 'dq-a', name: 'Bramblebound', source: 'Dragon Quest' },
+  { slug: 'dq-b', name: 'Lantern Road', source: 'Dragon Quest' },
+  { slug: 'dq3', name: 'Moonward III', source: 'Dragon Quest III', series: 'Dragon Quest' },
+  { slug: 'dq9-a', name: 'Starfall Pilgrims', source: 'Dragon Quest IX', series: 'Dragon Quest' },
+  { slug: 'dq9-b', name: 'Starward Errand', source: 'Dragon Quest IX', series: 'Dragon Quest' },
+  { slug: 'cr-a', name: 'Aetherfall', source: 'Crystalis' },
+  { slug: 'cr-b', name: 'Windwake', source: 'crystalis' },
+  { slug: 'okami', name: 'Bark & Brush', source: 'Okami' },
+  { slug: 'strata-1', name: 'Strata' },
+  { slug: 'strata-2', name: 'STRATA' },
+  { slug: 'undertow', name: 'Undertow' },
+].map(normalize);
+
+const wall = (patch = {}) => selectGames(lineup, state({ series: '', source: '', ...patch }), stats);
+const tiles = (patch = {}) =>
+  stackGames(wall(patch), state({ series: '', source: '', ...patch })).map((item) =>
+    item.stack ? `[${item.level} ${item.label} ${item.games.length}]` : item.slug
+  );
+
+test('a game is an attempt at its source, inside its series; an original is an attempt at itself', () => {
+  assert.deepEqual(lineageOf({ name: 'Moonward III', source: 'Dragon Quest III', series: 'Dragon Quest' }), {
+    series: 'Dragon Quest',
+    title: 'Dragon Quest III',
+  });
+  assert.deepEqual(lineageOf({ name: 'Aetherfall', source: 'Crystalis' }), { series: 'Crystalis', title: 'Crystalis' });
+  assert.deepEqual(lineageOf({ name: 'Strata' }), { series: 'Original', title: 'Strata' });
+});
+
+test('source and series are searchable but never a loose rail of their own', () => {
+  const keys = deriveFacets(lineup).map((f) => f.key);
+  assert.ok(!keys.includes('source') && !keys.includes('series') && !keys.includes('lineage'));
+  assert.deepEqual(wall({ query: 'dragon quest ix' }).map((g) => g.slug), ['dq9-a', 'dq9-b']);
+});
+
+test('the wall stacks by series, then by game, then lays out every attempt', () => {
+  assert.deepEqual(tiles(), [
+    'okami',
+    '[title Crystalis 2]',
+    '[series Dragon Quest 5]',
+    '[title Strata 2]',
+    'undertow',
+  ]);
+  // A to Z files a stack under its own name and a cabinet under the one on its marquee.
+  assert.deepEqual(tiles({ series: 'Dragon Quest' }), [
+    '[title Dragon Quest 2]',
+    '[title Dragon Quest IX 2]',
+    'dq3',
+  ]);
+  assert.deepEqual(tiles({ series: 'dragon quest', source: 'Dragon Quest IX' }), ['dq9-a', 'dq9-b']);
+  // One series holding one game: no point showing a single stack of it.
+  assert.deepEqual(tiles({ series: 'Crystalis' }), ['cr-a', 'cr-b']);
+  assert.deepEqual(tiles({ series: 'Original' }), ['[title Strata 2]', 'undertow']);
+});
+
+test('stacks keep the sort, and a search can leave a stack of one, which is just the game', () => {
+  const newest = (patch) =>
+    stackGames(wall(patch), state({ series: '', source: '', sort: 'newest', ...patch })).map((item) =>
+      item.stack ? item.label : item.slug
+    );
+  // Same added date everywhere, so newest falls back to names: the stack sits where its first game does.
+  assert.deepEqual(newest({}), ['Crystalis', 'okami', 'Dragon Quest', 'Strata', 'undertow']);
+  assert.deepEqual(tiles({ query: 'starward' }), ['dq9-b']);
+});
+
+test('the Source rail counts series, then the games inside the picked one', () => {
+  const counts = sourceCounts(lineup, state({ series: 'Dragon Quest', source: 'Dragon Quest IX' }), stats);
+  assert.deepEqual(counts.series, [
+    { value: 'Dragon Quest', count: 5 },
+    { value: 'Original', count: 3 },
+    { value: 'Crystalis', count: 2 },
+    { value: 'Okami', count: 1 },
+  ]);
+  assert.deepEqual(counts.titles, [
+    { value: 'Dragon Quest', count: 2 },
+    { value: 'Dragon Quest IX', count: 2 },
+    { value: 'Dragon Quest III', count: 1 },
+  ]);
+  assert.deepEqual(sourceCounts(lineup, state({}), stats).titles, []);
+});
+
+test('the catalogue gives every source one series', () => {
+  const overrides = JSON.parse(readFileSync(new URL('../data/overrides.json', import.meta.url), 'utf8'));
+  const seen = new Map();
+  for (const [slug, entry] of Object.entries(overrides)) {
+    if (slug === '_readme') continue;
+    assert.equal(entry.inspiredBy, undefined, `${slug}: inspiredBy is now source`);
+    if (!entry.source) continue;
+    const series = entry.series || entry.source;
+    if (!seen.has(entry.source)) seen.set(entry.source, { series, slug });
+    const first = seen.get(entry.source);
+    assert.equal(series, first.series, `${slug} puts ${entry.source} in ${series}, ${first.slug} in ${first.series}`);
+  }
 });

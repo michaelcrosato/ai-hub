@@ -10,13 +10,20 @@
  * The wall shows one shelf at a time — Games, Tech demos, Tools & websites —
  * and the rails are worked out for the shelf in view, so a Games wall never
  * offers a "Tech Demo" genre with nothing behind it.
+ *
+ * Attempts at the same thing stack: a series is one cabinet until you open
+ * it, then each game in it is one, then every attempt at that game is laid
+ * out. Each step is a link, so Back climbs out again.
  */
 
-import { h } from './dom.js';
-import { loadManifest, deriveFacets } from './manifest.js';
+import { h, icon, ICONS } from './dom.js';
+import { loadManifest, deriveFacets, sameKey } from './manifest.js';
+import { plural } from './format.js';
 import {
   selectGames,
   facetCounts,
+  sourceCounts,
+  stackGames,
   DEFAULT_SORT,
   SORTS,
   SHELVES,
@@ -36,7 +43,20 @@ import { createDev } from './ui/dev.js';
 const wallEl = document.getElementById('wall');
 const countEl = document.getElementById('count');
 
-const grid = createGrid(wallEl);
+/** The wall as it is now, narrowed (or widened) to one series and game. */
+function hrefWith(patch) {
+  const query = new URLSearchParams(router.current().query);
+  for (const [key, value] of Object.entries(patch)) {
+    if (value) query.set(key, value);
+    else query.delete(key);
+  }
+  const text = query.toString();
+  return `#/${text ? `?${text}` : ''}`;
+}
+
+const grid = createGrid(wallEl, {
+  stackHref: (stack) => hrefWith({ series: stack.series, source: stack.title }),
+});
 
 const stats = {
   isFave: (slug) => store.isFave(slug),
@@ -77,8 +97,16 @@ function readState(query) {
     query: query.get('q') || '',
     sort: query.get('sort') || store.ui().sort || DEFAULT_SORT,
     favesOnly: query.get('fav') === '1',
+    series: query.get('series') || '',
+    source: query.get('source') || '',
     facets: {},
   };
+  // A link that names only the game still gets its series, so the rail and
+  // the trail can show where it sits.
+  if (state.source && !state.series) {
+    const found = games.find((g) => sameKey(g.lineage.title) === sameKey(state.source));
+    if (found) state.series = found.lineage.series;
+  }
   if (!SORTS.some((s) => s.key === state.sort)) state.sort = DEFAULT_SORT;
   facets = facetsFor(state.shelf);
   for (const facet of facets) {
@@ -97,6 +125,9 @@ const stateKey = (state) =>
     state.query,
     state.sort,
     state.favesOnly,
+    state.series,
+    state.source,
+    store.ui().stack,
     state.facets,
     state.favesOnly ? store.faveCount() : 0,
     store.dev(),
@@ -108,7 +139,7 @@ const shelves = createShelves(document.getElementById('shelves'), {
   onSelect(shelf) {
     // A genre picked on one shelf rarely exists on another, so switching
     // shelves starts its rails fresh. The search stays: it travels well.
-    const patch = { shelf: shelf === DEFAULT_SHELF ? '' : shelf };
+    const patch = { shelf: shelf === DEFAULT_SHELF ? '' : shelf, series: '', source: '' };
     for (const facet of facets) patch[facet.key] = '';
     router.setQuery(patch);
   },
@@ -124,6 +155,7 @@ const controls = createControls(document.getElementById('controls'), {
     store.setUi({ density: next });
     applyDensity();
   },
+  onStack: (next) => store.setUi({ stack: next }),
   // Drawn from what the shelf and filters leave showing, so "Surprise me"
   // on the Games shelf is always a game.
   onSurprise() {
@@ -133,8 +165,28 @@ const controls = createControls(document.getElementById('controls'), {
   },
 });
 
+/** Every attempt at the same game on the same shelf, as a link to them all. */
+function attemptsOf(game) {
+  const { series, title } = game.lineage;
+  const shelf = shelfOf(game);
+  const count = games.filter(
+    (g) =>
+      isVisible(g, showAll()) &&
+      shelfOf(g) === shelf &&
+      sameKey(g.lineage.title) === sameKey(title) &&
+      sameKey(g.lineage.series) === sameKey(series)
+  ).length;
+  if (count < 2) return null;
+  const query = new URLSearchParams();
+  if (shelf !== DEFAULT_SHELF) query.set('shelf', shelf);
+  query.set('series', series);
+  query.set('source', title);
+  return { text: `All ${count} attempts at ${title}`, href: `#/?${query}` };
+}
+
 const detail = createDetail(document.getElementById('detail'), {
   onPlay: (game, build) => router.go(`/play/${game.slug}/${build.version || build.id}`),
+  attempts: attemptsOf,
 });
 
 const player = createPlayer(document.getElementById('player'), {
@@ -157,17 +209,43 @@ function renderCount(state, shown) {
   );
 }
 
+/**
+ * Where the wall is inside the Source rail, with a way back up each step. It
+ * sits at the top of the wall itself, because opening a stack scrolls there.
+ */
+function trail(state, sources, shown) {
+  if (!state.series) return null;
+  const label = (options, value) => options.find((o) => sameKey(o.value) === sameKey(value))?.value || value;
+  const series = label(sources.series, state.series);
+  const step = () => h('span', { class: 'trail__step', 'aria-hidden': 'true' }, '›');
+  return h(
+    'nav',
+    { class: 'trail', 'aria-label': 'Source' },
+    h('a', { class: 'trail__up', href: hrefWith({ series: '', source: '' }) }, icon(ICONS.back), 'All sources'),
+    step(),
+    state.source ? h('a', { href: hrefWith({ source: '' }) }, series) : h('b', {}, series),
+    state.source && [step(), h('b', {}, label(sources.titles, state.source))],
+    h('span', { class: 'trail__count' }, plural(shown, state.source ? 'attempt' : 'game'))
+  );
+}
+
 function renderWall(state) {
   const key = stateKey(state);
   const changed = key !== lastKey;
   const visible = selectGames(games, state, stats);
+  const sources = sourceCounts(games, state, stats);
   showing = visible;
 
   const perShelf = new Map(
     SHELVES.map((s) => [s.key, games.filter((g) => isVisible(g, state.showAll) && shelfOf(g) === s.key).length])
   );
   shelves.render(state.shelf, perShelf);
-  controls.render(state, { facets, counts: facetCounts(games, state, stats, facets), shown: visible.length });
+  controls.render(state, {
+    facets,
+    counts: facetCounts(games, state, stats, facets),
+    sources,
+    shown: visible.length,
+  });
   renderCount(state, visible.length);
 
   if (!changed) return;
@@ -182,7 +260,7 @@ function renderWall(state) {
         {
           type: 'button',
           onclick: () => {
-            const cleared = { q: '', fav: '' };
+            const cleared = { q: '', fav: '', series: '', source: '' };
             for (const facet of facets) cleared[facet.key] = '';
             router.setQuery(cleared);
           },
@@ -193,7 +271,15 @@ function renderWall(state) {
     return;
   }
 
-  grid.render(visible);
+  grid.render(store.ui().stack ? stackGames(visible, state) : visible, {
+    lead: trail(state, sources, visible.length),
+    // Inside a series every tile is the same genre; which game each one is an
+    // attempt at is what tells them apart.
+    label: (game) =>
+      state.series && !state.source && sameKey(game.lineage.title) !== sameKey(game.name)
+        ? game.lineage.title
+        : null,
+  });
   // Refining a search should show you the top of the new results, but the
   // first paint must not steal the scroll position from a deep link.
   if (isRefine && wallEl.getBoundingClientRect().top < 0) {

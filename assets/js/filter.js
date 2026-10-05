@@ -6,7 +6,7 @@
  * { isFave(slug), plays(slug), lastPlayed(slug) }.
  */
 
-import { matchesFacet, fold } from './manifest.js';
+import { matchesFacet, fold, sameKey, ORIGINAL } from './manifest.js';
 
 const byName = (a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' });
 
@@ -56,6 +56,11 @@ export const isVisible = (game, showAll) => showAll || game.restricted !== true;
 const inScope = (game, state) =>
   isVisible(game, state.showAll) && (!state.shelf || shelfOf(game) === state.shelf);
 
+/** Inside the series, and the one game in it, that the Source rail narrowed to. */
+const inLineage = (game, state) =>
+  (!state.series || sameKey(game.lineage.series) === sameKey(state.series)) &&
+  (!state.source || sameKey(game.lineage.title) === sameKey(state.source));
+
 export const tokenize = (query) => fold(query).split(/\s+/).filter(Boolean);
 
 const hasAllTokens = (game, tokens) => tokens.every((t) => game.search.includes(t));
@@ -85,6 +90,7 @@ export function selectGames(games, state, stats) {
   let out = games.filter(
     (game) =>
       inScope(game, state) &&
+      inLineage(game, state) &&
       (!state.favesOnly || stats.isFave(game.slug)) &&
       passesFacets(game, state.facets) &&
       (!tokens.length || hasAllTokens(game, tokens))
@@ -110,6 +116,7 @@ export function facetCounts(games, state, stats, facets) {
   const pool = games.filter(
     (game) =>
       inScope(game, state) &&
+      inLineage(game, state) &&
       (!state.favesOnly || stats.isFave(game.slug)) &&
       (!tokens.length || hasAllTokens(game, tokens))
   );
@@ -127,4 +134,89 @@ export function facetCounts(games, state, stats, facets) {
   }
 
   return counts;
+}
+
+const byCount = (a, b) => b.count - a.count || a.value.localeCompare(b.value, 'en', { numeric: true });
+
+/** One option per distinct value, labelled the way the first game spells it. */
+function tally(list, pick) {
+  const by = new Map();
+  for (const game of list) {
+    const value = pick(game);
+    const key = sameKey(value);
+    if (!by.has(key)) by.set(key, { value, count: 0 });
+    by.get(key).count += 1;
+  }
+  return [...by.values()].sort(byCount);
+}
+
+/**
+ * The Source rail: every series and how many games it holds, then, once a
+ * series is picked, every game inside it. Counted like the facet rails, against
+ * everything except the rail's own choice, so the other series still say what
+ * picking them instead would show.
+ */
+export function sourceCounts(games, state, stats) {
+  const tokens = tokenize(state.query);
+  const pool = games.filter(
+    (game) =>
+      inScope(game, state) &&
+      (!state.favesOnly || stats.isFave(game.slug)) &&
+      passesFacets(game, state.facets) &&
+      (!tokens.length || hasAllTokens(game, tokens))
+  );
+  const series = tally(pool, (game) => game.lineage.series);
+  const titles = state.series
+    ? tally(
+        pool.filter((game) => sameKey(game.lineage.series) === sameKey(state.series)),
+        (game) => game.lineage.title
+      )
+    : [];
+  return { series, titles };
+}
+
+/**
+ * Fold the wall into stacks, one level of the Source rail at a time. With no
+ * series picked, each series is one stack; originals have no series to share,
+ * so they stack by name instead. Inside a series, each game it holds is a
+ * stack. Inside one game, every attempt stands on its own.
+ *
+ * A stack of one is just that game, a series that holds a single game stacks
+ * as that game, and a wall that would fold into one lone stack shows what is
+ * in it instead. A stack takes the place of its first game, so the sort still
+ * decides the order, except A to Z, which files a stack under its own name.
+ */
+export function stackGames(list, state) {
+  if (state.source) return list;
+  const original = sameKey(ORIGINAL);
+  const groups = new Map();
+  for (const game of list) {
+    const level = !state.series && sameKey(game.lineage.series) !== original ? 'series' : 'title';
+    const key = `${level}:${sameKey(game.lineage[level])}`;
+    if (!groups.has(key)) groups.set(key, { level, games: [] });
+    groups.get(key).games.push(game);
+  }
+  if (groups.size === 1) return list;
+
+  const items = [...groups.values()].map(({ level, games }) => {
+    if (games.length === 1) return games[0];
+    const { series, title } = games[0].lineage;
+    const titles = new Set(games.map((game) => sameKey(game.lineage.title))).size;
+    const asTitle = level === 'title' || titles === 1;
+    return {
+      stack: true,
+      level: asTitle ? 'title' : 'series',
+      label: asTitle ? title : series,
+      series,
+      title: asTitle ? title : null,
+      titles,
+      games,
+    };
+  });
+
+  if (state.sort === 'name' && !tokenize(state.query).length) {
+    const label = (item) => (item.stack ? item.label : item.name);
+    items.sort((a, b) => label(a).localeCompare(label(b), 'en', { sensitivity: 'base' }));
+  }
+  return items;
 }

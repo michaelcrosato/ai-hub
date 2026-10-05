@@ -157,6 +157,10 @@ export function normalizeColor(value) {
 
 const SQUISH = (s) => decodeEntities(s).replace(/\s+/g, ' ').trim();
 
+// Older names for a hub:* field. Games keep whatever their prompt told them to
+// write, so `hub:inspired-by` still lands in `source`, the field the wall uses.
+const HUB_ALIASES = { inspiredBy: 'source' };
+
 /**
  * Pull catalogue metadata out of a document head. Attribute order is never
  * assumed: every `<meta>` is parsed into a map first, then looked up by name.
@@ -180,11 +184,12 @@ export function parseHead(html) {
   const hub = {};
   for (const [key, value] of byName) {
     if (!key.startsWith('hub:')) continue;
-    const field = key
+    const raw = key
       .slice(4)
       .replace(/[-_ ](.)/g, (_, c) => c.toUpperCase())
       .trim();
-    if (!field) continue;
+    const field = HUB_ALIASES[raw] || raw;
+    if (!field || (field !== raw && byName.has(`hub:${field}`))) continue;
     const text = SQUISH(value);
     hub[field] =
       field === 'tags' || field === 'controls'

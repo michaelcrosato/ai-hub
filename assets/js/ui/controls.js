@@ -9,10 +9,16 @@
  * A rail shows its most common options and folds the rest behind a "+N more"
  * chip, so a library with forty collections still has a control strip rather
  * than a control wall.
+ *
+ * The Source rail leads, and it works in two steps: pick a series (Dragon
+ * Quest), then, if you like, the one game in it (Dragon Quest III). The stacks
+ * on the wall are the same two steps, so pressing a stack and pressing its
+ * chip here land in the same place.
  */
 
 import { h, clear, icon, ICONS } from '../dom.js';
 import { SORTS } from '../filter.js';
+import { sameKey } from '../manifest.js';
 import { store } from '../store.js';
 
 /** Options a rail shows before folding the rest away. Chosen ones always show. */
@@ -24,7 +30,7 @@ const RAIL_LIMIT = 8;
  *                   strip, because a library with five rails would otherwise
  *                   pin a quarter of the screen
  */
-export function createControls(root, { railsRoot = root, onChange, onSurprise, onDensity }) {
+export function createControls(root, { railsRoot = root, onChange, onSurprise, onDensity, onStack }) {
   const expanded = new Set();
   let last = null;
   const input = h('input', {
@@ -89,6 +95,14 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
     onclick: () => onDensity(store.ui().density === 'compact' ? 'roomy' : 'compact'),
   });
 
+  // Also a preference: some days you want every attempt laid out at once.
+  const stacking = h('button', {
+    class: 'chip',
+    type: 'button',
+    title: 'Stack games that share a source',
+    onclick: () => onStack(!store.ui().stack),
+  });
+
   const rails = h('div', { class: 'rail rail--facets' });
 
   root.append(
@@ -96,6 +110,7 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
     h('div', { class: 'controls__spacer' }),
     surprise,
     faves,
+    stacking,
     sorter,
     density
   );
@@ -109,8 +124,94 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
 
   let lastSortKeys = '';
 
-  function render(state, { facets, counts, shown = 0 }) {
-    last = [state, { facets, counts, shown }];
+  /** The chips for one rail's options, folded past RAIL_LIMIT unless opened. */
+  function chips(key, options, { isOn, count, onPick }) {
+    const open = expanded.has(key);
+    const kept = open ? options : options.filter((option, i) => i < RAIL_LIMIT || isOn(option.value));
+    const folded = options.length - kept.length;
+    return [
+      ...kept.map((option) => {
+        const on = isOn(option.value);
+        const n = count(option);
+        return h(
+          'button',
+          {
+            class: 'chip',
+            type: 'button',
+            'aria-pressed': String(on),
+            disabled: !on && n === 0,
+            onclick: () => onPick(option.value, on),
+          },
+          option.value,
+          h('span', { class: 'chip__count' }, n)
+        );
+      }),
+      folded > 0 &&
+        h(
+          'button',
+          { class: 'chip chip--fold', type: 'button', 'aria-expanded': 'false', onclick: () => refold(key, true) },
+          `+${folded} more`
+        ),
+      open &&
+        options.length > RAIL_LIMIT &&
+        h(
+          'button',
+          { class: 'chip chip--fold', type: 'button', 'aria-expanded': 'true', onclick: () => refold(key, false) },
+          'Fewer'
+        ),
+    ];
+  }
+
+  /**
+   * Series first. Once one is picked it is the only series chip left, lit, and
+   * pressing it again goes back to every series; the games inside it follow.
+   * A series that holds one game skips that second step: there is no choice.
+   */
+  function sourceRail(state, sources) {
+    if (!sources || (!state.series && sources.series.length < 2)) return null;
+    const same = (a, b) => sameKey(a) === sameKey(b);
+    if (!state.series) {
+      return h(
+        'div',
+        { class: 'rail rail--source' },
+        h('span', { class: 'rail__label' }, 'Source'),
+        ...chips('source:series', sources.series, {
+          isOn: () => false,
+          count: (option) => option.count,
+          onPick: (value) => onChange({ series: value, source: '' }),
+        })
+      );
+    }
+    const picked = sources.series.find((option) => same(option.value, state.series));
+    return h(
+      'div',
+      { class: 'rail rail--source' },
+      h('span', { class: 'rail__label' }, 'Source'),
+      h(
+        'button',
+        {
+          class: 'chip',
+          type: 'button',
+          'aria-pressed': 'true',
+          title: 'Back to every series',
+          onclick: () => onChange({ series: '', source: '' }),
+        },
+        picked ? picked.value : state.series,
+        h('span', { class: 'chip__count' }, picked ? picked.count : 0)
+      ),
+      sources.titles.length > 1 && [
+        h('span', { class: 'rail__step', 'aria-hidden': 'true' }, '›'),
+        ...chips('source:titles', sources.titles, {
+          isOn: (value) => same(value, state.source),
+          count: (option) => option.count,
+          onPick: (value, on) => onChange({ source: on ? '' : value }),
+        }),
+      ]
+    );
+  }
+
+  function render(state, { facets, counts, sources, shown = 0 }) {
+    last = [state, { facets, counts, sources, shown }];
     if (input.value !== state.query) {
       input.value = state.query;
       clearButton.hidden = !state.query;
@@ -141,6 +242,15 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
 
     surprise.hidden = shown < 2;
 
+    const stacked = store.ui().stack;
+    stacking.setAttribute('aria-pressed', String(stacked));
+    stacking.setAttribute(
+      'aria-label',
+      stacked ? 'Stacks on: press to show every game' : 'Stacks off: press to stack games that share a source'
+    );
+    clear(stacking);
+    stacking.append(icon(ICONS.stack, { width: 13, height: 13 }), h('span', { class: 'chip__text' }, ' Stacks'));
+
     const compact = store.ui().density === 'compact';
     const label = compact ? 'Show bigger cabinets' : 'Show more cabinets per row';
     density.setAttribute('aria-label', label);
@@ -149,63 +259,24 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
     density.append(icon(compact ? ICONS.roomy : ICONS.dense, { width: 14, height: 14 }));
 
     clear(rails);
+    const source = sourceRail(state, sources);
+    if (source) rails.append(source);
     for (const facet of facets) {
       const active = state.facets[facet.key] || [];
       const counted = counts.get(facet.key) || new Map();
-      const open = expanded.has(facet.key);
-      const options = open
-        ? facet.options
-        : facet.options.filter((option, i) => i < RAIL_LIMIT || active.includes(option.value));
-      const folded = facet.options.length - options.length;
       rails.append(
         h(
           'div',
           { class: 'rail' },
           h('span', { class: 'rail__label' }, facet.label),
-          ...options.map((option) => {
-            const on = active.includes(option.value);
-            const n = counted.get(option.value) ?? 0;
-            return h(
-              'button',
-              {
-                class: 'chip',
-                type: 'button',
-                'aria-pressed': String(on),
-                disabled: !on && n === 0,
-                onclick: () => {
-                  const next = on
-                    ? active.filter((v) => v !== option.value)
-                    : [...active, option.value];
-                  onChange({ [facet.key]: next.join(',') });
-                },
-              },
-              option.value,
-              h('span', { class: 'chip__count' }, n)
-            );
-          }),
-          folded > 0 &&
-            h(
-              'button',
-              {
-                class: 'chip chip--fold',
-                type: 'button',
-                'aria-expanded': 'false',
-                onclick: () => refold(facet.key, true),
-              },
-              `+${folded} more`
-            ),
-          open &&
-            facet.options.length > RAIL_LIMIT &&
-            h(
-              'button',
-              {
-                class: 'chip chip--fold',
-                type: 'button',
-                'aria-expanded': 'true',
-                onclick: () => refold(facet.key, false),
-              },
-              'Fewer'
-            )
+          ...chips(facet.key, facet.options, {
+            isOn: (value) => active.includes(value),
+            count: (option) => counted.get(option.value) ?? 0,
+            onPick: (value, on) => {
+              const next = on ? active.filter((v) => v !== value) : [...active, value];
+              onChange({ [facet.key]: next.join(',') });
+            },
+          })
         )
       );
     }

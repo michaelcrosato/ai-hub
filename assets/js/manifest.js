@@ -22,6 +22,13 @@ export const NOT_A_FACET = new Set([
   'q', 'sort', 'fav', 'shelf',
 ]);
 
+/** Fields with a control of their own — the Source rail and the stacks on the
+ *  wall — rather than a rail of loose values. Still searched, still in the drawer. */
+export const OWN_CONTROL = new Set(['source', 'series']);
+
+/** What a game with no `source` riffs on: nothing, it is its own idea. */
+export const ORIGINAL = 'Original';
+
 /** Rails that exist are still found, never declared; these few just go first
  *  when they do, because they are how people actually browse. A field nobody
  *  fills in simply never shows up. */
@@ -85,8 +92,28 @@ export function normalize(game) {
     addedAt: Date.parse(game.added) || 0,
     updatedAt: Date.parse(game.updated || game.added) || 0,
   };
+  out.lineage = lineageOf(out);
   out.search = haystack(out);
   return out;
+}
+
+/** Same text for grouping: case, accents and spacing never split a stack. */
+export const sameKey = (text) => fold(text).replace(/\s+/g, ' ').trim();
+
+/**
+ * Where a game sits among the attempts at the same thing: its series, then
+ * the one game it is an attempt at. A licensed game is an attempt at its
+ * `source`, within the source's `series` (the source itself when the
+ * catalogue names none). An original is an attempt at itself, so originals
+ * sharing a name (six Stratas) stack, and a lone one stands alone.
+ */
+export function lineageOf(game) {
+  const source = typeof game.source === 'string' ? game.source.trim() : '';
+  const series = typeof game.series === 'string' ? game.series.trim() : '';
+  return {
+    series: series || source || ORIGINAL,
+    title: source || String(game.name ?? game.slug ?? '').trim(),
+  };
 }
 
 const prettyLabel = (key) =>
@@ -104,7 +131,7 @@ export function deriveFacets(games) {
 
   for (const game of games) {
     for (const [key, value] of Object.entries(game)) {
-      if (NOT_A_FACET.has(key)) continue;
+      if (NOT_A_FACET.has(key) || OWN_CONTROL.has(key)) continue;
       const values = Array.isArray(value) ? value : [value];
       for (const raw of values) {
         if (typeof raw !== 'string') continue;

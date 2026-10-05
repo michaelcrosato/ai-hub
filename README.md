@@ -73,7 +73,10 @@ games/Out-Run-SUPER-RUNOUT-The-coast-is-calling-2026-09-11-model-unknown.html
 ```
 
 The source is the classic a game riffs on, or `original` when there is none;
-`model-unknown` is used until the model is known (`GPT-6-Astra-Pro`).
+`model-unknown` is used until the model is known (`GPT-6-Astra-Pro`). A
+filename cannot say where the source ends and the title begins (`Out-Run` or
+`Out-Run-SUPER`?), so the wall's Source rail reads the catalogue's `source`
+field instead (see *Extra metadata*), and the filename only sorts the folder.
 
 The scan reads the pattern. The date and model say when and by what a file was
 made, not which game it is, so they stay out of the slug
@@ -213,10 +216,28 @@ shelf comes from each game's `type` in `data/overrides.json`; anything not
 catalogued counts as a game. The filter rails under them are worked out per
 shelf.
 
+### Sources and stacks
+
+Many games are attempts at the same classic: nine at Dragon Quest, seven at
+Final Fantasy Tactics. The **Source** rail, first under the search, sorts them
+in two steps: pick a series (*Dragon Quest 21*), then, if you like, the one game
+inside it (*Dragon Quest IX 2*). Pressing the lit series chip goes back to
+every series. Games with no source are under *Original*, and an original's
+"game" is its own name, so the six Stratas sit together.
+
+The wall follows the same two steps when **Stacks** is on (the default, and
+remembered per device). Each series is one stacked cabinet. Open it and each
+game in the series is a stack. Open one of those and every attempt is laid out.
+A series with only one game skips the middle step, and a stack of one is just
+the game. Each step is a link, so Back climbs out again. The trail at the top
+of the wall shows where you are, and each game's drawer links to *All N
+attempts* at the same game.
+
 On a big wall: **Surprise me** plays a random game from whatever the search and
-filters are showing, and the grid button beside the sort switches to a compact
-wall with twice the cabinets per row (remembered per device). A rail with many
-values shows the most common eight and folds the rest behind *+N more*.
+filters are showing (stacked or not, it picks a game), and the grid button
+beside the sort switches to a compact wall with twice the cabinets per row
+(remembered per device). A rail with many values shows the most common eight
+and folds the rest behind *+N more*.
 
 ## Optional extras
 
@@ -268,11 +289,15 @@ The library's own catalogue uses these fields, all in `data/overrides.json`:
 | `type` | `Game`, `Tech demo` or `Tool` | the Type rail, so demos and map viewers can be filtered out |
 | `tags` | 2–5 from a fixed vocabulary (`3d`, `retro`, `co-op`, `touch`…) | the Tags rail |
 | `players` | `1–2`, `1–4`… only when a game has co-op or versus | the Players rail |
-| `inspiredBy` | the classic a game riffs on | the drawer, and search |
+| `source` | the classic a game riffs on, as it is titled (`Dragon Quest IX`); none for an original | the Source rail, the stacks, the drawer, and search |
+| `series` | the franchise, only when it is not the source itself (`Dragon Quest` for `Dragon Quest IX`) | the first step of the Source rail and the stacks |
 | `controls` | a one-line summary | the drawer |
 | `description` | one or two plain sentences | the drawer |
 
-Genre, Collection, Type and Players lead the rail strip when they exist; the
+Every game with the same `source` must have the same `series`; `pnpm test`
+checks. A game can name its own source with `<meta name="hub:source">`
+(`hub:inspired-by`, the older name, still works). Source leads the rail strip.
+Genre, Collection, Type and Players follow it when they exist; the
 rest follow by how many games carry them. `docs/curation-2026-09-24.md`
 records how the library was curated: which file of each game was kept, and
 which older iterations it replaced. `docs/curation-2026-09-28.md` records the
@@ -315,7 +340,7 @@ data/
 assets/js/        native ES modules, no bundler
   color.js        theme-color → cabinet lighting, via OKLCH
   art.js          the six procedural screen patterns
-  filter.js       search, facets, sorting (pure, tested)
+  filter.js       search, facets, sorting, sources and stacks (pure, tested)
   ui/grid.js      the wall, rendered in batches as you scroll
   ui/player.js    the framed player and the ways out of it
 scripts/

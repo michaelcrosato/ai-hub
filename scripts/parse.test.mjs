@@ -78,6 +78,15 @@ test('parseHead pulls title, lang, data-uri icon and hub:* extras', () => {
   assert.deepEqual(head.hub.tags, ['flight', 'rescue']);
 });
 
+test('hub:inspired-by is read as the source, and never beats an explicit hub:source', () => {
+  const old = parseHead('<head><meta name="hub:inspired-by" content="Blast Corps"></head>');
+  assert.deepEqual(old.hub, { source: 'Blast Corps' });
+  const both = parseHead(
+    '<head><meta name="hub:source" content="Doom II"><meta name="hub:inspired-by" content="Doom"></head>'
+  );
+  assert.deepEqual(both.hub, { source: 'Doom II' });
+});
+
 test('parseHead ignores non-data icon hrefs that would not resolve from the hub', () => {
   assert.equal(parseHead('<link rel="icon" href="./favicon.png">').icon, null);
   assert.equal(

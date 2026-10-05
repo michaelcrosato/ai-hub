@@ -4,6 +4,9 @@
  * Opened from a cabinet's build/details button. Shows the blurb, the facts,
  * and every build of the game so you can play an older one deliberately.
  *
+ * When other attempts at the same game are on the wall, a link goes to all of
+ * them at once.
+ *
  * The facts list is generated from whatever the game carries, so a `model` or
  * `harness` added to data/overrides.json shows up here without touching this
  * file — the same rule the filter rails follow.
@@ -46,7 +49,7 @@ function facts(game) {
   );
 }
 
-export function createDetail(root, { onPlay }) {
+export function createDetail(root, { onPlay, attempts = () => null }) {
   let game = null;
   let returnFocus = null;
 
@@ -68,6 +71,7 @@ export function createDetail(root, { onPlay }) {
 
       const palette = cabinetPalette(game);
       const current = game.builds[0];
+      const others = attempts(game);
 
       const closeButton = h(
         'button',
@@ -132,6 +136,7 @@ export function createDetail(root, { onPlay }) {
               { class: 'detail__aside', href: current.path, target: '_blank', rel: 'noopener' },
               'Open on its own page'
             ),
+            others && h('a', { class: 'detail__aside detail__attempts', href: others.href }, others.text),
             facts(game),
             buildList
           )
