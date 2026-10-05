@@ -19,15 +19,71 @@ export const NOT_A_FACET = new Set([
   // switch, not something to browse by.
   'type', 'restricted',
   // Reserved by the router's query string: a facet may not shadow these.
-  'q', 'sort', 'fav', 'shelf',
+  'q', 'sort', 'fav', 'shelf', 'origin',
+  // Worked out here, below, rather than catalogued.
+  'lineage', 'rails',
 ]);
 
-/** Fields with a control of their own — the Source rail and the stacks on the
- *  wall — rather than a rail of loose values. Still searched, still in the drawer. */
-export const OWN_CONTROL = new Set(['source', 'series']);
+/** Fields that are searched and listed in the drawer but get no rail: the
+ *  Source rail and the stacks on the wall take `source` and `series`, and
+ *  which harness built a game is not something anyone browses by. */
+const NO_RAIL = new Set(['source', 'series', 'harness']);
 
 /** What a game with no `source` riffs on: nothing, it is its own idea. */
 export const ORIGINAL = 'Original';
+
+export const SINGLE = 'Single player';
+export const MULTI = 'Multiplayer';
+/** "4 players": a head count, a closer look at Multiplayer. */
+const SEATS = /^\d+ players$/;
+/** Past this a head count names a crowd, not a choice anyone makes. */
+const MOST_SEATS = 12;
+
+const KB = 1024;
+const MB = 1024 * KB;
+const SIZES = [
+  { under: 250 * KB, label: 'Under 250 KB' },
+  { under: 1 * MB, label: '250 KB–1 MB' },
+  { under: 4 * MB, label: '1–4 MB' },
+  { under: Infinity, label: 'Over 4 MB' },
+];
+
+/**
+ * Who a game is for, read off its `players` ("1–4"): alone, together, and,
+ * for together, every head count it seats, so a party of three finds what
+ * fits. A game that says nothing is for one: that is what nearly every game
+ * dropped in is. A tool or demo that says nothing is not for players at all.
+ */
+export function playersOf(game) {
+  const [low, high = low] = (String(game.players ?? '').match(/\d+/g) || []).map(Number);
+  if (!low) return !game.type || game.type === 'Game' ? [SINGLE] : [];
+  const out = low === 1 ? [SINGLE] : [];
+  if (high > 1) out.push(MULTI);
+  for (let n = Math.max(2, low); n <= Math.min(high, MOST_SEATS); n++) out.push(`${n} players`);
+  return out;
+}
+
+/** The bracket a file's size falls in. */
+export const sizeOf = (bytes) => SIZES.find((size) => bytes < size.under).label;
+
+/** Rails read through a lens rather than as written. The fields themselves
+ *  stay as they are, for the drawer and the search. */
+const LENSES = {
+  players: playersOf,
+  fileSize: (game) => (game.bytes > 0 ? [sizeOf(game.bytes)] : []),
+};
+
+/** Rails that read in their own order, smallest first, rather than most
+ *  common first. Values a scale does not list follow it, in natural order. */
+const SCALES = {
+  players: [SINGLE, MULTI],
+  fileSize: SIZES.map((size) => size.label),
+};
+
+/** Options that open from another option instead of sitting on the rail. */
+const UNDER = {
+  players: (value) => (SEATS.test(value) ? MULTI : null),
+};
 
 /** Rails that exist are still found, never declared; these few just go first
  *  when they do, because they are how people actually browse. A field nobody
@@ -93,34 +149,64 @@ export function normalize(game) {
     updatedAt: Date.parse(game.updated || game.added) || 0,
   };
   out.lineage = lineageOf(out);
+  out.rails = railsOf(out);
   out.search = haystack(out);
   return out;
+}
+
+/**
+ * What a game puts on each rail, worked out once: every field that
+ * classifies it, as trimmed strings, plus the ones read through a lens.
+ */
+function railsOf(game) {
+  const rails = {};
+  for (const [key, value] of Object.entries(game)) {
+    if (NOT_A_FACET.has(key) || NO_RAIL.has(key) || key in LENSES) continue;
+    const values = (Array.isArray(value) ? value : [value])
+      .filter((v) => typeof v === 'string')
+      .map((v) => v.trim())
+      .filter(Boolean);
+    if (values.length) rails[key] = values;
+  }
+  for (const [key, read] of Object.entries(LENSES)) {
+    const values = read(game);
+    if (values.length) rails[key] = values;
+  }
+  return rails;
 }
 
 /** Same text for grouping: case, accents and spacing never split a stack. */
 export const sameKey = (text) => fold(text).replace(/\s+/g, ' ').trim();
 
 /**
- * Where a game sits among the attempts at the same thing: its series, then
- * the one game it is an attempt at. A licensed game is an attempt at its
- * `source`, within the source's `series` (the source itself when the
- * catalogue names none). An original is an attempt at itself, so originals
- * sharing a name (six Stratas) stack, and a lone one stands alone.
+ * Where a game sits among the attempts at the same thing: original or
+ * inspired, its series, then the one game it is an attempt at. An inspired
+ * game is an attempt at its `source`, within the source's `series` (the
+ * source itself when the catalogue names none). An original is an attempt at
+ * itself, so originals sharing a name (six Stratas) stack, and a lone one
+ * stands alone.
  */
 export function lineageOf(game) {
   const source = typeof game.source === 'string' ? game.source.trim() : '';
   const series = typeof game.series === 'string' ? game.series.trim() : '';
   return {
+    original: !source && !series,
     series: series || source || ORIGINAL,
     title: source || String(game.name ?? game.slug ?? '').trim(),
   };
 }
 
+/** The first step of the Source rail: 'original' or 'inspired'. */
+export const originOf = (game) => (game.lineage.original ? 'original' : 'inspired');
+
+/** "fileSize" reads "File size", in the sentence case the rest of the wall uses. */
 const prettyLabel = (key) =>
   key
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([a-z0-9])([A-Z])/g, (_, a, b) => `${a} ${b.toLowerCase()}`)
     .replace(/[-_]+/g, ' ')
     .replace(/^./, (c) => c.toUpperCase());
+
+const natural = (a, b) => a.value.localeCompare(b.value, 'en', { numeric: true });
 
 /**
  * Every string-valued field carried by enough games becomes a rail, sorted by
@@ -130,17 +216,10 @@ export function deriveFacets(games) {
   const counters = new Map();
 
   for (const game of games) {
-    for (const [key, value] of Object.entries(game)) {
-      if (NOT_A_FACET.has(key) || OWN_CONTROL.has(key)) continue;
-      const values = Array.isArray(value) ? value : [value];
-      for (const raw of values) {
-        if (typeof raw !== 'string') continue;
-        const text = raw.trim();
-        if (!text) continue;
-        if (!counters.has(key)) counters.set(key, new Map());
-        const counts = counters.get(key);
-        counts.set(text, (counts.get(text) || 0) + 1);
-      }
+    for (const [key, values] of Object.entries(game.rails)) {
+      if (!counters.has(key)) counters.set(key, new Map());
+      const counts = counters.get(key);
+      for (const text of new Set(values)) counts.set(text, (counts.get(text) || 0) + 1);
     }
   }
 
@@ -153,14 +232,22 @@ export function deriveFacets(games) {
       const shared = [...counts.values()].filter((n) => n > 1).length;
       if (!shared || counts.size / coverage > MAX_UNIQUE_SHARE) continue;
     }
+    const scale = SCALES[key];
+    const place = (option) => {
+      const at = scale.indexOf(option.value);
+      return at === -1 ? scale.length : at;
+    };
     facets.push({
       key,
       label: prettyLabel(key),
       coverage,
       options: [...counts.entries()]
-        .map(([value, count]) => ({ value, count }))
+        .map(([value, count]) => {
+          const under = UNDER[key]?.(value);
+          return under ? { value, count, under } : { value, count };
+        })
         // Natural order within a count, so "Batch 2" sits before "Batch 10".
-        .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value, 'en', { numeric: true })),
+        .sort(scale ? (a, b) => place(a) - place(b) || natural(a, b) : (a, b) => b.count - a.count || natural(a, b)),
     });
   }
 
@@ -173,9 +260,5 @@ export function deriveFacets(games) {
   );
 }
 
-/** True when a game carries `value` in `key`, whether that field is a string or a list. */
-export function matchesFacet(game, key, value) {
-  const held = game[key];
-  if (Array.isArray(held)) return held.some((v) => String(v).trim() === value);
-  return typeof held === 'string' && held.trim() === value;
-}
+/** True when a game puts `value` on the `key` rail. */
+export const matchesFacet = (game, key, value) => Boolean(game.rails[key]?.includes(value));

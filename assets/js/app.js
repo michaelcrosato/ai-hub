@@ -17,7 +17,7 @@
  */
 
 import { h, icon, ICONS } from './dom.js';
-import { loadManifest, deriveFacets, sameKey } from './manifest.js';
+import { loadManifest, deriveFacets, sameKey, originOf, ORIGINAL } from './manifest.js';
 import { plural } from './format.js';
 import {
   selectGames,
@@ -27,6 +27,7 @@ import {
   DEFAULT_SORT,
   SORTS,
   SHELVES,
+  ORIGINS,
   DEFAULT_SHELF,
   shelfOf,
   isVisible,
@@ -54,8 +55,15 @@ function hrefWith(patch) {
   return `#/${text ? `?${text}` : ''}`;
 }
 
+/** Where a series or a game sits in the Source rail, as the query that opens it. */
+const lineageQuery = ({ original, series, title }) => ({
+  origin: original ? 'original' : 'inspired',
+  series: original ? '' : series,
+  source: title || '',
+});
+
 const grid = createGrid(wallEl, {
-  stackHref: (stack) => hrefWith({ series: stack.series, source: stack.title }),
+  stackHref: (stack) => hrefWith(lineageQuery(stack)),
 });
 
 const stats = {
@@ -97,15 +105,26 @@ function readState(query) {
     query: query.get('q') || '',
     sort: query.get('sort') || store.ui().sort || DEFAULT_SORT,
     favesOnly: query.get('fav') === '1',
+    origin: ORIGINS.some((o) => o.key === query.get('origin')) ? query.get('origin') : '',
     series: query.get('series') || '',
     source: query.get('source') || '',
     facets: {},
   };
-  // A link that names only the game still gets its series, so the rail and
-  // the trail can show where it sits.
-  if (state.source && !state.series) {
-    const found = games.find((g) => sameKey(g.lineage.title) === sameKey(state.source));
-    if (found) state.series = found.lineage.series;
+  // A link that names only the series or the game still gets the steps above
+  // it, so the rail and the trail can show where it sits. Originals have no
+  // series: "Original" there is the step itself.
+  if (state.series && !state.origin) {
+    state.origin = sameKey(state.series) === sameKey(ORIGINAL) ? 'original' : 'inspired';
+  }
+  if (state.origin === 'original') state.series = '';
+  if (state.source && !state.series && state.origin !== 'original') {
+    const found = games.find(
+      (g) => sameKey(g.lineage.title) === sameKey(state.source) && (!state.origin || originOf(g) === state.origin)
+    );
+    if (found) {
+      state.origin = originOf(found);
+      if (state.origin === 'inspired') state.series = found.lineage.series;
+    }
   }
   if (!SORTS.some((s) => s.key === state.sort)) state.sort = DEFAULT_SORT;
   facets = facetsFor(state.shelf);
@@ -125,6 +144,7 @@ const stateKey = (state) =>
     state.query,
     state.sort,
     state.favesOnly,
+    state.origin,
     state.series,
     state.source,
     store.ui().stack,
@@ -139,7 +159,7 @@ const shelves = createShelves(document.getElementById('shelves'), {
   onSelect(shelf) {
     // A genre picked on one shelf rarely exists on another, so switching
     // shelves starts its rails fresh. The search stays: it travels well.
-    const patch = { shelf: shelf === DEFAULT_SHELF ? '' : shelf, series: '', source: '' };
+    const patch = { shelf: shelf === DEFAULT_SHELF ? '' : shelf, origin: '', series: '', source: '' };
     for (const facet of facets) patch[facet.key] = '';
     router.setQuery(patch);
   },
@@ -179,8 +199,7 @@ function attemptsOf(game) {
   if (count < 2) return null;
   const query = new URLSearchParams();
   if (shelf !== DEFAULT_SHELF) query.set('shelf', shelf);
-  query.set('series', series);
-  query.set('source', title);
+  for (const [key, value] of Object.entries(lineageQuery(game.lineage))) if (value) query.set(key, value);
   return { text: `All ${count} attempts at ${title}`, href: `#/?${query}` };
 }
 
@@ -214,17 +233,26 @@ function renderCount(state, shown) {
  * sits at the top of the wall itself, because opening a stack scrolls there.
  */
 function trail(state, sources, shown) {
-  if (!state.series) return null;
+  if (!state.origin) return null;
   const label = (options, value) => options.find((o) => sameKey(o.value) === sameKey(value))?.value || value;
-  const series = label(sources.series, state.series);
-  const step = () => h('span', { class: 'trail__step', 'aria-hidden': 'true' }, '›');
+  const steps = [
+    [ORIGINS.find((o) => o.key === state.origin).label, { series: '', source: '' }],
+    state.series && [label(sources.series, state.series), { source: '' }],
+    state.source && [label(sources.titles, state.source)],
+  ].filter(Boolean);
   return h(
     'nav',
     { class: 'trail', 'aria-label': 'Source' },
-    h('a', { class: 'trail__up', href: hrefWith({ series: '', source: '' }) }, icon(ICONS.back), 'All sources'),
-    step(),
-    state.source ? h('a', { href: hrefWith({ source: '' }) }, series) : h('b', {}, series),
-    state.source && [step(), h('b', {}, label(sources.titles, state.source))],
+    h(
+      'a',
+      { class: 'trail__up', href: hrefWith({ origin: '', series: '', source: '' }) },
+      icon(ICONS.back),
+      'All sources'
+    ),
+    steps.map(([text, up], i) => [
+      h('span', { class: 'trail__step', 'aria-hidden': 'true' }, '›'),
+      i === steps.length - 1 ? h('b', {}, text) : h('a', { href: hrefWith(up) }, text),
+    ]),
     h('span', { class: 'trail__count' }, plural(shown, state.source ? 'attempt' : 'game'))
   );
 }
@@ -260,7 +288,7 @@ function renderWall(state) {
         {
           type: 'button',
           onclick: () => {
-            const cleared = { q: '', fav: '', series: '', source: '' };
+            const cleared = { q: '', fav: '', origin: '', series: '', source: '' };
             for (const facet of facets) cleared[facet.key] = '';
             router.setQuery(cleared);
           },
@@ -273,10 +301,10 @@ function renderWall(state) {
 
   grid.render(store.ui().stack ? stackGames(visible, state) : visible, {
     lead: trail(state, sources, visible.length),
-    // Inside a series every tile is the same genre; which game each one is an
-    // attempt at is what tells them apart.
+    // Among inspired games, which game each one is an attempt at says more
+    // than its genre; inside a series every tile is the same genre anyway.
     label: (game) =>
-      state.series && !state.source && sameKey(game.lineage.title) !== sameKey(game.name)
+      state.origin === 'inspired' && !state.source && sameKey(game.lineage.title) !== sameKey(game.name)
         ? game.lineage.title
         : null,
   });

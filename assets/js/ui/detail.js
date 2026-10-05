@@ -17,8 +17,6 @@ import { cabinetPalette, paletteVars } from '../color.js';
 import { NOT_A_FACET } from '../manifest.js';
 import { bytes, date, plural } from '../format.js';
 
-const ALWAYS_SHOWN = new Set(['weight']);
-
 const prettyLabel = (key) =>
   key
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
@@ -33,8 +31,7 @@ function facts(game) {
   if (game.version) rows.splice(1, 0, ['Current build', `v${game.version}`]);
 
   for (const [key, value] of Object.entries(game)) {
-    if (NOT_A_FACET.has(key) && !ALWAYS_SHOWN.has(key)) continue;
-    if (key === 'addedAt' || key === 'updatedAt') continue;
+    if (NOT_A_FACET.has(key)) continue;
     const text = Array.isArray(value) ? value.join(', ') : value;
     if (typeof text !== 'string' || !text.trim()) continue;
     rows.push([prettyLabel(key), text]);

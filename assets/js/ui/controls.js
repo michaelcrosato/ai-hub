@@ -8,21 +8,27 @@
  *
  * A rail shows its most common options and folds the rest behind a "+N more"
  * chip, so a library with forty collections still has a control strip rather
- * than a control wall.
+ * than a control wall. Tags fold away entirely until asked for.
  *
- * The Source rail leads, and it works in two steps: pick a series (Dragon
- * Quest), then, if you like, the one game in it (Dragon Quest III). The stacks
- * on the wall are the same two steps, so pressing a stack and pressing its
- * chip here land in the same place.
+ * The Source rail leads, and it works in steps: Original or Inspired; for
+ * inspired, a series (Dragon Quest); then, if you like, the one game in it
+ * (Dragon Quest III). The stacks on the wall are the same steps, so pressing
+ * a stack and pressing its chip here land in the same place.
  */
 
 import { h, clear, icon, ICONS } from '../dom.js';
 import { SORTS } from '../filter.js';
-import { sameKey } from '../manifest.js';
+import { sameKey, MULTI } from '../manifest.js';
 import { store } from '../store.js';
 
 /** Options a rail shows before folding the rest away. Chosen ones always show. */
 const RAIL_LIMIT = 8;
+/** Rails folded away entirely until opened: dozens of tags narrow little
+ *  until you go looking for one. */
+const FOLDED = new Set(['tags']);
+
+/** How an option that opens a menu names itself as the menu's first item. */
+const ANY = { [MULTI]: 'Any number' };
 
 /**
  * @param root       the sticky strip: search, surprise, favourites, sort, density
@@ -124,90 +130,182 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
 
   let lastSortKeys = '';
 
-  /** The chips for one rail's options, folded past RAIL_LIMIT unless opened. */
-  function chips(key, options, { isOn, count, onPick }) {
+  /**
+   * The chips for one rail's options, folded past its limit unless opened.
+   * An option with others under it (Multiplayer, then how many) is a chip
+   * that drops a menu of them instead.
+   */
+  function chips(key, label, options, { isOn, onPick, under = () => [], onSet }) {
     const open = expanded.has(key);
-    const kept = open ? options : options.filter((option, i) => i < RAIL_LIMIT || isOn(option.value));
+    const limit = FOLDED.has(key) ? 0 : RAIL_LIMIT;
+    const kept = open ? options : options.filter((option, i) => i < limit || isOn(option.value));
     const folded = options.length - kept.length;
+    const noun = label.toLowerCase();
     return [
       ...kept.map((option) => {
+        const inner = under(option);
+        if (inner.length) return dropChip(key, option, inner, { isOn, onSet });
         const on = isOn(option.value);
-        const n = count(option);
         return h(
           'button',
           {
             class: 'chip',
             type: 'button',
             'aria-pressed': String(on),
-            disabled: !on && n === 0,
+            disabled: !on && option.count === 0,
             onclick: () => onPick(option.value, on),
           },
-          option.value,
-          h('span', { class: 'chip__count' }, n)
+          option.label ?? option.value
         );
       }),
       folded > 0 &&
         h(
           'button',
           { class: 'chip chip--fold', type: 'button', 'aria-expanded': 'false', onclick: () => refold(key, true) },
-          `+${folded} more`
+          limit === 0 && !kept.length ? `Show ${noun}` : `+${folded} more`
         ),
       open &&
-        options.length > RAIL_LIMIT &&
+        options.length > limit &&
         h(
           'button',
           { class: 'chip chip--fold', type: 'button', 'aria-expanded': 'true', onclick: () => refold(key, false) },
-          'Fewer'
+          limit === 0 ? `Hide ${noun}` : 'Fewer'
         ),
     ];
   }
 
   /**
-   * Series first. Once one is picked it is the only series chip left, lit, and
-   * pressing it again goes back to every series; the games inside it follow.
-   * A series that holds one game skips that second step: there is no choice.
+   * A chip that drops a menu: the option itself first, as "Any number", then
+   * each closer look at it. One of them at a time, and picking the lit one
+   * again lets go. The menu sits in the top layer, so a rail that scrolls
+   * sideways on a phone cannot clip it, and any scroll closes it.
+   */
+  function dropChip(key, option, inner, { isOn, onSet }) {
+    const items = [{ ...option, label: ANY[option.value] ?? option.value }, ...inner];
+    const picked = items.find((item) => isOn(item.value));
+    const id = `drop-${key}-${sameKey(option.value).replace(/\W+/g, '-')}`;
+
+    const shut = (event) => {
+      if (event?.target === menu) return;
+      if (menu.matches(':popover-open')) menu.hidePopover();
+    };
+    const menu = h(
+      'div',
+      {
+        id,
+        class: 'drop',
+        popover: 'auto',
+        'aria-label': option.value,
+        ontoggle: (event) => {
+          if (event.newState === 'open') addEventListener('scroll', shut, { capture: true, passive: true });
+          else removeEventListener('scroll', shut, { capture: true });
+        },
+        onbeforetoggle: (event) => {
+          if (event.newState === 'open') place(menu, chip);
+        },
+      },
+      items.map((item) => {
+        const on = item === picked;
+        return h(
+          'button',
+          {
+            class: 'drop__item',
+            type: 'button',
+            'aria-pressed': String(on),
+            disabled: !on && item.count === 0,
+            onclick: () => {
+              shut();
+              onSet(items.map((i) => i.value), on ? null : item.value);
+            },
+          },
+          item.label ?? item.value
+        );
+      })
+    );
+    const chip = h(
+      'button',
+      {
+        class: `chip chip--drop${picked ? ' is-on' : ''}`,
+        type: 'button',
+        popovertarget: id,
+        disabled: !picked && items.every((item) => item.count === 0),
+      },
+      picked && picked !== items[0] ? picked.value : option.value,
+      icon(ICONS.caret, { width: 12, height: 12 })
+    );
+    return [chip, menu];
+  }
+
+  /** Under its chip, or over it when the page has no room below. */
+  function place(menu, chip) {
+    const box = chip.getBoundingClientRect();
+    const below = innerHeight - box.bottom;
+    const up = below < 220 && box.top > below;
+    const room = (up ? box.top : below) - 14;
+    Object.assign(menu.style, {
+      top: up ? 'auto' : `${box.bottom + 6}px`,
+      bottom: up ? `${innerHeight - box.top + 6}px` : 'auto',
+      left: box.left < innerWidth / 2 ? `${box.left}px` : 'auto',
+      right: box.left < innerWidth / 2 ? 'auto' : `${document.documentElement.clientWidth - box.right}px`,
+      maxHeight: `${Math.max(room, 120)}px`,
+    });
+  }
+
+  /**
+   * Original or inspired first. Once one is picked it stays, lit, and pressing
+   * it again goes back to both; inspired then offers its series, and a series,
+   * or the originals, the games that more than one attempt went at.
    */
   function sourceRail(state, sources) {
-    if (!sources || (!state.series && sources.series.length < 2)) return null;
+    if (!sources || (!state.origin && sources.origins.length < 2)) return null;
     const same = (a, b) => sameKey(a) === sameKey(b);
-    if (!state.series) {
-      return h(
-        'div',
-        { class: 'rail rail--source' },
-        h('span', { class: 'rail__label' }, 'Source'),
-        ...chips('source:series', sources.series, {
+    const step = () => h('span', { class: 'rail__step', 'aria-hidden': 'true' }, '›');
+    const lit = (text, title, onclick) =>
+      h('button', { class: 'chip', type: 'button', 'aria-pressed': 'true', title, onclick }, text);
+    const parts = [h('span', { class: 'rail__label' }, 'Source')];
+
+    if (!state.origin) {
+      parts.push(
+        ...chips('source:origin', 'Source', sources.origins, {
           isOn: () => false,
-          count: (option) => option.count,
+          onPick: (value) => onChange({ origin: value, series: '', source: '' }),
+        })
+      );
+    } else {
+      const origin = sources.origins.find((option) => option.value === state.origin);
+      parts.push(
+        lit(origin ? origin.label : state.origin, 'Back to every source', () =>
+          onChange({ origin: '', series: '', source: '' })
+        )
+      );
+    }
+
+    if (state.origin === 'inspired' && !state.series && sources.series.length) {
+      parts.push(
+        step(),
+        ...chips('source:series', 'Series', sources.series, {
+          isOn: () => false,
           onPick: (value) => onChange({ series: value, source: '' }),
         })
       );
+    } else if (state.series) {
+      const picked = sources.series.find((option) => same(option.value, state.series));
+      parts.push(
+        step(),
+        lit(picked ? picked.value : state.series, 'Back to every series', () => onChange({ series: '', source: '' }))
+      );
     }
-    const picked = sources.series.find((option) => same(option.value, state.series));
-    return h(
-      'div',
-      { class: 'rail rail--source' },
-      h('span', { class: 'rail__label' }, 'Source'),
-      h(
-        'button',
-        {
-          class: 'chip',
-          type: 'button',
-          'aria-pressed': 'true',
-          title: 'Back to every series',
-          onclick: () => onChange({ series: '', source: '' }),
-        },
-        picked ? picked.value : state.series,
-        h('span', { class: 'chip__count' }, picked ? picked.count : 0)
-      ),
-      sources.titles.length > 1 && [
-        h('span', { class: 'rail__step', 'aria-hidden': 'true' }, '›'),
-        ...chips('source:titles', sources.titles, {
+
+    if (sources.titles.length) {
+      parts.push(
+        step(),
+        ...chips('source:titles', 'Games', sources.titles, {
           isOn: (value) => same(value, state.source),
-          count: (option) => option.count,
           onPick: (value, on) => onChange({ source: on ? '' : value }),
-        }),
-      ]
-    );
+        })
+      );
+    }
+    return h('div', { class: 'rail rail--source' }, ...parts);
   }
 
   function render(state, { facets, counts, sources, shown = 0 }) {
@@ -236,8 +334,7 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
     faves.setAttribute('aria-label', `Favourites only (${faveCount})`);
     faves.append(
       icon(ICONS.star, { fill: state.favesOnly ? 'currentColor' : 'none', width: 13, height: 13 }),
-      h('span', { class: 'chip__text' }, ' Favourites'),
-      h('span', { class: 'chip__count' }, faveCount)
+      h('span', { class: 'chip__text' }, ' Favourites')
     );
 
     surprise.hidden = shown < 2;
@@ -264,19 +361,25 @@ export function createControls(root, { railsRoot = root, onChange, onSurprise, o
     for (const facet of facets) {
       const active = state.facets[facet.key] || [];
       const counted = counts.get(facet.key) || new Map();
+      // Counts only grey out what would empty the wall; the chips never show them.
+      const options = facet.options.map((option) => ({ ...option, count: counted.get(option.value) ?? 0 }));
+      const set = (next) => onChange({ [facet.key]: next.join(',') });
       rails.append(
         h(
           'div',
           { class: 'rail' },
           h('span', { class: 'rail__label' }, facet.label),
-          ...chips(facet.key, facet.options, {
-            isOn: (value) => active.includes(value),
-            count: (option) => counted.get(option.value) ?? 0,
-            onPick: (value, on) => {
-              const next = on ? active.filter((v) => v !== value) : [...active, value];
-              onChange({ [facet.key]: next.join(',') });
-            },
-          })
+          ...chips(
+            facet.key,
+            facet.label,
+            options.filter((option) => !option.under),
+            {
+              isOn: (value) => active.includes(value),
+              onPick: (value, on) => set(on ? active.filter((v) => v !== value) : [...active, value]),
+              under: (option) => options.filter((inner) => inner.under === option.value),
+              onSet: (group, value) => set([...active.filter((v) => !group.includes(v)), ...(value ? [value] : [])]),
+            }
+          )
         )
       );
     }

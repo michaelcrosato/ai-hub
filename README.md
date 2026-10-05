@@ -37,7 +37,7 @@ Nothing is typed in by hand. On every build, `scripts/scan.mjs` reads just the
 | `<meta name="theme-color">` | That cabinet's marquee colour and the light it throws |
 | `<link rel="icon" href="data:…">` | The emblem on its screen (a relative path works in a project folder) |
 | `<meta property="og:image">` | Its cover art, in a project folder that ships the image |
-| file size, the date in its name (or the date first seen) | The Weight rail, the Newest sort |
+| file size, the date in its name (or the date first seen) | The File size rail, the Newest sort |
 
 A game with none of these still works — it gets its filename as a name and a
 colour derived from its slug.
@@ -220,12 +220,14 @@ shelf.
 
 Many games are attempts at the same classic: nine at Dragon Quest, seven at
 Final Fantasy Tactics. The **Source** rail, first under the search, sorts them
-in two steps: pick a series (*Dragon Quest 21*), then, if you like, the one game
-inside it (*Dragon Quest IX 2*). Pressing the lit series chip goes back to
-every series. Games with no source are under *Original*, and an original's
-"game" is its own name, so the six Stratas sit together.
+in steps. Every game is **Original** (no source) or **Inspired** (it has one).
+Pick *Inspired* and the rail offers each series (*Dragon Quest*), then, if you
+like, the one game inside it (*Dragon Quest IX*). Pick *Original* and it offers
+the names several originals share, so the six Stratas sit together. A series
+or a game with only one attempt gets no chip: it is still on the wall under
+*Inspired* or *Original*. Pressing a lit chip goes back up a step.
 
-The wall follows the same two steps when **Stacks** is on (the default, and
+The wall follows the same steps when **Stacks** is on (the default, and
 remembered per device). Each series is one stacked cabinet. Open it and each
 game in the series is a stack. Open one of those and every attempt is laid out.
 A series with only one game skips the middle step, and a stack of one is just
@@ -237,7 +239,8 @@ On a big wall: **Surprise me** plays a random game from whatever the search and
 filters are showing (stacked or not, it picks a game), and the grid button
 beside the sort switches to a compact wall with twice the cabinets per row
 (remembered per device). A rail with many values shows the most common eight
-and folds the rest behind *+N more*.
+and folds the rest behind *+N more*; Tags fold away entirely until *Show tags*.
+Chips carry no counts: one that would empty the wall is greyed out instead.
 
 ## Optional extras
 
@@ -276,7 +279,9 @@ games and a Model rail appears on the wall by itself; remove them and it goes.
 Any field works, including ones invented on the spot. A game can also carry its
 own, with `<meta name="hub:model" content="…">` in its head. A field whose
 values are nearly all different (a build id, a URL) is searchable but never
-becomes a rail. Every field is searchable.
+becomes a rail. Every field is searchable. `harness` is searched and shown in
+the drawer but never gets a rail, and neither do `source` and `series`, which
+have the Source rail.
 
 `collection` comes from the folder a game sits in, but it is an ordinary field:
 an override, or a `hub:collection` meta, replaces it.
@@ -288,9 +293,9 @@ The library's own catalogue uses these fields, all in `data/overrides.json`:
 | `genre` | one of a fixed list (Racing, Platformer, Life Sim, Tech Demo…) | the Genre rail, and the cabinet's panel |
 | `type` | `Game`, `Tech demo` or `Tool` | the Type rail, so demos and map viewers can be filtered out |
 | `tags` | 2–5 from a fixed vocabulary (`3d`, `retro`, `co-op`, `touch`…) | the Tags rail |
-| `players` | `1–2`, `1–4`… only when a game has co-op or versus | the Players rail |
+| `players` | `1–2`, `1–4`… only when a game has co-op or versus | the Players rail: *Single player*, or *Multiplayer*, which drops a menu of head counts (*4 players* finds every game that seats four). A game with no `players` is single player |
 | `source` | the classic a game riffs on, as it is titled (`Dragon Quest IX`); none for an original | the Source rail, the stacks, the drawer, and search |
-| `series` | the franchise, only when it is not the source itself (`Dragon Quest` for `Dragon Quest IX`) | the first step of the Source rail and the stacks |
+| `series` | the franchise, only when it is not the source itself (`Dragon Quest` for `Dragon Quest IX`) | the series step of the Source rail, under *Inspired*, and the stacks |
 | `controls` | a one-line summary | the drawer |
 | `description` | one or two plain sentences | the drawer |
 

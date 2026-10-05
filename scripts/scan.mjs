@@ -17,7 +17,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { parseHead, splitTitle, slugify, compareVersions, weightClass, rootAbsoluteRefs } from './lib/parse.mjs';
+import { parseHead, splitTitle, slugify, compareVersions, rootAbsoluteRefs } from './lib/parse.mjs';
 import { classify, assignSlugs, prettify, INDEX_FILE } from './lib/layout.mjs';
 
 const run = promisify(execFile);
@@ -381,7 +381,6 @@ export async function scan({ quiet = false, list = false } = {}) {
       path: current.path,
       version: current.version,
       bytes: current.bytes,
-      weight: weightClass(current.bytes),
       collection: group.collection ? prettify(group.collection) : undefined,
       added: dates[0],
       updated: dates[dates.length - 1],

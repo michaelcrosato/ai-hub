@@ -10,7 +10,6 @@ import {
   slugify,
   parseVersion,
   compareVersions,
-  weightClass,
 } from './lib/parse.mjs';
 
 test('decodeEntities handles named, numeric and hex references', () => {
@@ -173,11 +172,4 @@ test('compareVersions orders numerically, not lexically', () => {
   assert.equal(compareVersions('2.1', '2.1'), 0);
   assert.ok(compareVersions(null, '0.1') < 0, 'unversioned sorts below any version');
   assert.equal(compareVersions(null, null), 0);
-});
-
-test('weightClass buckets by file size', () => {
-  assert.equal(weightClass(90 * 1024), 'Featherweight');
-  assert.equal(weightClass(600 * 1024), 'Lightweight');
-  assert.equal(weightClass(3 * 1024 * 1024), 'Middleweight');
-  assert.equal(weightClass(10.5 * 1024 * 1024), 'Heavyweight');
 });

@@ -64,6 +64,7 @@ export const icon = (d, extra) =>
 export const ICONS = {
   star: 'M12 3.6l2.5 5.3 5.5.8-4 4.1 1 5.9-5-2.8-5 2.8 1-5.9-4-4.1 5.5-.8z',
   back: 'M15 5l-7 7 7 7',
+  caret: 'M6 9l6 6 6-6',
   close: 'M6 6l12 12M18 6L6 18',
   play: 'M7 4.5v15l13-7.5z',
   external: 'M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',

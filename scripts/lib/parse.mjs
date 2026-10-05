@@ -296,17 +296,6 @@ export function compareVersions(a, b) {
   return 0;
 }
 
-const KB = 1024;
-const MB = 1024 * 1024;
-
-/** Arcade flavour for a filter rail that costs nothing to maintain. */
-export function weightClass(bytes) {
-  if (bytes < 250 * KB) return 'Featherweight';
-  if (bytes < 1 * MB) return 'Lightweight';
-  if (bytes < 4 * MB) return 'Middleweight';
-  return 'Heavyweight';
-}
-
 // src="/assets/x.js", href='/style.css' — but not "//cdn…" or a bare "/".
 const ROOT_REF = /(\b(?:src|href|poster)\s*=\s*)(["'])\/(?![/"'])([^"'?#]*)([^"']*)\2/gi;
 

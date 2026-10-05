@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 
 import { readFileSync } from 'node:fs';
 
-import { normalize, deriveFacets, matchesFacet, lineageOf } from '../assets/js/manifest.js';
+import { normalize, deriveFacets, matchesFacet, lineageOf, playersOf } from '../assets/js/manifest.js';
 import { selectGames, facetCounts, shelfOf, sourceCounts, stackGames } from '../assets/js/filter.js';
 
 const stats = { isFave: () => false, plays: () => 0, lastPlayed: () => 0 };
@@ -15,7 +15,7 @@ const library = Array.from({ length: 400 }, (_, i) =>
   normalize({
     slug: `game-${i}`,
     name: i === 7 ? 'Pokémon Drift' : `Game ${i}`,
-    weight: ['Featherweight', 'Lightweight', 'Middleweight'][i % 3],
+    bytes: [90, 600, 3 * 1024][i % 3] * 1024,
     collection: `Folder ${i % 12}`,
     buildId: `unique-${i}`,
     tags: i % 2 ? ['puzzle'] : ['action', 'retro'],
@@ -25,7 +25,7 @@ const library = Array.from({ length: 400 }, (_, i) =>
 
 test('fields where nearly every value is different never become rails', () => {
   const keys = deriveFacets(library).map((f) => f.key);
-  assert.ok(keys.includes('weight'));
+  assert.ok(keys.includes('fileSize'));
   assert.ok(keys.includes('collection'));
   assert.ok(keys.includes('tags'));
   assert.ok(!keys.includes('buildId'));
@@ -43,7 +43,7 @@ test('search reaches custom fields and ignores accents', () => {
 
 test('single-pass facet counts match counting option by option', () => {
   const facets = deriveFacets(library);
-  const s = state({ facets: { weight: ['Lightweight'] }, query: 'game' });
+  const s = state({ facets: { fileSize: ['250 KB–1 MB'] }, query: 'game' });
   const counts = facetCounts(library, s, stats, facets);
   for (const facet of facets) {
     for (const option of facet.options) {
@@ -54,6 +54,44 @@ test('single-pass facet counts match counting option by option', () => {
     }
   }
   assert.equal(matchesFacet(library[0], 'tags', 'retro'), true);
+});
+
+test('players read as alone or together, and together as every head count a game seats', () => {
+  assert.deepEqual(playersOf({ players: '1–4' }), ['Single player', 'Multiplayer', '2 players', '3 players', '4 players']);
+  assert.deepEqual(playersOf({ players: '2' }), ['Multiplayer', '2 players']);
+  assert.deepEqual(playersOf({ players: '1' }), ['Single player']);
+  // Saying nothing is a one-player game; a tool saying nothing is not a game at all.
+  assert.deepEqual(playersOf({}), ['Single player']);
+  assert.deepEqual(playersOf({ type: 'Tool' }), []);
+
+  const lib = ['1–2', '1–8', '2', undefined, undefined].map((players, i) =>
+    normalize({ slug: `p${i}`, name: `P${i}`, players })
+  );
+  const rail = deriveFacets(lib).find((f) => f.key === 'players');
+  assert.equal(rail.label, 'Players');
+  assert.deepEqual(
+    rail.options.filter((o) => !o.under).map((o) => o.value),
+    ['Single player', 'Multiplayer']
+  );
+  const seats = rail.options.filter((o) => o.under === 'Multiplayer');
+  assert.deepEqual(seats.map((o) => o.value), ['2 players', '3 players', '4 players', '5 players', '6 players', '7 players', '8 players']);
+  const seated = (value) => selectGames(lib, state({ facets: { players: [value] } }), stats).map((g) => g.slug);
+  assert.deepEqual(seated('Single player'), ['p0', 'p1', 'p3', 'p4']);
+  assert.deepEqual(seated('Multiplayer'), ['p0', 'p1', 'p2']);
+  assert.deepEqual(seated('3 players'), ['p1']);
+  // The drawer still reads the catalogue's own words.
+  assert.equal(lib[0].players, '1–2');
+});
+
+test('file size is a rail in size order, and the harness never is', () => {
+  const lib = [5, 300, 2000, 9000, 6, 7].map((kb, i) =>
+    normalize({ slug: `f${i}`, name: `F${i}`, bytes: kb * 1024, harness: i % 2 ? 'Codex' : 'Claude Code' })
+  );
+  const facets = deriveFacets(lib);
+  assert.deepEqual(facets.map((f) => f.key), ['fileSize']);
+  assert.equal(facets[0].label, 'File size');
+  assert.deepEqual(facets[0].options.map((o) => o.value), ['Under 250 KB', '250 KB–1 MB', '1–4 MB', 'Over 4 MB']);
+  assert.deepEqual(selectGames(lib, state({ query: 'codex' }), stats).length, 3);
 });
 
 test('shelves split by type, uncatalogued games are games, restricted ones stay off the wall', () => {
@@ -91,19 +129,24 @@ const lineup = [
   { slug: 'undertow', name: 'Undertow' },
 ].map(normalize);
 
-const wall = (patch = {}) => selectGames(lineup, state({ series: '', source: '', ...patch }), stats);
+const wall = (patch = {}) => selectGames(lineup, state({ origin: '', series: '', source: '', ...patch }), stats);
 const tiles = (patch = {}) =>
-  stackGames(wall(patch), state({ series: '', source: '', ...patch })).map((item) =>
+  stackGames(wall(patch), state({ origin: '', series: '', source: '', ...patch })).map((item) =>
     item.stack ? `[${item.level} ${item.label} ${item.games.length}]` : item.slug
   );
 
 test('a game is an attempt at its source, inside its series; an original is an attempt at itself', () => {
   assert.deepEqual(lineageOf({ name: 'Moonward III', source: 'Dragon Quest III', series: 'Dragon Quest' }), {
+    original: false,
     series: 'Dragon Quest',
     title: 'Dragon Quest III',
   });
-  assert.deepEqual(lineageOf({ name: 'Aetherfall', source: 'Crystalis' }), { series: 'Crystalis', title: 'Crystalis' });
-  assert.deepEqual(lineageOf({ name: 'Strata' }), { series: 'Original', title: 'Strata' });
+  assert.deepEqual(lineageOf({ name: 'Aetherfall', source: 'Crystalis' }), {
+    original: false,
+    series: 'Crystalis',
+    title: 'Crystalis',
+  });
+  assert.deepEqual(lineageOf({ name: 'Strata' }), { original: true, series: 'Original', title: 'Strata' });
 });
 
 test('source and series are searchable but never a loose rail of their own', () => {
@@ -129,12 +172,17 @@ test('the wall stacks by series, then by game, then lays out every attempt', () 
   assert.deepEqual(tiles({ series: 'dragon quest', source: 'Dragon Quest IX' }), ['dq9-a', 'dq9-b']);
   // One series holding one game: no point showing a single stack of it.
   assert.deepEqual(tiles({ series: 'Crystalis' }), ['cr-a', 'cr-b']);
-  assert.deepEqual(tiles({ series: 'Original' }), ['[title Strata 2]', 'undertow']);
+  // Every game is original or inspired, and each side stacks the way the whole wall does.
+  assert.deepEqual(tiles({ origin: 'original' }), ['[title Strata 2]', 'undertow']);
+  assert.deepEqual(tiles({ origin: 'inspired' }), ['okami', '[title Crystalis 2]', '[series Dragon Quest 5]']);
+  assert.deepEqual(tiles({ origin: 'original', query: 'dragon' }), []);
+  const stack = stackGames(wall(), state({})).find((item) => item.stack && item.label === 'Strata');
+  assert.equal(stack.original, true);
 });
 
 test('stacks keep the sort, and a search can leave a stack of one, which is just the game', () => {
   const newest = (patch) =>
-    stackGames(wall(patch), state({ series: '', source: '', sort: 'newest', ...patch })).map((item) =>
+    stackGames(wall(patch), state({ origin: '', series: '', source: '', sort: 'newest', ...patch })).map((item) =>
       item.stack ? item.label : item.slug
     );
   // Same added date everywhere, so newest falls back to names: the stack sits where its first game does.
@@ -142,20 +190,29 @@ test('stacks keep the sort, and a search can leave a stack of one, which is just
   assert.deepEqual(tiles({ query: 'starward' }), ['dq9-b']);
 });
 
-test('the Source rail counts series, then the games inside the picked one', () => {
-  const counts = sourceCounts(lineup, state({ series: 'Dragon Quest', source: 'Dragon Quest IX' }), stats);
-  assert.deepEqual(counts.series, [
-    { value: 'Dragon Quest', count: 5 },
-    { value: 'Original', count: 3 },
-    { value: 'Crystalis', count: 2 },
-    { value: 'Okami', count: 1 },
+test('the Source rail splits original from inspired, then offers only what gathers attempts', () => {
+  const rail = (patch) => sourceCounts(lineup, state({ origin: '', series: '', source: '', ...patch }), stats);
+  const shape = (options) => options.map((o) => `${o.value} ${o.count}/${o.total}`);
+
+  const top = rail({});
+  assert.deepEqual(shape(top.origins), ['original 3/3', 'inspired 8/8']);
+  assert.deepEqual(top.series, []);
+  assert.deepEqual(top.titles, []);
+
+  // Okami is one game: it stays on the wall under Inspired, with no chip of its own.
+  assert.deepEqual(shape(rail({ origin: 'inspired' }).series), ['Dragon Quest 5/5', 'Crystalis 2/2']);
+  assert.deepEqual(shape(rail({ origin: 'original' }).titles), ['Strata 2/2']);
+  assert.deepEqual(shape(rail({ origin: 'inspired', series: 'Dragon Quest' }).titles), [
+    'Dragon Quest 2/2',
+    'Dragon Quest IX 2/2',
   ]);
-  assert.deepEqual(counts.titles, [
-    { value: 'Dragon Quest', count: 2 },
-    { value: 'Dragon Quest IX', count: 2 },
-    { value: 'Dragon Quest III', count: 1 },
-  ]);
-  assert.deepEqual(sourceCounts(lineup, state({}), stats).titles, []);
+  // A series that is one game has no step below it.
+  assert.deepEqual(rail({ origin: 'inspired', series: 'Crystalis' }).titles, []);
+
+  // The chips hold still under a search; only their counts move, to grey out the empty ones.
+  const searched = rail({ origin: 'inspired', query: 'starfall' });
+  assert.deepEqual(shape(searched.origins), ['original 0/3', 'inspired 1/8']);
+  assert.deepEqual(shape(searched.series), ['Dragon Quest 1/5', 'Crystalis 0/2']);
 });
 
 test('the catalogue gives every source one series', () => {
