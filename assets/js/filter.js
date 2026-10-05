@@ -6,7 +6,7 @@
  * { isFave(slug), plays(slug), lastPlayed(slug) }.
  */
 
-import { matchesFacet, fold, sameKey, originOf } from './manifest.js';
+import { matchesFacet, fold, sameKey, originOf, MULTI, SINGLE } from './manifest.js';
 
 const byName = (a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' });
 
@@ -164,6 +164,70 @@ export function sourceCounts(games, state, stats) {
 }
 
 /**
+ * How the wall can stack. Source is the default: attempts at the same game
+ * gathered up. The others gather by a filter's value instead, and pressing
+ * such a stack filters the wall to it.
+ */
+export const GROUPINGS = [
+  { key: 'source', label: 'Source' },
+  { key: 'genre', label: 'Genre' },
+  { key: 'players', label: 'Players' },
+  { key: 'model', label: 'Model' },
+  { key: 'none', label: "Don't stack" },
+];
+
+export const DEFAULT_GROUPING = GROUPINGS[0].key;
+
+/** The one value a game stacks under for a filter, or none. Players stack as
+ *  single player or multiplayer, not by every head count a game seats. */
+const groupValue = (game, key) => {
+  const values = game.rails[key] || [];
+  if (key === 'players') return values.includes(MULTI) ? MULTI : values.includes(SINGLE) ? SINGLE : null;
+  return values[0] ?? null;
+};
+
+/**
+ * Fold the wall into stacks. By source, see stackBySource. By a filter, every
+ * game sharing a value is one stack; a game with no value for it stands on
+ * its own, and once that filter is down to one value there is nothing left
+ * to stack.
+ */
+export function stackGames(list, state, by = DEFAULT_GROUPING) {
+  if (by === 'none') return list;
+  if (by === 'source') return stackBySource(list, state);
+  if ((state.facets?.[by] || []).length === 1) return list;
+  const groups = new Map();
+  const loose = [];
+  for (const game of list) {
+    const value = groupValue(game, by);
+    if (!value) {
+      loose.push({ key: `game:${game.slug}`, games: [game] });
+      continue;
+    }
+    if (!groups.has(value)) groups.set(value, { key: value, games: [] });
+    groups.get(value).games.push(game);
+  }
+  if (groups.size + loose.length < 2) return list;
+  const items = [...groups.values()].map(({ key, games }) =>
+    games.length === 1 ? games[0] : { stack: true, level: 'facet', facet: by, label: key, games }
+  );
+  return orderStacks([...items, ...loose.map((l) => l.games[0])], list, state);
+}
+
+/** A stack takes its first game's place, so the sort still decides the order,
+ *  except A to Z, which files a stack under its own name. */
+function orderStacks(items, list, state) {
+  const at = new Map(list.map((game, i) => [game, i]));
+  const first = (item) => at.get(item.stack ? item.games[0] : item);
+  items.sort((a, b) => first(a) - first(b));
+  if (state.sort === 'name' && !tokenize(state.query).length) {
+    const label = (item) => (item.stack ? item.label : item.name);
+    items.sort((a, b) => label(a).localeCompare(label(b), 'en', { sensitivity: 'base' }));
+  }
+  return items;
+}
+
+/**
  * Fold the wall into stacks, one level of the Source rail at a time. With no
  * series picked, each series is one stack; originals have no series to share,
  * so they stack by name instead. Inside a series, each game it holds is a
@@ -174,7 +238,7 @@ export function sourceCounts(games, state, stats) {
  * in it instead. A stack takes the place of its first game, so the sort still
  * decides the order, except A to Z, which files a stack under its own name.
  */
-export function stackGames(list, state) {
+function stackBySource(list, state) {
   if (state.source) return list;
   const groups = new Map();
   for (const game of list) {

@@ -1,35 +1,42 @@
 /**
  * ui/controls.js — the search box in the sign's corner, and the toolbar under
- * the shelves.
+ * the shelves: five boxes across, each a dropdown.
  *
- * The toolbar keeps one thing per job, in the order people reach for them:
- * Source (All, Original, Inspired), Filters, then Sort and View on the right.
- * Whatever is filtering the wall shows underneath as chips you can knock off
- * one at a time, so the state of the wall is never hidden inside a menu.
+ *   Genre · Players · Filters · Sort · View
  *
- * Filters open a panel: under the toolbar on a wide screen, a sheet from the
- * bottom on a phone. Nothing is declared there either: the filters come from
- * whatever fields the games carry, grouped by manifest.js, and they apply as
- * you tap, so there is no Apply button to forget. Options that would empty
- * the wall are greyed out; nothing shows a count.
+ * Genre and Players are the filters people reach for first, so they get boxes
+ * of their own. Every other filter (Model, Tags, File size, and whatever field
+ * the games carry next) sits in the Filters menu, which opens downwards and
+ * flies each filter's values out to the right; on a phone they open in place
+ * instead. Filters apply as you tap, and a menu stays open so you can pick
+ * several. Whatever is filtering the wall shows under the toolbar as chips
+ * with a ×. Options that would empty the wall are greyed out; nothing shows a
+ * count. The filters themselves are never declared: they come from whatever
+ * fields the games carry (manifest.js).
  *
- * The search box and the toolbar are built once and kept, because rebuilding
- * them on every keystroke would steal focus. Only their contents re-render.
+ * The search box, the boxes and their menus are built once and kept, so an
+ * open menu stays open while its contents re-render under it.
  */
 
 import { h, append, clear, icon, ICONS } from '../dom.js';
-import { SORTS } from '../filter.js';
-import { GROUPS, MULTI } from '../manifest.js';
-import { plural } from '../format.js';
+import { SORTS, GROUPINGS } from '../filter.js';
+import { MULTI } from '../manifest.js';
 import { store } from '../store.js';
 
+/** Filters with a box of their own; the rest go under Filters. */
+const OWN_BOX = ['genre', 'players'];
+
+/** How a filter's values read on its box: "Any", "Racing", "Racing +2". */
+const summary = (values) => (!values.length ? 'Any' : values.length === 1 ? values[0] : `${values[0]} +${values.length - 1}`);
+
 /**
- * @param root        the sticky toolbar, with the active filters and the panel under it
+ * @param root        the sticky toolbar, with the active filters under it
  * @param searchRoot  where the search box goes: the sign's top corner
  */
-export function createControls(root, { searchRoot = root, onChange, onDensity, onStack }) {
-  let panelOpen = false;
+export function createControls(root, { searchRoot = root, onChange, onGroup }) {
   let last = null;
+  /** Which submenu is out, per menu, so a re-render keeps it out. */
+  const openSub = new Map();
 
   const input = h('input', {
     type: 'search',
@@ -60,295 +67,243 @@ export function createControls(root, { searchRoot = root, onChange, onDensity, o
     icon(ICONS.close)
   );
 
-  const source = h('div', { class: 'segment', role: 'group', 'aria-label': 'Source' });
-  const filtersButton = h('button', {
-    class: 'tool',
-    type: 'button',
-    'aria-expanded': 'false',
-    'aria-controls': 'filter-panel',
-    onclick: () => setPanel(!panelOpen),
-  });
-  const sortMenu = menu('menu-sort', 'Sort');
-  const viewMenu = menu('menu-view', 'View');
-  const sortButton = h('button', { class: 'tool', type: 'button', popovertarget: 'menu-sort' });
-  const viewButton = h(
-    'button',
-    { class: 'tool', type: 'button', popovertarget: 'menu-view' },
-    icon(ICONS.roomy, { width: 15, height: 15 }),
-    h('span', { class: 'tool__text' }, 'View'),
-    icon(ICONS.caret, { width: 12, height: 12, class: 'tool__caret' })
+  const boxes = Object.fromEntries(
+    ['genre', 'players', 'filters', 'sort', 'view'].map((key) => [key, dropBox(key)])
   );
-  sortMenu.addEventListener('beforetoggle', (e) => e.newState === 'open' && place(sortMenu, sortButton));
-  viewMenu.addEventListener('beforetoggle', (e) => e.newState === 'open' && place(viewMenu, viewButton));
-
   const actives = h('div', { class: 'actives', 'aria-label': 'Active filters' });
-  const panelBody = h('div', { class: 'panel__body' });
-  const showButton = h('button', { class: 'panel__show', type: 'button', onclick: () => setPanel(false) });
-  const panel = h(
-    'section',
-    { class: 'panel', id: 'filter-panel', 'aria-label': 'Filters', hidden: true },
-    h(
-      'header',
-      { class: 'panel__head' },
-      h('h2', { class: 'panel__title' }, 'Filters'),
-      h(
-        'button',
-        { class: 'panel__close', type: 'button', 'aria-label': 'Close filters', onclick: () => setPanel(false) },
-        icon(ICONS.close)
-      )
-    ),
-    panelBody,
-    h(
-      'footer',
-      { class: 'panel__foot' },
-      h('button', { class: 'panel__reset', type: 'button', onclick: () => clearAll() }, 'Clear all'),
-      showButton
-    )
-  );
-  const backdrop = h('div', { class: 'panel__backdrop', hidden: true, onclick: () => setPanel(false) });
 
   searchRoot.append(
     h('div', { class: 'hunt' }, icon(ICONS.search, { class: 'hunt__icon' }), input, clearButton)
   );
-  root.append(
-    h(
-      'div',
-      { class: 'toolbar' },
-      source,
-      filtersButton,
-      h('div', { class: 'toolbar__spacer' }),
-      sortButton,
-      sortMenu,
-      viewButton,
-      viewMenu
-    ),
-    actives,
-    panel,
-    backdrop
-  );
+  root.append(h('div', { class: 'toolbar' }, Object.values(boxes).map((box) => box.wrap)), actives);
 
-  addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && panelOpen) setPanel(false);
-  });
+  /* --- a box and its menu ------------------------------------------------- */
 
-  function setPanel(open) {
-    panelOpen = open;
-    if (last) render(...last);
-    if (open) panel.querySelector('button')?.focus({ preventScroll: true });
-  }
-
-  /** Every filter off, and favourites; the search and Source stay. */
-  function clearAll() {
-    const patch = { fav: '' };
-    for (const facet of last?.[1].facets || []) patch[facet.key] = '';
-    onChange(patch);
-  }
-
-  /* --- menus: Sort and View --------------------------------------------- */
-
-  function menu(id, label) {
-    const el = h('div', { id, class: 'drop', popover: 'auto', 'aria-label': label });
-    const shut = (event) => {
-      if (event?.target !== el && el.matches(':popover-open')) el.hidePopover();
-    };
-    // In the top layer, so nothing clips it; any scroll closes it.
-    el.addEventListener('toggle', (event) => {
-      if (event.newState === 'open') addEventListener('scroll', shut, { capture: true, passive: true });
-      else removeEventListener('scroll', shut, { capture: true });
+  function dropBox(key) {
+    const id = `menu-${key}`;
+    const button = h('button', { class: 'box', type: 'button', popovertarget: id });
+    const menu = h('div', { id, class: 'drop drop--cascade', popover: 'auto' });
+    // Fixed in the top layer, so nothing clips it; it follows its box while
+    // the page scrolls, because picking a filter can scroll the wall.
+    const follow = () => place(menu, button);
+    menu.addEventListener('beforetoggle', (event) => {
+      if (event.newState === 'open') follow();
     });
-    return el;
+    menu.addEventListener('toggle', (event) => {
+      if (event.newState === 'open') {
+        // Again now it has a width, so it can keep clear of the right edge.
+        follow();
+        addEventListener('scroll', follow, { passive: true });
+      }
+      else {
+        removeEventListener('scroll', follow);
+        openSub.delete(key);
+      }
+    });
+    return { key, button, menu, follow, wrap: h('div', { class: 'toolbar__item' }, button, menu) };
   }
 
-  /** Under its button, or over it when the page has no room below. */
-  function place(el, button) {
+  function setBox(box, label, value, on) {
+    box.button.classList.toggle('is-on', on);
+    box.button.setAttribute('aria-label', `${label}: ${value}`);
+    append(clear(box.button), [
+      h('span', { class: 'box__text' }, h('span', { class: 'box__label' }, label), h('span', { class: 'box__value' }, value)),
+      icon(ICONS.caret, { width: 14, height: 14, class: 'box__caret' }),
+    ]);
+  }
+
+  /** Under its box, or over it when the page has no room below. */
+  function place(menu, button) {
     const box = button.getBoundingClientRect();
     const below = innerHeight - box.bottom;
     const up = below < 220 && box.top > below;
-    const room = (up ? box.top : below) - 14;
-    const leftSide = box.left < innerWidth / 2;
-    Object.assign(el.style, {
+    Object.assign(menu.style, {
       top: up ? 'auto' : `${box.bottom + 6}px`,
       bottom: up ? `${innerHeight - box.top + 6}px` : 'auto',
-      left: leftSide ? `${box.left}px` : 'auto',
-      right: leftSide ? 'auto' : `${document.documentElement.clientWidth - box.right}px`,
-      maxHeight: `${Math.max(room, 120)}px`,
+      left: `${Math.max(8, Math.min(box.left, document.documentElement.clientWidth - menu.offsetWidth - 8))}px`,
+      minWidth: `${box.width}px`,
+      maxHeight: `${Math.max((up ? box.top : below) - 14, 160)}px`,
     });
   }
 
-  const menuItem = (text, on, onclick, hint) =>
+  /** One row of a menu. `close` shuts the menu after (single choices do). */
+  const item = (text, { on = false, disabled = false, onclick, close = false, check = 'box' } = {}) =>
     h(
       'button',
       {
-        class: 'drop__item',
+        class: `drop__item drop__item--${check}`,
         type: 'button',
         'aria-pressed': String(on),
+        disabled: !on && disabled,
         onclick: (event) => {
-          event.currentTarget.closest('[popover]')?.hidePopover();
+          if (close) event.currentTarget.closest('[popover]')?.hidePopover();
           onclick();
         },
       },
-      h('span', {}, text),
-      hint && h('span', { class: 'drop__hint' }, hint)
+      h('span', { class: 'drop__mark', 'aria-hidden': 'true' }),
+      h('span', { class: 'drop__text' }, text)
     );
 
-  let lastSortKeys = '';
+  /**
+   * A row that opens a submenu: out to the right of the menu on a wide screen
+   * (to the left when the right edge is too close), in place on a phone.
+   */
+  function submenu(menuKey, subKey, text, hint, rows, on = null) {
+    const open = openSub.get(menuKey) === subKey;
+    const sub = h('div', { class: 'drop__sub', role: 'group', 'aria-label': text }, rows);
+    const group = h(
+      'div',
+      { class: `drop__group${open ? ' is-open' : ''}` },
+      h(
+        'button',
+        {
+          class: 'drop__item drop__item--parent',
+          type: 'button',
+          'aria-expanded': String(open),
+          'aria-pressed': on === null ? null : String(on),
+          onclick: () => {
+            if (open) openSub.delete(menuKey);
+            else openSub.set(menuKey, subKey);
+            if (last) render(...last);
+          },
+          onmouseenter: () => {
+            if (!matchMedia('(hover: hover) and (min-width: 48rem)').matches || open) return;
+            openSub.set(menuKey, subKey);
+            if (last) render(...last);
+          },
+        },
+        // Beside rows that tick, a row with a submenu ticks too, so it lines up.
+        on !== null && h('span', { class: 'drop__mark', 'aria-hidden': 'true' }),
+        h('span', { class: 'drop__text' }, text),
+        hint && h('span', { class: 'drop__hint' }, hint),
+        icon(ICONS.caret, { width: 12, height: 12, class: 'drop__chev' })
+      ),
+      sub
+    );
+    if (open) {
+      requestAnimationFrame(() => {
+        const box = sub.getBoundingClientRect();
+        sub.classList.toggle('drop__sub--left', box.right > document.documentElement.clientWidth - 8);
+      });
+    }
+    return group;
+  }
+
+  /* --- the filters -------------------------------------------------------- */
+
+  /**
+   * A filter's values as rows. Several in one filter widen the wall (Racing or
+   * Flight); different filters narrow it. A value with others under it
+   * (Multiplayer, then how many) opens them as a submenu, and those pick one
+   * at a time.
+   */
+  function facetRows(menuKey, facet, state, counted) {
+    const active = state.facets[facet.key] || [];
+    const set = (next) => onChange({ [facet.key]: next.join(',') });
+    const zero = (option) => (counted.get(option.value) ?? 0) === 0;
+    const rows = [item(`Any ${facet.label.toLowerCase()}`, { on: !active.length, onclick: () => set([]), check: 'radio' })];
+    for (const option of facet.options.filter((o) => !o.under)) {
+      const inner = facet.options.filter((o) => o.under === option.value);
+      const group = [option.value, ...inner.map((o) => o.value)];
+      const on = active.some((v) => group.includes(v));
+      const others = active.filter((v) => !group.includes(v));
+      if (!inner.length) {
+        rows.push(
+          item(option.value, {
+            on,
+            disabled: zero(option),
+            onclick: () => set(on ? others : [...active, option.value]),
+          })
+        );
+        continue;
+      }
+      const picked = inner.find((o) => active.includes(o.value));
+      rows.push(
+        submenu(menuKey, `${facet.key}:${option.value}`, option.value, on ? picked?.value ?? 'Any number' : null, [
+          item(option.value === MULTI ? 'Any number' : `Any ${option.value.toLowerCase()}`, {
+            on: active.includes(option.value),
+            disabled: zero(option),
+            check: 'radio',
+            onclick: () => set(active.includes(option.value) ? others : [...others, option.value]),
+          }),
+          inner.map((o) =>
+            item(o.value, {
+              on: active.includes(o.value),
+              disabled: zero(o),
+              check: 'radio',
+              onclick: () => set(active.includes(o.value) ? others : [...others, o.value]),
+            })
+          ),
+        ], on)
+      );
+    }
+    return rows;
+  }
+
+  function renderFacetBox(box, facet, state, counts) {
+    box.wrap.hidden = !facet;
+    if (!facet) return;
+    const active = state.facets[facet.key] || [];
+    setBox(box, facet.label, summary(active), active.length > 0);
+    clear(box.menu).append(...facetRows(box.key, facet, state, counts.get(facet.key) || new Map()));
+  }
+
+  function renderFilters(state, facets, counts) {
+    const box = boxes.filters;
+    const rest = facets.filter((facet) => !OWN_BOX.includes(facet.key));
+    const faves = store.faveCount() > 0;
+    box.wrap.hidden = !rest.length && !faves;
+    const on = rest.filter((facet) => (state.facets[facet.key] || []).length).map((facet) => facet.label);
+    if (state.favesOnly) on.unshift('Favourites');
+    setBox(box, 'Filters', summary(on), on.length > 0);
+    clear(box.menu).append(
+      ...(faves
+        ? [
+            item('Favourites only', {
+              on: state.favesOnly,
+              onclick: () => onChange({ fav: state.favesOnly ? '' : '1' }),
+            }),
+          ]
+        : []),
+      ...rest.map((facet) => {
+        const active = state.facets[facet.key] || [];
+        return submenu(
+          'filters',
+          facet.key,
+          facet.label,
+          active.length ? summary(active) : null,
+          facetRows('filters', facet, state, counts.get(facet.key) || new Map())
+        );
+      })
+    );
+  }
+
+  /* --- Sort and View ------------------------------------------------------ */
+
   function renderSort(state) {
     // "Most played" is meaningless before anything has been played.
     const available = SORTS.filter(
       (sort) => !['played', 'recent'].includes(sort.key) || store.playedCount() > 0
     );
     const current = available.find((s) => s.key === state.sort) || available[0];
-    clear(sortButton).append(
-      icon(ICONS.sort, { width: 15, height: 15 }),
-      h('span', { class: 'tool__text' }, 'Sort: ', h('b', {}, current.label)),
-      icon(ICONS.caret, { width: 12, height: 12, class: 'tool__caret' })
-    );
-    sortButton.setAttribute('aria-label', `Sort: ${current.label}`);
-    const keys = `${available.map((s) => s.key).join()}|${current.key}`;
-    if (keys === lastSortKeys) return;
-    lastSortKeys = keys;
-    clear(sortMenu).append(
-      ...available.map((sort) => menuItem(sort.label, sort === current, () => onChange({ sort: sort.key })))
+    setBox(boxes.sort, 'Sort', current.label, false);
+    clear(boxes.sort.menu).append(
+      ...available.map((sort) =>
+        item(sort.label, { on: sort === current, check: 'radio', close: true, onclick: () => onChange({ sort: sort.key }) })
+      )
     );
   }
 
   function renderView() {
-    const { stack, density } = store.ui();
-    clear(viewMenu).append(
-      h('p', { class: 'drop__head' }, 'Layout'),
-      menuItem('Comfortable', density !== 'compact', () => onDensity('roomy'), 'Bigger cabinets'),
-      menuItem('Compact', density === 'compact', () => onDensity('compact'), 'More per row'),
-      h('p', { class: 'drop__head' }, 'Grouping'),
-      menuItem('Group attempts at the same game', stack, () => onStack(!stack), 'Stacks by series')
-    );
-  }
-
-  /* --- Source: All, Original, Inspired ------------------------------------ */
-
-  function renderSource(state, sources) {
-    clear(source);
-    source.hidden = !sources || (!state.origin && sources.origins.length < 2);
-    if (source.hidden) return;
-    const options = [{ value: '', label: 'All', count: 1 }, ...sources.origins];
-    for (const option of options) {
-      const on = state.origin === option.value;
-      source.append(
-        h(
-          'button',
-          {
-            class: 'segment__item',
-            type: 'button',
-            'aria-pressed': String(on),
-            disabled: !on && option.count === 0,
-            onclick: () => !on && onChange({ origin: option.value, series: '', source: '' }),
-          },
-          option.label
-        )
-      );
-    }
-  }
-
-  /* --- the panel ---------------------------------------------------------- */
-
-  /**
-   * One filter's options as chips. Several in one filter widen the wall (Racing
-   * or Flight); different filters narrow it. An option with others under it
-   * (Multiplayer, then how many) opens them on a row beneath once it is on,
-   * and those pick one at a time.
-   */
-  function facetField(facet, state, counted) {
-    const active = state.facets[facet.key] || [];
-    const set = (next) => onChange({ [facet.key]: next.join(',') });
-    const count = (option) => counted.get(option.value) ?? 0;
-    const chip = (option, on, onclick) =>
-      h(
-        'button',
-        {
-          class: 'chip',
-          type: 'button',
-          'aria-pressed': String(on),
-          disabled: !on && count(option) === 0,
-          onclick,
-        },
-        option.value
-      );
-
-    const rows = [];
-    const top = facet.options.filter((option) => !option.under);
-    rows.push(
-      h(
-        'div',
-        { class: 'field__chips' },
-        top.map((option) => {
-          const inner = facet.options.filter((o) => o.under === option.value);
-          const group = [option.value, ...inner.map((o) => o.value)];
-          const on = active.some((v) => group.includes(v));
-          return chip(option, on, () =>
-            set(on ? active.filter((v) => !group.includes(v)) : [...active, option.value])
-          );
-        })
+    const current = GROUPINGS.find((g) => g.key === store.ui().group) || GROUPINGS[0];
+    setBox(boxes.view, 'View', current.key === 'none' ? 'No stacks' : `Stack by ${current.label.toLowerCase()}`, false);
+    clear(boxes.view.menu).append(
+      h('p', { class: 'drop__head' }, 'Size'),
+      item('Comfortable', { on: true, check: 'radio', onclick: () => {} }),
+      h('p', { class: 'drop__head' }, 'Stack by'),
+      ...GROUPINGS.map((g) =>
+        item(g.label, { on: g === current, check: 'radio', close: true, onclick: () => onGroup(g.key) })
       )
-    );
-    for (const option of top) {
-      const inner = facet.options.filter((o) => o.under === option.value);
-      const group = [option.value, ...inner.map((o) => o.value)];
-      if (!inner.length || !active.some((v) => group.includes(v))) continue;
-      const others = active.filter((v) => !group.includes(v));
-      rows.push(
-        h(
-          'div',
-          { class: 'field__chips field__chips--under' },
-          h('span', { class: 'field__under' }, option.value === MULTI ? 'How many' : option.value),
-          inner.map((o) => {
-            const on = active.includes(o.value);
-            return chip(o, on, () => set([...others, on ? option.value : o.value]));
-          })
-        )
-      );
-    }
-    return h('div', { class: 'field' }, h('h4', { class: 'field__label' }, facet.label), rows);
-  }
-
-  function renderPanel(state, facets, counts) {
-    const groups = GROUPS.map((group) => ({
-      ...group,
-      facets: facets.filter((facet) => facet.group === group.key),
-    }));
-    const faveCount = store.faveCount();
-    if (faveCount) {
-      groups[0].lead = h(
-        'div',
-        { class: 'field' },
-        h('h4', { class: 'field__label' }, 'Yours'),
-        h(
-          'div',
-          { class: 'field__chips' },
-          h(
-            'button',
-            {
-              class: 'chip',
-              type: 'button',
-              'aria-pressed': String(state.favesOnly),
-              onclick: () => onChange({ fav: state.favesOnly ? '' : '1' }),
-            },
-            icon(ICONS.star, { fill: state.favesOnly ? 'currentColor' : 'none', width: 13, height: 13 }),
-            ' Favourites only'
-          )
-        )
-      );
-    }
-    clear(panelBody).append(
-      ...groups
-        .filter((group) => group.facets.length || group.lead)
-        .map((group) =>
-          h(
-            'div',
-            { class: 'panel__group' },
-            h('h3', { class: 'panel__group-title' }, group.label),
-            group.lead,
-            group.facets.map((facet) => facetField(facet, state, counts.get(facet.key) || new Map()))
-          )
-        )
     );
   }
 
@@ -375,40 +330,30 @@ export function createControls(root, { searchRoot = root, onChange, onDensity, o
     }
     clear(actives);
     actives.hidden = !chips.length;
-    if (chips.length) {
-      actives.append(...chips, h('button', { class: 'actives__clear', type: 'button', onclick: clearAll }, 'Clear all'));
-    }
-    return chips.length;
+    if (!chips.length) return;
+    const patch = { fav: '' };
+    for (const facet of facets) patch[facet.key] = '';
+    actives.append(
+      ...chips,
+      h('button', { class: 'actives__clear', type: 'button', onclick: () => onChange(patch) }, 'Clear all')
+    );
   }
 
-  function render(state, { facets, counts, sources, shown = 0 }) {
-    last = [state, { facets, counts, sources, shown }];
+  function render(state, { facets, counts }) {
+    last = [state, { facets, counts }];
     if (input.value !== state.query) {
       input.value = state.query;
       clearButton.hidden = !state.query;
     }
-
-    renderSource(state, sources);
+    const byKey = (key) => facets.find((facet) => facet.key === key);
+    renderFacetBox(boxes.genre, byKey('genre'), state, counts);
+    renderFacetBox(boxes.players, byKey('players'), state, counts);
+    renderFilters(state, facets, counts);
     renderSort(state);
     renderView();
-    const active = renderActives(state, facets);
-
-    const hasFilters = facets.length > 0 || store.faveCount() > 0;
-    filtersButton.hidden = !hasFilters;
-    if (!hasFilters) panelOpen = false;
-    filtersButton.setAttribute('aria-expanded', String(panelOpen));
-    append(clear(filtersButton), [
-      icon(ICONS.filter, { width: 15, height: 15 }),
-      h('span', { class: 'tool__text' }, 'Filters'),
-      active > 0 && h('span', { class: 'tool__badge', 'aria-label': `${active} on` }, String(active)),
-      icon(ICONS.caret, { width: 12, height: 12, class: `tool__caret${panelOpen ? ' is-flipped' : ''}` }),
-    ]);
-
-    panel.hidden = !panelOpen;
-    backdrop.hidden = !panelOpen;
-    document.body.classList.toggle('has-sheet', panelOpen);
-    if (panelOpen) renderPanel(state, facets, counts);
-    showButton.textContent = shown ? `Show ${plural(shown, 'game')}` : 'Nothing matches';
+    renderActives(state, facets);
+    // A submenu opening or closing changes a menu's size: keep it in place.
+    for (const box of Object.values(boxes)) if (box.menu.matches(':popover-open')) box.follow();
   }
 
   return {

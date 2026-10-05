@@ -29,6 +29,7 @@ import {
   SHELVES,
   SHELF_ALIASES,
   ORIGINS,
+  GROUPINGS,
   DEFAULT_SHELF,
   shelfOf,
   isVisible,
@@ -64,8 +65,17 @@ const lineageQuery = ({ original, series, title }) => ({
 });
 
 const grid = createGrid(wallEl, {
-  stackHref: (stack) => hrefWith(lineageQuery(stack)),
+  // A source stack opens that series or game; a genre or model stack
+  // filters the wall to it.
+  stackHref: (stack) =>
+    stack.level === 'facet' ? hrefWith({ [stack.facet]: stack.label }) : hrefWith(lineageQuery(stack)),
 });
+
+/** How the wall stacks, remembered per device. */
+const grouping = () => {
+  const key = store.ui().group;
+  return GROUPINGS.some((g) => g.key === key) ? key : GROUPINGS[0].key;
+};
 
 const stats = {
   isFave: (slug) => store.isFave(slug),
@@ -149,7 +159,7 @@ const stateKey = (state) =>
     state.origin,
     state.series,
     state.source,
-    store.ui().stack,
+    grouping(),
     state.facets,
     state.favesOnly ? store.faveCount() : 0,
     store.dev(),
@@ -165,6 +175,7 @@ const shelves = createShelves(document.getElementById('shelves'), {
     for (const facet of facets) patch[facet.key] = '';
     router.setQuery(patch);
   },
+  onSource: (origin) => router.setQuery({ origin, series: '', source: '' }),
   // Drawn from what the shelf and filters leave showing, so "Surprise me"
   // on the Games shelf is always a game.
   onSurprise() {
@@ -180,11 +191,7 @@ const controls = createControls(document.getElementById('controls'), {
     if (patch.sort) store.setUi({ sort: patch.sort });
     router.setQuery(patch);
   },
-  onDensity(next) {
-    store.setUi({ density: next });
-    applyDensity();
-  },
-  onStack: (next) => store.setUi({ stack: next }),
+  onGroup: (group) => store.setUi({ group }),
 });
 
 /** Every attempt at the same game on the same shelf, as a link to them all. */
@@ -271,12 +278,14 @@ function renderWall(state) {
   const perShelf = new Map(
     SHELVES.map((s) => [s.key, games.filter((g) => isVisible(g, state.showAll) && shelfOf(g) === s.key).length])
   );
-  shelves.render(state.shelf, perShelf, { canSurprise: visible.length > 0 });
+  shelves.render(state.shelf, perShelf, {
+    origin: state.origin,
+    origins: sources.origins,
+    canSurprise: visible.length > 0,
+  });
   controls.render(state, {
     facets,
     counts: facetCounts(games, state, stats, facets),
-    sources,
-    shown: visible.length,
   });
   renderCount(state, visible.length);
 
@@ -303,7 +312,7 @@ function renderWall(state) {
     return;
   }
 
-  grid.render(store.ui().stack ? stackGames(visible, state) : visible, {
+  grid.render(stackGames(visible, state, grouping()), {
     lead: trail(state, visible.length),
     // Among inspired games, which game each one is an attempt at says more
     // than its genre; inside a series every tile is the same genre anyway.
@@ -317,10 +326,6 @@ function renderWall(state) {
   if (isRefine && wallEl.getBoundingClientRect().top < 0) {
     wallEl.scrollIntoView({ block: 'start', behavior: 'auto' });
   }
-}
-
-function applyDensity() {
-  wallEl.classList.toggle('is-compact', store.ui().density === 'compact');
 }
 
 const findBuild = (game, token) =>
@@ -405,7 +410,6 @@ addEventListener('keydown', (event) => {
 
 /* --- go ------------------------------------------------------------------ */
 
-applyDensity();
 grid.message('Loading the wall…');
 
 loadManifest()

@@ -1,11 +1,11 @@
 /**
  * ui/shelves.js — the big buttons under the sign.
  *
- * Games, and Tech demos & tools. Games is the wall people come for, so it is
- * the default and the other is a press away. Each is drawn as an arcade
- * push-button: dark plastic when up, lit and sunk when chosen, so the current
- * shelf reads at a glance from across the room. Surprise me sits beside them
- * as a third button the same size: it is the other way into a game.
+ * Games has a row to itself: it is the wall people come for. Under it, five
+ * equal buttons: the Source of what is showing (All, Original, Inspired), the
+ * other shelf (Tech demos & tools), and Surprise me. Each is drawn as an arcade
+ * push-button: dark plastic when up, lit and sunk when chosen, so the state of
+ * the wall reads at a glance from across the room.
  */
 
 import { h } from '../dom.js';
@@ -33,6 +33,23 @@ const ART = {
     h('path', { ...line, 'stroke-dasharray': '2.5 3.5', d: 'M13 42l18-10 18 10M31 10v22' }),
     h('path', { ...line, d: 'M53 5v8M49 9h8' }),
   ],
+  // Four tiles: the whole wall.
+  all: () => [
+    h('rect', { ...line, x: 12, y: 12, width: 17, height: 17, rx: 3 }),
+    h('rect', { ...line, x: 35, y: 12, width: 17, height: 17, rx: 3 }),
+    h('rect', { ...line, x: 12, y: 35, width: 17, height: 17, rx: 3 }),
+    h('rect', { ...line, x: 35, y: 35, width: 17, height: 17, rx: 3 }),
+  ],
+  // A spark: its own idea.
+  original: () => [
+    h('path', { ...line, d: 'M32 8l5.5 18.5L56 32l-18.5 5.5L32 56l-5.5-18.5L8 32l18.5-5.5z' }),
+  ],
+  // Two cards, one tracing the other: after a classic.
+  inspired: () => [
+    h('rect', { ...line, x: 10, y: 14, width: 30, height: 36, rx: 4, 'stroke-dasharray': '3 4' }),
+    h('rect', { ...line, x: 24, y: 10, width: 30, height: 36, rx: 4 }),
+    h('path', { ...line, d: 'M31 22h16M31 30h12' }),
+  ],
   // A die, five showing.
   surprise: () => [
     h('rect', { ...line, x: 10, y: 10, width: 44, height: 44, rx: 8 }),
@@ -47,56 +64,64 @@ const ART = {
 const art = (key) =>
   h('span', { class: 'shelf__art', 'aria-hidden': 'true' }, h('svg', { viewBox: '0 0 64 64', focusable: 'false' }, ART[key]()));
 
-export function createShelves(root, { onSelect, onSurprise }) {
-  const buttons = new Map();
-
-  for (const shelf of SHELVES) {
-    const count = h('span', { class: 'shelf__count' });
-    const button = h(
-      'button',
-      {
-        class: 'shelf',
-        type: 'button',
-        dataset: { shelf: shelf.key },
-        'aria-pressed': 'false',
-        onclick: () => onSelect(shelf.key),
-      },
-      art(shelf.key),
-      h('span', { class: 'shelf__text' }, h('span', { class: 'shelf__label' }, shelf.label), count)
-    );
-    buttons.set(shelf.key, { button, count });
-    root.append(button);
-  }
-
-  const surprise = h(
+const button = (key, label, sub, onclick, extra = {}) => {
+  const note = h('span', { class: 'shelf__count' }, sub);
+  const el = h(
     'button',
-    {
-      class: 'shelf shelf--surprise',
-      type: 'button',
-      title: 'Play a random game from the ones showing',
-      onclick: () => onSurprise(),
-    },
-    art('surprise'),
-    h(
-      'span',
-      { class: 'shelf__text' },
-      h('span', { class: 'shelf__label' }, 'Surprise me'),
-      h('span', { class: 'shelf__count' }, 'A random game')
-    )
+    { class: `shelf shelf--${key}`, type: 'button', 'aria-pressed': 'false', onclick, ...extra },
+    art(key),
+    h('span', { class: 'shelf__text' }, h('span', { class: 'shelf__label' }, label), note)
   );
-  root.append(surprise);
+  return { el, note };
+};
+
+const SOURCES = [
+  { key: 'all', origin: '', label: 'All', sub: 'Original and inspired' },
+  { key: 'original', origin: 'original', label: 'Original', sub: 'Its own idea' },
+  { key: 'inspired', origin: 'inspired', label: 'Inspired', sub: 'After a classic' },
+];
+
+export function createShelves(root, { onSelect, onSource, onSurprise }) {
+  const [games, tools] = SHELVES.map((shelf) => ({
+    shelf,
+    ...button(shelf.key, shelf.label, '', () => onSelect(shelf.key)),
+  }));
+  const sources = SOURCES.map((source) => ({
+    source,
+    ...button(source.key, source.label, source.sub, () => onSource(source.origin)),
+  }));
+  const surprise = button('surprise', 'Surprise me', 'A random game', () => onSurprise(), {
+    title: 'Play a random game from the ones showing',
+    'aria-pressed': null,
+  });
+
+  root.append(
+    h('div', { class: 'shelves__row shelves__row--lead' }, games.el),
+    h('div', { class: 'shelves__row' }, ...sources.map((s) => s.el), tools.el, surprise.el)
+  );
 
   return {
-    /** @param counts Map of shelf key → how many are on that shelf right now */
-    render(current, counts, { canSurprise = true } = {}) {
-      surprise.disabled = !canSurprise;
-      for (const [key, { button, count }] of buttons) {
-        const n = counts.get(key) || 0;
-        button.setAttribute('aria-pressed', String(key === current));
-        count.textContent = String(n);
+    /**
+     * @param counts   Map of shelf key → how many are on that shelf right now
+     * @param origins  Original and Inspired with how many the other filters leave
+     */
+    render(current, counts, { origin = '', origins = [], canSurprise = true } = {}) {
+      for (const { shelf, el, note } of [games, tools]) {
+        el.setAttribute('aria-pressed', String(shelf.key === current));
+        note.textContent = String(counts.get(shelf.key) || 0);
         // An empty shelf is not worth a big button; the current one always shows.
-        button.hidden = n === 0 && key !== current;
+        el.hidden = !counts.get(shelf.key) && shelf.key !== current;
       }
+      // Source is only a choice when the shelf holds both kinds.
+      const split = origins.length > 1 || origin;
+      for (const { source, el } of sources) {
+        const on = source.origin === origin;
+        const option = origins.find((o) => o.value === source.origin);
+        el.hidden = !split;
+        el.setAttribute('aria-pressed', String(on));
+        el.disabled = !on && option ? option.count === 0 : false;
+      }
+      surprise.el.disabled = !canSurprise;
     },
   };
 }

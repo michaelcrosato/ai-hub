@@ -180,6 +180,24 @@ test('the wall stacks by series, then by game, then lays out every attempt', () 
   assert.equal(stack.original, true);
 });
 
+test('the wall can stack by a filter instead, and a stack of that kind opens to its value', () => {
+  const lib = [
+    { slug: 'a', name: 'A', genre: 'Racing' },
+    { slug: 'b', name: 'B', genre: 'Racing', players: '1–2' },
+    { slug: 'c', name: 'C', genre: 'RPG' },
+    { slug: 'd', name: 'D' },
+  ].map(normalize);
+  const by = (key, patch = {}) =>
+    stackGames(selectGames(lib, state(patch), stats), state(patch), key).map((item) =>
+      item.stack ? `[${item.facet} ${item.label} ${item.games.length}]` : item.slug
+    );
+  // A game with no genre stands on its own; a genre of one is just that game.
+  assert.deepEqual(by('genre'), ['c', 'd', '[genre Racing 2]']);
+  assert.deepEqual(by('players'), ['b', '[players Single player 3]']);
+  assert.deepEqual(by('genre', { facets: { genre: ['Racing'] } }), ['a', 'b']);
+  assert.deepEqual(by('none'), ['a', 'b', 'c', 'd']);
+});
+
 test('stacks keep the sort, and a search can leave a stack of one, which is just the game', () => {
   const newest = (patch) =>
     stackGames(wall(patch), state({ origin: '', series: '', source: '', sort: 'newest', ...patch })).map((item) =>

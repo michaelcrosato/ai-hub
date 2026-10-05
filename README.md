@@ -210,43 +210,42 @@ pause menu still works.
 If a game misbehaves in a frame, the ↗ button in the corner reopens it in a
 plain tab and remembers that choice for that game.
 
-The wall is split into two shelves, picked with the big buttons under the
-sign: **Games** (the default) and **Tech demos & tools** (demos, tools and
-websites together). The shelf comes from each game's `type` in
-`data/overrides.json`; anything not catalogued counts as a game. Beside them,
-**Surprise me** plays a random game from whatever the search and filters are
-showing (stacked or not, it picks a game). The search box sits in the sign's
-top corner.
+Under the sign, the big buttons. **Games** (the default) has a row to itself.
+Under it, five across: **All**, **Original** and **Inspired** (every game is
+one or the other: an original has no `source`, an inspired one riffs on a
+classic), **Tech demos & tools** (demos, tools and websites, the other shelf),
+and **Surprise me**, which plays a random game from whatever the search and
+filters are showing. The shelf comes from each game's `type` in
+`data/overrides.json`; anything not catalogued counts as a game. The search
+box sits in the sign's top corner.
 
-Under the shelves, one sticky toolbar, in the order people reach for it:
-**All | Original | Inspired**, then **Filters**, then **Sort** and **View** on
-the right. View holds the layout (Comfortable or Compact) and *Group attempts
-at the same game* (the stacks). Whatever is filtering the wall shows under the
-toolbar as chips with a ×, plus *Clear all*.
-
-**Filters** opens a panel (a sheet from the bottom on a phone), worked out per
-shelf and grouped into Game (Genre, Players, Tags), Provenance (Model,
-Collection) and Technical (File size); a field nobody grouped yet lands under
-More. Choices apply as you tap. Several in one filter widen the wall (Racing
-or Flight); different filters narrow it. Players is *Single player* or
-*Multiplayer*, and Multiplayer opens head counts beneath it (*4 players* finds
-every game that seats four). Nothing shows a count: an option that would empty
-the wall is greyed out instead. The groups live in `FACET_UI` in
+Under those, a sticky toolbar of five dropdowns: **Genre**, **Players**,
+**Filters**, **Sort** and **View**. Filters holds every other filter (Model,
+Tags, File size, and whatever field the games carry next); it opens downwards
+and each filter's values fly out to the right (in place on a phone). Choices
+apply as you tap and a menu stays open, so you can tick several: several in
+one filter widen the wall (Racing or Flight), different filters narrow it.
+Players is *Single player* or *Multiplayer*, and Multiplayer opens head counts
+(*4 players* finds every game that seats four). Whatever is filtering the wall
+shows under the toolbar as chips with a ×, plus *Clear all*. Nothing shows a
+count: an option that would empty the wall is greyed out instead. The filters
+are worked out per shelf, and their order lives in `ORDER` in
 `assets/js/manifest.js`.
 
 ### Sources and stacks
 
 Many games are attempts at the same classic: nine at Dragon Quest, seven at
-Final Fantasy Tactics. Every game is **Original** (no source) or **Inspired**
-(it has one), and the toolbar's first control picks All, Original or Inspired.
+Final Fantasy Tactics. **View** decides how the wall stacks, remembered per
+device. *Stack by source* is the default: each series is one stacked cabinet,
+and originals that share a name (six Stratas) stack together. Open a series and
+each game in it is a stack. Open one of those and every attempt is laid out. A
+series with only one game skips the middle step, and a stack of one is just the
+game. Each step is a link, so Back climbs out again. The trail at the top of the
+wall shows where you are, and each game's drawer links to *All N attempts* at
+the same game.
 
-The wall then sorts them when grouping is on in View (the default, and remembered
-per device). Each series is one stacked cabinet; originals that share a name
-(six Stratas) stack together. Open a series and each game in it is a stack.
-Open one of those and every attempt is laid out. A series with only one game
-skips the middle step, and a stack of one is just the game. Each step is a
-link, so Back climbs out again. The trail at the top of the wall shows where
-you are, and each game's drawer links to *All N attempts* at the same game.
+View can instead stack by **Genre**, **Players** or **Model** (pressing such a
+stack filters the wall to it), or not at all.
 
 ## Optional extras
 

@@ -105,7 +105,9 @@ export function stackCabinet(stack, index = 0, href = '#/') {
   const what =
     stack.level === 'series'
       ? `${plural(stack.titles, 'game')}, ${plural(count, 'attempt')}`
-      : plural(count, 'attempt');
+      : stack.level === 'facet'
+        ? plural(count, 'game')
+        : plural(count, 'attempt');
 
   return h(
     'article',

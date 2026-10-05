@@ -86,25 +86,12 @@ const UNDER = {
 };
 
 /**
- * Filters are still found, never declared; this only says where the known
- * ones sit in the filter panel. A field nobody fills in never shows up, and a
- * field invented tomorrow lands under More by itself.
+ * Filters are still found, never declared; this only says the order the known
+ * ones take. Genre and Players get boxes of their own on the toolbar; the rest
+ * sit under Filters in this order, and a field invented tomorrow joins the end.
  */
-export const GROUPS = [
-  { key: 'game', label: 'Game' },
-  { key: 'provenance', label: 'Provenance' },
-  { key: 'technical', label: 'Technical' },
-  { key: 'more', label: 'More' },
-];
-const FACET_UI = {
-  genre: { group: 'game', order: 10 },
-  players: { group: 'game', order: 20 },
-  tags: { group: 'game', order: 30 },
-  model: { group: 'provenance', order: 10 },
-  collection: { group: 'provenance', order: 20 },
-  fileSize: { group: 'technical', order: 10 },
-};
-const facetUi = (key) => FACET_UI[key] ?? { group: 'more', order: 100 };
+const ORDER = ['genre', 'players', 'model', 'tags', 'fileSize', 'collection'];
+const rankOf = (key) => (ORDER.includes(key) ? ORDER.indexOf(key) : ORDER.length);
 
 /** A rail needs at least this many distinct values, and this many games covered. */
 const MIN_VALUES = 2;
@@ -255,7 +242,6 @@ export function deriveFacets(games) {
     };
     facets.push({
       key,
-      ...facetUi(key),
       label: prettyLabel(key),
       coverage,
       options: [...counts.entries()]
@@ -268,9 +254,8 @@ export function deriveFacets(games) {
     });
   }
 
-  const group = (facet) => GROUPS.findIndex((g) => g.key === facet.group);
   return facets.sort(
-    (a, b) => group(a) - group(b) || a.order - b.order || b.coverage - a.coverage || a.label.localeCompare(b.label)
+    (a, b) => rankOf(a.key) - rankOf(b.key) || b.coverage - a.coverage || a.label.localeCompare(b.label)
   );
 }
 
