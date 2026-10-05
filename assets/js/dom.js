@@ -65,10 +65,10 @@ export const ICONS = {
   star: 'M12 3.6l2.5 5.3 5.5.8-4 4.1 1 5.9-5-2.8-5 2.8 1-5.9-4-4.1 5.5-.8z',
   back: 'M15 5l-7 7 7 7',
   caret: 'M6 9l6 6 6-6',
+  dice: 'M6 4h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM8.5 8.5h.01M15.5 8.5h.01M12 12h.01M8.5 15.5h.01M15.5 15.5h.01',
   search: 'M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zM15.2 15.2L20 20',
   close: 'M6 6l12 12M18 6L6 18',
   play: 'M7 4.5v15l13-7.5z',
-  external: 'M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
   // Three cards fanned on top of each other: a stack of attempts.
   stack: 'M8 4h11a1 1 0 0 1 1 1v11M5 7h11a1 1 0 0 1 1 1v11M3 10h10a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z',
   // A die showing five; the pips are zero-length strokes drawn by round caps.

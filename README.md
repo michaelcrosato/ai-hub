@@ -203,12 +203,15 @@ them. Nothing is written into a game file to make that work — the hub only
 attaches listeners to the game's document, which it is allowed to do because
 the games are served from the same origin.
 
-Ways out: the corner tab, the browser's Back button, the `` ` `` key, or holding
-**Esc** for about a second. A *tap* of Esc is never intercepted, so a game's own
-pause menu still works.
+The bar in the corner has three buttons: **←** back to the wall, **🎲** roll
+another random game from what the wall was showing, and **✕**. A tap of ✕
+folds the bar down to just the ✕ (tap again to bring it back); holding it
+removes the bar entirely until the hub is reloaded. The browser's Back button
+always works too. The hub claims no keys while a game runs, so every key
+belongs to the game.
 
-If a game misbehaves in a frame, the ↗ button in the corner reopens it in a
-plain tab and remembers that choice for that game.
+If a game misbehaves in a frame, *Open on its own page* in its Details drawer
+runs it in a plain tab.
 
 Under the sign, the big buttons. **Games** (the default) has a row to itself.
 Under it, five across: **All**, **Original** and **Inspired** (every game is

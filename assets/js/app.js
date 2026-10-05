@@ -229,6 +229,13 @@ const detail = createDetail(document.getElementById('detail'), {
 
 const player = createPlayer(document.getElementById('player'), {
   onExit: () => (hops > 1 ? history.back() : router.go('/', { replace: true })),
+  // Another game from what the wall was showing, never the one already up.
+  onRoll() {
+    const current = player.current()?.slug;
+    const pool = showing.filter((game) => game.slug !== current);
+    if (!pool.length) return;
+    router.go(`/play/${pool[Math.floor(Math.random() * pool.length)].slug}`, { replace: true });
+  },
 });
 
 const dev = createDev(document.getElementById('dev'), { library: () => manifest });

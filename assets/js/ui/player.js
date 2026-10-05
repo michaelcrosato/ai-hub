@@ -6,9 +6,11 @@
  * because the games are served from this same origin. That is what lets the
  * hub offer a way out without a single edit to a game file.
  *
- * The listeners never call preventDefault. All four sample games bind Escape
- * themselves, so a tap must still reach the game's own pause menu — only a
- * sustained hold means "leave".
+ * The hub claims no keys while a game runs: every key belongs to the game.
+ * The way out is the bar in the corner, three buttons: back to the wall, roll
+ * another game, and ✕. A tap of ✕ folds the bar down to just the ✕ (a tap
+ * brings it back); holding it takes the bar away entirely, until the hub is
+ * reloaded, for a game that needs every pixel.
  */
 
 import { h, clear, icon, ICONS } from '../dom.js';
@@ -17,7 +19,7 @@ import { store } from '../store.js';
 
 const HOLD_MS = 700;
 const IDLE_MS = 3500;
-const RING = 2 * Math.PI * 28;
+const RING = 2 * Math.PI * 10;
 
 const FRAME_ALLOW = [
   'fullscreen',
@@ -35,32 +37,51 @@ const FRAME_ALLOW = [
 
 const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-export function createPlayer(root, { onExit }) {
+export function createPlayer(root, { onExit, onRoll }) {
   let session = null;
   let pageTitle = document.title;
+  /** The bar: 'open', 'folded' to just the ✕, or 'gone' until a reload. */
+  let bar = 'open';
 
-  /* --- leaving ---------------------------------------------------------- */
+  /* --- the ✕: a tap folds the bar, a hold takes it away ------------------- */
+
+  function setBar(next) {
+    bar = next;
+    root.classList.toggle('is-folded', bar === 'folded');
+    root.classList.toggle('is-bare', bar === 'gone');
+  }
 
   function cancelHold() {
     if (!session?.hold) return;
     cancelAnimationFrame(session.hold.raf);
     session.hold = null;
-    session.holdLayer.classList.remove('is-on');
-    session.arc.setAttribute('stroke-dashoffset', RING);
+    session.arc?.setAttribute('stroke-dashoffset', RING);
   }
 
-  function beginHold() {
+  function beginHold(event) {
     if (!session || session.hold) return;
+    event.preventDefault();
     const started = performance.now();
-    session.holdLayer.classList.add('is-on');
     const step = (now) => {
       if (!session?.hold) return;
       const progress = Math.min(1, (now - started) / HOLD_MS);
       session.arc.setAttribute('stroke-dashoffset', String(RING * (1 - progress)));
-      if (progress >= 1) return onExit();
+      if (progress >= 1) {
+        session.hold.done = true;
+        setBar('gone');
+        return;
+      }
       session.hold.raf = requestAnimationFrame(step);
     };
-    session.hold = { raf: requestAnimationFrame(step) };
+    session.hold = { raf: requestAnimationFrame(step), done: false };
+  }
+
+  /** Let go: a short press was a tap, which folds or unfolds the bar. */
+  function endHold() {
+    if (!session?.hold) return;
+    const held = session.hold.done;
+    cancelHold();
+    if (!held) setBar(bar === 'folded' ? 'open' : 'folded');
   }
 
   /* --- chrome that gets out of the way ---------------------------------- */
@@ -89,11 +110,8 @@ export function createPlayer(root, { onExit }) {
       doc.addEventListener(type, fn, opts);
       session?.unbind.push(() => doc.removeEventListener(type, fn, opts));
     };
-    bind('keydown', onKeyDown);
-    bind('keyup', onKeyUp);
     bind('mousemove', onInnerMove, { passive: true });
     bind('touchstart', onInnerTouch, { passive: true });
-    bind('blur', cancelHold, true);
   }
 
   function onInnerMove(event) {
@@ -104,15 +122,6 @@ export function createPlayer(root, { onExit }) {
   // there is no mousemove on a touch screen, and no keyboard for the hotkeys.
   function onInnerTouch(event) {
     if ((event.touches?.[0]?.clientY ?? 999) < 90) wake();
-  }
-
-  function onKeyDown(event) {
-    if (event.key === 'Escape' && !event.repeat) beginHold();
-    else if (event.code === 'Backquote' && !event.metaKey && !event.ctrlKey) onExit();
-  }
-
-  function onKeyUp(event) {
-    if (event.key === 'Escape') cancelHold();
   }
 
   /* --- opening ---------------------------------------------------------- */
@@ -157,8 +166,9 @@ export function createPlayer(root, { onExit }) {
     clear(root);
 
     if (store.prefersStandalone(game.slug) || store.dev().alwaysStandalone) {
-      root.append(exitBar(game, build, { standalone: true }), standalonePanel(game, build));
-      session = { game, build, unbind: [], idle: 0 };
+      const { el: barEl, arc } = exitBar();
+      root.append(barEl, standalonePanel(game, build));
+      session = { game, build, arc, unbind: [], idle: 0, hold: null };
       return;
     }
 
@@ -172,31 +182,10 @@ export function createPlayer(root, { onExit }) {
     });
 
     const crt = h('div', { class: 'player__crt', 'aria-hidden': 'true' });
+    const { el: barEl, arc } = exitBar();
+    root.append(frame, crt, barEl);
 
-    const arc = h('circle', {
-      class: 'arc',
-      cx: 32,
-      cy: 32,
-      r: 28,
-      'stroke-dasharray': RING,
-      'stroke-dashoffset': RING,
-    });
-
-    const holdLayer = h(
-      'div',
-      { class: 'player__hold', 'aria-hidden': 'true' },
-      h(
-        'svg',
-        { viewBox: '0 0 64 64' },
-        h('circle', { class: 'track', cx: 32, cy: 32, r: 28 }),
-        arc
-      ),
-      h('p', {}, 'Keep holding to leave')
-    );
-
-    root.append(frame, crt, exitBar(game, build, {}), holdLayer);
-
-    session = { game, build, frame, crt, arc, holdLayer, unbind: [], idle: 0, hold: null };
+    session = { game, build, frame, crt, arc, unbind: [], idle: 0, hold: null };
 
     frame.addEventListener('load', () => {
       crt.classList.add('is-off');
@@ -217,32 +206,47 @@ export function createPlayer(root, { onExit }) {
     if (fromTile && !reducedMotion()) zoomFrom(fromTile);
   }
 
-  function exitBar(game, build, { standalone = false }) {
-    return h(
-      'div',
-      { class: 'player__exit' },
+  /** Back to the wall, roll another game, and the ✕ with its hold ring. */
+  function exitBar() {
+    const arc = h('circle', {
+      class: 'arc',
+      cx: 12,
+      cy: 12,
+      r: 10,
+      'stroke-dasharray': RING,
+      'stroke-dashoffset': RING,
+    });
+    const tool = (cls, label, glyph, props = {}) =>
       h(
         'button',
-        { type: 'button', class: 'player__leave', onclick: onExit },
-        icon(ICONS.back),
-        'Back to the wall'
-      ),
-      !standalone && h('kbd', {}, 'hold Esc'),
-      !standalone &&
-        h(
-          'a',
-          {
-            class: 'player__pop',
-            href: build.path,
-            target: '_blank',
-            rel: 'noopener',
-            'aria-label': 'Open this game in a plain tab and remember that choice',
-            title: 'Open in a plain tab, and remember that choice for this game',
-            onclick: () => store.setStandalone(game.slug, true),
+        { type: 'button', class: `player__tool ${cls}`, 'aria-label': label, title: label, ...props },
+        glyph
+      );
+    const el = h(
+      'div',
+      { class: 'player__exit' },
+      tool('player__back', 'Back to the wall', icon(ICONS.back), { onclick: onExit }),
+      tool('player__roll', 'Roll: play another random game', icon(ICONS.dice), { onclick: () => onRoll() }),
+      tool(
+        'player__fold',
+        'Tap to fold this bar away, hold to remove it until you reload',
+        [h('svg', { class: 'player__ring', viewBox: '0 0 24 24', 'aria-hidden': 'true' }, arc), icon(ICONS.close)],
+        {
+          onpointerdown: beginHold,
+          onpointerup: endHold,
+          onpointerleave: cancelHold,
+          onpointercancel: cancelHold,
+          oncontextmenu: (event) => event.preventDefault(),
+          onkeydown: (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              setBar(bar === 'folded' ? 'open' : 'folded');
+            }
           },
-          icon(ICONS.external)
-        )
+        }
+      )
     );
+    return { el, arc };
   }
 
   function zoomFrom(tile) {
@@ -306,14 +310,6 @@ export function createPlayer(root, { onExit }) {
     shrink.finished.then(finish, finish);
   }
 
-  addEventListener('keydown', (event) => {
-    if (!session) return;
-    if (event.key === 'Escape' && !event.repeat) beginHold();
-    else if (event.code === 'Backquote') onExit();
-  });
-  addEventListener('keyup', (event) => {
-    if (session && event.key === 'Escape') cancelHold();
-  });
   addEventListener(
     'mousemove',
     (event) => {
@@ -328,7 +324,6 @@ export function createPlayer(root, { onExit }) {
     },
     { passive: true }
   );
-  addEventListener('blur', cancelHold);
 
   return {
     open,
