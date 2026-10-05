@@ -188,9 +188,9 @@ const groupValue = (game, key) => {
 
 /**
  * Fold the wall into stacks. By source, see stackBySource. By a filter, every
- * game sharing a value is one stack; a game with no value for it stands on
- * its own, and once that filter is down to one value there is nothing left
- * to stack.
+ * game sharing a value is one stack, and the stacks come first; a game with
+ * no value for it (most games name no model) follows them on its own. Once
+ * that filter is down to one value there is nothing left to stack.
  */
 export function stackGames(list, state, by = DEFAULT_GROUPING) {
   if (by === 'none') return list;
@@ -211,7 +211,7 @@ export function stackGames(list, state, by = DEFAULT_GROUPING) {
   const items = [...groups.values()].map(({ key, games }) =>
     games.length === 1 ? games[0] : { stack: true, level: 'facet', facet: by, label: key, games }
   );
-  return orderStacks([...items, ...loose.map((l) => l.games[0])], list, state);
+  return [...orderStacks(items, list, state), ...orderStacks(loose.map((l) => l.games[0]), list, state)];
 }
 
 /** A stack takes its first game's place, so the sort still decides the order,

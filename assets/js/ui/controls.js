@@ -23,6 +23,14 @@ import { SORTS, GROUPINGS } from '../filter.js';
 import { MULTI } from '../manifest.js';
 import { store } from '../store.js';
 
+/** How big a cabinet is: one to a row, wide, with room for its blurb; or
+ *  three to a row. On a phone both are one to a row. */
+export const SIZES = [
+  { key: 'wide', label: 'One per row' },
+  { key: 'three', label: 'Three per row' },
+];
+export const currentSize = () => (SIZES.some((s) => s.key === store.ui().size) ? store.ui().size : SIZES[0].key);
+
 /** Filters with a box of their own; the rest go under Filters. */
 const OWN_BOX = ['genre', 'players'];
 
@@ -33,7 +41,7 @@ const summary = (values) => (!values.length ? 'Any' : values.length === 1 ? valu
  * @param root        the sticky toolbar, with the active filters under it
  * @param searchRoot  where the search box goes: the sign's top corner
  */
-export function createControls(root, { searchRoot = root, onChange, onGroup }) {
+export function createControls(root, { searchRoot = root, onChange, onGroup, onSize }) {
   let last = null;
   /** Which submenu is out, per menu, so a re-render keeps it out. */
   const openSub = new Map();
@@ -299,7 +307,9 @@ export function createControls(root, { searchRoot = root, onChange, onGroup }) {
     setBox(boxes.view, 'View', current.key === 'none' ? 'No stacks' : `Stack by ${current.label.toLowerCase()}`, false);
     clear(boxes.view.menu).append(
       h('p', { class: 'drop__head' }, 'Size'),
-      item('Comfortable', { on: true, check: 'radio', onclick: () => {} }),
+      ...SIZES.map((size) =>
+        item(size.label, { on: size.key === currentSize(), check: 'radio', close: true, onclick: () => onSize(size.key) })
+      ),
       h('p', { class: 'drop__head' }, 'Stack by'),
       ...GROUPINGS.map((g) =>
         item(g.label, { on: g === current, check: 'radio', close: true, onclick: () => onGroup(g.key) })

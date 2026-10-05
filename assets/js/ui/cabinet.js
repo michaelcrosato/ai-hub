@@ -178,6 +178,8 @@ export function cabinet(game, index = 0, caption = null) {
         'div',
         { class: 'cab__panel' },
         h('p', { class: 'cab__tagline' }, game.tagline || game.description || 'No blurb — open it and find out.'),
+        // Only shown one to a row, where there is room to say more.
+        game.tagline && game.description && h('p', { class: 'cab__about' }, game.description),
         h(
           'div',
           { class: 'cab__meta' },

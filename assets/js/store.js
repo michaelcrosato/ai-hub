@@ -14,7 +14,7 @@ const EMPTY = {
   plays: {},
   lastPlayed: {},
   standalone: {},
-  ui: { sort: 'name', group: 'source' },
+  ui: { sort: 'name', group: 'source', size: 'wide' },
   // Behind the PIN. Not security — the games are public files — just a way
   // to keep grown-up and unfinished things off the wall on a shared device.
   dev: { showAll: false, showSlugs: false, alwaysStandalone: false },

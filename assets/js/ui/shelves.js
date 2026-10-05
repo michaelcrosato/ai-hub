@@ -112,14 +112,14 @@ export function createShelves(root, { onSelect, onSource, onSurprise }) {
         // An empty shelf is not worth a big button; the current one always shows.
         el.hidden = !counts.get(shelf.key) && shelf.key !== current;
       }
-      // Source is only a choice when the shelf holds both kinds.
-      const split = origins.length > 1 || origin;
+      // All, Original and Inspired are ways onto the Games shelf: from Tech
+      // demos & tools, pressing one goes back to games, so none is lit there.
+      const onGames = current === SHELVES[0].key;
       for (const { source, el } of sources) {
-        const on = source.origin === origin;
+        const on = onGames && source.origin === origin;
         const option = origins.find((o) => o.value === source.origin);
-        el.hidden = !split;
         el.setAttribute('aria-pressed', String(on));
-        el.disabled = !on && option ? option.count === 0 : false;
+        el.disabled = onGames && !on && option ? option.count === 0 : false;
       }
       surprise.el.disabled = !canSurprise;
     },

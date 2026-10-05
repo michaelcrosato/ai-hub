@@ -37,7 +37,7 @@ import {
 import { store } from './store.js';
 import { router } from './router.js';
 import { createGrid } from './ui/grid.js';
-import { createControls } from './ui/controls.js';
+import { createControls, SIZES, currentSize } from './ui/controls.js';
 import { createShelves } from './ui/shelves.js';
 import { createDetail } from './ui/detail.js';
 import { createPlayer } from './ui/player.js';
@@ -175,7 +175,13 @@ const shelves = createShelves(document.getElementById('shelves'), {
     for (const facet of facets) patch[facet.key] = '';
     router.setQuery(patch);
   },
-  onSource: (origin) => router.setQuery({ origin, series: '', source: '' }),
+  // All, Original and Inspired sort the Games shelf, so from the other shelf
+  // they go back to games, with that shelf's filters let go.
+  onSource(origin) {
+    const patch = { shelf: '', origin, series: '', source: '' };
+    if (readState(router.current().query).shelf !== DEFAULT_SHELF) for (const facet of facets) patch[facet.key] = '';
+    router.setQuery(patch);
+  },
   // Drawn from what the shelf and filters leave showing, so "Surprise me"
   // on the Games shelf is always a game.
   onSurprise() {
@@ -192,6 +198,10 @@ const controls = createControls(document.getElementById('controls'), {
     router.setQuery(patch);
   },
   onGroup: (group) => store.setUi({ group }),
+  onSize(size) {
+    store.setUi({ size });
+    applySize();
+  },
 });
 
 /** Every attempt at the same game on the same shelf, as a link to them all. */
@@ -328,6 +338,10 @@ function renderWall(state) {
   }
 }
 
+function applySize() {
+  for (const size of SIZES) wallEl.classList.toggle(`is-${size.key}`, size.key === currentSize());
+}
+
 const findBuild = (game, token) =>
   (token && game.builds.find((b) => b.version === token || b.id === token)) || game.builds[0];
 
@@ -410,6 +424,7 @@ addEventListener('keydown', (event) => {
 
 /* --- go ------------------------------------------------------------------ */
 
+applySize();
 grid.message('Loading the wall…');
 
 loadManifest()

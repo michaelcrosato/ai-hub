@@ -213,7 +213,8 @@ plain tab and remembers that choice for that game.
 Under the sign, the big buttons. **Games** (the default) has a row to itself.
 Under it, five across: **All**, **Original** and **Inspired** (every game is
 one or the other: an original has no `source`, an inspired one riffs on a
-classic), **Tech demos & tools** (demos, tools and websites, the other shelf),
+classic; from the other shelf they go back to Games), **Tech demos & tools**
+(demos, tools and websites, the other shelf),
 and **Surprise me**, which plays a random game from whatever the search and
 filters are showing. The shelf comes from each game's `type` in
 `data/overrides.json`; anything not catalogued counts as a game. The search
@@ -245,7 +246,10 @@ wall shows where you are, and each game's drawer links to *All N attempts* at
 the same game.
 
 View can instead stack by **Genre**, **Players** or **Model** (pressing such a
-stack filters the wall to it), or not at all.
+stack filters the wall to it; games with no value for it follow the stacks),
+or not at all. View also sets the size: *One per row* (the default: a wide
+cabinet with its whole blurb beside the screen) or *Three per row*. A phone
+shows one per row either way.
 
 ## Optional extras
 
