@@ -7,7 +7,7 @@
  * play session returns you to the same scroll position with the same search
  * still typed.
  *
- * The wall shows one shelf at a time — Games, Tech demos, Tools & websites —
+ * The wall shows one shelf at a time — Games, or Tech demos & tools —
  * and the rails are worked out for the shelf in view, so a Games wall never
  * offers a "Tech Demo" genre with nothing behind it.
  *
@@ -27,6 +27,7 @@ import {
   DEFAULT_SORT,
   SORTS,
   SHELVES,
+  SHELF_ALIASES,
   ORIGINS,
   DEFAULT_SHELF,
   shelfOf,
@@ -98,7 +99,8 @@ function facetsFor(shelf) {
 /* --- state lives in the URL --------------------------------------------- */
 
 function readState(query) {
-  const shelf = query.get('shelf') || DEFAULT_SHELF;
+  const asked = query.get('shelf') || DEFAULT_SHELF;
+  const shelf = SHELF_ALIASES[asked] || asked;
   const state = {
     shelf: SHELVES.some((s) => s.key === shelf) ? shelf : DEFAULT_SHELF,
     showAll: showAll(),
@@ -163,10 +165,17 @@ const shelves = createShelves(document.getElementById('shelves'), {
     for (const facet of facets) patch[facet.key] = '';
     router.setQuery(patch);
   },
+  // Drawn from what the shelf and filters leave showing, so "Surprise me"
+  // on the Games shelf is always a game.
+  onSurprise() {
+    if (!showing.length) return;
+    const game = showing[Math.floor(Math.random() * showing.length)];
+    router.go(`/play/${game.slug}`);
+  },
 });
 
 const controls = createControls(document.getElementById('controls'), {
-  railsRoot: document.getElementById('filters'),
+  searchRoot: document.getElementById('search'),
   onChange(patch) {
     if (patch.sort) store.setUi({ sort: patch.sort });
     router.setQuery(patch);
@@ -176,13 +185,6 @@ const controls = createControls(document.getElementById('controls'), {
     applyDensity();
   },
   onStack: (next) => store.setUi({ stack: next }),
-  // Drawn from what the shelf and filters leave showing, so "Surprise me"
-  // on the Games shelf is always a game.
-  onSurprise() {
-    if (!showing.length) return;
-    const game = showing[Math.floor(Math.random() * showing.length)];
-    router.go(`/play/${game.slug}`);
-  },
 });
 
 /** Every attempt at the same game on the same shelf, as a link to them all. */
@@ -232,13 +234,15 @@ function renderCount(state, shown) {
  * Where the wall is inside the Source rail, with a way back up each step. It
  * sits at the top of the wall itself, because opening a stack scrolls there.
  */
-function trail(state, sources, shown) {
+function trail(state, shown) {
   if (!state.origin) return null;
-  const label = (options, value) => options.find((o) => sameKey(o.value) === sameKey(value))?.value || value;
+  // Spelled the way the catalogue does, whatever case the link used.
+  const spelled = (step, value) =>
+    games.find((g) => sameKey(g.lineage[step]) === sameKey(value))?.lineage[step] || value;
   const steps = [
     [ORIGINS.find((o) => o.key === state.origin).label, { series: '', source: '' }],
-    state.series && [label(sources.series, state.series), { source: '' }],
-    state.source && [label(sources.titles, state.source)],
+    state.series && [spelled('series', state.series), { source: '' }],
+    state.source && [spelled('title', state.source)],
   ].filter(Boolean);
   return h(
     'nav',
@@ -267,12 +271,11 @@ function renderWall(state) {
   const perShelf = new Map(
     SHELVES.map((s) => [s.key, games.filter((g) => isVisible(g, state.showAll) && shelfOf(g) === s.key).length])
   );
-  shelves.render(state.shelf, perShelf);
+  shelves.render(state.shelf, perShelf, { canSurprise: visible.length > 0 });
   controls.render(state, {
     facets,
     counts: facetCounts(games, state, stats, facets),
     sources,
-    shown: visible.length,
   });
   renderCount(state, visible.length);
 
@@ -300,7 +303,7 @@ function renderWall(state) {
   }
 
   grid.render(store.ui().stack ? stackGames(visible, state) : visible, {
-    lead: trail(state, sources, visible.length),
+    lead: trail(state, visible.length),
     // Among inspired games, which game each one is an attempt at says more
     // than its genre; inside a series every tile is the same genre anyway.
     label: (game) =>

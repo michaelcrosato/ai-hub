@@ -103,13 +103,13 @@ test('shelves split by type, uncatalogued games are games, restricted ones stay 
     normalize({ slug: 'e', name: 'E', type: 'Website' }),
     normalize({ slug: 'f', name: 'F', type: 'Game', restricted: true }),
   ];
-  assert.deepEqual(lib.map(shelfOf), ['games', 'games', 'demos', 'tools', 'tools', 'games']);
+  assert.deepEqual(lib.map(shelfOf), ['games', 'games', 'tools', 'tools', 'tools', 'games']);
   const slugs = (patch) => selectGames(lib, state(patch), stats).map((g) => g.slug);
   assert.deepEqual(slugs({ shelf: 'games' }), ['a', 'b']);
   assert.deepEqual(slugs({ shelf: 'games', showAll: true }), ['a', 'b', 'f']);
-  assert.deepEqual(slugs({ shelf: 'tools' }), ['d', 'e']);
+  assert.deepEqual(slugs({ shelf: 'tools' }), ['c', 'd', 'e']);
   assert.deepEqual(slugs({ shelf: null }), ['a', 'b', 'c', 'd', 'e']);
-  const genreless = facetCounts(lib, state({ shelf: 'demos' }), stats, []);
+  const genreless = facetCounts(lib, state({ shelf: 'tools' }), stats, []);
   assert.equal(genreless.size, 0);
 });
 
@@ -190,29 +190,13 @@ test('stacks keep the sort, and a search can leave a stack of one, which is just
   assert.deepEqual(tiles({ query: 'starward' }), ['dq9-b']);
 });
 
-test('the Source rail splits original from inspired, then offers only what gathers attempts', () => {
+test('the Source rail is Original or Inspired, greying out whichever the filters empty', () => {
   const rail = (patch) => sourceCounts(lineup, state({ origin: '', series: '', source: '', ...patch }), stats);
-  const shape = (options) => options.map((o) => `${o.value} ${o.count}/${o.total}`);
-
-  const top = rail({});
-  assert.deepEqual(shape(top.origins), ['original 3/3', 'inspired 8/8']);
-  assert.deepEqual(top.series, []);
-  assert.deepEqual(top.titles, []);
-
-  // Okami is one game: it stays on the wall under Inspired, with no chip of its own.
-  assert.deepEqual(shape(rail({ origin: 'inspired' }).series), ['Dragon Quest 5/5', 'Crystalis 2/2']);
-  assert.deepEqual(shape(rail({ origin: 'original' }).titles), ['Strata 2/2']);
-  assert.deepEqual(shape(rail({ origin: 'inspired', series: 'Dragon Quest' }).titles), [
-    'Dragon Quest 2/2',
-    'Dragon Quest IX 2/2',
-  ]);
-  // A series that is one game has no step below it.
-  assert.deepEqual(rail({ origin: 'inspired', series: 'Crystalis' }).titles, []);
-
-  // The chips hold still under a search; only their counts move, to grey out the empty ones.
-  const searched = rail({ origin: 'inspired', query: 'starfall' });
-  assert.deepEqual(shape(searched.origins), ['original 0/3', 'inspired 1/8']);
-  assert.deepEqual(shape(searched.series), ['Dragon Quest 1/5', 'Crystalis 0/2']);
+  const shape = (options) => options.map((o) => `${o.label} ${o.count}/${o.total}`);
+  assert.deepEqual(shape(rail({}).origins), ['Original 3/3', 'Inspired 8/8']);
+  // Counted against everything but the rail's own choice, so the other side still says what it holds.
+  assert.deepEqual(shape(rail({ origin: 'inspired', query: 'starfall' }).origins), ['Original 0/3', 'Inspired 1/8']);
+  assert.deepEqual(shape(sourceCounts(lineup.slice(0, 3), state({}), stats).origins), ['Inspired 3/3']);
 });
 
 test('the catalogue gives every source one series', () => {

@@ -1,10 +1,11 @@
 /**
- * ui/shelves.js — the three big buttons under the sign.
+ * ui/shelves.js — the big buttons under the sign.
  *
- * Games, Tech demos, Tools & websites. Games is the wall people come for, so
- * it is the default and the others are a press away. Each is drawn as an
- * arcade push-button: dark plastic when up, lit and sunk when chosen, so the
- * current shelf reads at a glance from across the room.
+ * Games, and Tech demos & tools. Games is the wall people come for, so it is
+ * the default and the other is a press away. Each is drawn as an arcade
+ * push-button: dark plastic when up, lit and sunk when chosen, so the current
+ * shelf reads at a glance from across the room. Surprise me sits beside them
+ * as a third button the same size: it is the other way into a game.
  */
 
 import { h } from '../dom.js';
@@ -26,24 +27,27 @@ const ART = {
     dot(47.5, 36.5),
   ],
   // A wireframe cube with a spark: something built to show what an engine can do.
-  demos: () => [
+  tools: () => [
     h('path', { ...line, d: 'M31 10l18 10v22L31 52 13 42V20z' }),
     h('path', { ...line, d: 'M13 20l18 10 18-10M31 30v22' }),
     h('path', { ...line, 'stroke-dasharray': '2.5 3.5', d: 'M13 42l18-10 18 10M31 10v22' }),
     h('path', { ...line, d: 'M53 5v8M49 9h8' }),
   ],
-  // A browser window with code in it.
-  tools: () => [
-    h('rect', { ...line, x: 7, y: 12, width: 50, height: 40, rx: 4 }),
-    h('path', { ...line, d: 'M7 21h50' }),
-    dot(12.5, 16.5, 1.4),
-    dot(17.5, 16.5, 1.4),
-    dot(22.5, 16.5, 1.4),
-    h('path', { ...line, d: 'M25 29l-7 7 7 7M39 29l7 7-7 7M34.5 27l-5 18' }),
+  // A die, five showing.
+  surprise: () => [
+    h('rect', { ...line, x: 10, y: 10, width: 44, height: 44, rx: 8 }),
+    dot(21, 21, 3.2),
+    dot(43, 21, 3.2),
+    dot(32, 32, 3.2),
+    dot(21, 43, 3.2),
+    dot(43, 43, 3.2),
   ],
 };
 
-export function createShelves(root, { onSelect }) {
+const art = (key) =>
+  h('span', { class: 'shelf__art', 'aria-hidden': 'true' }, h('svg', { viewBox: '0 0 64 64', focusable: 'false' }, ART[key]()));
+
+export function createShelves(root, { onSelect, onSurprise }) {
   const buttons = new Map();
 
   for (const shelf of SHELVES) {
@@ -57,20 +61,35 @@ export function createShelves(root, { onSelect }) {
         'aria-pressed': 'false',
         onclick: () => onSelect(shelf.key),
       },
-      h(
-        'span',
-        { class: 'shelf__art', 'aria-hidden': 'true' },
-        h('svg', { viewBox: '0 0 64 64', focusable: 'false' }, ART[shelf.key]())
-      ),
+      art(shelf.key),
       h('span', { class: 'shelf__text' }, h('span', { class: 'shelf__label' }, shelf.label), count)
     );
     buttons.set(shelf.key, { button, count });
     root.append(button);
   }
 
+  const surprise = h(
+    'button',
+    {
+      class: 'shelf shelf--surprise',
+      type: 'button',
+      title: 'Play a random game from the ones showing',
+      onclick: () => onSurprise(),
+    },
+    art('surprise'),
+    h(
+      'span',
+      { class: 'shelf__text' },
+      h('span', { class: 'shelf__label' }, 'Surprise me'),
+      h('span', { class: 'shelf__count' }, 'A random game')
+    )
+  );
+  root.append(surprise);
+
   return {
     /** @param counts Map of shelf key → how many are on that shelf right now */
-    render(current, counts) {
+    render(current, counts, { canSurprise = true } = {}) {
+      surprise.disabled = !canSurprise;
       for (const [key, { button, count }] of buttons) {
         const n = counts.get(key) || 0;
         button.setAttribute('aria-pressed', String(key === current));

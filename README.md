@@ -75,7 +75,7 @@ games/Out-Run-SUPER-RUNOUT-The-coast-is-calling-2026-09-11-model-unknown.html
 The source is the classic a game riffs on, or `original` when there is none;
 `model-unknown` is used until the model is known (`GPT-6-Astra-Pro`). A
 filename cannot say where the source ends and the title begins (`Out-Run` or
-`Out-Run-SUPER`?), so the wall's Source rail reads the catalogue's `source`
+`Out-Run-SUPER`?), so the wall's Original and Inspired split reads the catalogue's `source`
 field instead (see *Extra metadata*), and the filename only sorts the folder.
 
 The scan reads the pattern. The date and model say when and by what a file was
@@ -210,37 +210,36 @@ pause menu still works.
 If a game misbehaves in a frame, the ↗ button in the corner reopens it in a
 plain tab and remembers that choice for that game.
 
-The wall is split into three shelves, picked with the big buttons under the
-sign: **Games** (the default), **Tech demos**, and **Tools & websites**. The
-shelf comes from each game's `type` in `data/overrides.json`; anything not
-catalogued counts as a game. The filter rails under them are worked out per
-shelf.
+The wall is split into two shelves, picked with the big buttons under the
+sign: **Games** (the default) and **Tech demos & tools** (demos, tools and
+websites together). The shelf comes from each game's `type` in
+`data/overrides.json`; anything not catalogued counts as a game. Beside them,
+**Surprise me** plays a random game from whatever the search and filters are
+showing (stacked or not, it picks a game). The search box sits in the sign's
+top corner.
+
+The filters are one sticky strip, worked out per shelf: each is a chip that
+drops a menu (*Genre*, *Tags*, *File size*, *Model*…), one pick at a time, and
+the chip names the pick once there is one. Players is *Single player* beside a
+*Multiplayer* menu of head counts. Chips carry no counts: an option that would
+empty the wall is greyed out instead.
 
 ### Sources and stacks
 
 Many games are attempts at the same classic: nine at Dragon Quest, seven at
-Final Fantasy Tactics. The **Source** rail, first under the search, sorts them
-in steps. Every game is **Original** (no source) or **Inspired** (it has one).
-Pick *Inspired* and the rail offers each series (*Dragon Quest*), then, if you
-like, the one game inside it (*Dragon Quest IX*). Pick *Original* and it offers
-the names several originals share, so the six Stratas sit together. A series
-or a game with only one attempt gets no chip: it is still on the wall under
-*Inspired* or *Original*. Pressing a lit chip goes back up a step.
+Final Fantasy Tactics. Every game is **Original** (no source) or **Inspired**
+(it has one), and the first two chips in the strip toggle between them.
 
-The wall follows the same steps when **Stacks** is on (the default, and
-remembered per device). Each series is one stacked cabinet. Open it and each
-game in the series is a stack. Open one of those and every attempt is laid out.
-A series with only one game skips the middle step, and a stack of one is just
-the game. Each step is a link, so Back climbs out again. The trail at the top
-of the wall shows where you are, and each game's drawer links to *All N
-attempts* at the same game.
+The wall then sorts them when **Stacks** is on (the default, and remembered
+per device). Each series is one stacked cabinet; originals that share a name
+(six Stratas) stack together. Open a series and each game in it is a stack.
+Open one of those and every attempt is laid out. A series with only one game
+skips the middle step, and a stack of one is just the game. Each step is a
+link, so Back climbs out again. The trail at the top of the wall shows where
+you are, and each game's drawer links to *All N attempts* at the same game.
 
-On a big wall: **Surprise me** plays a random game from whatever the search and
-filters are showing (stacked or not, it picks a game), and the grid button
-beside the sort switches to a compact wall with twice the cabinets per row
-(remembered per device). A rail with many values shows the most common eight
-and folds the rest behind *+N more*; Tags fold away entirely until *Show tags*.
-Chips carry no counts: one that would empty the wall is greyed out instead.
+The grid button beside the sort switches to a compact wall with twice the
+cabinets per row (remembered per device).
 
 ## Optional extras
 
@@ -281,7 +280,7 @@ own, with `<meta name="hub:model" content="…">` in its head. A field whose
 values are nearly all different (a build id, a URL) is searchable but never
 becomes a rail. Every field is searchable. `harness` is searched and shown in
 the drawer but never gets a rail, and neither do `source` and `series`, which
-have the Source rail.
+have Original, Inspired and the stacks.
 
 `collection` comes from the folder a game sits in, but it is an ordinary field:
 an override, or a `hub:collection` meta, replaces it.
@@ -291,11 +290,11 @@ The library's own catalogue uses these fields, all in `data/overrides.json`:
 | Field | What it is | On the wall |
 |---|---|---|
 | `genre` | one of a fixed list (Racing, Platformer, Life Sim, Tech Demo…) | the Genre rail, and the cabinet's panel |
-| `type` | `Game`, `Tech demo` or `Tool` | the Type rail, so demos and map viewers can be filtered out |
+| `type` | `Game`, `Tech demo` or `Tool` | the shelf: games, or tech demos & tools |
 | `tags` | 2–5 from a fixed vocabulary (`3d`, `retro`, `co-op`, `touch`…) | the Tags rail |
 | `players` | `1–2`, `1–4`… only when a game has co-op or versus | the Players rail: *Single player*, or *Multiplayer*, which drops a menu of head counts (*4 players* finds every game that seats four). A game with no `players` is single player |
-| `source` | the classic a game riffs on, as it is titled (`Dragon Quest IX`); none for an original | the Source rail, the stacks, the drawer, and search |
-| `series` | the franchise, only when it is not the source itself (`Dragon Quest` for `Dragon Quest IX`) | the series step of the Source rail, under *Inspired*, and the stacks |
+| `source` | the classic a game riffs on, as it is titled (`Dragon Quest IX`); none for an original | Original or Inspired, the stacks, the drawer, and search |
+| `series` | the franchise, only when it is not the source itself (`Dragon Quest` for `Dragon Quest IX`) | the stacks |
 | `controls` | a one-line summary | the drawer |
 | `description` | one or two plain sentences | the drawer |
 

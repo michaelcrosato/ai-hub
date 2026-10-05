@@ -30,20 +30,22 @@ export const SORTS = [
 export const DEFAULT_SORT = SORTS[0].key;
 
 /**
- * The three shelves the wall is split into, by the catalogue's `type`. A game
- * nobody has catalogued is a game: that is what almost everything dropped
- * into games/ is.
+ * The two shelves the wall is split into, by the catalogue's `type`: games,
+ * and everything else. A game nobody has catalogued is a game: that is what
+ * almost everything dropped into games/ is.
  */
 export const SHELVES = [
   { key: 'games', label: 'Games', noun: ['game', 'games'], holds: (type) => !type || type === 'Game' },
-  { key: 'demos', label: 'Tech demos', noun: ['tech demo', 'tech demos'], holds: (type) => type === 'Tech demo' },
   {
     key: 'tools',
-    label: 'Tools & websites',
-    noun: ['tool or website', 'tools & websites'],
-    holds: (type) => type === 'Tool' || type === 'Website',
+    label: 'Tech demos & tools',
+    noun: ['demo or tool', 'demos & tools'],
+    holds: (type) => type === 'Tech demo' || type === 'Tool' || type === 'Website',
   },
 ];
+
+/** Shelf keys from before the demos and tools shelves were one. */
+export const SHELF_ALIASES = { demos: 'tools' };
 
 export const DEFAULT_SHELF = SHELVES[0].key;
 
@@ -142,67 +144,23 @@ export function facetCounts(games, state, stats, facets) {
   return counts;
 }
 
-const bySize = (a, b) => b.total - a.total || a.value.localeCompare(b.value, 'en', { numeric: true });
-
 /**
- * One option per distinct value, labelled the way the first game spells it:
- * how many games hold it on the shelf (`total`), and how many of those the
- * other filters leave (`count`).
- */
-function tally(list, pick, live) {
-  const by = new Map();
-  for (const game of list) {
-    const value = pick(game);
-    const key = sameKey(value);
-    if (!by.has(key)) by.set(key, { value, total: 0, count: 0 });
-    const option = by.get(key);
-    option.total += 1;
-    if (live.has(game)) option.count += 1;
-  }
-  return [...by.values()].sort(bySize);
-}
-
-/**
- * The Source rail, a step at a time: original or inspired; for inspired, each
- * series; then each game inside the series, or, for originals, each name that
- * several originals share. A series or a game with one attempt gets no chip:
- * there is nothing to gather, and it is still on the wall under its step.
- *
- * Which chips there are is read off the whole shelf, so they hold still while
- * you search and filter. Their counts, which only grey out the empty ones, are
- * taken against everything except the rail's own choice.
+ * The Source rail: Original and Inspired, each with how many games the other
+ * filters leave in it, so an empty one can be greyed out. A shelf with only
+ * one of them gets no rail.
  */
 export function sourceCounts(games, state, stats) {
   const tokens = tokenize(state.query);
   const shelf = games.filter((game) => inScope(game, state));
-  const live = new Set(
-    shelf.filter(
-      (game) =>
-        (!state.favesOnly || stats.isFave(game.slug)) &&
-        passesFacets(game, state.facets) &&
-        (!tokens.length || hasAllTokens(game, tokens))
-    )
-  );
+  const live = (game) =>
+    (!state.favesOnly || stats.isFave(game.slug)) &&
+    passesFacets(game, state.facets) &&
+    (!tokens.length || hasAllTokens(game, tokens));
   const origins = ORIGINS.map(({ key, label }) => {
     const held = shelf.filter((game) => originOf(game) === key);
-    return { value: key, label, total: held.length, count: held.filter((game) => live.has(game)).length };
+    return { value: key, label, total: held.length, count: held.filter(live).length };
   }).filter((option) => option.total > 0);
-
-  const gathered = (options) => options.filter((option) => option.total > 1);
-  const picked = shelf.filter((game) => originOf(game) === state.origin);
-  const series =
-    state.origin === 'inspired' ? gathered(tally(picked, (game) => game.lineage.series, live)) : [];
-
-  let titles = [];
-  if (state.origin === 'original') {
-    titles = gathered(tally(picked, (game) => game.lineage.title, live));
-  } else if (state.series) {
-    const inSeries = picked.filter((game) => sameKey(game.lineage.series) === sameKey(state.series));
-    const all = tally(inSeries, (game) => game.lineage.title, live);
-    // A series of one game is already that game: no step to take.
-    titles = all.length > 1 ? gathered(all) : [];
-  }
-  return { origins, series, titles };
+  return { origins };
 }
 
 /**
