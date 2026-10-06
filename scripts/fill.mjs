@@ -124,7 +124,9 @@ const ready = async () => {
 async function capture(page, format) {
   const cdp = await page.context().newCDPSession(page);
   try {
-    const { data } = await cdp.send('Page.captureScreenshot', { format, quality: format === 'jpeg' ? 60 : undefined });
+    const shot = cdp.send('Page.captureScreenshot', { format, quality: format === 'jpeg' ? 60 : undefined });
+    const late = new Promise((_, reject) => setTimeout(() => reject(new Error('screenshot timed out after 60s')), 60_000).unref());
+    const { data } = await Promise.race([shot, late]);
     return Buffer.from(data, 'base64');
   } finally {
     await cdp.detach().catch(() => {});
