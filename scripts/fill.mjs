@@ -26,7 +26,7 @@
  * Exit code 1 when any game is boxed.
  */
 
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 
@@ -81,6 +81,12 @@ async function open() {
   const contexts = {};
   for (const [k, viewport] of Object.entries(VIEWS)) {
     const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
+    // Only the local server answers. A request that cannot complete (a web
+    // font, a CDN script) fails at once rather than holding up the load event
+    // and the page's fonts.
+    await context.route('**', (route) =>
+      route.request().url().startsWith(origin) || route.request().url().startsWith('data:') ? route.continue() : route.abort()
+    );
     // Headless WebGPU is unreliable; hiding it sends three.js down its WebGL 2
     // path, so 3D games actually draw and the bars check has pixels to read.
     await context.addInitScript(() => {
@@ -102,6 +108,20 @@ const ready = async () => {
     .finally(() => (opening = null));
   return opening;
 };
+
+/**
+ * A screenshot straight from DevTools. page.screenshot() waits for fonts and
+ * a settled frame, and a busy WebGL game under load can starve that for good.
+ */
+async function capture(page, format) {
+  const cdp = await page.context().newCDPSession(page);
+  try {
+    const { data } = await cdp.send('Page.captureScreenshot', { format, quality: format === 'jpeg' ? 60 : undefined });
+    return Buffer.from(data, 'base64');
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
 
 /** Mean and spread of the outer strips and the middle of a screenshot. */
 const strips = (helper, png, axis) =>
@@ -159,9 +179,9 @@ await pool(games, JOBS, async (game) => {
         await page.waitForTimeout(1500);
       }
       const m = await page.evaluate(measurePage);
-      const png = await page.screenshot({ type: 'png' });
+      const png = await capture(page, 'png');
       m.bars = hasBars(await strips(helper, png, 'x')) || hasBars(await strips(helper, png, 'y'));
-      if (SHOTS) await page.screenshot({ path: path.join(SHOTS, `${game.slug}-${k}.jpg`), type: 'jpeg', quality: 60 });
+      if (SHOTS) await writeFile(path.join(SHOTS, `${game.slug}-${k}.jpg`), await capture(page, 'jpeg'));
       m.errors = errors;
       row.views[k] = m;
     } catch (error) {
