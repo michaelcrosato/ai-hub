@@ -492,17 +492,35 @@ export class VoxelView {
 
   // ---------------------------------------------------------------- camera
 
+  /** The board is framed in the .board-frame box (clear of the panels) while the canvas fills the stage. */
+  frameBoard() {
+    const c = this.kit.canvas.getBoundingClientRect();
+    const box = document.querySelector('.board-frame');
+    const f = box && box.getBoundingClientRect();
+    const W = Math.max(1, c.width), H = Math.max(1, c.height);
+    const ok = f && f.width > 1 && f.height > 1;
+    const dx = ok ? f.left + f.width / 2 - (c.left + W / 2) : 0;
+    const dy = ok ? f.top + f.height / 2 - (c.top + H / 2) : 0;
+    const zoom = ok ? Math.min(1, f.height / H) : 1;
+    this.frameAspect = ok ? f.width / f.height : W / H;
+    const key = `${W}|${H}|${dx}|${dy}|${zoom}`;
+    if (key === this.frameKey) return;
+    this.frameKey = key;
+    this.camera.zoom = zoom;
+    this.camera.setViewOffset(W, H, -dx, -dy, W, H);
+    this.camera.updateProjectionMatrix();
+  }
+
   fit(animate = true) {
-    const w = this.kit.size.width || 1;
-    const h = this.kit.size.height || 1;
-    const aspect = w / h;
+    this.frameBoard();
+    const aspect = this.frameAspect;
     const distance = this.size * Math.max(1.75, 2 / aspect);
     const dir = this.top ? new THREE.Vector3(0, 1, 0.001) : new THREE.Vector3(0.81, 1.12, 1.05).normalize();
     this.moveCamera(dir.multiplyScalar(distance), new THREE.Vector3(0, 0, 0), animate);
   }
 
   focusPattern(width, height) {
-    const distance = Math.max(this.size * 0.42, Math.max(width, height) * 2.3) / Math.min(1, this.camera.aspect);
+    const distance = Math.max(this.size * 0.42, Math.max(width, height) * 2.3) / Math.min(1, this.frameAspect || this.camera.aspect);
     const dir = this.camera.position.clone().sub(this.rig.target).normalize();
     this.moveCamera(dir.multiplyScalar(distance), new THREE.Vector3(0, 0, 0));
   }
@@ -751,6 +769,7 @@ export class VoxelView {
   // ---------------------------------------------------------------- frame
 
   render(now, dt) {
+    this.frameBoard();
     if (this.cameraTween) {
       const tw = this.cameraTween;
       const k = Math.min(1, (now - tw.start) / 500);
@@ -764,7 +783,7 @@ export class VoxelView {
     }
     this.animateMission(now);
     this.u.blend.value = this.settings.reducedMotion ? 1 : Math.min(1, (now - this.lastSync) / this.animationLength);
-    const pxPerCell = (this.kit.size.height || 1) / (2 * Math.tan(THREE.MathUtils.degToRad(18)) * Math.max(0.001, this.rig.distance()));
+    const pxPerCell = (this.kit.size.height || 1) * this.camera.zoom / (2 * Math.tan(THREE.MathUtils.degToRad(18)) * Math.max(0.001, this.rig.distance()));
     this.u.gridFade.value = THREE.MathUtils.smoothstep(pxPerCell, 2, 7);
     // Beveled voxels up close on high and ultra; simple cubes elsewhere (and on phones).
     const fine = pxPerCell > 12 && this.kit.tier.detail >= 1;
