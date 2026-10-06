@@ -40,6 +40,14 @@ const flag = (name, fallback) => {
   return at !== -1 && argv[at + 1] ? argv[at + 1] : fallback;
 };
 const valued = new Set(['--shots', '--jobs']);
+const KNOWN = new Set([...valued, '--play', '--json', '--help']);
+const unknown = argv.filter((a) => a.startsWith('--') && !KNOWN.has(a));
+if (argv.includes('--help') || unknown.length) {
+  // A typo'd flag would otherwise leave no match text and check every game.
+  if (unknown.length) console.error(`  Unknown option: ${unknown.join(' ')}`);
+  console.error('  Usage: node scripts/fill.mjs [match …] [--play] [--shots <dir>] [--json] [--jobs 4]');
+  process.exit(unknown.length ? 2 : 0);
+}
 const MATCH = argv.filter((a, i) => !a.startsWith('--') && !valued.has(argv[i - 1])).map((a) => a.toLowerCase());
 const PLAY = argv.includes('--play');
 const JSON_OUT = argv.includes('--json');
