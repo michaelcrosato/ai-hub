@@ -343,8 +343,9 @@ function applyDisplay() {
   updateSnap();
 }
 function updateSnap() {
-  const w = settings.pixels ? 768 : Math.min(1600, kit.size.width);
-  snapGrid.value.set(w / 2, (w * 9) / 32);
+  const aspect = kit.size.width / Math.max(1, kit.size.height);
+  const w = settings.pixels ? 432 * aspect : Math.min(1600, kit.size.width);
+  snapGrid.value.set(w / 2, w / aspect / 2);
 }
 
 function menuList() {
@@ -1534,7 +1535,9 @@ function updateCamera(dt) {
     ex += (Math.random() - 0.5) * shake;
     ey += (Math.random() - 0.5) * shake * 0.55;
   }
-  const fov = ((screen === 'title' ? 0.65 : 0.61) * 180) / Math.PI;
+  // The arena is framed for 16:9; narrower windows widen the vertical angle so both fighters stay in view.
+  const base = screen === 'title' ? 0.65 : 0.61, wide = Math.min(1, camera.aspect / (16 / 9));
+  const fov = (2 * Math.atan(Math.tan(base / 2) / wide) * 180) / Math.PI;
   if (fov !== lastFov) {
     lastFov = fov;
     camera.fov = fov;
@@ -1591,7 +1594,7 @@ function render(dt) {
 
 function drawFX(dt) {
   ctx.clearRect(0, 0, FW, FH);
-  const scale = FW / 1280;
+  const scale = Math.min(FW / 1280, FH / 720);
   // Warm lamp bloom, kept subtle enough to preserve the pixel edges; it flickers with the flame.
   for (const L of glows) {
     const p = project(L[0], L[1] - 0.02, L[2], _s);
@@ -1688,9 +1691,9 @@ function drawFX(dt) {
 
 /* ------------------------------------------------------------ sizing, pause, audio unlock */
 
-function resizeFx(w) {
+function resizeFx(w, h) {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
-  const fw = Math.min(2560, Math.max(640, Math.round(w * dpr))), fh = Math.round((fw * 9) / 16);
+  const fw = Math.min(2560, Math.max(640, Math.round(w * dpr))), fh = Math.round((fw * h) / Math.max(1, w));
   if (fx.width !== fw || fx.height !== fh) {
     fx.width = fw;
     fx.height = fh;
@@ -1705,8 +1708,8 @@ function placeTouch() {
   const portrait = innerHeight > innerWidth;
   kit.touch.placeTop('center', Math.round(portrait ? r.bottom + 10 : r.top + r.height * 0.23));
 }
-kit.onResize((w) => {
-  resizeFx(w);
+kit.onResize((w, h) => {
+  resizeFx(w, h);
   updateSnap();
   placeTouch();
 });
