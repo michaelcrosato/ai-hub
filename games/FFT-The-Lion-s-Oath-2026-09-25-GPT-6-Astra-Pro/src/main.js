@@ -2476,15 +2476,21 @@ class BattleView {
         this.dirty = true;
     }
     updateCamera() {
+        // The field fills the window; in battle the top bar and command dock lie over it,
+        // so the board is framed in the band between them.
+        const top = screenName === 'battle' ? $('.battle-top')?.offsetHeight || 0 : 0;
+        const bottom = screenName === 'battle' ? $('.battle-dock')?.offsetHeight || 0 : 0;
+        const band = Math.max(1, this.height - top - bottom);
         const aspect = this.width / this.height, cam = this.camera;
-        this.viewSize = Math.max(this.H * 1.18, (this.W + this.H) * .71 / Math.max(.35, aspect)) / this.zoom;
+        const fit = Math.max(this.H * 1.18, (this.W + this.H) * .71 / Math.max(.35, this.width / band)) / this.zoom;
+        const full = this.viewSize = fit * this.height / band, shift = (top - bottom) / 2 * fit / band;
         const x = this.focusX, z = this.focusZ;
         cam.position.set(x + Math.sin(this.angle) * 26, 23, z + Math.cos(this.angle) * 26);
         cam.lookAt(x, 1, z);
-        cam.left = -this.viewSize * aspect / 2;
-        cam.right = this.viewSize * aspect / 2;
-        cam.top = this.viewSize / 2;
-        cam.bottom = -this.viewSize / 2;
+        cam.left = -full * aspect / 2;
+        cam.right = full * aspect / 2;
+        cam.top = full / 2 + shift;
+        cam.bottom = -full / 2 + shift;
         cam.updateProjectionMatrix();
         cam.updateMatrixWorld();
     }
