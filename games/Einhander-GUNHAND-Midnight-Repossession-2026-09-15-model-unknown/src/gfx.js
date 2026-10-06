@@ -669,7 +669,7 @@ export function createGfx(kit, { W, H, models }) {
     }
     bg.fog.place(x0, 0, w, H);
     bg.veil.place(x0, 0, w, H);
-    bg.vignette.place(0, 0, W, H);
+    bg.vignette.place(view.x0, view.y0, view.w, view.h);
 
     // Far traffic lanes.
     const tn = bg.traffic.n, ta = bg.traffic.a;

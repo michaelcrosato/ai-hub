@@ -2326,10 +2326,12 @@ input.onSourceChange(() => {
   if (input.source === 'touch') clearNavFocus();
 });
 
-// The HUD layer is a fixed 1440 × 810 sheet scaled to the stage.
+// The HUD layer is a 1440 × 810 sheet scaled to fit the stage, widened or heightened to reach every edge.
 let uiScale = 1;
-kit.onResize((w) => {
-  uiScale = w / W;
+kit.onResize((w, h) => {
+  uiScale = Math.min(w / W, h / H);
+  UI.uiRoot.style.width = `${w / uiScale}px`;
+  UI.uiRoot.style.height = `${h / uiScale}px`;
   UI.uiRoot.style.transform = `scale(${uiScale})`;
   requestAnimationFrame(updateTouchLift);
 });
