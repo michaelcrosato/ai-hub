@@ -180,7 +180,10 @@ await pool(games, JOBS, async (game) => {
       const { contexts, helper } = await ready();
       page = await contexts[k].newPage();
       page.on('pageerror', (error) => errors.push(error.message.split('\n')[0]));
-      await page.goto(origin + row.path, { waitUntil: 'load', timeout: 45_000 });
+      // Some heavy games take minutes to fire 'load' headless; the layout is
+      // set long before that, so the full load is only waited on briefly.
+      await page.goto(origin + row.path, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      await page.waitForLoadState('load', { timeout: 15_000 }).catch(() => {});
       await page.waitForTimeout(SETTLE);
       if (PLAY) {
         await page.keyboard.press('Enter');
