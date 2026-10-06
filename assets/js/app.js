@@ -42,8 +42,10 @@ import { createShelves } from './ui/shelves.js';
 import { createDetail } from './ui/detail.js';
 import { createPlayer } from './ui/player.js';
 import { createDev } from './ui/dev.js';
+import { viewSwitch } from './ui/views.js';
 
 const wallEl = document.getElementById('wall');
+document.querySelector('.sign__side')?.prepend(viewSwitch('wall'));
 const countEl = document.getElementById('count');
 
 /** The wall as it is now, narrowed (or widened) to one series and game. */
@@ -91,6 +93,8 @@ let lastKey = '';
 let showing = [];
 let hops = 0;
 let scrollBeforePlay = 0;
+/** History's length when the game opened; see leaveGame. */
+let historyAtPlay = 0;
 
 /* --- what is on the wall ------------------------------------------------- */
 
@@ -227,8 +231,23 @@ const detail = createDetail(document.getElementById('detail'), {
   attempts: attemptsOf,
 });
 
+/**
+ * Back to the wall. Back is the way out, but a game may add history entries
+ * of its own (a hash per level, say), and one step back would only walk back
+ * through those, so it steps over all of them. Should the address still not
+ * have moved, the wall is put back in its place.
+ */
+function leaveGame() {
+  const playing = location.href;
+  if (hops > 1) history.go(-1 - Math.max(0, history.length - historyAtPlay));
+  else router.go('/', { replace: true });
+  setTimeout(() => {
+    if (player.isOpen() && location.href === playing) router.go('/', { replace: true });
+  }, 400);
+}
+
 const player = createPlayer(document.getElementById('player'), {
-  onExit: () => (hops > 1 ? history.back() : router.go('/', { replace: true })),
+  onExit: leaveGame,
   // Another game from what the wall was showing, never the one already up.
   onRoll() {
     const current = player.current()?.slug;
@@ -370,7 +389,10 @@ function onRoute(route) {
     const build = findBuild(game, route.build);
     const already = player.isOpen() && player.current()?.slug === game.slug && player.currentBuild()?.id === build.id;
     if (!already) {
-      if (!player.isOpen()) scrollBeforePlay = window.scrollY;
+      if (!player.isOpen()) {
+        scrollBeforePlay = window.scrollY;
+        historyAtPlay = history.length;
+      }
       detail.close();
       dev.close();
       player.open(game, build, { fromTile: grid.tile(game.slug) });

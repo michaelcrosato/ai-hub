@@ -37,7 +37,7 @@ const FRAME_ALLOW = [
 
 const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-export function createPlayer(root, { onExit, onRoll }) {
+export function createPlayer(root, { onExit, onRoll, backLabel = 'Back to the wall' }) {
   let session = null;
   let pageTitle = document.title;
   /** The bar: 'open', 'folded' to just the ✕, or 'gone' until a reload. */
@@ -206,7 +206,7 @@ export function createPlayer(root, { onExit, onRoll }) {
     if (fromTile && !reducedMotion()) zoomFrom(fromTile);
   }
 
-  /** Back to the wall, roll another game, and the ✕ with its hold ring. */
+  /** Back to where you came from, roll another game, and the ✕ with its hold ring. */
   function exitBar() {
     const arc = h('circle', {
       class: 'arc',
@@ -225,7 +225,7 @@ export function createPlayer(root, { onExit, onRoll }) {
     const el = h(
       'div',
       { class: 'player__exit' },
-      tool('player__back', 'Back to the wall', icon(ICONS.back), { onclick: onExit }),
+      tool('player__back', backLabel, icon(ICONS.back), { onclick: onExit }),
       tool('player__roll', 'Roll: play another random game', icon(ICONS.dice), { onclick: () => onRoll() }),
       tool(
         'player__fold',
@@ -284,6 +284,12 @@ export function createPlayer(root, { onExit, onRoll }) {
     // place while the overlay is still shrinking over it.
     document.body.classList.remove('is-playing');
 
+    // Removing the frame is what actually stops the game: its audio context,
+    // timers and animation frames all die with it. It goes before the exit
+    // animation, so a heavy game falls silent at once instead of fighting the
+    // animation for the main thread.
+    session.frame?.remove();
+
     const finish = () => {
       clear(root);
       root.hidden = true;
@@ -292,8 +298,6 @@ export function createPlayer(root, { onExit, onRoll }) {
       session = null;
     };
 
-    // Clearing the node is what actually stops the game: its audio context,
-    // timers and animation frames all die with the frame.
     if (silent || !toTile || reducedMotion()) return finish();
 
     const rect = toTile.getBoundingClientRect();
