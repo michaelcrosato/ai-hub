@@ -72,28 +72,39 @@ if (SHOTS) await mkdir(path.resolve(SHOTS), { recursive: true });
 const server = createServer(staticHandler(ROOT));
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const origin = `http://127.0.0.1:${server.address().port}`;
-const browser = await chromium.launch();
-const contexts = Object.fromEntries(
-  await Promise.all(
-    Object.entries(VIEWS).map(async ([k, viewport]) => {
-      const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
-      // Headless WebGPU is unreliable; hiding it sends three.js down its WebGL 2
-      // path, so 3D games actually draw and the bars check has pixels to read.
-      await context.addInitScript(() => {
-        try {
-          delete Object.getPrototypeOf(navigator).gpu;
-        } catch {
-          /* nothing to hide */
-        }
-      });
-      return [k, context];
-    })
-  )
-);
-const helper = await (await browser.newContext()).newPage();
+// A game can take the whole browser down with it; when that happens the next
+// page relaunches it, so one crash costs one game rather than the run.
+let session = null;
+let opening = null;
+async function open() {
+  const browser = await chromium.launch();
+  const contexts = {};
+  for (const [k, viewport] of Object.entries(VIEWS)) {
+    const context = await browser.newContext({ viewport, deviceScaleFactor: 1 });
+    // Headless WebGPU is unreliable; hiding it sends three.js down its WebGL 2
+    // path, so 3D games actually draw and the bars check has pixels to read.
+    await context.addInitScript(() => {
+      try {
+        delete Object.getPrototypeOf(navigator).gpu;
+      } catch {
+        /* nothing to hide */
+      }
+    });
+    contexts[k] = context;
+  }
+  const helper = await (await browser.newContext()).newPage();
+  return { browser, contexts, helper };
+}
+const ready = async () => {
+  if (session?.browser.isConnected()) return session;
+  opening ??= open()
+    .then((s) => (session = s))
+    .finally(() => (opening = null));
+  return opening;
+};
 
 /** Mean and spread of the outer strips and the middle of a screenshot. */
-const strips = (png, axis) =>
+const strips = (helper, png, axis) =>
   helper.evaluate(
     async ({ b64, axis }) => {
       const img = await createImageBitmap(await (await fetch('data:image/png;base64,' + b64)).blob());
@@ -132,11 +143,13 @@ const strips = (png, axis) =>
 const rows = [];
 await pool(games, JOBS, async (game) => {
   const row = { slug: game.slug, path: game.builds[0].path, views: {} };
-  for (const [k, context] of Object.entries(contexts)) {
-    const page = await context.newPage();
+  for (const k of Object.keys(VIEWS)) {
     const errors = [];
-    page.on('pageerror', (error) => errors.push(error.message.split('\n')[0]));
+    let page = null;
     try {
+      const { contexts, helper } = await ready();
+      page = await contexts[k].newPage();
+      page.on('pageerror', (error) => errors.push(error.message.split('\n')[0]));
       await page.goto(origin + row.path, { waitUntil: 'load', timeout: 45_000 });
       await page.waitForTimeout(SETTLE);
       if (PLAY) {
@@ -147,14 +160,14 @@ await pool(games, JOBS, async (game) => {
       }
       const m = await page.evaluate(measurePage);
       const png = await page.screenshot({ type: 'png' });
-      m.bars = hasBars(await strips(png, 'x')) || hasBars(await strips(png, 'y'));
+      m.bars = hasBars(await strips(helper, png, 'x')) || hasBars(await strips(helper, png, 'y'));
       if (SHOTS) await page.screenshot({ path: path.join(SHOTS, `${game.slug}-${k}.jpg`), type: 'jpeg', quality: 60 });
       m.errors = errors;
       row.views[k] = m;
     } catch (error) {
       row.views[k] = { error: error.message.split('\n')[0] };
     } finally {
-      await page.close();
+      await page?.close().catch(() => {});
     }
   }
   row.verdict = grade(row.views);
@@ -162,7 +175,7 @@ await pool(games, JOBS, async (game) => {
   row.errors = [...new Set(Object.values(row.views).flatMap((m) => m.errors ?? []))];
   rows.push(row);
 });
-await browser.close();
+await session?.browser.close().catch(() => {});
 server.close();
 
 rows.sort((a, b) => a.slug.localeCompare(b.slug));
@@ -173,7 +186,7 @@ if (JSON_OUT) {
   for (const r of rows) {
     if (r.verdict === 'fills' && !r.bars && !r.errors.length && MATCH.length === 0) continue;
     const views = Object.entries(r.views)
-      .map(([k, m]) => (m.error ? `${k} error` : `${k} ${gradeView(m)} surface ${pct(m.surface)} paint ${pct(m.paint)}`))
+      .map(([k, m]) => (m.error ? `${k} error (${m.error})` : `${k} ${gradeView(m)} surface ${pct(m.surface)} paint ${pct(m.paint)}`))
       .join('  |  ');
     console.log(`  ${r.verdict.padEnd(6)}${r.bars ? ' bars' : '     '}  ${r.slug}\n          ${views}`);
     for (const e of r.errors) console.log(`          page error: ${e}`);
