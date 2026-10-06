@@ -185,7 +185,7 @@ in and hitting reload is the whole loop. (It remembers each file's parsed head
 until the file changes, so that stays instant at four hundred games.)
 
 ```bash
-pnpm test         # the parsers, the layout rules, zip reading, search and filters
+pnpm test         # parsers, layout rules, zip reading, search and filters, Couch and Catalogue logic
 pnpm scan         # rebuild data/games.json by hand; --list prints every game
 pnpm dev --host 0.0.0.0   # reach it from your phone on the same wifi
 ```
@@ -253,6 +253,87 @@ stack filters the wall to it; games with no value for it follow the stacks),
 or not at all. View also sets the size: *One per row* (the default: a wide
 cabinet with its whole blurb beside the screen) or *Three per row*. A phone
 shows one per row either way.
+
+## Two more ways in: the Couch and the Catalogue
+
+The wall is one way into the library. The switch in the corner of every view
+(**Wall · Couch · Catalogue**) leads to two more, built over the same games
+and the same memory of this device: a game starred in one is starred in all,
+and a game played anywhere counts everywhere. An open game travels with you
+when you switch, and so does a search, as far as it is plain words. Hidden
+games stay hidden in all three.
+
+### The Couch — `/couch`
+
+The hub as a console's home screen, for a TV and a controller. One game at a
+time fills the screen: its stills cross-fade behind everything, tinted with
+its own colours, and its name, blurb, facts and keys sit over them. Under it
+run the rails: *Jump back in*, *Your favourites*, *Fresh on the wall*, one per
+genre, one for each series with three or more games (*Inspired by Final
+Fantasy*) and each model that made three or more, *Originals*, *Play together*
+and *Tech demos & tools*. Until you touch anything, the hero is *Today's
+spotlight*, a pick that changes with the date.
+
+| | Keyboard | Controller |
+|---|---|---|
+| Move | arrows; Home/End, PageUp/PageDown | D-pad or left stick |
+| Play | Enter | A |
+| More info | I | Y |
+| Favourite | F | X |
+| Back | Esc or Backspace | B |
+| Previous / next rail | ↑ / ↓ | LB / RB |
+| Search | / or S | View |
+| Surprise me | R | Menu |
+
+*More info* opens the game's own page: its stills as a gallery, its controls
+turned into keycaps, its facts and builds, and two rails, *Other attempts at …*
+and *More like this*. Search is a TV search screen with an on-screen keyboard
+the pad can drive; on a keyboard, just type. A mouse and a touch screen work
+too: point or tap to pick, click or tap again to play.
+
+While a game runs the Couch claims nothing, keys and buttons alike. With no
+mouse to reach the bar in the corner, **hold View and Menu together for a
+second** to come back. Left alone for a minute, the home screen drifts through
+random games, like a console's attract mode.
+
+### The Catalogue — `/catalogue`
+
+The hub as a reading room: every game a record, on paper instead of in a dark
+room, to query, sort, chart, compare and export. Across the top, figures for
+whatever is selected: how many records, how big, original against inspired,
+models named, the newest addition, games with several builds.
+
+The query is the whole selection, and it lives in the address, so any state of
+the catalogue is a link. Bare words search everything, as on the wall; fields
+narrow it down:
+
+```
+genre:racing   genre:"life sim"   model:gpt   source:"metal slug"   series:"final fantasy"
+tag:pixel   type:demo   origin:original   players:2   players:multi
+size:<500kb   size:1mb..4mb   added:>2026-09-20   added:2026-09-01..2026-09-15   added:<7d
+builds:>1   is:fav   is:played   is:new   has:model
+
+-genre:shooter              a minus leaves matches out
+genre:racing genre:flight   one field twice: either
+genre:rpg tag:3d            two fields: both
+```
+
+You rarely need to type it. Every facet on the left is a small bar chart, with
+the whole library ghosted behind your selection, and clicking a bar adds its
+term (shift-click leaves that value out). Drag across *Added over time* to
+take a span of days; click a bin of *File size* for a range of sizes. Each
+term shows as a chip under the query, with a ×, and `?` lists the syntax by
+example.
+
+The table sorts by any column and groups by genre, lineage, model or week
+added. **↑ ↓** (or **j k**) move through it, **Enter** plays, **Space** marks a
+record, **F** favourites, **O** opens a game on its own page, **/** writes a
+query. Beside the table sits the record card: the game's stills and colours,
+every fact it carries (each one a link that queries it), its lineage, meaning
+every attempt at the same game in the order they arrived, then similar games
+and builds. Mark two to four records and **Compare** lines them up side by
+side, differences picked out. **Export** downloads the selection as CSV or
+copies it as a Markdown table.
 
 ## Optional extras
 
@@ -354,12 +435,19 @@ data/
   overrides.json  optional metadata, by slug
   added.json      first-seen dates, maintained automatically
   games.json      generated every build; gitignored, never edited
+couch/            the Couch: a page of its own, over the same library
+catalogue/        the Catalogue, likewise
 assets/js/        native ES modules, no bundler
   color.js        theme-color → cabinet lighting, via OKLCH
   art.js          the six procedural screen patterns
   filter.js       search, facets, sorting, sources and stacks (pure, tested)
+  library.js      the games every view starts from, less any hidden ones
+  similar.js      other attempts, and "more like this" (pure, tested)
   ui/grid.js      the wall, rendered in batches as you scroll
-  ui/player.js    the framed player and the ways out of it
+  ui/player.js    the framed player and the ways out of it, for every view
+  ui/views.js     the switch between the Wall, the Couch and the Catalogue
+  couch/          rails, pad and keys, the game page, search (logic tested)
+  catalogue/      the query language, tallies, table, record card, compare
 scripts/
   scan.mjs        the build; walks games/, writes games.json
   ingest.mjs      bulk import of pages, folders and zips
