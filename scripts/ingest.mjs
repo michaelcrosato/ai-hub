@@ -238,7 +238,11 @@ async function duplicateOf(data) {
 
 /* --- single pages ---------------------------------------------------------- */
 
-async function importPage({ data, name, modified, from, subdir, qualifier }) {
+async function importPage(input) {
+  try { await performPage(input); }
+  catch (error) { report.failed.push({ from: input.from, why: error.message }); }
+}
+async function performPage({ data, name, modified, from, subdir, qualifier }) {
   const raw = new Map([['index.html', data]]);
   const localized = localizeGameLibraries(new Map([[name, data.toString('utf8')]]), libraries);
   data = Buffer.from(localized.files.get(name));
@@ -297,7 +301,11 @@ const safeDecode = (p) => {
  * @param files  [{ rel, read: () => Promise<Buffer>|Buffer, modified }] relative to the project root
  * @param entry  the page to serve as index.html, when it is named something else
  */
-async function importProject({ name, files, from, subdir, entry = null }) {
+async function importProject(input) {
+  try { await performProject(input); }
+  catch (error) { report.failed.push({ from: input.from, why: error.message }); }
+}
+async function performProject({ name, files, from, subdir, entry = null }) {
   if (files.length > MAX_FILES) throw new Error('project exceeds 10000 file limit');
   let total = 0;
   const raw = new Map();

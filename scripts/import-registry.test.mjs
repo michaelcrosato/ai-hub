@@ -85,3 +85,22 @@ test('oversized file is bounded; populated dry-run preserves registry and dates'
   assert.equal(await readFile(path.join(root, 'data/import-registry.json'), 'utf8'), registry);
   assert.equal(await readFile(path.join(root, 'data/added.json'), 'utf8'), dates);
 });
+test('persisted identity refuses older and unproven builds without touching installed bytes', async t => {
+  const { root, run } = await fixture(t);
+  const meta = { gameId: 'confirmed-game', identityEvidence: 'Owner verified this revision chain', sourceDate: '2026-10-12T00:00:00Z', revision: 'r2' };
+  async function stage(body) {
+    await writeFile(path.join(root, 'input/game.html'), body);
+    await writeFile(path.join(root, 'meta.json'), JSON.stringify({ schemaVersion: 1, sources: { 'game.html': meta } }));
+    return run('input/game.html', '--metadata', 'meta.json');
+  }
+  assert.equal((await stage(html)).counts.pages, 1);
+  const registry = await readFile(path.join(root, 'data/import-registry.json'), 'utf8');
+  meta.sourceDate = '2026-10-11T00:00:00Z'; meta.revision = 'r1';
+  assert.equal((await stage(html + '<!-- old -->')).counts['skip-older'], 1);
+  assert.equal(await readFile(path.join(root, 'data/import-registry.json'), 'utf8'), registry);
+  meta.sourceDate = '2026-10-13T00:00:00Z'; meta.revision = 'r3';
+  assert.equal((await stage(html + '<!-- next -->')).counts['review-lineage'], 1);
+  meta.predecessorRevision = 'r2';
+  assert.equal((await stage(html + '<!-- next -->')).counts['import-newer'], 1);
+  assert.equal(await readFile(path.join(root, 'games/game.html'), 'utf8'), html);
+});
