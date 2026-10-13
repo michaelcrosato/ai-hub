@@ -14,8 +14,7 @@
  *   - rewrites `/assets/…` style references in unpacked pages to relative ones,
  *     because inside the hub they would resolve against the hub, not the game
  *   - never copies secrets or clutter: .env files, keys, .git, node_modules
- *   - keeps each zip that carried more than what was unpacked in sources/,
- *     which is committed but never deployed
+ *   - leaves opaque source archives in place, avoiding accidental backup publication
  *
  * Usage:  node scripts/ingest.mjs <file|folder|zip>... [options]
  *   --into <name>     put everything in a collection folder, games/<name>/
@@ -23,7 +22,7 @@
  *   --dry-run         show what would happen, write nothing
  */
 
-import { readdir, stat, readFile, writeFile, mkdir, mkdtemp, rm, utimes, copyFile } from 'node:fs/promises';
+import { readdir, stat, readFile, writeFile, mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
@@ -31,24 +30,25 @@ import path from 'node:path';
 
 import { scan, pool, mb, ROOT, GAMES_DIR, ADDED_FILE } from './scan.mjs';
 import { openZip } from './lib/zip.mjs';
-import { isJunk, isSecret, isContainer, HTML, chooseWebRoot, packageName, UNINFORMATIVE_NAME } from './lib/intake.mjs';
-import { INDEX_FILE } from './lib/layout.mjs';
+import { isJunk, isContainer, HTML, chooseWebRoot, packageName, UNINFORMATIVE_NAME } from './lib/intake.mjs';
+import { INDEX_FILE, classify } from './lib/layout.mjs';
 import { parseHead, splitTitle, slugify, parseVersion, relativizeRefs } from './lib/parse.mjs';
+import { emptyRegistry, fingerprint, provenance, decide, PIPELINE } from './lib/import-registry.mjs';
 import { readLibraryManifest, localizeGameLibraries } from './lib/libraries.mjs';
 
-const SOURCES_DIR = path.join(ROOT, 'sources');
-const MAX_SOURCE_BYTES = 95 * 1024 * 1024;
 const BUILT_DIR = /^(dist|build|out|www|public_html)$/i;
 const libraries = readLibraryManifest();
 
 /* --- arguments ------------------------------------------------------------ */
 
 const argv = process.argv.slice(2);
-const opts = { into: '', keepFolders: false, dryRun: false };
+const opts = { into: '', keepFolders: false, dryRun: false, json: false, metadata: null };
 const inputs = [];
 for (let i = 0; i < argv.length; i++) {
   const arg = argv[i];
   if (arg === '--into') opts.into = argv[++i] || '';
+  else if (arg === '--json') opts.json = true;
+  else if (arg === '--metadata') opts.metadata = argv[++i];
   else if (arg === '--keep-folders') opts.keepFolders = true;
   else if (arg === '--dry-run' || arg === '-n') opts.dryRun = true;
   else if (arg === '--help' || arg === '-h') usage(0);
@@ -57,11 +57,12 @@ for (let i = 0; i < argv.length; i++) {
 }
 if (!inputs.length) usage(1);
 opts.into = opts.into.replace(/^[._/\\]+|[/\\]+$/g, '');
+if (opts.into.split(/[\\/]/).includes('..')) usage(1, '--into must stay inside games/');
 
 function usage(code, problem) {
   if (problem) console.error(`\n  ${problem}`);
   console.log(`
-  pnpm ingest <file|folder|zip>... [--into <collection>] [--keep-folders] [--dry-run]
+  pnpm ingest <file|folder|zip>... [--into <collection>] [--keep-folders] [--dry-run] [--json] [--metadata <json>]
 
   Brings .html games, project folders and .zip packages into games/.
   Start with --dry-run to see the plan; nothing is written until you drop it.
@@ -72,6 +73,7 @@ function usage(code, problem) {
 /* --- bookkeeping ---------------------------------------------------------- */
 
 const report = {
+  schemaVersion: 1, pipelineVersion: PIPELINE, dryRun: opts.dryRun, decisions: [],
   pages: [],
   projects: [],
   duplicates: [],
@@ -85,10 +87,58 @@ const report = {
   libraries: [],
   dependencies: [],
 };
+const REGISTRY_FILE = path.join(ROOT, 'data/import-registry.json');
+let registry;
+try { registry = JSON.parse(await readFile(REGISTRY_FILE, 'utf8')); }
+catch (error) { if (error.code !== 'ENOENT') throw error; registry = emptyRegistry(); }
+if (registry.schemaVersion !== 1 || registry.pipelineVersion !== PIPELINE) throw new Error('Unsupported import registry version');
+const plannedRecords = new Set();
+const originalRegistry = JSON.stringify(registry);
+const metadata = opts.metadata ? JSON.parse(await readFile(opts.metadata, 'utf8')) : {};
+if (opts.metadata && metadata.schemaVersion !== 1) throw new Error('Unsupported metadata version');
+
+async function prepare(from, raw, output) {
+  const candidate = { pipelineVersion: PIPELINE, provenance: provenance(metadata.sources?.[from]), raw: fingerprint(raw), output: fingerprint(output) };
+  // Verify persisted destinations; the registry is evidence, not permission to skip missing/edited output.
+  const valid = [];
+  for (const record of registry.records) {
+    if (record.output.sha256 !== candidate.output.sha256 && (!candidate.provenance.gameId || record.provenance?.gameId !== candidate.provenance.gameId)) continue;
+    if (plannedRecords.has(record)) { valid.push(record); continue; }
+    let matches = true;
+    for (const f of record.output.files) {
+      try {
+        const data = await readFile(path.join(GAMES_DIR, record.singlePage ? record.destination : path.posix.join(record.root, f.path)));
+        if (fingerprint(new Map([[f.path, data]])).files[0].sha256 !== f.sha256) matches = false;
+      } catch { matches = false; }
+    }
+    if (matches && !record.singlePage) {
+      const actual = await listTree(path.join(GAMES_DIR, record.root));
+      if (actual.length !== record.output.files.length) matches = false;
+    }
+    // Preserve lineage protection even if an older destination was edited or removed.
+    if (matches || (candidate.provenance.gameId && record.provenance?.gameId === candidate.provenance.gameId && record.output.sha256 !== candidate.output.sha256)) valid.push(record);
+  }
+  const decision = decide(valid, candidate);
+  const row = { from, ...decision, rawSha256: candidate.raw.sha256, outputSha256: candidate.output.sha256, files: candidate.output.files.length };
+  report.decisions.push(row);
+  return { candidate, row, skip: !['import', 'import-newer'].includes(decision.action) };
+}
+function remember(prepared, root, destination) {
+  prepared.row.destination = destination;
+  const record = { ...prepared.candidate, root, destination };
+  if (!registry.records.some(r => JSON.stringify(r) === JSON.stringify(record))) { registry.records.push(record); plannedRecords.add(record); }
+}
+const MAX_FILES = 10000;
+const MAX_BYTES = 95 * 1024 * 1024;
+async function boundedRead(abs) {
+  if ((await stat(abs)).size > MAX_BYTES) throw new Error('input exceeds 95 MiB limit');
+  return readFile(abs);
+}
 const hashes = new Map(); // sha1 of a page → where it lives in games/
 // games/-relative paths already used, lowercased: two files that differ only
 // in case would collide the moment the repo is checked out on Windows or macOS.
 const claimed = new Set();
+const gameKeys = new Set();
 const addedDates = {};
 
 const sha1 = (buf) => createHash('sha1').update(buf).digest('hex');
@@ -118,16 +168,18 @@ function freePath(dir, name, qualifier) {
   const tries = [name];
   const q = slugify(qualifier);
   if (q && q !== slugify(stem)) tries.push(`${stem}-${q}${ext}`);
-  for (let n = 2; n < 1000; n++) tries.push(`${stem}-${n}${ext}`);
+  for (let n = 2; n < 1000; n++) tries.push(`${stem}-${n}${ext}`, `import-${n}-${name}`);
   for (const candidate of tries) {
     const rel = posix(dir, candidate);
-    if (!taken(rel)) return { rel, renamed: candidate !== name };
+    const place = HTML.test(name) ? classify(rel) : classify(`${rel}/index.html`, { project: true });
+    if (!taken(rel) && !gameKeys.has(place.key)) return { rel, renamed: candidate !== name };
   }
   throw new Error(`no free name for ${name}`);
 }
 
 async function put(rel, data, modified) {
   claim(rel);
+  if (HTML.test(rel)) gameKeys.add(classify(rel, { project: INDEX_FILE.test(path.posix.basename(rel)) }).key);
   if (opts.dryRun) return;
   const abs = path.join(GAMES_DIR, rel);
   await mkdir(path.dirname(abs), { recursive: true });
@@ -147,7 +199,7 @@ async function listTree(dir, base = dir) {
     return [];
   }
   const out = [];
-  for (const entry of entries) {
+  for (const entry of entries.sort((a,b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
     const abs = path.join(dir, entry.name);
     const rel = path.relative(base, abs).split(path.sep).join('/');
     if (isJunk(rel)) continue;
@@ -168,11 +220,13 @@ async function learnExisting() {
   const everything = await listTree(GAMES_DIR);
   for (const f of everything) claim(f.rel);
   const pages = everything.filter((f) => HTML.test(f.rel));
+  for (const f of pages) gameKeys.add(classify(f.rel, { project: INDEX_FILE.test(path.posix.basename(f.rel)) }).key);
   await pool(pages, 16, async (f) => {
     const { size } = await stat(f.abs);
     if (!unhashed.has(size)) unhashed.set(size, []);
     unhashed.get(size).push(f);
   });
+  for (const bucket of unhashed.values()) bucket.sort((a, b) => a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
   return pages.length;
 }
 
@@ -189,14 +243,25 @@ async function duplicateOf(data) {
 
 /* --- single pages ---------------------------------------------------------- */
 
-async function importPage({ data, name, modified, from, subdir, qualifier }) {
+async function importPage(input) {
+  try { await performPage(input); }
+  catch (error) { report.failed.push({ from: input.from, why: error.message }); }
+}
+async function performPage({ data, name, modified, from, subdir, qualifier }) {
+  const raw = new Map([['index.html', data]]);
   const localized = localizeGameLibraries(new Map([[name, data.toString('utf8')]]), libraries);
   data = Buffer.from(localized.files.get(name));
   if (localized.libraries.length) report.libraries.push({ from, libraries: localized.libraries });
   if (localized.warnings.length) report.dependencies.push({ from, warnings: localized.warnings });
+  const prepared = await prepare(from, raw, new Map([['index.html', data]]));
+  if (prepared.skip) return;
+  if (prepared.candidate.provenance.sourceDate) modified = new Date(prepared.candidate.provenance.sourceDate);
   const { hash, same } = await duplicateOf(data);
-  if (same) {
+  if (same && !prepared.candidate.provenance.gameId) {
     report.duplicates.push({ from, same });
+    prepared.row.action = 'unchanged';
+    prepared.candidate.singlePage = true;
+    remember(prepared, path.posix.dirname(same), same);
     return;
   }
   // `index(3).html` says nothing about the game; its title, or else its
@@ -219,6 +284,9 @@ async function importPage({ data, name, modified, from, subdir, qualifier }) {
   const { rel, renamed } = freePath(dir, fileName, qualifier);
   if (renamed) report.renamed.push({ from, rel });
   await put(rel, data, modified);
+  // Canonical fingerprint path is resolved through destination for single pages.
+  prepared.candidate.singlePage = true;
+  remember(prepared, path.posix.dirname(rel), rel);
   hashes.set(hash, rel);
   if (modified) addedDates[rel] = modified.toISOString();
   report.pages.push({ from, rel, bytes: data.length, title: titleOf(data) });
@@ -238,7 +306,22 @@ const safeDecode = (p) => {
  * @param files  [{ rel, read: () => Promise<Buffer>|Buffer, modified }] relative to the project root
  * @param entry  the page to serve as index.html, when it is named something else
  */
-async function importProject({ name, files, from, subdir, entry = null }) {
+async function importProject(input) {
+  try { await performProject(input); }
+  catch (error) { report.failed.push({ from: input.from, why: error.message }); }
+}
+async function performProject({ name, files, from, subdir, entry = null }) {
+  if (files.length > MAX_FILES) throw new Error('project exceeds 10000 file limit');
+  let total = 0;
+  const raw = new Map();
+  if (files.some(f => /(^|\/)(?:[^/]*(?:save[-_]?backup|database[-_]?backup|save[-_]?export)[^/]*|[^/]*\.(?:sqlite3?|db|sql))(?:$|\/)/i.test(f.rel))) throw new Error('private save/database candidate; manual runtime-only export required');
+  for (const f of files) {
+    const data = await f.read();
+    total += data.length;
+    if (total > MAX_BYTES) throw new Error('project exceeds 95 MiB limit');
+    raw.set(f.rel, data);
+    f.read = () => data;
+  }
   const target = (rel) => (entry && rel === entry ? 'index.html' : rel);
   const present = new Set(files.map((f) => target(f.rel)));
   const keep = (p) => present.has(p) || present.has(safeDecode(p));
@@ -265,10 +348,22 @@ async function importProject({ name, files, from, subdir, entry = null }) {
   if (localized.warnings.length) report.dependencies.push({ from, warnings: localized.warnings });
   const entryKey = entry || files.find((f) => INDEX_FILE.test(f.rel))?.rel;
   const entryData = pages.get(entryKey);
+  if (!entryData) throw new Error('no runnable entry HTML');
+  const output = new Map(files.map(f => [target(f.rel), pages.get(f.rel) ?? raw.get(f.rel)]));
+  const prepared = await prepare(from, raw, output);
+  if (prepared.skip) return;
+  // Legacy projects must match the entire bundle, not just index.html.
   const { hash, same } = await duplicateOf(entryData);
-  if (same) {
-    report.duplicates.push({ from, same });
-    return;
+  if (same && !prepared.candidate.provenance.gameId && path.posix.basename(same) === 'index.html') {
+    const root = path.posix.dirname(same);
+    const existing = await listTree(path.join(GAMES_DIR, root));
+    const actual = fingerprint(new Map(await Promise.all(existing.map(async f => [f.rel, await readFile(f.abs)]))));
+    if (actual.sha256 === prepared.candidate.output.sha256) {
+      report.duplicates.push({ from, same });
+      prepared.row.action = 'unchanged';
+      remember(prepared, root, same);
+      return;
+    }
   }
 
   const { rel: dir, renamed } = freePath(posix(opts.into, subdir), clean(name), '');
@@ -287,7 +382,8 @@ async function importProject({ name, files, from, subdir, entry = null }) {
     }
     await put(posix(dir, rel), data, f.modified);
   }
-  const entryModified = files.find((f) => f.rel === entryKey)?.modified;
+  const entryModified = prepared.candidate.provenance.sourceDate ? new Date(prepared.candidate.provenance.sourceDate) : files.find((f) => f.rel === entryKey)?.modified;
+  remember(prepared, dir, `${dir}/index.html`);
   hashes.set(hash, `${dir}/index.html`);
   if (entryModified) addedDates[`${dir}/index.html`] = entryModified.toISOString();
   report.projects.push({ from, rel: `${dir}/`, files: files.length, bytes, fixed, title: titleOf(entryData) });
@@ -299,7 +395,7 @@ async function importProject({ name, files, from, subdir, entry = null }) {
 async function importZip(abs, subdir) {
   const from = shown(abs);
   let zip;
-  const buf = await readFile(abs);
+  const buf = await boundedRead(abs);
   try {
     zip = openZip(buf);
   } catch (error) {
@@ -307,6 +403,8 @@ async function importZip(abs, subdir) {
     return;
   }
 
+  if (zip.entries.length > MAX_FILES) throw new Error('archive exceeds 10000 entry limit');
+  if (zip.entries.reduce((n, e) => n + e.size, 0) > MAX_BYTES) throw new Error('archive exceeds 95 MiB expanded limit');
   const entries = zip.entries.filter((e) => !e.dir && e.path && !isJunk(e.path));
   if (isContainer(path.basename(abs), entries.map((e) => e.path))) return importContainer(zip, entries, subdir);
   const byPath = new Map(entries.map((e) => [e.path, e]));
@@ -360,12 +458,8 @@ async function importZip(abs, subdir) {
     report.failed.push({ from, why: error.message });
   }
 
-  // Keep the package when it held more than was unpacked: its source.
-  if (unpacked < entries.length) {
-    const kept = await keepSource(abs, buf.length, from);
-    const secrets = zip.entries.filter((e) => !e.dir && e.path && isSecret(e.path)).map((e) => e.path);
-    if (kept && secrets.length) report.secrets.push({ rel: kept, files: secrets });
-  }
+  // Opaque archives can contain private saves/databases. Leave originals with the owner.
+  if (unpacked < entries.length) report.sources.push({ from, rel: null, why: 'original archive retained only at source; review non-runtime files separately' });
 }
 
 /**
@@ -394,26 +488,6 @@ async function importContainer(zip, entries, subdir) {
   }
 }
 
-async function keepSource(abs, bytes, from) {
-  if (bytes > MAX_SOURCE_BYTES) {
-    report.sources.push({ from, rel: null, why: `${mb(bytes)} is over GitHub's limit — keep it somewhere else` });
-    return null;
-  }
-  const name = clean(path.basename(abs));
-  let rel = name;
-  for (let n = 2; await stat(path.join(SOURCES_DIR, rel)).then(() => true, () => false); n++) {
-    const same = sha1(await readFile(path.join(SOURCES_DIR, rel))) === sha1(await readFile(abs));
-    if (same) return null;
-    rel = name.replace(/(\.zip)?$/i, `-${n}$1`);
-  }
-  if (!opts.dryRun) {
-    await mkdir(SOURCES_DIR, { recursive: true });
-    await copyFile(abs, path.join(SOURCES_DIR, rel));
-  }
-  report.sources.push({ from, rel: `sources/${rel}` });
-  return `sources/${rel}`;
-}
-
 /* --- folders --------------------------------------------------------------- */
 
 /** `orbit/dist` is orbit; `orbit/v2` is orbit-v2, which the scan reads as build 2 of orbit. */
@@ -433,7 +507,7 @@ async function importDirAsProject(abs, verdict, subdir) {
       .filter((f) => !root || f.rel.startsWith(root + '/'))
       .map((f) => ({
         rel: root ? f.rel.slice(root.length + 1) : f.rel,
-        read: () => readFile(f.abs),
+        read: () => boundedRead(f.abs),
         modified: null,
         abs: f.abs,
       }));
@@ -470,7 +544,7 @@ async function importDir(abs, rootInput, under = '') {
   const parentSubdir = posix(under, opts.keepFolders ? path.posix.dirname(relFromInput).replace(/^\.$/, '') : '');
   let entries;
   try {
-    entries = (await readdir(abs, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    entries = (await readdir(abs, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   } catch (error) {
     report.failed.push({ from: shown(abs), why: error.message });
     return;
@@ -500,12 +574,13 @@ async function importDir(abs, rootInput, under = '') {
 
   for (const entry of entries) {
     const child = path.join(abs, entry.name);
+    try {
     if (entry.isDirectory()) {
       await importDir(child, rootInput, under);
     } else if (HTML.test(entry.name)) {
       const info = await stat(child);
       await importPage({
-        data: await readFile(child),
+        data: await boundedRead(child),
         name: entry.name,
         modified: info.mtime,
         from: shown(child),
@@ -519,6 +594,7 @@ async function importDir(abs, rootInput, under = '') {
     } else {
       report.ignored++;
     }
+    } catch (error) { report.failed.push({ from: shown(child), why: error.message }); }
   }
 }
 
@@ -538,11 +614,13 @@ for (const input of inputs) {
     report.failed.push({ from: home(input), why: 'not found' });
     continue;
   }
+  try {
   if (info.isDirectory()) await importDir(input, input);
   else if (/\.zip$/i.test(input)) await importZip(input, '');
   else if (HTML.test(input)) {
-    await importPage({ data: await readFile(input), name: path.basename(input), modified: info.mtime, from: shown(input), subdir: '', qualifier: path.basename(path.dirname(input)) });
+    await importPage({ data: await boundedRead(input), name: path.basename(input), modified: info.mtime, from: shown(input), subdir: '', qualifier: path.basename(path.dirname(input)) });
   } else report.failed.push({ from: shown(input), why: 'not an .html, .zip or folder' });
+  } catch (error) { report.failed.push({ from: shown(input), why: error.message }); }
 }
 
 if (!opts.dryRun && Object.keys(addedDates).length) {
@@ -557,12 +635,19 @@ if (!opts.dryRun && Object.keys(addedDates).length) {
   await writeFile(ADDED_FILE, JSON.stringify(sorted, null, 2) + '\n', 'utf8');
 }
 
-printReport();
+if (!opts.dryRun && JSON.stringify(registry) !== originalRegistry) {
+  await mkdir(path.dirname(REGISTRY_FILE), { recursive: true });
+  await writeFile(REGISTRY_FILE, JSON.stringify(registry, null, 2) + '\n');
+}
+report.counts = Object.fromEntries(['pages','projects','duplicates','failed','needsBuild'].map(k => [k, report[k].length]));
+for (const row of report.decisions) report.counts[row.action] = (report.counts[row.action] || 0) + 1;
+if (opts.json) console.log(JSON.stringify(report, null, 2));
+else printReport();
 
 if (!opts.dryRun && (report.pages.length || report.projects.length)) {
-  const manifest = await scan({ quiet: false });
-  sameNames(manifest);
-  console.log('  Look it over with `pnpm dev`, then commit games/, data/added.json and sources/.\n');
+  const manifest = await scan({ quiet: opts.json });
+  if (!opts.json) sameNames(manifest);
+  if (!opts.json) console.log('  Look it over with `pnpm dev`, then commit games/ and data/.\n');
 }
 
 function printReport() {
@@ -591,9 +676,10 @@ function printReport() {
     'need a build before they can be played — build them, then import the output folder',
     r.needsBuild.map((x) => `${x.from}  (source ${x.root ? `in ${x.root}/` : 'at its top level'})`)
   );
+  section('registry decisions', r.decisions.filter(x => x.action !== 'import').map(x => `${x.from} — ${x.action}${x.destination ? ` (${x.destination})` : ''}`));
   if (r.needsBuild.length) {
     console.log('    To play one: unpack it, run `npm install && npm run build` (for Vite, `npm run build -- --base ./`),');
-    console.log('    then `pnpm ingest <its dist or build folder>`. Its source zip is already kept in sources/.\n');
+    console.log('    then `pnpm ingest <its dist or build folder>`. The original source package stays at its input location.\n');
   }
   section(
     'may still request files from the site root at runtime — rebuild with a relative base if they load blank',

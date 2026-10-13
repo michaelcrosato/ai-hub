@@ -119,6 +119,10 @@ pnpm ingest ~/exports --keep-folders     # its top-level folders become collecti
 pnpm ingest ~/opus-games --into claude   # all of it into games/claude/
 ```
 
+For versioned provenance, full dependency fingerprints, and machine-readable plans,
+see [Import registry and structured plans](docs/import-registry.md).
+
+
 What it does, so you do not have to:
 
 - **Dates.** Each file keeps its own modified date as the day it joined the
