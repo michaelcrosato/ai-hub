@@ -57,12 +57,16 @@ Build recipes: original static Vite projects use their package manifests/lockfil
 
 ### Unresolved or unavailable source
 
-- **Windward — Flight School:** its supplied HTML embeds an entire HTML document into a minified engine regex, causing `SyntaxError: missing ) after argument list`. No intact matching source archive is in this backup. The authenticated original is retained unchanged under `sources/drive-import-2026-10-13/`, which `.vercelignore` excludes from deployment. A corrected source/export is needed. It is not counted among the 130 catalogue entries.
+- **Windward — Flight School:** its supplied HTML duplicates its 35,795-byte HTML prefix inside a minified engine regex, causing `SyntaxError: missing ) after argument list`. No intact matching source archive is in this backup. The authenticated original is retained unchanged under `sources/drive-import-2026-10-13/`, which `.vercelignore` excludes from deployment. A faithful two-character reconstruction now passes syntax and reaches the flight lesson in an isolated browser test; see the follow-up below. It is not counted among the 130 catalogue entries.
 - **Emberfall — The Endless Descent:** the backup manifest reports no saved version or usable source. No replacement was invented; the existing, differently identified Emberfall game is unchanged.
 - **Nacre: The Gilded Debt:** the game source is included; the partial private save backup is excluded. Cloud save/auth and other Site-only online services are not hosted by this static hub. No sign-in was attempted.
 - **RIFTBOUND:** source requires WebGPU and reports no adapter in this software-rendered browser. Its entry is preserved, but gameplay requires validation on hardware supporting WebGPU.
 - Four Site games had optional Google Fonts certificate failures; fallback typography rendered. AXIOM Contact and MIDWAY attempted CDN engines before using their embedded fallback. These failed attempts are included in the evidence.
 - Any remaining launch/resource limitations are recorded per entry in the browser evidence and summarized in the PR.
+
+## Follow-up evidence
+
+[Browser semantics, baseline failure and Windward repair assessment](2026-10-13-import-follow-up.md).
 
 ## New games
 
