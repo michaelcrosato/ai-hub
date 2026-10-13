@@ -23,7 +23,7 @@
  */
 
 import { readdir, stat, readFile, writeFile, mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -46,9 +46,9 @@ const opts = { into: '', keepFolders: false, dryRun: false, json: false, metadat
 const inputs = [];
 for (let i = 0; i < argv.length; i++) {
   const arg = argv[i];
-  if (arg === '--into') opts.into = argv[++i] || '';
+  if (arg === '--into') { if (!argv[i + 1] || argv[i + 1].startsWith('--')) usage(1, '--into requires a value'); opts.into = argv[++i]; }
   else if (arg === '--json') opts.json = true;
-  else if (arg === '--metadata') opts.metadata = argv[++i];
+  else if (arg === '--metadata') { if (!argv[i + 1] || argv[i + 1].startsWith('--')) usage(1, '--metadata requires a JSON path'); opts.metadata = argv[++i]; }
   else if (arg === '--keep-folders') opts.keepFolders = true;
   else if (arg === '--dry-run' || arg === '-n') opts.dryRun = true;
   else if (arg === '--help' || arg === '-h') usage(0);
@@ -73,7 +73,7 @@ function usage(code, problem) {
 /* --- bookkeeping ---------------------------------------------------------- */
 
 const report = {
-  schemaVersion: 1, pipelineVersion: PIPELINE, dryRun: opts.dryRun, decisions: [],
+  schemaVersion: 1, decisionVersion: 2, pipelineVersion: PIPELINE, dryRun: opts.dryRun, decisions: [],
   pages: [],
   projects: [],
   duplicates: [],
@@ -94,10 +94,15 @@ catch (error) { if (error.code !== 'ENOENT') throw error; registry = emptyRegist
 if (registry.schemaVersion !== 1 || registry.pipelineVersion !== PIPELINE) throw new Error('Unsupported import registry version');
 const plannedRecords = new Set();
 const originalRegistry = JSON.stringify(registry);
+const usedMetadata = new Set();
+const seenSources = new Set();
 const metadata = opts.metadata ? JSON.parse(await readFile(opts.metadata, 'utf8')) : {};
 if (opts.metadata && metadata.schemaVersion !== 1) throw new Error('Unsupported metadata version');
 
 async function prepare(from, raw, output) {
+  if (seenSources.has(from)) throw new Error(`ambiguous source key: ${from}; use non-overlapping input roots`);
+  seenSources.add(from);
+  if (metadata.sources?.[from]) usedMetadata.add(from);
   const candidate = { pipelineVersion: PIPELINE, provenance: provenance(metadata.sources?.[from]), raw: fingerprint(raw), output: fingerprint(output) };
   // Verify persisted destinations; the registry is evidence, not permission to skip missing/edited output.
   const valid = [];
@@ -121,6 +126,11 @@ async function prepare(from, raw, output) {
   const decision = decide(valid, candidate);
   const row = { from, ...decision, rawSha256: candidate.raw.sha256, outputSha256: candidate.output.sha256, files: candidate.output.files.length };
   report.decisions.push(row);
+  if (decision.action === 'record-revision') {
+    const existing = valid.find(r => r.destination === decision.destination && r.output.sha256 === candidate.output.sha256);
+    if (existing.singlePage) candidate.singlePage = true;
+    remember({ candidate, row }, existing.root, existing.destination);
+  }
   return { candidate, row, skip: !['import', 'import-newer'].includes(decision.action) };
 }
 function remember(prepared, root, destination) {
@@ -130,6 +140,17 @@ function remember(prepared, root, destination) {
 }
 const MAX_FILES = 10000;
 const MAX_BYTES = 95 * 1024 * 1024;
+function boundedText(abs) {
+  if (statSync(abs).size > MAX_BYTES) throw new Error('input exceeds 95 MiB limit');
+  return readFileSync(abs, 'utf8');
+}
+async function checkTreeLimits(tree) {
+  let total = 0;
+  for (const f of tree) {
+    total += (await stat(f.abs)).size;
+    if (total > MAX_BYTES) throw new Error('project exceeds 95 MiB limit');
+  }
+}
 async function boundedRead(abs) {
   if ((await stat(abs)).size > MAX_BYTES) throw new Error('input exceeds 95 MiB limit');
   return readFile(abs);
@@ -148,9 +169,19 @@ const home = (abs) => abs.replace(process.env.HOME || '\0', '~');
 // Paths in the report are shown from the folder each input sits in, so
 // `claude/snake.html` rather than the whole road to it.
 let base = process.cwd();
+let sourcePrefix = '';
+// Qualify colliding input basenames by their common parent. Unique existing keys stay compatible.
+const inputLabels = new Map();
+for (const input of inputs) {
+  const peers = inputs.filter(p => path.basename(p) === path.basename(input));
+  let parent = path.dirname(input);
+  while (peers.some(p => path.relative(parent, p).startsWith('..' + path.sep))) parent = path.dirname(parent);
+  inputLabels.set(input, peers.length > 1 ? path.relative(parent, input).split(path.sep).join('/') : path.basename(input));
+}
+
 const shown = (abs) => {
   const rel = path.relative(base, abs).split(path.sep).join('/');
-  return rel && !rel.startsWith('..') ? rel : home(abs);
+  return rel && !rel.startsWith('..') ? posix(sourcePrefix, rel) : home(abs);
 };
 
 const claim = (rel) => {
@@ -191,7 +222,7 @@ const titleOf = (buf) => parseHead(buf.subarray(0, 256 * 1024).toString('utf8'))
 
 /* --- what is already on the wall ----------------------------------------- */
 
-async function listTree(dir, base = dir) {
+async function listTree(dir, base = dir, maxFiles = Infinity, budget = { count: 0 }) {
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });
@@ -203,8 +234,11 @@ async function listTree(dir, base = dir) {
     const abs = path.join(dir, entry.name);
     const rel = path.relative(base, abs).split(path.sep).join('/');
     if (isJunk(rel)) continue;
-    if (entry.isDirectory()) out.push(...(await listTree(abs, base)));
-    else if (entry.isFile()) out.push({ abs, rel });
+    if (entry.isDirectory()) out.push(...(await listTree(abs, base, maxFiles, budget)));
+    else if (entry.isFile()) {
+      if (++budget.count > maxFiles) throw new Error('project exceeds 10000 file limit');
+      out.push({ abs, rel });
+    }
   }
   return out;
 }
@@ -322,7 +356,8 @@ async function performProject({ name, files, from, subdir, entry = null }) {
     raw.set(f.rel, data);
     f.read = () => data;
   }
-  const target = (rel) => (entry && rel === entry ? 'index.html' : rel);
+  const entryKey = entry || files.find((f) => INDEX_FILE.test(f.rel))?.rel;
+  const target = (rel) => (rel === entryKey ? 'index.html' : rel);
   const present = new Set(files.map((f) => target(f.rel)));
   const keep = (p) => present.has(p) || present.has(safeDecode(p));
 
@@ -346,7 +381,6 @@ async function performProject({ name, files, from, subdir, entry = null }) {
   for (const [rel, source] of localized.files) pages.set(rel, Buffer.from(source, 'utf8'));
   if (localized.libraries.length) report.libraries.push({ from, libraries: localized.libraries });
   if (localized.warnings.length) report.dependencies.push({ from, warnings: localized.warnings });
-  const entryKey = entry || files.find((f) => INDEX_FILE.test(f.rel))?.rel;
   const entryData = pages.get(entryKey);
   if (!entryData) throw new Error('no runnable entry HTML');
   const output = new Map(files.map(f => [target(f.rel), pages.get(f.rel) ?? raw.get(f.rel)]));
@@ -406,7 +440,7 @@ async function importZip(abs, subdir) {
   if (zip.entries.length > MAX_FILES) throw new Error('archive exceeds 10000 entry limit');
   if (zip.entries.reduce((n, e) => n + e.size, 0) > MAX_BYTES) throw new Error('archive exceeds 95 MiB expanded limit');
   const entries = zip.entries.filter((e) => !e.dir && e.path && !isJunk(e.path));
-  if (isContainer(path.basename(abs), entries.map((e) => e.path))) return importContainer(zip, entries, subdir);
+  if (isContainer(path.basename(abs), entries.map((e) => e.path))) return importContainer(zip, entries, subdir, from);
   const byPath = new Map(entries.map((e) => [e.path, e]));
   const read = (p) => zip.read(byPath.get(p));
   const stem = packageName(path.basename(abs, path.extname(abs)));
@@ -433,13 +467,13 @@ async function importZip(abs, subdir) {
           verdict.roots.length === 1 || !leaf || BUILT_DIR.test(leaf) ? stem : `${stem}-${leaf}`;
         const files = under(root);
         unpacked += files.length;
-        await importProject({ name, files, from, subdir });
+        await importProject({ name, files, from: `${from} › ${root || '.'}`, subdir });
       }
     } else if (verdict.kind === 'page') {
       const files = under(verdict.root);
       unpacked = files.length;
       const entry = verdict.root ? verdict.entry.slice(verdict.root.length + 1) : verdict.entry;
-      await importProject({ name: stem, files, from, subdir, entry });
+      await importProject({ name: stem, files, from: `${from} › ${verdict.root || '.'}`, subdir, entry });
     } else if (verdict.kind === 'loose') {
       // A zip of several single-file games becomes a collection named after it.
       const folder = verdict.files.length > 1 ? posix(subdir, clean(stem)) : subdir;
@@ -467,9 +501,10 @@ async function importZip(abs, subdir) {
  * it was. A single wrapping folder (Drive puts everything in `files/`) is
  * stepped into, so it does not become a collection of its own.
  */
-async function importContainer(zip, entries, subdir) {
+async function importContainer(zip, entries, subdir, from) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'ai-hub-ingest-'));
   const savedBase = base;
+  const savedPrefix = sourcePrefix;
   try {
     for (const e of entries) {
       const out = path.join(temp, e.path);
@@ -481,9 +516,11 @@ async function importContainer(zip, entries, subdir) {
     const single = tops.size === 1 && entries.every((e) => e.path.includes('/'));
     const root = single ? path.join(temp, [...tops][0]) : temp;
     base = temp;
+    sourcePrefix = `${from} ›`;
     await importDir(root, root, subdir);
   } finally {
     base = savedBase;
+    sourcePrefix = savedPrefix;
     await rm(temp, { recursive: true, force: true });
   }
 }
@@ -500,7 +537,7 @@ const nameForDir = (abs) => {
 };
 
 async function importDirAsProject(abs, verdict, subdir) {
-  const all = await listTree(abs);
+  const all = await listTree(abs, abs, MAX_FILES);
   const from = shown(abs);
   const files = (root) =>
     all
@@ -558,16 +595,18 @@ async function importDir(abs, rootInput, under = '') {
   const listingPage = hasIndex && !hasPackage && !assetsHere && pagesHere.length >= 4;
 
   if ((hasIndex && !listingPage) || hasPackage) {
-    const tree = await listTree(abs);
-    const verdict = chooseWebRoot(tree.map((f) => f.rel), (p) => readFileSync(path.join(abs, p), 'utf8'));
+    const tree = await listTree(abs, abs, MAX_FILES);
+    await checkTreeLimits(tree);
+    const verdict = chooseWebRoot(tree.map((f) => f.rel), (p) => boundedText(path.join(abs, p)));
     return importDirAsProject(abs, verdict, parentSubdir);
   }
 
   // One page plus the images and scripts it loads, without an index.html.
   if (pagesHere.length === 1 && !listingPage) {
-    const tree = await listTree(abs);
+    const tree = await listTree(abs, abs, MAX_FILES);
+    await checkTreeLimits(tree);
     if (tree.filter((f) => HTML.test(f.rel)).length === 1) {
-      const verdict = chooseWebRoot(tree.map((f) => f.rel), (p) => readFileSync(path.join(abs, p), 'utf8'));
+      const verdict = chooseWebRoot(tree.map((f) => f.rel), (p) => boundedText(path.join(abs, p)));
       if (verdict.kind === 'page') return importDirAsProject(abs, verdict, parentSubdir);
     }
   }
@@ -606,7 +645,9 @@ for (const input of inputs) {
   if (input === GAMES_DIR || input.startsWith(GAMES_DIR + path.sep)) {
     usage(1, `${home(input)} is already inside games/ — the wall picks it up by itself.`);
   }
+  const label = inputLabels.get(input);
   base = path.dirname(input);
+  sourcePrefix = path.posix.dirname(label).replace(/^\.$/, '');
   let info;
   try {
     info = await stat(input);
@@ -639,6 +680,7 @@ if (!opts.dryRun && JSON.stringify(registry) !== originalRegistry) {
   await mkdir(path.dirname(REGISTRY_FILE), { recursive: true });
   await writeFile(REGISTRY_FILE, JSON.stringify(registry, null, 2) + '\n');
 }
+report.unusedMetadata = Object.keys(metadata.sources || {}).filter(key => !usedMetadata.has(key)).sort();
 report.counts = Object.fromEntries(['pages','projects','duplicates','failed','needsBuild'].map(k => [k, report[k].length]));
 for (const row of report.decisions) report.counts[row.action] = (report.counts[row.action] || 0) + 1;
 if (opts.json) console.log(JSON.stringify(report, null, 2));
@@ -685,7 +727,7 @@ function printReport() {
     'may still request files from the site root at runtime — rebuild with a relative base if they load blank',
     r.leftovers.map((x) => `games/${x.rel}  ${x.files.slice(0, 3).join(', ')}${x.files.length > 3 ? ', …' : ''}`)
   );
-  section('source packages kept (committed, never deployed)', r.sources.map((s) => (s.rel ? `${s.rel}  ← ${s.from}` : `${s.from}  — ${s.why}`)));
+  section('source archives left at input (not copied)', r.sources.map((s) => (s.rel ? `${s.rel}  ← ${s.from}` : `${s.from}  — ${s.why}`)));
   section(
     'kept packages that contain what look like secrets — the repo is private, but rotate any live keys or delete them from the zip before committing',
     r.secrets.map((x) => `${x.rel}  ${x.files.slice(0, 4).join(', ')}${x.files.length > 4 ? ', …' : ''}`)

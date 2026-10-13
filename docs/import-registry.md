@@ -4,8 +4,8 @@ A runnable HTML file remains sufficient. Metadata and screenshots are optional.
 Existing game files, destinations, and save identifiers are never overwritten.
 
 ```sh
-pnpm ingest /tmp/exports --dry-run --json > /tmp/import-plan.json
-pnpm ingest /tmp/exports --metadata /tmp/provenance.json --json > /tmp/import-report.json
+node scripts/ingest.mjs /tmp/exports --dry-run --json > /tmp/import-plan.json
+node scripts/ingest.mjs /tmp/exports --metadata /tmp/provenance.json --json > /tmp/import-report.json
 node -e 'const r=require("/tmp/import-report.json"); console.log(r.counts, r.failed, r.needsBuild, r.decisions.filter(x=>/review|older/.test(x.action)))'
 ```
 
@@ -16,7 +16,18 @@ consumers if your package manager prints its own command banner. Dry run writes
 no repository files (ZIP containers may use automatically removed OS temp files).
 Shell redirection is the caller's responsibility; write plans outside the checkout.
 
-Optional provenance format (keys match `from` in a dry-run plan):
+Optional provenance format (keys match `from` in a dry-run plan). Colliding
+input basenames are qualified by their common parent (for example `a/game.html`
+and `b/game.html`). Archive projects use `archive.zip › project/root`, including
+`.` for an archive-root project; container ZIP paths retain their archive name.
+Generate the plan for the complete input set before assigning metadata; adding
+another same-basename input may qualify previously short keys.
+
+```text
+node scripts/ingest.mjs /exports/a/game.html /exports/b/game.html --dry-run --json
+```
+
+Provenance example:
 
 ```json
 {
@@ -72,3 +83,10 @@ into `sources/`. Inspect exports and supply runtime-only content: filename
 checks cannot establish that arbitrary JSON contains no private data.
 No source deletion, network publication, game execution, screenshot admission
 check, or numerical token-savings claim is part of this phase.
+
+Decision reports use `decisionVersion: 2`. Explicit identities never match an
+anonymous seeded record solely by bytes. A confirmed successor with identical
+bytes returns `record-revision`: its provenance is appended using the existing
+destination, without changing game files or added dates. Later successors can
+name that revision. Repeating it returns `unchanged`. Unproven or older revision
+claims do not advance lineage, even when bytes match.
