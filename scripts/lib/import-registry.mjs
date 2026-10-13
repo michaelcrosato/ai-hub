@@ -22,17 +22,21 @@ export function decide(records, candidate) {
   const identity = candidate.provenance.gameId;
   const related = identity ? records.filter(r => r.provenance?.gameId === identity) : [];
   const exact = records.find(r => r.pipelineVersion === PIPELINE && r.output.sha256 === candidate.output.sha256 &&
-    (!identity || !r.provenance?.gameId || r.provenance.gameId === identity));
-  if (exact) return { action: 'unchanged', destination: exact.destination };
-  if (!related.length) return { action: 'import' };
+    (!identity || r.provenance?.gameId === identity));
+  if (!related.length) return exact ? { action: 'unchanged', destination: exact.destination } : { action: 'import' };
   const prior = related.at(-1);
   const old = prior.provenance, next = candidate.provenance;
+  // A repeated, known revision needs no registry churn. Bytes alone cannot certify a new revision.
+  if (exact && (!next.revision || related.some(r => r.provenance.revision === next.revision && r.output.sha256 === candidate.output.sha256))) {
+    return { action: 'unchanged', destination: exact.destination };
+  }
   if (old.sourceDate && next.sourceDate && Date.parse(next.sourceDate) <= Date.parse(old.sourceDate)) {
     return { action: 'skip-older', destination: prior.destination };
   }
   if (old.revision && next.predecessorRevision === old.revision && old.sourceDate && next.sourceDate &&
       Date.parse(next.sourceDate) > Date.parse(old.sourceDate)) {
-    return { action: 'import-newer', predecessor: prior.destination };
+    return exact ? { action: 'record-revision', destination: exact.destination, predecessor: prior.destination }
+      : { action: 'import-newer', predecessor: prior.destination };
   }
   return { action: 'review-lineage', destination: prior.destination };
 }

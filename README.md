@@ -144,10 +144,9 @@ What it does, so you do not have to:
   runtime) is listed so you know which to rebuild with a relative base.
 - **Secrets and clutter.** `.env` files, keys, `.git`, `node_modules` and
   `__MACOSX` are never copied into `games/`, which is public.
-- **Source.** A zip that carried more than was unpacked — its source, or
-  source with no build — is kept in `sources/`. That folder is committed with
-  the (private) repo but never deployed. If a kept zip holds a `.env` or a key,
-  the report says so; rotate the key or strip it from the zip before committing.
+- **Source.** Opaque archives stay at their original input location. The importer
+  does not copy them into the repository or deployment. Keep your originals;
+  a successful runtime import is not a backup of source files or private data.
 
 Afterwards it rescans and lists titles shared by more than one tile — often
 the same game saved under different filenames. Those are never merged for you;
@@ -170,7 +169,7 @@ standard/SIMD/deterministic, each with ordinary and compatibility packages.
 See `lib/vendor/README.md` for paths, import maps and verification commands.
 
 **Size.** GitHub refuses any single file over 100 MB and warns above 50 MB;
-the scan flags both. A source zip over 95 MB is not kept. For the whole wall,
+the scan flags both. Inputs or expanded packages over 95 MiB are reported and skipped. For the whole wall,
 a library of ~400 games at ~2.5 MB each (~900 MB) packs to roughly 500 MB in
 git, under GitHub's 1 GB recommendation and 2 GB push limit. Deploy it by
 pushing: Vercel builds from the repo with room to spare, whereas `vercel
@@ -434,7 +433,7 @@ JavaScript, and every game is a public file.
 ```
 games/            the drop zone
 covers/           optional art, by slug
-sources/          source packages kept by `pnpm ingest`; committed, never deployed
+sources/          historical source packages; new imports leave originals at input
 data/
   overrides.json  optional metadata, by slug
   added.json      first-seen dates, maintained automatically

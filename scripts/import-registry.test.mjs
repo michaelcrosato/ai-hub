@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { crc32 } from 'node:zlib';
 import assert from 'node:assert/strict';
 import { mkdtemp, cp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -113,4 +114,108 @@ test('version-like filenames alone cannot collapse distinct games into one catal
   assert.equal(run('input/snake-v1.html', 'input/snake-v2.html').counts.pages, 2);
   const manifest = JSON.parse(await readFile(path.join(root, 'data/games.json'), 'utf8'));
   assert.equal(manifest.games.length, 2);
+});
+
+test('same basenames in separate input roots get distinct provenance keys', async t => {
+  const { root, run } = await fixture(t);
+  for (const id of ['a', 'b']) {
+    await mkdir(path.join(root, `input/${id}`));
+    await writeFile(path.join(root, `input/${id}/game.html`), html + id);
+  }
+  const args = ['input/a/game.html', 'input/b/game.html'];
+  const plan = run(...args, '--dry-run');
+  assert.deepEqual(plan.decisions.map(x => x.from), ['a/game.html', 'b/game.html']);
+  const sources = Object.fromEntries(plan.decisions.map((x, i) => [x.from, { gameId: `distinct-${i}`, identityEvidence: 'Independent original campaign', revision: 'r1', sourceDate: '2026-10-12T00:00:00Z' }]));
+  await writeFile(path.join(root, 'meta.json'), JSON.stringify({ schemaVersion: 1, sources }));
+  assert.equal(run(...args, '--metadata', 'meta.json').counts.pages, 2);
+  assert.equal(run(...args, '--metadata', 'meta.json').counts.unchanged, 2);
+});
+
+// Stored ZIP fixture; no external archiver required.
+function projectZip(files) {
+  const locals = [], central = []; let offset = 0;
+  for (const [name, content] of Object.entries(files)) {
+    const n = Buffer.from(name), data = Buffer.from(content), l = Buffer.alloc(30), c = Buffer.alloc(46);
+    l.writeUInt32LE(crc32(data), 14); c.writeUInt32LE(crc32(data), 16);
+    l.writeUInt32LE(0x04034b50); l.writeUInt16LE(20, 4); l.writeUInt32LE(data.length, 18); l.writeUInt32LE(data.length, 22); l.writeUInt16LE(n.length, 26);
+    c.writeUInt32LE(0x02014b50); c.writeUInt16LE(20, 4); c.writeUInt16LE(20, 6); c.writeUInt32LE(data.length, 20); c.writeUInt32LE(data.length, 24); c.writeUInt16LE(n.length, 28); c.writeUInt32LE(offset, 42);
+    locals.push(l,n,data); central.push(c,n); offset += l.length+n.length+data.length;
+  }
+  const cd = Buffer.concat(central), end = Buffer.alloc(22), count = Object.keys(files).length;
+  end.writeUInt32LE(0x06054b50); end.writeUInt16LE(count, 8); end.writeUInt16LE(count, 10); end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals,cd,end]);
+}
+
+test('multiple projects inside one ZIP have independent metadata and decisions', async t => {
+  const { root, run } = await fixture(t);
+  await writeFile(path.join(root, 'input/games.zip'), projectZip({ 'a/index.html': html + 'a', 'b/index.html': html + 'b' }));
+  const plan = run('input/games.zip', '--dry-run');
+  assert.deepEqual(plan.decisions.map(x => x.from), ['games.zip › a', 'games.zip › b']);
+  const sources = Object.fromEntries(plan.decisions.map((x, i) => [x.from, { gameId: `zip-game-${i}`, identityEvidence: 'Independent campaign', revision: 'r1', sourceDate: '2026-10-12T00:00:00Z' }]));
+  await writeFile(path.join(root, 'meta.json'), JSON.stringify({ schemaVersion: 1, sources }));
+  assert.equal(run('input/games.zip', '--metadata', 'meta.json').counts.projects, 2);
+  assert.equal(run('input/games.zip', '--metadata', 'meta.json').counts.unchanged, 2);
+});
+
+test('explicit identity never collapses into an anonymous seeded exact match', async t => {
+  const { root, run } = await fixture(t);
+  await writeFile(path.join(root, 'input/anonymous.html'), html);
+  run('input/anonymous.html');
+  await writeFile(path.join(root, 'input/identified.html'), html);
+  await writeFile(path.join(root, 'meta.json'), JSON.stringify({ schemaVersion: 1, sources: { 'identified.html': { gameId: 'independent', identityEvidence: 'Explicitly independent original game' } } }));
+  assert.equal(run('input/identified.html', '--metadata', 'meta.json').counts.pages, 1);
+  assert.equal((await readdir(path.join(root, 'games'))).length, 2);
+});
+
+test('byte-identical successor remembers revision without rewriting games; next successor uses it', async t => {
+  const { root, run } = await fixture(t);
+  const meta = { gameId: 'game', identityEvidence: 'Confirmed source revision chain', revision: 'r1', sourceDate: '2026-10-11T00:00:00Z' };
+  await writeFile(path.join(root, 'input/game.html'), html);
+  const stage = async (...args) => {
+    await writeFile(path.join(root, 'meta.json'), JSON.stringify({ schemaVersion: 1, sources: { 'game.html': meta } }));
+    return run('input/game.html', '--metadata', 'meta.json', ...args);
+  };
+  await stage();
+  const before = await readFile(path.join(root, 'data/import-registry.json'), 'utf8');
+  const dates = await readFile(path.join(root, 'data/added.json'), 'utf8');
+  Object.assign(meta, { revision: 'r2', predecessorRevision: 'r1', sourceDate: '2026-10-12T00:00:00Z' });
+  assert.equal((await stage('--dry-run')).counts['record-revision'], 1);
+  assert.equal(await readFile(path.join(root, 'data/import-registry.json'), 'utf8'), before);
+  assert.equal((await stage()).counts['record-revision'], 1);
+  assert.equal(await readFile(path.join(root, 'data/added.json'), 'utf8'), dates);
+  const remembered = await readFile(path.join(root, 'data/import-registry.json'), 'utf8');
+  assert.equal((await stage()).counts.unchanged, 1);
+  assert.equal(await readFile(path.join(root, 'data/import-registry.json'), 'utf8'), remembered);
+  assert.deepEqual(await readdir(path.join(root, 'games')), ['same-title.html']);
+  Object.assign(meta, { revision: 'r3', predecessorRevision: 'r2', sourceDate: '2026-10-13T00:00:00Z' });
+  await writeFile(path.join(root, 'input/game.html'), html + 'new');
+  assert.equal((await stage()).counts['import-newer'], 1);
+});
+
+test('uppercase index normalizes destination and remains unchanged on rerun', async t => {
+  const { root, run } = await fixture(t);
+  await mkdir(path.join(root, 'input/game'));
+  await writeFile(path.join(root, 'input/game/INDEX.HTML'), html);
+  assert.equal(run('input/game').counts.projects, 1);
+  assert.equal(await readFile(path.join(root, 'games/game/index.html'), 'utf8'), html);
+  assert.equal(run('input/game').counts.unchanged, 1);
+});
+
+test('classification bounds oversized index before read and continues sibling input', async t => {
+  const { root, run } = await fixture(t);
+  await mkdir(path.join(root, 'input/large'));
+  const { open } = await import('node:fs/promises');
+  const f = await open(path.join(root, 'input/large/index.html'), 'w');
+  await f.truncate(96 * 1024 * 1024); await f.close();
+  await writeFile(path.join(root, 'input/good.html'), html);
+  const report = run('input/large', 'input/good.html');
+  assert.equal(report.counts.failed, 1);
+  assert.equal(report.counts.pages, 1);
+});
+
+test('missing metadata option value stops before any import', async t => {
+  const { root, run } = await fixture(t);
+  await writeFile(path.join(root, 'input/game.html'), html);
+  assert.throws(() => run('input/game.html', '--metadata'));
+  assert.deepEqual(await readdir(path.join(root, 'games')), []);
 });
