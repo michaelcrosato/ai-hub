@@ -10,8 +10,8 @@ This continuation adds **7 catalogue entries**, bringing the branch from **504 t
 |---|---|---|
 | Windward — Flight School | Plane/checkride game, previously malformed export | Replace precisely the duplicated 35,795-byte HTML prefix with the two-character regex terminator. Every other source byte is unchanged; original remains excluded from deployment. |
 | DITHER — Sector 07 & Chapel of Ash | Two built-in missions, three objectives each, health and win/fail states | Original standalone cartridge player, unchanged; both missions available through its selector. |
-| Stick Lab — Sparring & Parkour | Controllable fighter, sparring AI, damage, knockout and parkour modes | Original HTML unchanged. |
-| TIDELINE — Lights & Rescue | Light collection and boat-towing rescue objectives, alongside surface lab | Original HTML unchanged. |
+| Stick Lab — Sparring & Parkour | Controllable fighter, sparring AI, damage, knockout and parkour modes | Original game logic unchanged; Git may normalize line endings. |
+| TIDELINE — Lights & Rescue | Light collection and boat-towing rescue objectives, alongside surface lab | Original game logic unchanged; Git may normalize line endings. |
 | my-3D2dge — Five Game Slices | Adventure, platformer, brawler, shooter and turn-based battle | Original collection unchanged, preserving menu and animation lab. |
 | CO55 — Combat Arena | Authored arena, four enemies, movement, attacks and health | Original HTML unchanged. Engine ancestry overlaps Emberwell, but layout and hero/enemy setup differ; preserved as a separate combat sandbox. |
 | Mosslight — Crystal Island | Five crystals, movement/jumping, physics and completion state | `npm ci` with original lockfile, `npm run build -- --base ./`; own asset paths rebased, source maps omitted. Three.js 0.186.0 / Rapier 0.20.0 preserved. |
