@@ -31,7 +31,7 @@ import path from 'node:path';
 import { scan, pool, mb, ROOT, GAMES_DIR, ADDED_FILE } from './scan.mjs';
 import { openZip } from './lib/zip.mjs';
 import { isJunk, isContainer, HTML, chooseWebRoot, packageName, UNINFORMATIVE_NAME } from './lib/intake.mjs';
-import { INDEX_FILE } from './lib/layout.mjs';
+import { INDEX_FILE, classify } from './lib/layout.mjs';
 import { parseHead, splitTitle, slugify, parseVersion, relativizeRefs } from './lib/parse.mjs';
 import { emptyRegistry, fingerprint, provenance, decide, PIPELINE } from './lib/import-registry.mjs';
 import { readLibraryManifest, localizeGameLibraries } from './lib/libraries.mjs';
@@ -138,6 +138,7 @@ const hashes = new Map(); // sha1 of a page → where it lives in games/
 // games/-relative paths already used, lowercased: two files that differ only
 // in case would collide the moment the repo is checked out on Windows or macOS.
 const claimed = new Set();
+const gameKeys = new Set();
 const addedDates = {};
 
 const sha1 = (buf) => createHash('sha1').update(buf).digest('hex');
@@ -167,16 +168,18 @@ function freePath(dir, name, qualifier) {
   const tries = [name];
   const q = slugify(qualifier);
   if (q && q !== slugify(stem)) tries.push(`${stem}-${q}${ext}`);
-  for (let n = 2; n < 1000; n++) tries.push(`${stem}-${n}${ext}`);
+  for (let n = 2; n < 1000; n++) tries.push(`${stem}-${n}${ext}`, `import-${n}-${name}`);
   for (const candidate of tries) {
     const rel = posix(dir, candidate);
-    if (!taken(rel)) return { rel, renamed: candidate !== name };
+    const place = HTML.test(name) ? classify(rel) : classify(`${rel}/index.html`, { project: true });
+    if (!taken(rel) && !gameKeys.has(place.key)) return { rel, renamed: candidate !== name };
   }
   throw new Error(`no free name for ${name}`);
 }
 
 async function put(rel, data, modified) {
   claim(rel);
+  if (HTML.test(rel)) gameKeys.add(classify(rel, { project: INDEX_FILE.test(path.posix.basename(rel)) }).key);
   if (opts.dryRun) return;
   const abs = path.join(GAMES_DIR, rel);
   await mkdir(path.dirname(abs), { recursive: true });
@@ -217,6 +220,7 @@ async function learnExisting() {
   const everything = await listTree(GAMES_DIR);
   for (const f of everything) claim(f.rel);
   const pages = everything.filter((f) => HTML.test(f.rel));
+  for (const f of pages) gameKeys.add(classify(f.rel, { project: INDEX_FILE.test(path.posix.basename(f.rel)) }).key);
   await pool(pages, 16, async (f) => {
     const { size } = await stat(f.abs);
     if (!unhashed.has(size)) unhashed.set(size, []);

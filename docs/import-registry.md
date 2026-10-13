@@ -43,7 +43,9 @@ as version numbers. A known identity with older/equal date is `skip-older`;
 changed content with uncertain lineage is `review-lineage`. A later dated,
 explicit successor is `import-newer`, written to a new destination with its
 predecessor recorded in the report. This phase does not retire older URLs or
-change the catalogue's version grouping automatically.
+change the catalogue's version grouping automatically. New destinations avoid
+existing catalogue grouping keys, so version-like filenames alone cannot hide a
+distinct game behind an existing tile.
 
 `data/import-registry.json` uses schema 1 and pipeline `ingest-bundle-v1`.
 SHA-256 fingerprints include sorted relative paths, byte lengths, and hashes

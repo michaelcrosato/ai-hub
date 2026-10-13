@@ -106,3 +106,11 @@ test('persisted identity refuses older and unproven builds without touching inst
   assert.equal((await stage(html + '<!-- next -->')).counts['import-newer'], 1);
   assert.equal(await readFile(path.join(root, 'games', installed), 'utf8'), html);
 });
+test('version-like filenames alone cannot collapse distinct games into one catalogue tile', async t => {
+  const { root, run } = await fixture(t);
+  await writeFile(path.join(root, 'input/snake-v1.html'), html);
+  await writeFile(path.join(root, 'input/snake-v2.html'), html + '<script>let different=2</script>');
+  assert.equal(run('input/snake-v1.html', 'input/snake-v2.html').counts.pages, 2);
+  const manifest = JSON.parse(await readFile(path.join(root, 'data/games.json'), 'utf8'));
+  assert.equal(manifest.games.length, 2);
+});
