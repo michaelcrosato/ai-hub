@@ -70,3 +70,18 @@ test('private database project is bounded failure and next input continues', asy
   assert.equal(result.counts.pages, 1);
   assert.deepEqual(await readdir(path.join(root, 'games')), ['good.html']);
 });
+test('oversized file is bounded; populated dry-run preserves registry and dates', async t => {
+  const { root, run } = await fixture(t);
+  await writeFile(path.join(root, 'input/ok.html'), html);
+  run('input/ok.html');
+  const registry = await readFile(path.join(root, 'data/import-registry.json'), 'utf8');
+  const dates = await readFile(path.join(root, 'data/added.json'), 'utf8');
+  const { open } = await import('node:fs/promises');
+  const f = await open(path.join(root, 'input/large.html'), 'w');
+  await f.truncate(96 * 1024 * 1024); await f.close();
+  const report = run('input/large.html', 'input/ok.html', '--dry-run');
+  assert.equal(report.counts.failed, 1);
+  assert.equal(report.counts.unchanged, 1);
+  assert.equal(await readFile(path.join(root, 'data/import-registry.json'), 'utf8'), registry);
+  assert.equal(await readFile(path.join(root, 'data/added.json'), 'utf8'), dates);
+});
