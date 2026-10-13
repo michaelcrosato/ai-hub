@@ -93,7 +93,9 @@ test('persisted identity refuses older and unproven builds without touching inst
     await writeFile(path.join(root, 'meta.json'), JSON.stringify({ schemaVersion: 1, sources: { 'game.html': meta } }));
     return run('input/game.html', '--metadata', 'meta.json');
   }
-  assert.equal((await stage(html)).counts.pages, 1);
+  const first = await stage(html);
+  assert.equal(first.counts.pages, 1);
+  const installed = first.decisions[0].destination;
   const registry = await readFile(path.join(root, 'data/import-registry.json'), 'utf8');
   meta.sourceDate = '2026-10-11T00:00:00Z'; meta.revision = 'r1';
   assert.equal((await stage(html + '<!-- old -->')).counts['skip-older'], 1);
@@ -102,5 +104,5 @@ test('persisted identity refuses older and unproven builds without touching inst
   assert.equal((await stage(html + '<!-- next -->')).counts['review-lineage'], 1);
   meta.predecessorRevision = 'r2';
   assert.equal((await stage(html + '<!-- next -->')).counts['import-newer'], 1);
-  assert.equal(await readFile(path.join(root, 'games/game.html'), 'utf8'), html);
+  assert.equal(await readFile(path.join(root, 'games', installed), 'utf8'), html);
 });
