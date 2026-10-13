@@ -222,6 +222,7 @@ async function learnExisting() {
     if (!unhashed.has(size)) unhashed.set(size, []);
     unhashed.get(size).push(f);
   });
+  for (const bucket of unhashed.values()) bucket.sort((a, b) => a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
   return pages.length;
 }
 
@@ -539,7 +540,7 @@ async function importDir(abs, rootInput, under = '') {
   const parentSubdir = posix(under, opts.keepFolders ? path.posix.dirname(relFromInput).replace(/^\.$/, '') : '');
   let entries;
   try {
-    entries = (await readdir(abs, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+    entries = (await readdir(abs, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
   } catch (error) {
     report.failed.push({ from: shown(abs), why: error.message });
     return;
