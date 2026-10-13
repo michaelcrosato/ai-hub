@@ -1,0 +1,1559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#17251c">
+<title>Architecture — Fern</title>
+<link rel="icon" href="../fern.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../docs/docs.css">
+</head>
+<body>
+<nav aria-label="Documentation"><a href="/">fern. <span>Back to the world</span></a><a href="../docs/report.html">Design report</a><a href="../docs/agent-protocol.html">Agent protocol</a><a href="../docs/verification.html">Verification</a></nav>
+<main><h1 id="architecture">Architecture</h1>
+<p>Fern is a single TypeScript repository with a browser-independent
+simulation. Its solo physics playground uses the official Rapier2D
+JavaScript/WASM package behind a local adapter. There is no imported
+game engine, scene editor, rendering framework, artwork pack or audio
+pack. Adventure actors use Rapier in solo and host-authoritative co-op;
+ambient wildlife uses an explicit regional movement owner. Guests
+consume complete physical replicas without allocating or solving a
+Rapier world per frame.</p>
+<pre class="text"><code>JSONL / browser commands ─── AgentRuntime ─── Simulation (60 Hz)
+                                                │
+                           World generation ────┤
+                           Spatial hash/physics ┤
+                           Quest and players ───┤
+                           Adventure/builds ────┤
+                                                │
+                      checkpoints/replays ◄─────┼────► binary network snapshots
+                                                │
+                                Canvas 2D ◄─────┴────► procedural Web Audio</code></pre>
+<h2 id="ownership-and-modules">Ownership and modules</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Module</th>
+<th>Owns</th>
+<th>Must not depend on</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src/engine/math.ts</code></td>
+<td>Integer coordinate hashes, smooth noise, checksums</td>
+<td>DOM, network, wall-clock randomness</td>
+</tr>
+<tr>
+<td><code>src/engine/world.ts</code></td>
+<td>Seeded terrain, tile patches, bounded chunk cache</td>
+<td>Camera, renderer, mutable RNG</td>
+</tr>
+<tr>
+<td><code>src/engine/physics.ts</code></td>
+<td>Spatial buckets, circle impulses, static contacts, swept
+substeps</td>
+<td>Game UI or audio</td>
+</tr>
+<tr>
+<td><code>src/physics/bootstrap.ts</code></td>
+<td>Shared async Rapier initialization, readiness and caller
+cancellation</td>
+<td>DOM, network</td>
+</tr>
+<tr>
+<td><code>src/physics/runtime.ts</code></td>
+<td>Rapier world/queue, stable body IDs, solved transforms, contacts and
+validated playground snapshots</td>
+<td>DOM, renderer, transport</td>
+</tr>
+<tr>
+<td><code>src/physics/policies.ts</code></td>
+<td>Validated land/area/region profiles, revisions, transaction queue,
+resolution and provenance</td>
+<td>DOM, Rapier handles, transport</td>
+</tr>
+<tr>
+<td><code>src/app/physics-ui.ts</code></td>
+<td>Solo lab controls and real body/collider drawing</td>
+<td>Ownership of Rapier handles</td>
+</tr>
+<tr>
+<td><code>src/engine/simulation.ts</code></td>
+<td>Fixed-step state, NPC arrays, players, shared quest,
+checkpoints</td>
+<td>Browser or transport</td>
+</tr>
+<tr>
+<td><code>src/engine/agent.ts</code></td>
+<td>Validated commands, observation and replay</td>
+<td>Browser or filesystem</td>
+</tr>
+<tr>
+<td><code>src/game/content.ts</code>, <code>skills.ts</code>,
+<code>loot.ts</code></td>
+<td>Area recipes, modular registries, skill gates and item rolls</td>
+<td>DOM, transport, mutable RNG</td>
+</tr>
+<tr>
+<td><code>src/game/adventure.ts</code>, <code>validation.ts</code></td>
+<td>Combat, AI, mechanics, progression, town services and bounded state
+validation</td>
+<td>Browser, rendering or wall clock</td>
+</tr>
+<tr>
+<td><code>src/net/protocol.ts</code></td>
+<td>Bounded packet validation and binary snapshots</td>
+<td>PeerJS, DOM</td>
+</tr>
+<tr>
+<td><code>src/net/coop.ts</code></td>
+<td>Connection lifecycle, host authority, input and snapshot
+delivery</td>
+<td>World generation decisions</td>
+</tr>
+<tr>
+<td><code>src/render/</code></td>
+<td>Camera, interpolation, culling, terrain caches, procedural
+sprites</td>
+<td>Simulation ownership</td>
+</tr>
+<tr>
+<td><code>src/audio/</code></td>
+<td>Pure sample synthesis and browser playback adapter</td>
+<td>Simulation timing decisions</td>
+</tr>
+<tr>
+<td><code>src/main.ts</code></td>
+<td>Input, UI, frame accumulator and adapters</td>
+<td>New physics rules</td>
+</tr>
+<tr>
+<td><code>tools/</code></td>
+<td>JSONL entry point, reproducible asset exporters, benchmarks</td>
+<td>Hidden editor state</td>
+</tr>
+</tbody>
+</table>
+<h2 id="coordinate-and-time-model">Coordinate and time model</h2>
+<p>One world unit is one base-art pixel. Tiles are 16 units and chunks
+are 16×16 tiles. Collision and simulation coordinates use world units.
+Tile brush coordinates explicitly use tiles, so <code>tx:10</code>
+starts at world x=160. The nominal world square spans ±16,000,000 units;
+bodies are clamped slightly inside that bound. Chunk coordinates use
+mathematical floor, including negative positions.</p>
+<p>Simulation targets 60 fixed ticks per second. Browser frame deltas
+feed an accumulator capped at five ticks, with a maximum accepted frame
+delta of 100 ms. A measured 12 ms stepping budget chooses one to five
+ticks per frame, keeping controls responsive under heavy populations.
+Overload slows simulation rather than inventing a variable timestep or
+accumulating an unbounded backlog; settings and benchmarks expose actual
+simulation ticks/second as well as rendered FPS. Frame interpolation is
+presentation-only. Node tools advance an explicit tick count. Float64
+positions preserve precision over large travel distances. Velocities
+live in Float32 arrays. Determinism is verified in the supported
+Node/Chrome environment; bit-identical trigonometry across unrelated
+JavaScript engines is not promised.</p>
+<h2 id="streaming-and-lifetime">Streaming and lifetime</h2>
+<p>Terrain is a pure function of seed and tile coordinates, with a small
+validated patch layer. Request order cannot change content. The
+simulation’s LRU retains at most 1,024 chunks; each chunk contains three
+256-byte arrays for terrain, decoration and variant. That is 768 KiB of
+raw tile data at capacity, excluding map/object overhead. Drawing
+retains at most 96 256×256 terrain canvases (24 MiB of uncompressed RGBA
+pixels, excluding browser overhead). If too many chunks would be visible
+for that cache, rendering selects a coarse terrain representation
+instead of thrashing it.</p>
+<p>NPC storage is a fixed pool of 65,536 slots. Positions, previous
+positions, velocities, species, attunement and generation use typed
+arrays. Each creature slot has a stable party anchor. Populations above
+8,192 per occupied party region expand their spawn radius with the
+square root of population, avoiding an ever-denser physics hotspot.
+Nearby travelers share a region for density budgeting; additions
+distribute across party anchors. Recycling distance is the larger of
+2,200 units or 1.7× the spawn radius, with work staggered over 60 ticks.
+Generation increments and placement is deterministic. This is
+active-world population streaming, not a persistent biography for every
+creature in the coordinate space.</p>
+<p>Collected crystal coordinates, lit beacons and terrain patches
+survive unloading and checkpointing. The edited-tile layer has an
+explicit 2,048-tile limit. There is no global ever-growing cache of
+terrain or sprite objects.</p>
+<h2 id="physics-and-creature-behavior">Physics and creature
+behavior</h2>
+<p>The spatial hash uses fixed head/next/cell arrays, 24-unit cells, and
+a power-of-two bucket count scaled to capacity (131,072 buckets for
+65,536 slots). Neighbor queries verify cell coordinates after hashing,
+preventing collisions in the hash table from returning unrelated or
+duplicate cells. Contact traversal follows deterministic ID and
+distance-tier rules. Circle response includes inverse-mass separation
+and an impulse with restitution. Players also collide with one another.
+Creature encounters are intentionally non-blocking for travelers; pulses
+provide the physical interaction with wildlife.</p>
+<p>Static collision handles deep-water tile rectangles, tree trunks and
+rocks. Motion is subdivided according to distance and radius, so a fast
+dash cannot skip a one-tile wall. Shallow water reduces player speed.
+Dash consumes spirit and has a cooldown; spirit regenerates. Pulse
+applies radial forces and attunes nearby wisps once per active lifetime.
+Combat adds separate enemy/player and enemy/enemy contacts, stagger,
+knockback and dodge invulnerability; ambient wildlife remains
+non-blocking.</p>
+<p>Creatures within 420 units of a player retain full-rate steering and
+contacts. Far steering runs every fourth tick. Above 8,192 total
+creatures, distant static and creature contacts run every eighth tick;
+below that threshold, static contacts run every fourth tick and creature
+contacts run every tick. All positions integrate each fixed tick. Thus
+distant contact frequency is nominally 7.5 Hz at large populations,
+while nearby gameplay retains 60 Hz physics when the machine sustains
+the target tick rate. Wisp drift, beetle wandering and deer avoidance
+use deterministic functions of tick, seed and ID. No simulation decision
+reads real time.</p>
+<h2 id="adventure-and-modular-content">Adventure and modular
+content</h2>
+<p><code>Simulation.adventure</code> owns the complete run and advances
+after player movement on the same fixed tick. Its state includes every
+hero’s XP, level, gold, skill ranks, equipment, inventory, timed buffs,
+health, flasks and cooldowns; it also includes all encounter actors,
+projectiles, loot, mechanics, delayed effects and event counters. Saves
+and replay hashes cover these fields. Skill points plus allocated ranks
+must equal level plus two. Derived stats recompute from base growth,
+skill ranks, equipped affixes, legendary powers, timed buffs and live
+tuning.</p>
+<p>The first eight recipes introduce one named mechanic each. Subsequent
+recipes combine a signature mechanic with secondary mechanics and
+explicit effect links. No gate requires a mechanic activation: regular
+kills summon the warden and its death unlocks travel. Six AI behaviors
+choose pursuit, charging, ranged fire, orbiting, summoning or guarding,
+with telegraphed windups and per-enemy seeded parameters. Bosses add
+rotating attacks and a half-health phase change. Melee has a three-hit
+combo; Whorl, Thornlance and Bloom Nova have independent
+costs/cooldowns. Echo effects preserve the original ability and aim
+across checkpoint continuation.</p>
+<p>Each land contains a town and four connected encounter clearings.
+Generated layout rules alter terrain/obstacles while retaining entrances
+and exits. All four clearings stay stable while traveling in that land.
+Completing its fourth area opens the next town; the new land changes
+seed and returns actors to local coordinates. There is no ever-growing
+scene graph. Positive safe-integer area indices select recipes; power
+grows linearly early and logarithmically later. The generator has no
+authored ending, but finite numeric ranges and finite registries, rather
+than a claim of mathematically infinite unique content.</p>
+<p>Combat holds at most 100 live enemies (plus brief fading corpses),
+180 projectiles, 150 drops, 96 recent events, 256 delayed effects and 40
+items per hero. The skill tree has 48 nodes and repeatable mastery;
+hero/item levels are capped at one million. XP/gold magnet toward
+players; equipment pickup requires interaction, ahead of nearby optional
+mechanics or portals. Town services restore resources, sell
+deterministic stock, buy spare gear and refund skill ranks for gold.
+Death retains the build and charges 10% gold. A solo/all-dead party
+returns to town; a fallen guest with living teammates revives
+individually at the trailhead.</p>
+<p>Solo modal dialogs and the atlas pause fixed stepping without
+clearing a separately requested lab pause. Online menus leave the host
+clock running. Recall requires 150 uninterrupted ticks; movement and
+incoming damage cancel it. Difficulty and the six damage/health/speed
+multipliers are validated authoritative actions, so headless tests and
+browser controls tune the same system.</p>
+<h2 id="rendering-and-assets">Rendering and assets</h2>
+<p><code>monsterPixels()</code> shares six articulated skeletons between
+runtime and SVG export. Seeded proportions, five theme palettes, five
+poses and sixteen frames per pose produce readable silhouettes without
+independent opaque art files. Windups lift limbs before their
+corresponding damage frame; attack, hurt, walk and idle use different
+geometry. Boss scaling, glowing cores, death collapse, shadows, slash
+arcs, elemental effects and additive light share the same colors. The
+original wayfarer sprite remains intact beneath its sword, dodge trail
+and damage feedback. Town NPCs combine the existing humanoid recipe with
+role-specific props and gestures.</p>
+<p>The monster image cache holds at most 512 canvases. Combat event
+effects derive from authoritative ticks while their smooth interpolation
+remains presentation-only. Ambient wildlife inside a live encounter’s
+clearing is hidden to preserve visual clarity. Combatants, projectiles,
+loot and mechanics sit outside the ambient view cap. Sound adds slash,
+impact, hurt and level cues with a 24-voice cap, per-effect rate limits
+and a compressor.</p>
+<p>Canvas 2D draws cached terrain, then sorts visible
+props/creatures/players by their ground y-coordinate. Tree canopies fade
+when they obscure the local traveler. High-detail sprites come from
+rectangle recipes, with eight generated poses and species-specific
+walk/bob motion. At distant zoom levels, creatures become readable
+colored marks. Zoom spans 0.08× to 5× (62.5:1). The minimap and atlas
+sample the same world function; they do not maintain a second map
+model.</p>
+<p><code>spritePixels()</code> supplies both the Canvas sprite cache and
+the SVG exporter. Custom palettes and recipes are validated.
+<code>synthesize()</code> supplies both browser audio buffers and PCM
+WAV export. Audio includes seeded noise, pitched pulses, a rising beacon
+chord and an eight-second ambient harmonic/arpeggio loop. Audio timing,
+fog/motes and lighting never alter simulation state. Fonts are the only
+third-party visual assets, bundled with their OFL licenses.</p>
+<p>Presentation settings independently bound the circular draw radius
+(256–16,384 units) and visible creatures (0–65,536).
+<code>EntityVisibility</code> intersects camera bounds and distance,
+then uses stable distance bands to prioritize nearer entities under a
+cap. Travelers and landmarks are outside the creature budget. Terrain
+beyond the radius is covered by fog. Overview terrain is cached until
+its sampled bounds or world revision changes. Distant creatures
+rasterize into one reusable RGBA image and composite once per frame;
+this replaces up to 65,536 separate Canvas calls. Near views still draw
+the original animated sprites.</p>
+<p><code>GameDisplay</code> requests native fullscreen on the document
+root, preserving dialogs in the fullscreen top layer. CSS removes
+workspace navigation, the editor sidebar and footer, and supplies
+compact game controls, performance readout, map and abilities. Native
+fullscreen exits, Escape and the explicit exit button restore the
+workspace. A rejected or unsupported request retains usable
+window-filling game mode. The responsive HUD supports touch and short
+landscape viewports. Quality preferences use a small validated
+localStorage record. World checkpoints use atomic IndexedDB transactions
+so large worlds with edits do not compete with that string-storage
+quota; legacy version-1 localStorage saves remain readable.</p>
+<h2 id="online-co-op">Online co-op</h2>
+<p>One browser owns simulation. Up to seven browsers connect to it
+through PeerJS/WebRTC data channels. PeerJS Cloud is the default
+rendezvous service; <code>tools/signal.ts</code> provides a self-hosted
+alternative. The same build supports optional ICE configuration. There
+is no Vercel function pretending to maintain a persistent WebSocket
+process.</p>
+<p>Guests send input at approximately 30 Hz. The host clamps input,
+enforces monotonically increasing sequence numbers, limits acceptance
+rate, and clears stale input after 300 ms. Guests do not supply
+authoritative positions, shard counts or quest completion. The host
+sends snapshots at approximately 10 Hz and skips sending when a data
+channel is congested. Each guest supplies a bounded camera center,
+radius (256–16,384) and creature limit (0–65,536), so network interest
+matches local view settings. Changing guest quality cannot alter the
+host’s population or another guest’s budget.</p>
+<p>Each visible NPC costs 16 bytes: ID, species, attunement, relative
+float positions and quantized velocities. JSON metadata contains
+players, seed/tick, quest, nearby collected resources, patches and
+recent effects. Relative float encoding retains subpixel detail far from
+the origin. Total packet size, counts, values and enum ranges are
+validated before state mutation. Both ArrayBuffer and reassembled
+Uint8Array delivery are supported and regression-tested.</p>
+<p>Wire protocol <strong>5</strong> uses a separate version-2 physical
+channel described below. The bounded observational packet helper remains
+available for tools/tests: up to 65,536 compact ambient records plus
+512,000 metadata bytes (1,560,584 bytes total). It is not a complete
+physical checkpoint or the co-op replication channel. Co-op carries the
+complete selected ambient pool, all physical bodies and all party
+builds; renderer view budgets remain local. Older room clients receive
+an explicit physics-protocol refresh message. Outer checkpoints are
+version 2, with explicit version-1 game/playground/adventure migration.
+Replays belong to their recording engine revision.</p>
+<p>Reliable adventure RPCs carry monotonically increasing action
+sequences. The host supplies player identity, validates skill
+prerequisites, stock, gold and item ownership, and acknowledges success
+or errors. Only the leader may change shared travel, difficulty or the
+run. Guest movement, aim and combat buttons still use the ordinary input
+stream. XP/gold pickups reward each party member with their own
+modifiers; gear belongs to its collector. Joining initializes a catch-up
+build for that room; no account persistence is implied. Disconnect
+rekeys the local hero and owned effects for solo continuation.
+Enemy/projectile/player interpolation uses prior snapshot positions, but
+a changed run or portal transition snaps all actors to their new
+land.</p>
+<p>Guests interpolate snapshots. They do not run a competing simulation
+or deterministic network lockstep. The host’s open, active tab is a
+requirement; host loss ends the shared room, resets input and leaves
+guests with a solo copy. There is no automatic host migration,
+anti-cheat guarantee or server-side account ownership. NAT/firewall
+reachability may require a TURN relay. The default is suitable for
+invited cooperative play, with stronger deployment requirements
+documented separately from local verification.</p>
+<h2 id="agent-contracts">Agent contracts</h2>
+<p>Agents can inspect state without a screenshot, advance time without
+waiting, author terrain without a GUI and compare deterministic results
+without guessing. Every accepted mutating command can be recorded.
+Replays contain an initial versioned checkpoint and an ordered command
+list; adjacent idle simulation steps are coalesced. A final checksum
+verifies the result. Checksums are non-cryptographic and quantize
+numbers to a thousandth; exact checkpoint continuation also has a
+full-state equality test.</p>
+<p>Solo browser recording covers gameplay inputs and simulation
+advancement. Online recording is disabled because guest input arrives
+asynchronously through a different authority. When the session becomes
+solo, recording starts from the received checkpoint. CLI checkpoints
+preserve all players; browser loads choose one local traveler and resume
+solo. The browser lab is a QA console, not an editor that future agents
+must operate.</p>
+<h3 id="join-lifecycle">Join lifecycle</h3>
+<p>A guest repeats its hello until the host’s welcome arrives. The host
+admits an already-open native channel idempotently, binds the traveler’s
+physical body once at admission and answers repeated hellos with a
+rate-limited welcome only; a population-sized rebind per hello
+previously starved every channel during a late join. A transient failure
+during admission recreates the connection, with handshake timeouts of 6,
+10 and 22 seconds across at most three attempts. Explicit
+full-room/version rejection and invalid snapshots are not retried.
+Generation and request identifiers prevent callbacks from canceled
+attempts from mutating a new session. The native connection still
+carries every byte; no test substitutes a fake transport.</p>
+<h2 id="m01-physics-foundation">M01 physics foundation</h2>
+<p>Await <code>initializePhysics()</code> from
+<code>src/physics/bootstrap.ts</code> before constructing, restoring or
+replaying a <code>Simulation</code>. Browser boot, all direct Node tool
+entry points, headless tests and browser replay tests use this explicit
+barrier. Importing engine modules still requires no DOM, GPU or network.
+The compatibility package embeds WASM; initialization does not fetch a
+separate WASM URL. Failed browser boot displays an error with reload
+guidance. Canceling one initialization waiter does not cancel another;
+no world exists until a ready caller explicitly opens a scene.</p>
+<p><code>Simulation.playground</code> is null by default.
+<code>physics/reset</code> is the temporary development selector that
+opens its ten-body recipe. Rapier exclusively owns those poses, with
+zero global gravity, 16 Fern units per physics unit and one synchronous
+1/60-second step per simulation tick. Commands apply between ticks;
+impulses take effect on the next solve. No legacy integration writes
+playground bodies. <code>physics/close</code>, reset, restore, failed
+replay and browser replacement dispose the superseded world and event
+queue. <code>Simulation.dispose()</code> is idempotent. Caller-owned
+simulations returned by <code>replay()</code> must be disposed by the
+caller.</p>
+<p>Version-1 game checkpoints optionally contain a
+<code>playground</code> member: M01 wrote version 1; M02 writes version
+2 and imports M01 snapshots. It preserves pinned backend version, unit
+scale, tick, stable body IDs with body/collider handles, recipes,
+snapshot bytes/checksum and bounded contact history. Version 2 also
+preserves policy documents, queued edits and applied body state. Restore
+validates lengths, byte values, identity uniqueness, registry/world
+correspondence, shapes, body properties and finite solved state;
+rejected restores preserve the current simulation. Same-build tests
+compare full solved continuation and replay hashes. Raw backend
+snapshots are version-specific and are not a cross-version migration
+format. The development lab explicitly limits command/checkpoint bodies
+to 4,096 and binary snapshots to 4 MB; this is neither an ambient
+physics budget nor an adaptive cutoff.</p>
+<p>The Canvas playground draws solved positions/angles and Rapier’s
+collider lines, with contact impact audio through the existing synth. It
+remains a separate solo laboratory; M04 synchronizes the playable
+adventure scene. Opening a room while a scene exists is rejected before
+altering the scene; opening a scene during an online or connecting room
+is also rejected. The room rejects a standalone playground before
+admission; shared props belong to the adventure scene. Eight actual
+browser clients continue to exercise the ordinary adventure
+protocol.</p>
+<h2 id="m02-regional-policies">M02 regional policies</h2>
+<p><code>src/physics/policies.ts</code> owns a validated version-1
+policy document with authored/current land, area and region profiles,
+live overrides, master switch, boundary margin, applied revision and a
+revision-reserving queue. <code>PhysicsWorld</code> validates
+transactions against every body’s area binding, commits them before each
+step, and resolves the center sampled at that boundary. Explicit paused
+apply commits without stepping. Profiles resolve before live overrides;
+specificity, region priority and stable ID determine per-value
+provenance. Master-off gates optional features absolutely. See <a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/POLICIES.md#m02-delivered-contract">exact
+semantics</a>.</p>
+<p>Only world reactions, dynamic props, prop blocking and commanded
+impulse strength are implemented controls. Prop freezing changes Rapier
+body type to fixed at the current pose, discarding velocity, force and
+torque. Waking performs stable pairwise separation before switching to
+dynamic, with zero motion. Unresolved placement remains visibly frozen.
+Real interaction groups preserve essential terrain/prop contacts and
+independently toggle prop-to-actor contacts. A dynamic lab contact
+traveler demonstrates this behavior; it is separate from the adventure
+motor, which remains M03.</p>
+<p>Playground version-2 snapshots retain complete policies/pending
+transactions, tick-start membership/position samples, applied
+values/provenance, frozen and blocked state, lab drive intent and
+validated consequence fields. Binary restore verifies body type, contact
+groups and zero frozen motion, plus resolver consistency at the saved
+sample. It does not resample an end-of-tick region crossing before the
+next boundary. Invalid loads retain the existing simulation.
+<code>{destroyed,claimed,durability?}</code> fields survive controls;
+the lab still has no destruction system (M05 implements adventure
+scenery destruction below).</p>
+<p>The lab UI and agent use the same configure/apply/place/drive
+operations. Only collider/region overlays persist in localStorage;
+policies live in simulation checkpoints and replay hashes. These
+historical M02 save formats migrate explicitly through the M04 contract
+below.</p>
+<h2 id="m03-adventure-motion-and-terrain">M03 adventure motion and
+terrain</h2>
+<p><code>Simulation.physical</code> owns one
+<code>AdventurePhysics</code> land registry.
+<code>src/physics/runtime.ts</code> keeps Rapier handles private; stable
+player/enemy/ambient IDs refer to locked-rotation dynamic circles. The
+motor saves desired velocity, controlled velocity, external velocity,
+acceleration, recovery, stagger deadline and dash contact phase. Walking
+acceleration is bounded at 6,000 units/s²; dash/charge bursts use a
+120,000 units/s² bound for immediate authored motion. Player/enemy
+smoothing is 0.18/0.1 per tick. External velocity recovers at 6/s and
+survives subsequent control/AI updates. Motor values use Rapier’s float
+precision; gameplay facing remains separate. Exact same-build Node and
+browser replays are tested within their own runtime; unrelated runtime
+trigonometry is not a bit-identity contract.</p>
+<p>Tick order: commit policy transactions and regional ownership at the
+boundary; synchronize actor lifecycle and occupied terrain; sample
+controls/AI and issue combat impulses; update newly spawned
+actors/terrain; solve Rapier once; publish solved poses/velocities to
+the existing render/observation arrays. Contacts are telemetry only at
+this stage. Authored hit damage, charge checks, rewards, projectiles and
+existing area mechanics remain gameplay-owned. No new impact damage,
+destruction, materials, joints or ragdolls are claimed. The legacy actor
+<code>moveBody</code>/<code>collideCircles</code> paths run only under
+the explicit online rollout selector; ambient-owned wildlife keeps its
+established integrator and never collides through both solvers.</p>
+<p>Interaction memberships distinguish terrain, props, players,
+monsters, bosses, NPCs, ambient creatures, loot and sensors.
+NPC/loot/sensor bits reserve the later role contracts; physical loot and
+sensor mechanics are not implemented. Actors always use essential
+obstacle CCD. Dash disables actor contacts while preserving terrain and
+permitted prop contacts. <code>sweptCollision</code> changes actual prop
+CCD. Crowd/prop contacts require both participants’ effective
+permission.</p>
+<p><code>src/physics/terrain.ts</code> samples seed plus validated tile
+patches directly: deep water becomes a 16×16 rectangle; trunks/rocks
+become radius-4/5 circles at the existing ground anchors. Keys contain
+land/run and tile/object identity. Occupied chunks include a safety
+margin around active actors, physical ambient participants and all
+persistent props, independent of cameras and renderer cache eviction.
+Changes replace affected runtime recipes at a command boundary.
+Canonical chunk/ID removal order preserves same-build continuation after
+crossings and restore. The adapter retains the finite world
+boundary.</p>
+<p>Land bindings are <code>land-&lt;run&gt;-&lt;land&gt;</code>,
+<code>town</code>, <code>wilderness</code>, and
+<code>area-&lt;index&gt;</code>. Each of the land’s four clearings has a
+quiet rectangle and reactive circle, inspectable/editable through the
+same policy system. The reactive circle opts ambient creatures into
+physics; an area/land live override can enable the entire selected
+population. There is no interest/FPS eligibility cap. Slot/generation
+and tick-start membership/position samples persist. Off removes the body
+and returns its solved pose/velocity to ambient steering; on creates
+exactly one body at that pose. Ordinary population recycling retains its
+explicit generation change. Physical participants render in normal
+encounters rather than being hidden with decorative wildlife.</p>
+<p>Ownership is re-evaluated for every selected creature on every tick.
+<code>PolicyController.resolve</code> memoizes per immutable policy
+state: only region containment, with its hysteresis margin, is evaluated
+per position, and every creature in the same area and ordered region set
+shares one frozen result. <code>adventureAreaAt</code> caches each
+land’s four area footprints, and samples are updated in place. These
+caches hold derived values only; they are not saved or replicated, and a
+state-hash comparison against the uncached path is identical.</p>
+<p>Four crates and a wheel per clearing are real optional props visible
+in ordinary play. Same-land recall/travel retains them. Outward travel
+archives old-land prop poses/motion, consequences, policies and tile
+patches; debug/save return restores mutations. The session master
+remains absolute across land changes. A new run clears the old run’s
+archive.</p>
+<p>M03 wrote outer save version 1. Its <code>actorPhysics</code> version
+1 includes backend/land identity, world snapshot v3, occupied chunks,
+ambient ownership samples, navigation/stuck recovery, land archives,
+applied transition and pending terrain boundary. Gameplay transitions
+pending the next physics boundary remain explicit; synchronized actor
+poses must match the game envelope. Restore validates binary mappings,
+shapes, mass, locked rotations, collision masks, freeze state, policy
+provenance, ownership and terrain recipes before replacing the old
+simulation. Legacy saves without this member get fresh physics while
+retaining progression; pre-M03 playground v2 imports explicitly.
+<code>PhysicalEntityState</code> defines stable IDs, land/area,
+blueprint revision/shape, solved pose/velocity, status, consequences and
+membership for M04. It is not a replicated wire section yet.</p>
+<p>M04 removes M03’s legacy co-op rollout selector after actual
+transport verification. Hosts solve the same physical adventure scene as
+solo. Guest commands inspect received bodies/policies; shared body
+editing and scoped policies are host-only. The standalone playground
+stays separate from a room’s adventure.</p>
+<p>Paused tile edits save the old valid collider registry plus an
+explicit pending-terrain flag. Restore retains that boundary and
+rebuilds from the saved seed/patch recipes before the next motion step;
+it neither rejects a legitimate unstepped brush nor publishes new
+movement against stale obstacles.</p>
+<h2 id="m04-saves-replication-and-recovery">M04 saves, replication and
+recovery</h2>
+<p>Outer saves write <strong>2</strong>, adventure physics envelopes
+<strong>2</strong>, and both lab/adventure worlds <strong>4</strong>
+(policy documents remain <strong>1</strong>). Each physical entry
+retains a stable ID/blueprint, solved position/angle/linear and angular
+velocity, sleeping/frozen/blocked/CCD state, applied policy and
+tick-start sample, complete actor intent/controlled/external motor state
+and handle mapping. Saves also retain policies and accepted queues,
+contacts, ambient slot/generation/owner samples, navigation, applied
+transition, pending terrain boundary, land
+archives/patches/consequences, complete builds, progression, delayed
+combat work and bounded observation events (excluded from replay
+hashes). No M05 destruction or reactions are introduced.</p>
+<p>Normal saves include checksummed Rapier bytes and backend
+<code>0.21.0</code> for exact same-build continuation. World v4 declares
+<code>continuation: snapshot|rebuild</code>; an incompatible backend
+version or deliberate portable checkpoint uses the complete semantic
+rebuild. The rebuild restores every saved body, motor, policy
+sample/queue, collider groups, CCD and sleeping state; it does not reset
+props or heroes. Same-build raw continuation is exact. Rebuild rotation
+can drift below 0.00001 radians due to Rapier’s rotation representation;
+solver contact caches are re-created, so subsequent physical
+trajectories use outcome tolerances. Gameplay facts remain exact.
+Corrupt compatible bytes are rejected, not silently replaced with fresh
+content. Original M01 v1 and M02 v2 lab bytes, M03 adventure v1/world
+v3, and pre-physics version-1 games import explicitly; old version-1
+co-op legacy/replica flags migrate into fresh authoritative physics with
+unchanged builds/terrain; only content absent from an old save receives
+defaults.</p>
+<p><code>validateSave</code>, <code>validatePhysicsSnapshot</code> and
+semantic terrain validation reject invalid identities, motor/policy
+facts, pose mappings, seed/land bindings and recipes before allocating a
+new solver or publishing a replica. Compatible raw restore additionally
+validates binary shape, body properties, groups and registry
+correspondence. <code>Adventure.configureTerrain</code> shares seeded
+region configuration with validation. Pending terrain saves keep the
+previous collider boundary until the next tick, as in M03.</p>
+<p><code>src/net/physical.ts</code> owns physical wire
+<strong>2</strong>, separate from the observational JSON header. A
+<code>physical-start</code> manifest names sequence, scene revision,
+compressed and expanded UTF-8 lengths, chunk count and checksum.
+<code>physical-chunk</code> payloads are at most <strong>48,000
+bytes</strong>; compressed and expanded transfer lengths are explicitly
+bounded at <strong>256,000,000 bytes</strong> each. Native gzip streams
+preserve every semantic fact; bounded inflation rejects over-expansion
+before scene allocation. The payload includes a complete portable save
+and reliable scene/spawn/remove/policy lifecycle events. Every selected
+ambient creature and physical body is carried. A scene exceeding that
+bound reports an export/checkpoint-loading error; no body is clipped.
+One complete frame build serves every recipient. At most one build runs
+at a time, builds are spaced by twice their measured cost (at least 100
+ms, the nominal 10 Hz cadence), and each guest receives the newest frame
+above its acknowledgement floor. A traveler’s floor starts at admission,
+so it never receives a frame built before its body existed; an accepted
+action forces a frame built after it. Sending waits for
+acknowledgement/backpressure without altering host simulation or
+physical eligibility. Large scenes may transmit at less than the nominal
+10 Hz cadence.</p>
+<p>One receiver stages chunks, accepting equal duplicates and any chunk
+order after its manifest. Missing chunks leave the previous complete
+scene intact. Conflicting duplicates, invalid counts/lengths,
+checksum/schema corruption and old sequences cannot publish a partial
+world. A new transfer supersedes unfinished staging; a guest reports
+<code>physical-staged</code> once every chunk is held, before its
+decode. The host never resends a staged transfer and resends an unstaged
+one, with the same immutable sequence/payload, only after 10 seconds
+without sending. Chunks refill to 256 KiB of native buffered data
+whenever the channel drains below 64 KiB or the host updates, and
+respect PeerJS buffering (a 1 MiB refill starved a loaded host’s
+admission of new connections). Already committed duplicates receive
+acknowledgement. Valid transfer traffic, and after the welcome an
+in-order host heartbeat, refreshes join progress, so loading a large
+baseline does not spuriously close a working channel. Connected guests
+also receive the 1 Hz host heartbeat: a loaded host can process
+acknowledgements seconds late, so liveness does not depend on them. A
+guest continues solo only after 10 seconds without any host frame, chunk
+or heartbeat. The manifest precedes chunks on the reliable channel. Both
+PeerJS ArrayBuffer and Uint8Array chunk forms are supported. First
+baseline publication/acknowledgement precedes guest interactions. A
+pending join retains its old local scene until a complete host baseline
+replaces it.</p>
+<p><code>Simulation.applyReplica</code> validates then reuses game
+arrays/world state, retains the complete semantic scene and interpolates
+prop position and shortest-path angle. Guests never step authoritative
+physics or allocate a Rapier world per snapshot. Changed
+seed/run/transition/land snaps players, enemies, projectiles and props.
+Physical ambient ownership is visible to rendering independently of
+camera budgets. Full party inventories are present in the complete
+replicated checkpoint; the observational packet helper can still omit
+other travelers’ unequipped items.</p>
+<p><code>interact-physics</code> /
+<code>window.fern.network.interact</code> request an impulse to an
+existing movable prop within <strong>96 units</strong>. The host
+supplies the connection’s player identity, rejects unknown/extra fields
+and non-props, bounds each impulse component to <strong>±120</strong>,
+and bounds optional application points to <strong>32 units</strong> from
+the prop. Frozen-region impulses are discarded. Guests have no
+configuration RPC; host UI/agent policy changes use M02’s revision
+queue. Normal guest movement/combat also runs through the host’s M03
+motor and contacts.</p>
+<p>Leave, host loss, canceled joins and browser loads preserve the
+received scene and the chosen traveler’s build. Recovery rekeys that
+player’s body and combat effects to <code>local</code>, removes departed
+actors/references before rekeying contact IDs, rebuilds a local solver,
+and frees replaced worlds/queues. Received ambient arrays preserve the
+actual selected population, even when a guest’s draw budget is small.
+The CLI’s <code>restore-file</code> parses expanded checkpoint files
+outside the unchanged 8 MB JSONL command limit; browser IndexedDB and
+JSON export retain complete saves.</p>
+<p>M04 release repair also keeps paused browser input stable until
+explicit input or resume. A distant teleport publishes Rapier’s solved
+Float32 pose to game state immediately, so legitimate paused saves do
+not contain contradictory coordinates. Version-1 co-op solver flags
+migrate to fresh physics initialized in the saved land after restoring
+game/terrain, avoiding unused initial worlds and phantom land
+archives.</p>
+<h2 id="m05-materials-and-destructible-scenery">M05 materials and
+destructible scenery</h2>
+<p><code>src/physics/materials.ts</code> registers wood, stone, metal,
+glass, cloth, vegetation, ceramic and volatile containers. One recipe
+sets density, friction, restitution, damping, resistance (damage removed
+per hit), vulnerability (multiplier), fracture burst speed, knockback,
+presentation feedback (<code>splinters</code>, <code>dust</code>,
+<code>shards</code>, <code>sparks</code>, <code>fibres</code>,
+<code>leaves</code>), colors and sound identity. Flammability and
+conductivity are recorded for M08; nothing reads them yet.
+<code>src/physics/blueprints.ts</code> defines thirteen families: crate,
+barrel, pot, log, loose stone, wheel, wagon, fence, glass pylon,
+lantern, tree, plus stump and debris pieces. Each family has its
+collider, motion, mass scale, toughness, one-time reward, authored
+fracture pieces and a named variant for each of the five land palettes
+(<code>townLand % 5</code>). The renderer draws different construction
+for each variant (iron-bound crates and spiked fences in Cinderwild,
+birch trees and logs in Pale Orchard, willow fronds in Glasswater), not
+a recolored box.</p>
+<p>A prop recipe carries <code>material</code> and
+<code>blueprint {family, palette, piece?, parent?, expiresAt?}</code>;
+both or neither are present. <code>consequences.durability</code> is the
+percentage remaining (100 intact, stages at 66.7/33.3/0) and is absent
+on stumps and debris. Every clearing gets its authored
+<code>CLEARING_LAYOUT</code>
+(<code>prop-&lt;family&gt;-&lt;area&gt;-&lt;n&gt;</code>, 16 per area,
+84 props per land including M03’s crates and wheel). A layout spot over
+solid terrain turns around the area center in fixed steps, keeping its
+distance from the mechanic ring. M03 crates/wheels keep their exact
+bodies and gain a wood blueprint.</p>
+<p>Gameplay owns damage. <code>Adventure.damageArea</code> (slash,
+Whorl, Nova, Bloom, Bramble, Rift and delayed effects) calls
+<code>AdventurePhysics.damageProps</code> after the unchanged enemy hit.
+Props are visited in stable ID order: a loose body in reach gets a
+material-scaled push through the normal impulse path (impulse strength
+and freezing apply); material damage is
+<code>max(0, damage - resistance) * vulnerability / materialDurability</code>,
+divided by family toughness. A non-positive result is a resisted hit.
+Thornlance projectiles do not hit scenery until M06’s projectile world
+collision. Contacts never damage props in M05, so resting or grinding
+pieces cannot destroy or reward anything.</p>
+<p>At zero durability <code>breakProp</code> removes the parent at this
+command boundary (never inside Rapier’s contact iteration), spawns its
+authored pieces and records a
+<code>DestroyedRecord {id, family, palette, material, x, y, angle, tick, owner, cause, reward, pieces}</code>.
+Piece IDs are <code>&lt;parent&gt;-&lt;kind&gt;</code> with
+<code>blueprint.parent</code>. Layouts tile the parent’s footprint with
+gaps, so no fracture starts interpenetrated; seeded variation lives in
+burst speed and spin. Pieces inherit the parent’s velocity plus an
+outward material burst; a tree uses the hit direction, leaving a fixed
+stump and a dynamic log that falls away from the attacker. Every piece
+is a gameplay solid. Particles, cracks, sway and shake are
+presentation-only. The parent’s ID can never return: validation rejects
+a body or archived prop with a destroyed ID, so a later hit, save,
+recall, migration or replica cannot re-create or re-reward it.
+<code>Adventure.propEffects</code> turns each new record’s reward
+(<code>round(base * (1 + min(area, 500) * 0.13))</code>) into one party
+gold drop and emits bounded <code>impact</code>/<code>break</code>
+observations.</p>
+<p>Policies add <code>destruction</code> (effective only with world
+reactions; master-off is absolute), <code>materialDurability</code> and
+<code>debrisLifetime</code>. Destruction off keeps existing durability
+and broken state and reports a protected hit. Dynamics off freezes
+pieces at their pose; a break in a frozen region spawns frozen pieces.
+Neither switch reconstructs a parent. A positive lifetime stamps debris
+(not stumps, logs or wheels) with
+<code>expiresAt = tick + seconds * 60</code> at break time;
+<code>begin()</code> removes due debris in sorted ID order before the
+boundary. Zero keeps debris for the scene. Quiet and Sanctuary disable
+destruction; Wild uses 0.6× toughness.</p>
+<p>Adventure envelope <strong>3</strong> adds <code>destroyed</code> and
+per-archive <code>destroyed</code>; physical world <strong>5</strong>
+carries material/blueprint recipes; room protocol <strong>6</strong>
+(physical wire 2 unchanged) because older clients cannot validate them.
+Saves, recall archives, portable rebuilds and replicas carry the same
+records, pieces and durability. M04 envelopes (v1/v2, world v4) migrate:
+policy samples re-resolve with the new defaults after confirming every
+M04 field is unchanged, legacy crates/wheels and archived props gain
+wood blueprints with pose key order preserved, and absent clearing props
+are added once as fresh content to the active and archived lands.
+Validation requires world 5 for envelope 3. Real M04 checkpoints from
+<code>main</code> are test fixtures.</p>
+<p>Per-tick reads stay cheap with the larger scene. The post-step finite
+check reads Rapier values directly. Poses and saves copy recipes,
+policies, body entries and ambient samples structurally, with the same
+JSON as before. <code>stateHash</code> covers raw Rapier bytes through
+the snapshot’s checksum instead of serializing the byte array. Only
+movable props occupy terrain chunks. The M05 combat tick matches main’s
+with 2.5× the bodies, and <code>observe()</code> is cheaper than main’s
+(<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/evidence/physics-m05-tick.json">tick evidence</a>).</p>
+<p><code>src/render/props.ts</code> draws each family in its body frame
+(trees, pylons and lanterns upright), with land-palette construction,
+crack stages, frozen outlines, debris fade before expiry, a canopy/cloth
+sway driven by solved velocity and a short shake when durability drops
+(so replicas respond from received state). Sway rests where effective
+world reactions are off. Material particles and floating RESIST/KEPT
+labels come from replicated events. <code>src/audio/synth.ts</code> adds
+one deterministic voice per material plus a crumble for breaks.</p>
+<h2 id="m06-combat-forces-projectiles-and-physical-loot">M06 combat
+forces, projectiles and physical loot</h2>
+<p><code>src/game/interactions.ts</code> is the shared attack
+interaction specification. Each recipe names its team, query shape, prop
+impulse (units/s), torque, scenery material multiplier, scenery rule
+(cover, pierce, phase), pierce and ricochet counts. Slash combo stages,
+Whorl, Bloom Nova, Thornlance, dash, the Living Bastion bloom, area
+mechanics and delayed effects, enemy charges, enemy shots and
+launched-prop impacts all resolve through it. Gameplay still decides
+authored damage and rewards; a hero’s <code>force</code> and
+<code>shatter</code> stats scale only the physical part.
+<code>actors/attacks</code> exports the registry.</p>
+<p>Attacks reach scenery through
+<code>AdventurePhysics.damageProps</code>, which now applies the
+recipe’s impulse and torque and the material multiplier. It records the
+attacker as each pushed prop’s instigator, and <code>once</code> keys
+strike a prop at most once per charge. Fracture pieces inherit the
+launch velocity and the breaker’s ownership.</p>
+<p>Projectiles sweep their tick’s path with Rapier shape casts
+(<code>PhysicsWorld.castScenery</code>, via <code>sceneryHit</code>)
+against props and rooted terrain; deep water is not cover. Enemy shots
+stop at the first scenery and damage fragile cover. Thornlance breaks
+fragile material and flies on, spends a pierce on wood, and stops on
+stone, metal and stumps. With ricochets it reflects about the contact
+normal instead. <code>Projectile</code> records struck scenery and
+remaining ricochets; both are optional for older saves.</p>
+<p><code>src/physics/combat.ts</code> (<code>CombatPhysics</code>, owned
+and saved by <code>AdventurePhysics</code>) keeps instigators (owner,
+team, cause, expiry), pending impacts, per-pair suppression, holds and
+settled loot. Before each solve it drives held props toward the holder’s
+aim and samples props moving at 110+ units/s. After the solve it turns
+started contacts into pending impacts with team rules: party and unowned
+props hurt monsters, enemy props hurt heroes, and any prop hurts props.
+<code>Adventure.step</code> applies them at the next tick boundary
+through the ordinary <code>hit</code>, <code>damageHero</code> and
+<code>damageProps</code> paths, so kills, XP, gold, drops and procs
+happen exactly once. An unowned non-boss kill counts for the area but
+grants no credit or drops.</p>
+<p>Grab and release are acknowledged adventure actions validated on the
+host (reach 72, mass ≤ 8, dynamic and unfrozen, one holder). The drag
+target is the existing aim input. Held props carry a saved
+<code>held</code> flag that removes traveler contacts but keeps monster
+contacts, so a swung prop can hit enemies without shoving its holder.
+Throws use the aim, the hero’s force and the region’s impulse strength,
+and assign ownership.</p>
+<p>Loot drops get bodies <code>loot-&lt;id&gt;</code> (actor kind
+<code>loot</code>, meeting terrain and props only; props now accept loot
+contacts). They launch on their tick, bounce for 30 ticks, then the
+magnet removes gold/XP bodies and flies them to the traveler as before.
+Item drops stay physical until E. Resting drops on deep water, rooted
+decor or fixed scenery move to the nearest reachable tile; with physics
+off, drops are recovered immediately and remain collectible.</p>
+<p>Adventure envelope <strong>4</strong> adds the combat state. Physical
+world <strong>6</strong> changes prop collision filters, so v5 and older
+raw bytes restore through the semantic rebuild. Room protocol
+<strong>7</strong> carries the new actions. Real M05 checkpoints
+migrate.</p>
+<h2 id="m07-jointed-mechanisms-and-assemblies">M07 jointed mechanisms
+and assemblies</h2>
+<p><code>PhysicsWorld</code> owns assemblies and joints next to bodies.
+An <code>AssemblyRecipe</code> names its kind, area, declared root and
+members (each member’s <code>BodyRecipe.assembly</code> names it back);
+a <code>JointRecipe</code> connects two members as a hinge (revolute),
+fixed attachment, rope (tether), spring or slider (prismatic), with
+local anchors, optional limits, an optional motor, a
+<code>breakLoad</code> and a cut <code>toughness</code>. Each
+<code>JointEntry</code> keeps its Rapier handle while intact (−1 once
+broken), cut damage, latest and peak load, current motor and when/why it
+broke. Joints never re-form: disabling a feature, restoring or
+re-entering a land keeps every break.</p>
+<p><strong>Rapier usage.</strong> Joints are created with no wake-up and
+without any joint setter. Rapier queues setter wake-ups in a hash set
+whose iteration order changes across a snapshot restore until the next
+step, so checkpoints taken in between would not round-trip byte for byte
+(a zero-length step to flush it corrupted Rapier’s islands). Hinge and
+slider limits and motors are therefore Fern rules applied before each
+solve (<code>driveJoints</code>): a position motor is a damped spring
+(stiffness 1/s², damping 1/s), a velocity motor approaches its speed at
+rate <code>damping</code>, and limits stop motion exactly at them. Spin
+changes keep the part’s linear velocity consistent with its pin.
+Authored gaps keep linked parts apart, so collision between them stays
+on; raised vanes meet nothing. After each solve,
+<code>projectJoints</code> walks every connected part outward from its
+root and pulls drifted hinge pins together and over-long ropes back to
+length: Rapier’s iterative solver otherwise let a held eight-body vine
+stretch past twice its length.</p>
+<p><strong>Strain.</strong> Rapier 0.21 exposes no joint impulses.
+Before each solve, a joint’s load is the momentum of its connected part
+moving away from its anchor: Σ mass × outward speed relative to the
+anchor point, counting ropes only when taut, springs only past 2.5× rest
+and sliders only across their axis. Gameplay impulses, hold drives and
+charges arrive as velocity before the solve, so a yank or a heavy blow
+snaps the joint in the same tick and the released part keeps that tick’s
+motion. Free swinging is tangential and loads nothing. A joint snaps
+when load &gt; <code>breakLoad × jointStrength</code> and
+<code>jointBreakage</code> is on.</p>
+<p><strong>Cuts.</strong> Mechanism parts are never destroyed (their
+families have no toughness, and removing a member is refused). A
+damaging attack that reaches a member cuts the intact joint of that
+member nearest the attack’s origin, by the member material’s damage
+after resistance; it severs at <code>toughness × jointStrength</code>.
+Agents can cut directly (<code>actors/cut</code>).</p>
+<p><strong>Policy.</strong> Connected parts are derived from intact
+joints. Every member resolves its region policy at its part’s root (the
+declared root, or the first listed member of a part cut free) and saves
+that root sample, which checkpoint validation enforces. A dynamic member
+freezes when dynamics are off or, if it is jointed, when
+<code>mechanisms</code> is off; a waking part wakes whole and only where
+it stands. <code>place</code> moves a jointed part as one unit and
+<code>transport</code> (rifts, agents) carries an unanchored part with
+its motion; anchored parts refuse.</p>
+<p><strong>Mechanisms</strong> (<code>src/physics/mechanisms.ts</code>).
+<code>areaMechanisms(area, palette)</code> lays out six assemblies per
+area plus companions: a penned gate (hinge ±1.9 rad, return spring, a
+fence pen holding an 18-gold cache chest), a chained iron ball (four
+links), a vine (six segments on ropes plus a seed pod), a sprung
+launcher (slider plus a 2000-stiffness spring, a stone payload), a
+raised wind vane (driven pivot) and a four-plank causeway between bank
+posts. They sit in the north meadow and west edge, away from the entry,
+exit, return portal and lane. Every area now has a wadeable creek across
+its north meadow (shallow water has no physics body).
+<code>MechanismPhysics</code> adds the authored events: a gate pushed
+past 83° latches open (its motor target is saved) and a slow push closes
+it; a launcher pulled back 9+ units and released fast throws whatever
+lies in front of it at 420 units/s as its cocker’s; and a causeway loses
+its span when no path joins its bank posts. Joint breaks become events
+with the responsible traveler. A traveler standing on a plank still tied
+to a bank post does not wade (<code>deckAt</code>, also computed from a
+received scene on guests). Planks and vanes are not cover and cannot be
+grabbed. Waves never start inside a gate pen.</p>
+<p><code>Adventure.step</code> emits pending mechanism events
+(<code>assembly</code> events: <code>gate:latched</code>,
+<code>gate:closed</code>, <code>launcher:cocked</code>,
+<code>launcher:fired</code>, <code>bridge:span-lost</code>,
+<code>&lt;kind&gt;:&lt;joint&gt;:snapped|cut</code>). Rifts carry a held
+unanchored part as a unit.</p>
+<p><strong>Versions.</strong> Physical world <strong>7</strong> adds
+<code>assemblies</code> and <code>joints</code>; adventure envelope
+<strong>5</strong> adds mechanism state and archives a land’s
+assemblies, joints and mechanisms with its props. Room protocol
+<strong>8</strong>. Real M06 checkpoints migrate: mechanisms join the
+active land once, and an archived pre-M07 land gains them when it is
+entered again; destruction is kept.</p>
+<h2 id="m08-material-reactions-and-environmental-fields">M08 material
+reactions and environmental fields</h2>
+<p><code>ReactionPhysics</code> (<code>src/physics/reactions.ts</code>)
+belongs to the host’s adventure physics beside
+<code>CombatPhysics</code> and <code>MechanismPhysics</code>. It owns: -
+<strong>Statuses</strong> per body (props and
+<code>enemy-&lt;id&gt;</code>): remaining ticks of <code>burning</code>,
+<code>wet</code>, <code>oiled</code>, <code>charged</code> and a
+volatile’s <code>fuse</code>, brazier <code>heat</code>, a
+<code>charred</code> (burnt-out or spent) flag, and the chain, depth and
+owner that last changed it. - <strong>Surfaces</strong>: water puddles
+and oil slicks (an oil slick can burn) with a centre, radius and
+remaining ticks. - <strong>Fields</strong>: <code>wind</code> lanes and
+circular <code>pressure</code>, <code>attract</code>, <code>repel</code>
+and <code>vortex</code> fields with a strength, remaining ticks (−1 for
+authored lanes), gust amplitude and owner. - <strong>Delayed
+reactions</strong> (fuses, spreading fire and discharge hops),
+<strong>chains</strong> and a bounded event history.</p>
+<p><strong>Rules.</strong> <code>RULES</code> is the data registry: each
+row names its trigger (<code>fire</code>, <code>water</code>,
+<code>oil</code>, <code>shock</code>, <code>blast</code>, contact, timer
+or break), whether it is propagation, and every parameter the resolver
+reads. Ignite (flammable material or any oil coat, dry), steam (fire on
+a wet body boils off 300 ticks of wetness instead), extinguish, soak,
+coat, flare (oil slicks burn), spread, burn (9 durability or 6 health
+per half second; ×1.5 oiled), burnout (dry brush and cloth crumble to
+ash where destruction is allowed; everything else chars), dry, conduct,
+detonate, spill, release, field and heat. <code>REACTIVITY</code> gives
+each material’s fuel and windage: flammable means
+<code>flammability &gt; 0</code>, conductive means
+<code>conductivity ≥ 0.5</code> or wet or standing in a puddle. Water
+casks spill water, oil jars spill oil (fire bursts a jar into a burning
+slick), lanterns release fire and Stormglass pylons release a
+discharge.</p>
+<p><strong>Chains</strong> (D55, D56). Every primary stimulus starts a
+chain with an owner. A rule applies to a target once per chain
+(<code>rule|target</code> keys). Discharges hop from conductor to
+conductor within 72 units (anything touching a conductor, creatures and
+volatile or brittle props, is shocked but does not carry it on), losing
+15% per hop down to a 0.2 floor. Fuses (50 ticks lit, 8 sparked, 12
+sympathetic) end in an explosion: a 4-tick pressure field (2,400
+units/s²), blast damage with falloff (42 to monsters, 60 to props within
+100 units), then fire within 70 and sympathetic detonations as
+propagation. Direct effects ignore <code>chainReactions</code>;
+propagation (depth + 1) is gated at its source when queued and every
+tick while pending.</p>
+<p><strong>Order.</strong> <code>AdventurePhysics.solve</code> applies
+fields as velocity changes before the solve
+(<code>PhysicsWorld.fieldPush</code>), then after the solve, impacts and
+mechanisms, runs <code>ReactionPhysics.update</code>: 1. Retire bodies
+that left and spent transient fields. 2. Wading: water terrain keeps
+bodies soaked and puts out what burns. 3. Brazier contact: 18 ticks of
+contact build heat to ignition; oil touching a lit brazier flares. 4.
+Status timers in id order, skipping paused bodies: burn pulses, spread
+queues and fuses that reach zero explode. 5. Surfaces: soak or oil what
+stands in them; burning slicks light it; water puts slicks out. 6. Due
+delayed events in <code>(due, id)</code> order.</p>
+<p>Reaction damage and events wait for <code>Adventure.step</code>,
+which applies monster damage through the ordinary hit path (credited to
+the chain owner, never a team-<code>enemy</code> reaction against
+monsters) and scenery damage through <code>damageProps</code> with the
+chain id, so breaks, spills and rewards follow the M05/M06 paths.
+Reaction events become <code>reaction</code> combat events
+(<code>ignite:&lt;material&gt;</code>,
+<code>spread:&lt;material&gt;</code>, <code>steam</code>,
+<code>extinguish</code>, <code>flare</code>,
+<code>conduct:source|arc</code>, <code>discharge</code>,
+<code>detonate:fuse|spark|sympathetic</code>, <code>blast</code>,
+<code>spill:water|oil</code>, <code>release:fire|shock</code>,
+<code>burnout:ash|char</code>, <code>field:fan</code>,
+<code>heat</code>). Soak and coat stay in the reaction history only.</p>
+<p><strong>Sources in play.</strong> - Burning strikes (a hero with
+Cinderwake’s buff or a burn skill) ignite the flammable scenery they
+hit. - Struck storm coils discharge (120-tick cooldown). - Struck fans
+blow a 230 × 84 lane at 900 units/s² for 240 ticks. - Stormglass
+activations also discharge. - Gravity Knots add a 170-unit attraction
+field for props, debris and loot. - Riftstep arrivals add an 8-tick
+repelling field. - Slipstream activations add a 90-unit vortex. - Each
+area has a reaction yard (D59) and a gusting wind lane over its meadow
+vane; wind turns the vane.</p>
+<p><strong>Versions.</strong> Physical world <strong>8</strong>: policy
+samples carry <code>materialReactions</code>,
+<code>chainReactions</code>, <code>environmentalForces</code> and
+<code>fieldStrength</code>, and older samples are recomputed and proven
+unchanged. Adventure envelope <strong>6</strong>:
+<code>reactions</code>. Land archives keep a land’s reactions with
+relative fuse and cooldown timers and drop monster statuses. Room
+protocol <strong>9</strong>. Real M07 checkpoints migrate: yards and
+wind lanes join the active land once, and an archived pre-M08 land gains
+them on return.</p>
+<p><strong>Presentation</strong> (<code>src/render/reactions.ts</code>):
+flames, drips, oil sheen, crackle, fuse sparks and char on props and
+monsters; puddles and slicks under everything; wind streaks, swirls and
+rings; arcs, blasts, splashes, steam puffs and short labels; six new
+synthesized voices (ignite, hiss, zap, boom, splash, gust).</p>
+<h2 id="m09-physical-rigs-and-expressive-reactions">M09 physical rigs
+and expressive reactions</h2>
+<p><strong>Rig recipes</strong> (<code>src/game/rigs.ts</code>,
+engine-safe). Each of the six monster rigs is a tree of parts. A part
+has:</p>
+<ul>
+<li>a socket (its pivot on its parent, in sprite units with the origin
+at the feet), a mass share and hinge limits;</li>
+<li>a material (vegetation, wood, cloth, metal or glass) and its own
+pixel art;</li>
+<li>secondary-motion <code>follow</code> and <code>lag</code>, and an
+authored animation channel (leg, arm, tail, antenna, head) with a windup
+<code>lift</code>;</li>
+<li>optionally <code>detach</code>: <code>hit</code> armor and bark
+(brute bark plates, warden metal plates and emblem, totem crown) or a
+<code>death</code> piece (the wraith’s glass lantern core).</li>
+</ul>
+<p>Collider boxes are measured from each part’s own art
+(<code>rigGeometry</code>), so a ragdoll limb is exactly the shape that
+is drawn. Each blueprint also sets its locomotion
+(<code>grounded</code>, <code>floating</code> or <code>rooted</code>),
+death style (<code>topple</code>, <code>flip</code>,
+<code>collapse</code> or <code>fell</code>), lean spring, poise
+thresholds, knockback multiplier and ragdoll mass.
+<code>rigExport()</code> serves agents and docs.</p>
+<p><strong>Living rigs</strong> stay one Rapier actor each (no per-limb
+bodies while alive). <code>Enemy.reaction</code> is authoritative, saved
+and replicated in the room header:</p>
+<ul>
+<li>a screen-space lean spring and a vertical squash spring;</li>
+<li>poise, <code>staggerUntil</code>, a knockdown
+(<code>toppleAt</code>, <code>toppleUntil</code>, side);</li>
+<li>the latest blow (<code>knockX</code>, <code>knockY</code>) and a
+<code>shed</code> mask.</li>
+</ul>
+<p><code>stepReaction</code> advances it every tick.
+<code>hitReaction</code> adds recoil
+(<code>recoil × knock × reaction strength</code>) and poise
+(<code>(10 + % of max health) × strength</code>). Past a rig’s
+thresholds the monster staggers (the windup or charge is interrupted,
+the motor slows) or is knocked down. A knocked-down monster neither
+steers nor attacks until it rises. Stagger, knockdown and shedding need
+effective world reactions. Bosses only stagger, at 2.5× poise, and
+rooted totems never fall over.</p>
+<p><code>enemyPose(e, tick)</code> turns authored channels plus
+<code>follow × lean + lag × lean rate</code> into part angles within
+limits. A knockdown rotates the figure about its fall pivot: grounded
+rigs fall over, the crawler flips onto its back, and the wraith
+scatters. Renderer and physics use the same function.</p>
+<p><strong>Death transfer</strong> (<code>src/physics/rigs.ts</code>,
+<code>AdventurePhysics.retire</code>). At the first boundary after a
+kill, the actor body leaves the solver and, in the same tick,
+<code>remainsRecipes</code> builds the remains from the drawn pose at
+that tick:</p>
+<ul>
+<li>one dynamic <code>remains</code> prop per part
+(<code>prop-remains-&lt;enemy&gt;-&lt;part&gt;</code>), joined by
+unbreakable limited hinges into a <code>remains-&lt;enemy&gt;</code>
+assembly whose root is the first part;</li>
+<li>detachables not already shed as loose material props.</li>
+</ul>
+<p>The bodies lie where the art would lie after the fall: rotated
+through <code>fallAngle</code> (away from the killing blow and mostly
+sideways, π for a crawler, a slump for a wraith) about the rig’s fall
+pivot. A felled totem keeps its roots as a fixed body. Every body
+carries the actor’s velocity plus 0.35 × the killing knock.</p>
+<p>The fall itself is presentation over solved bodies: for
+<code>fallTicks</code> the renderer rotates the assembled parts back
+about the pivot by the part of the fall still to come, as a rigid
+rotation. The figure never separates, and it lands on the bodies’ actual
+poses. A <code>fall:&lt;rig&gt;:&lt;material&gt;</code> rig event marks
+the landing. Fire, water, oil and charge on the monster pass to the
+remains’ root.</p>
+<p>Remains are <code>remains</code> family props with a validated
+<code>RemainsTag</code> (rig, part, theme, variant, scale, mirror,
+enemy, birth tick, fall angle and pivot). Agents, fields, Whorl, grabs,
+fire and impact damage treat them as props. Joints cannot be cut, the
+family cannot be damaged, and burnt remains char rather than turn to
+ash.</p>
+<p><strong>Collision.</strong> Remains use their own interaction bit.
+They meet terrain, props and travelers but never each other, and sit in
+dominance group −1, so everything pushes them and they block nobody.
+Frozen remains meet only terrain.</p>
+<p><strong>Controls.</strong></p>
+<ul>
+<li><code>ragdolls</code> freezes jointed remains in place; loose pieces
+follow <code>dynamicProps</code>.</li>
+<li>Where ragdolls are off at death, no bodies are made: the enemy
+record shows the authored death pose (the same fall, faded out with the
+40-tick record).</li>
+<li>Remains are cosmetic transients: they leave whole
+(<code>PhysicsWorld.removeAssembly</code>) 2,700 ticks (45 s) after
+death, and never enter land archives.</li>
+</ul>
+<p><strong>Wayfarer and townsfolk.</strong></p>
+<ul>
+<li><code>Hero.recoil</code> holds a lean and a lantern pendulum stepped
+from the traveler’s acceleration and blows. It is presentation-only in
+effect: input and movement are untouched. It is saved and replicated
+but, like foliage bend, stays out of <code>stateHash</code> (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D69</a>): its <code>Math.sin</code> differs
+in the last bits between browser and Node engines.</li>
+<li>In town, each townsperson is a physical actor
+(<code>npc-&lt;id&gt;</code>, mass 0.8). Travelers always touch them,
+whatever the town’s crowd contacts. A motor walks them back along their
+authored stroll, and a traveler’s shove emits
+<code>npc:bump:&lt;id&gt;</code>.</li>
+<li>Services are offered where the townsperson stands now.</li>
+</ul>
+<p><strong>Foliage</strong> (<code>RigPhysics</code>). Trees and brush
+carry a saved bend spring, excited by wind and pressure fields (scaled
+by field strength where environmental forces are on), bodies brushing
+past and blows. Where <code>foliage</code> is off, nothing excites it
+and it relaxes to rest.</p>
+<p><strong>Versions.</strong> Physical world <strong>9</strong>: every
+collision filter changed, so older raw bytes rebuild semantically, and
+policy samples gain <code>ragdolls</code>, <code>foliage</code> and
+<code>reactionStrength</code>. Adventure envelope <strong>7</strong>:
+<code>rigs</code> (remains records, foliage bend, pending rig events).
+Room protocol <strong>10</strong>: the header carries enemy reactions,
+hero recoil and <code>rig</code> events.</p>
+<p><strong>Presentation</strong> (<code>src/render/rigs.ts</code>). Part
+images are rasterized once per rig, theme, variant and part, and drawn
+with per-part transforms. Living figures get a ground shadow that
+stretches when knocked down and shrinks under a hover, emissive light
+from glowing parts, and a hurt flash. Remains are drawn as one y-sorted
+group at their lowest point, with soft per-part shadows, a fade before
+expiry and a still marker where frozen. Two new voices: thud and
+flutter. Camera shake strength and hit/blast flashes are local
+<code>Settings</code> preferences, never simulation state.</p>
+<p><strong>Key taps</strong> (<code>src/main.ts</code>). Browser input
+is sampled once per animation frame. A key pressed and released between
+two frames (a quick tap on a slow device) is latched until a simulation
+tick has consumed it, or until a guest has sent it to the host, so it
+still acts once. A tap that cannot apply (paused, a dialog open) is
+dropped rather than replayed later.</p>
+<h2 id="m10-reactive-towns-and-authored-areas">M10 reactive towns and
+authored areas</h2>
+<p><strong>Town Sanctuary</strong> (<code>townScene</code> in
+<code>src/physics/showcase.ts</code>). Each town’s policy is the
+Sanctuary preset’s values (<code>TOWN_VALUES</code>): things shove and
+swing but never break, and material reactions are off. A
+<code>market</code> region (x −230, y −178, 210 × 103) keeps prop
+blocking, so goods there stand in the way while the rest of the town
+stays soft. Town content:</p>
+<ul>
+<li>three <code>stall</code> assemblies (a counter and an awning on a
+position-motor hinge, limits ±0.9);</li>
+<li>four <code>lamp</code> assemblies (a post and a lamp on a 10-unit
+bracket arm);</li>
+<li>one <code>bunting</code> line (ten pennants on ropes between two
+posts), kept moving by a <code>breeze-town</code> wind strip;</li>
+<li>baskets in front of each stall, plus crates, a barrel and pots as
+loose goods.</li>
+</ul>
+<p>Services are protected by permanent
+<code>sanctuary-&lt;service&gt;</code> repel fields
+(<code>TOWN_SERVICES</code>: the hearth, the gate and each townsperson’s
+home), not by freezing the town. Services still follow their townsperson
+(M09).</p>
+<p><strong>Area showcases</strong> (<code>areaShowcase</code>, registry
+<code>SHOWCASE</code>, keyed by mechanic). Every area mechanic has three
+instances on rings (<code>mechanicLayout</code> in
+<code>src/game/content.ts</code>, shared with <code>startArea</code>).
+For every mechanic an area lists, each instance gets that mechanic’s set
+piece:</p>
+<ul>
+<li>bramble: a thorn-hedge arc and a pot cache;</li>
+<li>wind: a permanent tailwind lane with a barrel, a wheel and a driven
+vane;</li>
+<li>glass: a permanent pool, two conductor rods and a pylon;</li>
+<li>echo: resonance pots and stones;</li>
+<li>cinder: a dry-brush fuse into a weakened four-board stockade around
+a cache;</li>
+<li>blood: the bloom (vines anchor there);</li>
+<li>gravity: stones, a log and a barrel;</li>
+<li>rift: freight on the first arch’s pad.</li>
+</ul>
+<p>Placement (<code>placeFrame</code>): - Each frame turns around the
+full circle and pushes outward until it clears terrain, earlier reaction
+sources (30-unit berth) and the keep-clear spots (entry, portals, a
+22-unit warden spot). - Loose pieces relocate individually; a piece that
+still clashes is skipped. - Tailwind lanes route around ignition hazards
+(<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D79</a>).</p>
+<p>Later areas combine mechanics automatically: area 9 gets three kinds
+of set piece.</p>
+<p><strong>Regions inside an area.</strong> Instance n=1 of the
+signature mechanic sits in <code>wild-&lt;area&gt;</code> (Wild values),
+n=2 in <code>calm-&lt;area&gt;</code> (<code>CALM_VALUES</code>: Quiet
+with world reactions left on). Both are circles (radius 64, priority
+20), drawn as dashed rings marked CALM and WILD.</p>
+<p><strong>Mechanic hooks</strong> (<code>Adventure.activate</code> and
+friends): - Bramble pods call <code>thornburst</code>: a 5-tick pressure
+field that spares the party, eight owned
+<code>prop-thorn-&lt;seq&gt;-&lt;k&gt;</code> splinters, and hedges
+breaking. - Wind mechanics add a <code>gust:&lt;id&gt;</code> lane field
+owned by the crosser. - Glass: hero strikes on wet monsters stimulate
+shock (<code>stormglass:arc</code>). - Echo repeats carry cause
+<code>echo:&lt;ability&gt;</code>. - Cinder vents ignite their own fuse.
+- Blood blooms call <code>snare</code>. - Gravity knots add an attract
+field with <code>spare: "party"</code> and a <code>drift</code> along
+the blow. - Rift arches carry <code>freight</code> and spare it from the
+arrival strike.</p>
+<p><strong>Fields and surfaces</strong> gain <code>spare</code>,
+<code>drift</code> and permanent <code>ticks: -1</code> surfaces
+(<code>addSurface</code>). <strong>Restraints</strong>
+(<code>ShowcasePhysics</code>) are Fern elastic tethers applied as
+velocity changes before each solve; they are saved, released with their
+actor and pruned on save (<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D74</a>).</p>
+<p><strong>Wardens</strong> (<code>src/game/wardens.ts</code>).
+<code>Enemy.warden</code> (<code>WardenState</code>: move, locked
+target, echo time, exposure) is saved and replicated. Each boss’s
+signature move replaces the slam: windup <code>WARDEN_WINDUP</code> = 64
+ticks with the target locked at its start, then <code>signature()</code>
+resolves it:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Warden</th>
+<th>Move</th>
+<th>Telegraph</th>
+<th>Exposed by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Brambleheart</td>
+<td>thornburst</td>
+<td>ring</td>
+<td>a pod bursting beside it</td>
+</tr>
+<tr>
+<td>The Gale Stag</td>
+<td>gale charge</td>
+<td>lane</td>
+<td>crashing into a solid prop, fence or tree</td>
+</tr>
+<tr>
+<td>Vyr, Glasskeeper</td>
+<td>discharge</td>
+<td>ring</td>
+<td>shock while wet</td>
+</tr>
+<tr>
+<td>The Echo Matron</td>
+<td>echo slam</td>
+<td>ring</td>
+<td>an Echo Well’s repeat</td>
+</tr>
+<tr>
+<td>Cinderjaw</td>
+<td>breath</td>
+<td>line</td>
+<td>being doused</td>
+</tr>
+<tr>
+<td>The Bloom Tyrant</td>
+<td>lash</td>
+<td>line</td>
+<td>a dash out of the lash</td>
+</tr>
+<tr>
+<td>The Hollow Atlas</td>
+<td>collapse</td>
+<td>ring (closing)</td>
+<td>a hero-launched prop</td>
+</tr>
+<tr>
+<td>The Riftbound King</td>
+<td>blink</td>
+<td>marker</td>
+<td>a traveler’s rift arrival beside it</td>
+</tr>
+</tbody>
+</table>
+<p>Exposure (<code>EXPOSED</code>): 180 ticks of 1.5× damage, a 40-tick
+stagger and a broken telegraph, then a 300-tick cooldown. Only the
+area’s own weakness counts.</p>
+<p><strong>Physics runtime.</strong> -
+<code>PhysicsWorld.settle()</code> canonicalizes a freshly built land
+(<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D76</a>). - <code>reauthor</code> (with
+<code>PolicyController.reauthor</code>) migrates an older layout (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D80</a>). - <code>driveJoints</code> reads a
+hinged part’s turn from its angular momentum about the pin (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D77</a>). - Per-tick physics trig that feeds
+state (<code>rotate</code>, the hinge angle, wind fields) uses
+<code>dsin</code>/<code>dcos</code> from
+<code>src/engine/math.ts</code>: they agree bit for bit across
+JavaScript engines, so browser-to-Node replays of the jointed town stay
+exact (<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D82</a>). - New assembly kinds:
+<code>stall</code>, <code>lamp</code> and <code>bunting</code>. - New
+families: <code>stall</code>, <code>awning</code>, <code>lamp</code>,
+<code>pennant</code>, <code>basket</code>, <code>hedge</code>
+(vegetation, thorn pieces) and <code>barricade</code> (wood, plank
+pieces).</p>
+<p><strong>Versions.</strong> Adventure envelope <strong>8</strong>:
+<code>showcase</code> (restraints, sequence, events; land archives keep
+it). Room protocol <strong>11</strong>. The physical world stays
+<strong>9</strong>. M09 checkpoints and archives are re-authored once
+(<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D80</a>).</p>
+<p><strong>Presentation and tools.</strong> -
+<code>src/render/showcase.ts</code> draws vines, region rings, warden
+telegraphs, the pending echo and exposure. <code>combat.ts</code> marks
+the market and annotates the atlas. The HUD shows EXPOSED or the
+signature with its dodge hint. The mechanic guide explains each physical
+extension, warden and calm/wild ring. - <code>actors</code> actions:
+<code>showcase</code>, <code>mechanic</code> (id) and
+<code>warden</code> (<code>enemy-&lt;id&gt;</code>). - The QA bot steers
+around solid scenery.
+<code>node tools/adventure.ts playthrough 9 --reactions off</code> runs
+the route with the session master switch off.
+<code>node tools/physics-world.ts</code> writes the receipt.</p>
+<h2 id="m11-generated-encounters-and-modular-wardens">M11 generated
+encounters and modular wardens</h2>
+<p>Areas 9+ (<code>recipe.procedural</code>) build their physical
+content from an <strong>encounter grammar</strong> instead of the
+authored M05 clearing layout, M07 mechanism set and M08 yard (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D83</a>). Authored areas 1–8 are
+unchanged.</p>
+<ul>
+<li><strong>Plan</strong> (<code>src/game/encounters.ts</code>, pure
+function of the recipe; <code>encounterPlan</code>):
+<ul>
+<li><code>MODULES</code>: 18 kits of M05–M10 vocabulary (storm coil,
+glass garden, flood basin, brazier camp, oil cellar, brush fuse, timber
+stockade, thorn hedge, powder store, rubble field, maelstrom, gale lane,
+fan tower, chain gallows, launcher nest, cargo train, vine tether, gate
+pen), each with tags (<code>conductor</code>, <code>water</code>,
+<code>ignition</code>, <code>fuse</code>, <code>timber</code>,
+<code>volatile</code>, <code>loose</code>, <code>gravity</code>,
+<code>wind</code>, <code>cart</code>, <code>swing</code>,
+<code>launcher</code>, <code>brittle</code>, <code>spark</code>, …) and
+the switches it follows.</li>
+<li><code>COMBINATIONS</code>: 14 compatibility rules. Each orders role
+modules along a chain and names the M08 rules (or M07/M10 hooks) the
+chain records, its regional profile and how a traveler starts it.
+Examples: conductors leading into a pool (<code>storm-pool</code>), a
+fuse from a brazier camp into a weakened stockade
+(<code>fire-stockade</code>), a vortex holding powder barrels
+(<code>vortex-powder</code>), a launcher aimed at powder
+(<code>launch-powder</code>), a chained ball beside glass
+(<code>swing-glass</code>), and a cargo train on a rift arch’s pad
+(<code>rift-cart</code>).</li>
+<li>Combinations rank by the area’s mechanics (affinity ×6) plus a seed
+term. Areas 9–20 carry two clusters, 21+ three, plus one standalone
+mechanism module. Each cluster has a ranked list (its intent, then
+fallbacks), a ring slot (six slots at radius 252–280, none on the
+arrival–exit line) and a regional profile (<code>PROFILES</code>:
+charged, tinder, gale, heavy, freight).</li>
+<li>Combat pockets 85 units inward of each cluster (radius 55): waves
+gather there (<code>pocketPoint</code>).</li>
+<li>Routes: the essential arrival → warden → exit line, plus an optional
+advantage route through each cluster.</li>
+<li><code>bossPlan</code>: the M10 rig choice, composed signature moves
+from the area’s mechanics (two; three from area 21), weaknesses = the
+union of the moves’ weaknesses, an armor kit by theme and seed
+(<code>ARMOR</code>: bark, glass, stone, censer) and two arena kits
+(<code>ARENA</code>: one that counters the armor, one that serves a
+weakness).</li>
+</ul></li>
+<li><strong>Realization</strong>
+(<code>src/physics/encounters.ts</code>, pure function of recipe,
+palette and terrain; <code>generatedArea</code>):
+<ul>
+<li>the three trees of the M05 layout, the M10 set pieces around the
+mechanics (on that base), then each cluster, the filler module and the
+arena;</li>
+<li>a cluster is one frame: its modules laid along the chain with
+per-combination gaps (<code>CLUSTERS</code>), and its links (for example
+“the last rod stands in the pool”, “the fuse’s end within spread reach
+12 of the front board”, “the pylon inside the ball’s 67.5-unit sweep”)
+checked with the pieces actually kept;</li>
+<li>frames try turns about the clearing centre (±0.3 rad) and radial
+shifts (±44), then spare slots, then alternate modules, then the next
+combination; a cluster with no room anywhere leaves its slot open; every
+fallback is written to the manifest (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D84</a>);</li>
+<li>placement hazards, from the soak (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D85</a>): nothing within 12 units of a lit
+brazier; modules keep out of lanes and 96 units of run-out; pools never
+cover a piece a fire chain needs dry; such pieces never stand on water
+tiles; a maelstrom is a vortex plus a pull;</li>
+<li>essential routes: a 12-unit walkability grid treats every placed
+body as solid (except walk-through and raised parts) and keeps arrival,
+the warden’s ground, the exit, every mechanic and every pocket reachable
+if they were before the modules (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D86</a>);</li>
+<li>the manifest (<code>RealizedEncounter</code>): clusters with links,
+region and profile; the filler; the arena; the boss plan; routes;
+fallbacks; overlaps (must be empty); body count;</li>
+<li>regions <code>combo-&lt;area&gt;-&lt;k&gt;</code> (circle radius 85,
+priority 15) carry each cluster’s profile values.</li>
+</ul></li>
+<li><strong>Land ownership.</strong>
+<code>AdventurePhysics.grammar</code> is true for a land built in M11 or
+later. Generated areas skip the legacy layers and
+<code>ensureEncounters</code> adds content that never existed (destroyed
+pieces never return; fields and pools are authored once). A land saved
+before M11 keeps <code>grammar: false</code> and its earlier content;
+nothing is generated over it. Manifests are cached per world, terrain
+revision and palette, shared by the policy layout and spawning.</li>
+<li><strong>Modular wardens</strong> (<a
+href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D88</a>):
+<ul>
+<li><code>Enemy.name</code> is the composed title, for example
+“Glasswater Usurper, Censer-bearer”.</li>
+<li><code>WardenState.armor</code> is the number of pieces still to
+mount. On the warden’s first tick with a body,
+<code>AdventurePhysics.armBoss</code> spawns
+<code>prop-armor-&lt;enemy&gt;-&lt;k&gt;</code> pieces
+(<code>plate</code>, <code>shard</code>, <code>stone</code> or a dynamic
+<code>lantern</code> censer). Each hangs on a <code>mount</code>
+restraint (<code>ShowcasePhysics</code>, anchored to the warden, rest
+30–40, break load by piece mass).</li>
+<li>Each mounted piece within 64 units removes 12% of damage taken
+(<code>ARMOR_RULES</code>; at most 4 pieces).</li>
+<li>Pieces break by their material (bark burns, glass cracks under
+shock, stone yields to blasts and launched props). A tether snaps under
+a yank, and every mount is released when the warden dies.</li>
+<li>With mechanisms or dynamic props off at its ground, the warden
+spawns unarmored.</li>
+<li>A blink carries its armor along, and the warden’s own blows never
+strike its armor.</li>
+<li><code>Adventure.nextMove</code> rotates the composed moves each slam
+turn (<code>attacks / 3</code>). <code>expose</code> accepts any of the
+composed weaknesses, and water exposes whenever it is one of them.</li>
+</ul></li>
+<li><strong>New vocabulary.</strong> Families <code>plate</code>,
+<code>shard</code> (armor) and <code>pillar</code> (fixed stone, arena),
+and the assembly kind <code>cart</code> (wagon towing a crate and a
+barrel on ropes, unanchored, so rift freight carries it whole).</li>
+<li><strong>Versions</strong> (<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D90</a>):
+adventure envelope <strong>9</strong> (<code>encounters</code>: grammar
+flag and manifests; land archives keep them), room protocol
+<strong>12</strong>, physical world still <strong>9</strong>. Wardens
+validate with seven fields (before M11) or eight. A real M10 checkpoint
+in a generated land restores unchanged.</li>
+<li><strong>Agent:</strong> <code>encounters</code> catalog, preview,
+validate and export (<a
+href="AGENT-PROTOCOL.md#m11-generated-encounters">AGENT-PROTOCOL</a>).</li>
+<li><strong>Presentation:</strong>
+<ul>
+<li><code>src/render/showcase.ts</code> draws mount chains (reddening
+with strain) and each cluster’s ring, labelled with its combination in
+its profile’s colour;</li>
+<li><code>src/render/props.ts</code> draws bark plates, ward shards,
+pillars and censers;</li>
+<li>the mechanic guide lists the generated encounter (each combination
+and how to start it) and the composed warden (moves, weaknesses, armor
+and its counter, arena);</li>
+<li>the boss HUD shows <code>ARMORED ×N</code> while armor holds.</li>
+</ul></li>
+</ul>
+<h2 id="m12-controls-showcase-and-release">M12 controls, showcase and
+release</h2>
+<p>M12 finishes the reactive world as a product: its controls are in the
+game, one route shows every system, and a matrix proves each switch the
+same way (<a href="https://github.com/michaelcrosato/gpt61sol2daige/blob/main/docs/physics/DECISIONS.md">D94–D97</a>).</p>
+<ul>
+<li><strong>World physics panel</strong>
+(<code>src/app/world-physics.ts</code>, mounted by
+<code>AdventureUI</code> as the <code>physics</code> panel).
+<ul>
+<li><strong>Opening it:</strong> O (with the mouse over an object, that
+object is inspected), the HUD button beside I/K/P, the game-mode menu,
+or “World physics · O” in the pause menu. Solo menus pause time.</li>
+<li><strong>Where you stand:</strong> every effective value at the
+traveler, with its source; the session master; “Undo every live
+change”.</li>
+<li><strong>Choose where a change applies:</strong> whole land, this
+area, or a region of this area. Regions carry readable names: the
+combination’s name for an M11 cluster, Calm/Wild ring, Market,
+Pass-through patch, Creature circle, Your region.</li>
+<li><strong>Presets and switches:</strong> four preset cards with an
+explanation and their exact differences from Reactive. Each switch has
+an explanation, Default/On/Off buttons and a note of where its value
+comes from. Numeric fields accept a value, or empty for the
+default.</li>
+<li><strong>Region editing:</strong> Center on me, Larger, Smaller,
+Priority ±5, New region around me, Remove (custom regions only), Clear
+live changes here, Reset to authored.</li>
+<li><strong>Inspect an object:</strong> pick on the map (the next click
+or tap chooses it; Esc returns), “Nearest to me”, or a list of objects
+within 240 units. It shows kind and material, motion (free, fixed,
+frozen, reactivation blocked), durability, mechanism, regions, every
+effective value that differs from Reactive with its source, reaction
+status, last reaction and last push.</li>
+<li><strong>Guests:</strong> the same view with every control disabled
+(“The host controls shared physics”).</li>
+<li><strong>Implementation:</strong> every control is an agent command
+(<code>actors policies|policy|body|configure|apply</code>). Paused
+panels apply at once; a running co-op host’s edit commits at the next
+tick.</li>
+</ul></li>
+<li><strong>Highlight</strong> (<code>Renderer.inspection</code>, drawn
+by <code>drawInspection</code> in <code>src/render/showcase.ts</code>):
+the selected region’s true bounds and priority, and a ring on the
+selected body. It is local presentation, outside saves and replays, and
+cleared when the panel closes.</li>
+<li><strong>Profiles.</strong> The adventure’s areas inherit the engine
+defaults, which are the Reactive preset; the town is Sanctuary (D70).
+The M03 <code>quiet-&lt;n&gt;</code> and <code>reactive-&lt;n&gt;</code>
+patches stay as authored comparison regions with honest names.
+<code>ambientPhysics</code> stays off by default: the creature circles
+turn it on. The lab panel is labelled “Physics lab · developer tools”: a
+comparison surface, not a rollout switch.</li>
+<li><strong>Showcase route.</strong>
+<ul>
+<li>The scene recipe is <a
+href="../examples/showcase.json"><code>examples/showcase.json</code></a>,
+in Brambleburst at seed 142. It has six beats, each starting from the
+same clean scene: destructible scenery (the pen fence), a launched prop
+kill (a thrown crate), a physical rig death (the ragdoll, flung by
+Whorl), a jointed mechanism (the sprung launcher), a material chain (an
+oil jar in the brazier) and a regional off/on (the calm ring switched to
+Reactive in the panel, then reset).</li>
+<li><code>tools/lib/showcase.ts</code> plays it headless
+(<code>npm run showcase</code>); <code>e2e/showcase.spec.ts</code> plays
+it with real input. The capture is in
+<code>docs/evidence/physics-m12-showcase.{png,webm}</code>.</li>
+</ul></li>
+<li><strong>Functional matrix</strong>
+(<code>tests/physics-matrix.test.ts</code>): each of the 24 policy
+values gets a cause and a measured effect, checked on, off in a
+priority-900 region, after save/restore, on a late-join replica, and on
+again. A separate test covers the dependency combinations that change
+meaning.</li>
+</ul></main>
+<footer>Fern · A world engine built for agents · <a href="https://github.com/michaelcrosato/gpt61sol2daige">Source on GitHub</a></footer>
+</body>
+</html>
