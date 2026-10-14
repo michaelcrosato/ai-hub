@@ -28,7 +28,7 @@ git add games/ && git commit -m "Add Whatever You Called It" && git push
 ### Where the game's details come from
 
 Nothing is typed in by hand. On every build, `scripts/scan.mjs` reads just the
-`<head>` of each file:
+`<head>` of each file for catalogue metadata (the audio inventory also reads source text and asset paths):
 
 | From the game | Becomes |
 |---|---|
@@ -508,3 +508,48 @@ that one gets a stable hue hashed from its slug.
 
 The rest of the interface has no colour of its own on purpose. Every saturated
 pixel on the wall belongs to a game.
+
+### Audio source review
+
+On the **Wall**, open Dev settings with **Shift + F2** (not Ctrl + F2), or
+five taps within 2.5 seconds on “AI Hub”. The existing PIN flow is unchanged: `0000`,
+`1111`, `1234`, `8888`, or `9999`; unlock lasts for the tab until **Lock**.
+Under **Audio source review**, select **Contains MP3**, **Contains WAV**, or
+**MP3 or WAV (either)**. Tick **Explicit placeholder music** to intersect that
+condition with the format selection, and type a title, tag or evidence phrase
+in the review search. **Reset audio filters** clears all three controls.
+The counts refer to individual catalogue records, across shelves, not stacks.
+This review includes restricted catalogue records inside the unlocked panel;
+it does not change wall visibility or the Show all content setting.
+
+Expand a result for source paths, line numbers and short matching excerpts.
+The inventory lists local files, inline payload identities and remote references;
+remote audio is never downloaded by the scanner. `MP3`, `WAV`, and
+`placeholder music` are generated in `audioTags` and are also searchable in the
+ordinary wall, Couch and Catalogue search. Audio formats include voice and sound
+effects, and are independent of placeholder music. Original-audio, provenance
+and license statements are source claims, not automatic clearance or infringement
+findings.
+
+The normal scan/build, dev refresh and importer regenerate this inventory.
+Project records own their folder's assets and source text; loose HTML records
+follow resolvable literal local code/data/audio references, without assigning
+unrelated files from their collection. Retained builds are combined per game.
+Repeated local paths, inline payloads and remote URLs (ignoring query/fragment)
+are deduplicated. Counts measure distinct reference identities, not tracks:
+a remote source and its local copy remain separate identities; query-dependent
+remote resources may be combined. Case of extensions and MIME aliases is ignored,
+but filesystem path case is preserved.
+
+This is a static English-text review aid. It recognizes explicit nearby music /
+soundtrack / BGM placeholder statements, plus structured soundtrack-manifest
+purpose evidence. It excludes detected negations and art/SFX/voice placeholders.
+It may miss statements with unusual wording, other languages or distant context.
+Text is read from HTML, JS/TS, JSON, Markdown, plain text, CSS and SVG. Unreferenced
+loose assets, dynamically assembled paths, opaque encodings, archives, nonliteral
+fetches, Web Audio synthesis and external code are outside its coverage. Absence
+of a tag is not evidence of absence of audio or of license clearance.
+
+Regression checks: `npm test`, `npm run build`, and (with optional Playwright
+installed and the dev server running) `node scripts/audio-review-browser.mjs`.
+Pass a site URL to the latter to verify deployed counts and controls.

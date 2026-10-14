@@ -14,6 +14,7 @@
 import { h, clear, icon, ICONS } from '../dom.js';
 import { store } from '../store.js';
 import { SHELVES, shelfOf } from '../filter.js';
+import { createAudioReview } from './audio-review.js';
 import { bytes, plural } from '../format.js';
 
 const PINS = new Set(['0000', '1111', '1234', '8888', '9999']);
@@ -204,6 +205,7 @@ export function createDev(root, { library }) {
               ...facts.map(([k, v]) => h('div', {}, h('dt', {}, k), h('dd', {}, String(v))))
             )
           ),
+          createAudioReview(games),
           h(
             'footer',
             { class: 'dev__foot' },
