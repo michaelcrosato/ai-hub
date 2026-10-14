@@ -60,6 +60,11 @@ function cycleFrames(img, frames) {
 
 const framesOf = (game) => (Array.isArray(game.frames) && game.frames.length > 1 ? game.frames : null);
 
+function sizeScreen(event) {
+  const img = event.currentTarget;
+  img.closest('.cab__body')?.style.setProperty('--screen-width', `${img.naturalWidth}px`);
+}
+
 /** What is on the glass: cycling stills, a cover, or the generated pattern. */
 function art(game) {
   const frames = framesOf(game);
@@ -68,10 +73,11 @@ function art(game) {
         src: frameAt(frames, 0),
         alt: '',
         decoding: 'async',
+        onload: sizeScreen,
         dataset: { frames: JSON.stringify(frames), frameMs: String(FRAME_MS) },
       })
     : game.cover
-      ? h('img', { src: game.cover, alt: '', loading: 'lazy', decoding: 'async' })
+      ? h('img', { src: game.cover, alt: '', loading: 'lazy', decoding: 'async', onload: sizeScreen })
       : screenArt(game);
   if (frames) cycleFrames(picture, frames);
   return picture;
