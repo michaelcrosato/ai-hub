@@ -1,5 +1,5 @@
 import { test } from 'node:test';
-import { crc32 } from 'node:zlib';
+import * as zlib from 'node:zlib';
 import assert from 'node:assert/strict';
 import { mkdtemp, cp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -136,7 +136,9 @@ function projectZip(files) {
   const locals = [], central = []; let offset = 0;
   for (const [name, content] of Object.entries(files)) {
     const n = Buffer.from(name), data = Buffer.from(content), l = Buffer.alloc(30), c = Buffer.alloc(46);
-    l.writeUInt32LE(crc32(data), 14); c.writeUInt32LE(crc32(data), 16);
+    // Match zip.test.mjs: older Node 20 also skips CRC validation in openZip.
+    const crc = typeof zlib.crc32 === 'function' ? zlib.crc32(data) >>> 0 : 0;
+    l.writeUInt32LE(crc, 14); c.writeUInt32LE(crc, 16);
     l.writeUInt32LE(0x04034b50); l.writeUInt16LE(20, 4); l.writeUInt32LE(data.length, 18); l.writeUInt32LE(data.length, 22); l.writeUInt16LE(n.length, 26);
     c.writeUInt32LE(0x02014b50); c.writeUInt16LE(20, 4); c.writeUInt16LE(20, 6); c.writeUInt32LE(data.length, 20); c.writeUInt32LE(data.length, 24); c.writeUInt16LE(n.length, 28); c.writeUInt32LE(offset, 42);
     locals.push(l,n,data); central.push(c,n); offset += l.length+n.length+data.length;
