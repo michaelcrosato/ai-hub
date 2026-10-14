@@ -2,7 +2,7 @@
 /**
  * scan.mjs — the one thing that makes this hub dynamic.
  *
- * Walks games/, reads only the <head> of each game, and writes
+ * Walks games/, reads game heads plus static audio evidence, and writes
  * data/games.json. This runs as the Vercel build command, so adding game #401
  * is `git add` and nothing else. It never writes to a game file.
  *
@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseHead, splitTitle, slugify, compareVersions, rootAbsoluteRefs } from './lib/parse.mjs';
 import { classify, assignSlugs, prettify, INDEX_FILE } from './lib/layout.mjs';
+import { scanAudio, mergeAudio } from './lib/audio-inventory.mjs';
 import { gitAddedDates } from './lib/dates.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -265,8 +266,10 @@ export async function scan({ quiet = false, list = false } = {}) {
   const notes = { skipped: [], big: [], rootRefs: [], bigIcons: 0, projectPages: [] };
 
   const inspected = await pool(entries, 24, async (entry) => {
+    // An inventory failure must fail the build, never quietly remove a game.
+    const audio = await scanAudio(entry, GAMES_DIR);
     try {
-      return { ...entry, ...(await inspect(entry.abs, entry.project)) };
+      return { ...entry, ...(await inspect(entry.abs, entry.project)), audio };
     } catch (err) {
       notes.skipped.push(`games/${entry.rel}: ${err.message}`);
       return null;
@@ -292,6 +295,7 @@ export async function scan({ quiet = false, list = false } = {}) {
     if (!icon) icon = await localAsset(rel, info.iconHref, IMAGE_EXT);
 
     const build = {
+      audio: item.audio,
       id: slugify(rel.replace(/\.[^.]+$/, '')) || place.key,
       version: place.version,
       label: place.label,
@@ -364,6 +368,9 @@ export async function scan({ quiet = false, list = false } = {}) {
       ...head.hub,
       ...override,
     };
+    game.audioReview = mergeAudio(builds.map(b => b.audio));
+    for (const build of builds) delete build.audio;
+    game.audioTags = [...game.audioReview.formats.map(f => f.toUpperCase()), ...(game.audioReview.evidence.length ? ['placeholder music'] : [])];
     delete game.hidden;
     for (const [field, value] of Object.entries(game)) {
       if (value === undefined || value === null || value === '') delete game[field];
