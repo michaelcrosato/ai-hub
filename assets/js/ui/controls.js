@@ -23,11 +23,11 @@ import { SORTS, GROUPINGS } from '../filter.js';
 import { MULTI } from '../manifest.js';
 import { store } from '../store.js';
 
-/** How big a cabinet is: one to a row, wide, with room for its blurb; or
- *  three to a row. On a phone both are one to a row. */
+/** Cabinet layouts: a wide row, three columns, or as many compact tiles as fit. */
 export const SIZES = [
   { key: 'wide', label: 'One per row' },
   { key: 'three', label: 'Three per row' },
+  { key: 'auto', label: 'Auto fit (320 × 240)' },
 ];
 export const currentSize = () => (SIZES.some((s) => s.key === store.ui().size) ? store.ui().size : SIZES[0].key);
 
