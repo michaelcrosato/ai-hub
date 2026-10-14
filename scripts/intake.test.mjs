@@ -10,6 +10,14 @@ const VITE_BUILT = '<html><head><script type="module" src="/assets/index-a1b2.js
 
 const reader = (pages) => (p) => pages[p] ?? PLAIN;
 
+test('inline engine documentation does not become missing script dependencies', () => {
+  const html = '<!-- <script src="comment.js"></script> -->' +
+    '<script>/* Example: <script src="game.js"><\\/script> */</script>' +
+    '<style>/* <script src="style.js"></script> */</style>';
+  assert.deepEqual(chooseWebRoot(['index.html'], () => html), { kind: 'projects', roots: [''] });
+  assert.equal(chooseWebRoot(['index.html'], () => html + '<script src="actual.js"></script>').kind, 'needs-build');
+});
+
 test('a plain folder with an index.html is one project', () => {
   const files = ['index.html', 'game.js', 'sprites/hero.png'];
   assert.deepEqual(chooseWebRoot(files, reader({})), { kind: 'projects', roots: [''] });
