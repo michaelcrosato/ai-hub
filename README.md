@@ -160,6 +160,11 @@ and `2.jpg`: a title or initial view, followed by two useful game or tool views.
 Use the shared 640×480 JPEG quality 58 format. Loading, blank and error screens
 do not count as screenshots; keep uncertain model details unset.
 
+When an import's identity is uncertain, set `"unsure": true` and a `reviewNote`
+in its `data/overrides.json` entry. It appears on the **Unsure** shelf on the
+wall and in the Couch, with its own screenshots and URL for comparison. Its
+genre and type stay intact. Remove `unsure` once the identity is resolved.
+
 **Local engine dependencies.** The importer also recognizes Three.js and
 Rapier references from jsDelivr, unpkg, esm.sh, Skypack and JSPM, and rewrites
 them to the exact version on the local library shelf. It handles both inline

@@ -116,7 +116,8 @@ export function weave(genres, others, cadence = CADENCE) {
  */
 export function buildRails(games, stats, { now = Date.now(), seed = dayKey(now) } = {}) {
   const shelf = games.filter((game) => shelfOf(game) === GAMES);
-  const tools = games.filter((game) => shelfOf(game) !== GAMES);
+  const tools = games.filter((game) => shelfOf(game) === 'tools');
+  const unsure = games.filter((game) => shelfOf(game) === 'unsure');
 
   const recent = games
     .filter((game) => stats.lastPlayed(game.slug) > 0)
@@ -161,6 +162,7 @@ export function buildRails(games, stats, { now = Date.now(), seed = dayKey(now) 
     ...weave(genres, others),
     worth(FEWEST.library, rail('originals', 'Originals', shelf.filter((game) => game.lineage.original))),
     worth(FEWEST.together, rail('together', 'Play together', together)),
+    worth(1, rail('unsure', 'Unsure', unsure)),
     worth(FEWEST.library, rail('tools', 'Tech demos & tools', tools)),
   ].filter(Boolean);
 }
