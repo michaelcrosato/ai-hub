@@ -47,7 +47,8 @@ zero imports, zero failures, zero build requirements and no unused metadata.
   browser start, keyboard movement and save/reload preserve the player's position.
 - Pier 17: 138/138 tests, content validation and installed browser save suite pass,
   including legacy migration, recovery and resumable activities.
-- Hub: 211/211 tests and build pass with the current audio scanner.
+- Hub: 211/211 tests and build pass with the current audio scanner. All five
+  games also start inside the hub player iframe without page errors.
 - Both new games: real Chromium/WebGL startup, rendering and keyboard movement
   at 640×480 and 390×844; fire/burst/roll for Vesper and movement/jump/high profile
   for Ochre exercised without page errors or failed HTTP assets. Engine errors
