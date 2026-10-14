@@ -23,9 +23,14 @@ export function placeholderEvidence(text, file) {
   // A structured soundtrack manifest can state its purpose without repeating
   // “music”. Require both a music source and looping tracks in that case.
   const soundtrackManifest = /manifest\.json$/i.test(file) && /["']source["']\s*:\s*["'][^"']*\/music\//i.test(text) && /["']loop["']\s*:\s*true/i.test(text);
-  for (const match of text.matchAll(/\bplace[ -]?holders?\b/gi)) {
-    const before = text.slice(Math.max(0, match.index - 240), match.index).split(/[\n.!?;]/).pop();
-    const after = text.slice(match.index + match[0].length, match.index + match[0].length + 240).split(/[\n.!?;]/)[0];
+  // Keep offsets/lines while removing URL vocabulary and separating HTML blocks.
+  const prose = text.replace(/https?:\/\/[^\s<>"']+/gi, s => ' '.repeat(s.length))
+    .replace(/<\/?[a-z][a-z0-9-]*(?:\s+[^<>]*?)?\/?>/gi, s => /<\/?(?:p|li|tr|h[1-6]|div|br)\b/i.test(s)
+      ? ';' + ' '.repeat(s.length - 1) : ' '.repeat(s.length));
+  const boundary = /[\n.!?;]|\b(?:but|however|whereas)\b/i;
+  for (const match of prose.matchAll(/\bplace[ -]?holders?\b/gi)) {
+    const before = prose.slice(Math.max(0, match.index - 240), match.index).split(boundary).pop();
+    const after = prose.slice(match.index + match[0].length, match.index + match[0].length + 240).split(boundary)[0];
     const clause = before + match[0] + after;
     if (!/\b(?:music|soundtrack|bgm|background track)\b/i.test(clause) && !soundtrackManifest) continue;
     if (/\b(?:no|not|never|without|isn't|aren't|removed|replaced|replace|replaces)\b[^.!?;]{0,55}\bplace[ -]?holders?\b|\bplace[ -]?holders?\b[^.!?;]{0,45}\b(?:removed|replaced|not used)\b/i.test(clause)) continue;
@@ -65,6 +70,29 @@ export async function scanAudio(entry, root) {
       const f = mimeFormat(m[1]);
       if (f) add(`inline:${hash(m[3].replace(/\s/g, ''))}`, f, 'inline', rel);
     }
+    // Parse inert JSON only; never evaluate scripts or infer audio from a MIME
+    // label alone. Validate field types, base64 encoding and matching signatures.
+    const jsonSources = /\.json$/i.test(rel) ? [text] : [];
+    for (const m of text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
+      if (/\btype\s*=\s*(?:"application\/json"|'application\/json'|application\/json(?=\s|$))/i.test(m[1])) jsonSources.push(m[2]);
+    }
+    for (const json of jsonSources) {
+      let parsed;
+      try { parsed = JSON.parse(json); } catch { continue; }
+      const pending = [parsed];
+      while (pending.length) {
+        const value = pending.pop();
+        if (!value || typeof value !== 'object') continue;
+        for (const child of Object.values(value)) if (child && typeof child === 'object') pending.push(child);
+        if (typeof value.mime !== 'string' || typeof value.data !== 'string') continue;
+        const f = mimeFormat(value.mime), payload = value.data.replace(/\s/g, '');
+        if (!f || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(payload)) continue;
+        const bytes = Buffer.from(payload, 'base64');
+        const actual = bytes.subarray(0, 3).toString() === 'ID3' ? 'mp3'
+          : bytes.subarray(0, 4).toString() === 'RIFF' && bytes.subarray(8, 12).toString() === 'WAVE' ? 'wav' : null;
+        if (f === actual) add(`inline:${hash(payload)}`, f, 'inline', rel);
+      }
+    }
     // Recognizable raw base64 passed to atob: only ID3 MP3 or RIFF/WAVE
     // signatures, not arbitrary blobs or MIME labels alone.
     for (const m of text.matchAll(/\batob\(\s*["'`]([a-z0-9+/=\s]+)["'`]\s*\)/gi)) {
@@ -77,6 +105,7 @@ export async function scanAudio(entry, root) {
     // Quoted literals include URLs in JS, HTML, CSS and JSON. Ignore templates
     // with substitutions; reconstructing runtime expressions is out of scope.
     function* references() {
+      yield* text.matchAll(/<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*([^\s"'`=<>]+)/gi);
       yield* text.matchAll(/["'`]([^"'`\r\n<>]{1,2048})["'`]/g);
       yield* text.matchAll(/(https?:\/\/[^\s"'`<>()\\]{1,2048}\.(?:mp3|wav)(?=[?#\s"'`<>()]|$)(?:[?#][^\s"'`<>()\\]*)?)/gi);
       yield* text.matchAll(/(?:\b(?:src|href)\s*=\s*|\burl\(\s*)([^\s"'`<>()]+\.(?:mp3|wav)(?=[?#\s"'`<>()]|$)(?:[?#][^\s"'`<>()]*)?)/gi);
@@ -93,7 +122,9 @@ export async function scanAudio(entry, root) {
             add(url.href, f, 'remote', rel);
           } catch { /* malformed or opaque URL */ }
         }
-      } else if (f || TEXT.test(ref.split(/[?#]/)[0])) {
+      // Loose HTML pages are separate games, not literal dependencies. Project
+      // pages are still inventoried by walk() within their own directory.
+      } else if (f || (TEXT.test(ref.split(/[?#]/)[0]) && !/\.html?$/i.test(ref.split(/[?#]/)[0]))) {
         const target = await resolve(ref, rel);
         if (target) await inspect(target);
       }
