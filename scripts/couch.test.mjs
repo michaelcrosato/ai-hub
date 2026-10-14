@@ -39,6 +39,14 @@ function library() {
   return games;
 }
 
+test('one uncertain import gets a review rail and stays out of the tools rail', () => {
+  const candidate = game('candidate', { type: 'Game', unsure: true });
+  const rails = buildRails([...library(), candidate], quiet, { now: NOW });
+  assert.deepEqual(slugs(rails.find(row => row.key === 'unsure').games), ['candidate']);
+  assert.ok(!rails.find(row => row.key === 'tools').games.includes(candidate));
+  assert.ok(!rails.find(row => row.key === 'originals').games.includes(candidate));
+});
+
 test('the home screen opens with what is yours and what is new, and ends with the other shelf', () => {
   const games = library();
   const stats = {

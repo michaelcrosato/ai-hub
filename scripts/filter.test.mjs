@@ -11,6 +11,19 @@ import { selectGames, facetCounts, shelfOf, sourceCounts, stackGames } from '../
 const stats = { isFave: () => false, plays: () => 0, lastPlayed: () => 0 };
 const state = (patch = {}) => ({ query: '', sort: 'name', favesOnly: false, facets: {}, ...patch });
 
+test('uncertain entries have a separate review shelf without losing their type', () => {
+  const games = [
+    normalize({ slug: 'confirmed', name: 'Twin', type: 'Game' }),
+    normalize({ slug: 'candidate', name: 'Twin', type: 'Game', unsure: true, reviewNote: 'Compare the menus' }),
+    normalize({ slug: 'lab', name: 'Lab', type: 'Tech demo', unsure: true }),
+  ];
+  assert.equal(shelfOf(games[1]), 'unsure');
+  assert.equal(games[1].type, 'Game');
+  assert.deepEqual(selectGames(games, state({ shelf: 'games' }), stats).map(g => g.slug), ['confirmed']);
+  assert.deepEqual(selectGames(games, state({ shelf: 'unsure' }), stats).map(g => g.slug), ['lab', 'candidate']);
+  assert.equal(selectGames(games, state({ shelf: null }), stats).length, 3);
+});
+
 const library = Array.from({ length: 400 }, (_, i) =>
   normalize({
     slug: `game-${i}`,

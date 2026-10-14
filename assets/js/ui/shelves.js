@@ -33,6 +33,11 @@ const ART = {
     h('path', { ...line, 'stroke-dasharray': '2.5 3.5', d: 'M13 42l18-10 18 10M31 10v22' }),
     h('path', { ...line, d: 'M53 5v8M49 9h8' }),
   ],
+  unsure: () => [
+    h('circle', { ...line, cx: 32, cy: 32, r: 22 }),
+    h('path', { ...line, d: 'M24 24a8 8 0 1 1 12 7c-3 2-4 3-4 7' }),
+    dot(32, 45),
+  ],
   // Four tiles: the whole wall.
   all: () => [
     h('rect', { ...line, x: 12, y: 12, width: 17, height: 17, rx: 3 }),
@@ -82,7 +87,7 @@ const SOURCES = [
 ];
 
 export function createShelves(root, { onSelect, onSource, onSurprise }) {
-  const [games, tools] = SHELVES.map((shelf) => ({
+  const [games, tools, unsure] = SHELVES.map((shelf) => ({
     shelf,
     ...button(shelf.key, shelf.label, '', () => onSelect(shelf.key)),
   }));
@@ -97,7 +102,7 @@ export function createShelves(root, { onSelect, onSource, onSurprise }) {
 
   root.append(
     h('div', { class: 'shelves__row shelves__row--lead' }, games.el),
-    h('div', { class: 'shelves__row' }, ...sources.map((s) => s.el), tools.el, surprise.el)
+    h('div', { class: 'shelves__row' }, ...sources.map((s) => s.el), tools.el, unsure.el, surprise.el)
   );
 
   return {
@@ -106,7 +111,7 @@ export function createShelves(root, { onSelect, onSource, onSurprise }) {
      * @param origins  Original and Inspired with how many the other filters leave
      */
     render(current, counts, { origin = '', origins = [], canSurprise = true } = {}) {
-      for (const { shelf, el, note } of [games, tools]) {
+      for (const { shelf, el, note } of [games, tools, unsure]) {
         el.setAttribute('aria-pressed', String(shelf.key === current));
         note.textContent = String(counts.get(shelf.key) || 0);
         // An empty shelf is not worth a big button; the current one always shows.

@@ -42,6 +42,7 @@ export const SHELVES = [
     noun: ['demo or tool', 'demos & tools'],
     holds: (type) => type === 'Tech demo' || type === 'Tool' || type === 'Website',
   },
+  { key: 'unsure', label: 'Unsure', noun: ['entry to review', 'entries to review'], holds: () => false },
 ];
 
 /** Shelf keys from before the demos and tools shelves were one. */
@@ -49,7 +50,7 @@ export const SHELF_ALIASES = { demos: 'tools' };
 
 export const DEFAULT_SHELF = SHELVES[0].key;
 
-export const shelfOf = (game) => (SHELVES.find((s) => s.holds(game.type)) || SHELVES[0]).key;
+export const shelfOf = (game) => game.unsure === true ? 'unsure' : (SHELVES.find((s) => s.holds(game.type)) || SHELVES[0]).key;
 
 /** On the wall at all: restricted games only when dev settings ask for everything. */
 export const isVisible = (game, showAll) => showAll || game.restricted !== true;
