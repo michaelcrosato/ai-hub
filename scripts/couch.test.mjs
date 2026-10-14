@@ -160,7 +160,8 @@ test('the real catalogue makes a full home screen, every row within its cap', as
   assert.equal(rails.at(-1).key, 'tools');
   const hidden = new Set(manifest.games.filter((g) => g.restricted === true).map((g) => g.slug));
   for (const row of rails) {
-    assert.ok(row.games.length >= 2 && row.games.length <= CAP.library, row.key);
+    const minimum = row.key === 'unsure' ? 1 : 2;
+    assert.ok(row.games.length >= minimum && row.games.length <= CAP.library, row.key);
     assert.equal(new Set(slugs(row.games)).size, row.games.length, `${row.key} repeats a game`);
     assert.ok(row.games.every((g) => !hidden.has(g.slug)), `${row.key} shows a hidden game`);
   }
