@@ -208,6 +208,33 @@ test('stacks keep the sort, and a search can leave a stack of one, which is just
   assert.deepEqual(tiles({ query: 'starward' }), ['dq9-b']);
 });
 
+test('Newest first orders hub arrivals across source stacks, independent of original source dates', () => {
+  const list = [
+    normalize({ slug: 'old-source-new-import', name: 'Zulu', source: 'Series A', added: '2026-10-13T21:00:00Z', sourceDate: '2026-08-01' }),
+    normalize({ slug: 'new-source-old-import', name: 'Alpha', source: 'Series B', added: '2026-10-13T18:00:00Z', sourceDate: '2026-10-13' }),
+    normalize({ slug: 'older-attempt', name: 'Bravo', source: 'Series A', added: '2026-09-01', sourceDate: '2026-07-01' }),
+  ];
+  const s = state({ sort: 'newest' });
+  const selected = selectGames(list, s, stats);
+  assert.deepEqual(selected.map(g => g.slug), ['old-source-new-import', 'new-source-old-import', 'older-attempt']);
+  const tiles = stackGames(selected, s);
+  assert.equal(tiles[0].stack, true);
+  assert.deepEqual(tiles[0].games.map(g => g.slug), ['old-source-new-import', 'older-attempt']);
+  assert.equal(tiles[1].slug, 'new-source-old-import');
+  assert.ok(!deriveFacets(list).some(facet => facet.key === 'sourceDate'), 'provenance dates are not genre/filter rails');
+});
+
+test('latest GitHub and Sites imports precede the earlier Grok batch in Newest first', () => {
+  const added = JSON.parse(readFileSync(new URL('../data/added.json', import.meta.url), 'utf8'));
+  const latest = ['rdr2-gpt6a', 'policegame-2', 'policegame', 'agent-engine', '90spcrpg'];
+  const sites = ['cinder-choir', 'threads-of-the-last-dawn'];
+  const prior = added['grok-adventureforge/index.html'];
+  for (const slug of [...latest, ...sites, 'morrowglass-hollow-bell']) {
+    assert.ok(Date.parse(added[`${slug}/index.html`]) > Date.parse(prior), slug);
+  }
+  assert.ok(Date.parse(added[`${latest[0]}/index.html`]) > Date.parse(added[`${sites[0]}/index.html`]));
+});
+
 test('the Source rail is Original or Inspired, greying out whichever the filters empty', () => {
   const rail = (patch) => sourceCounts(lineup, state({ origin: '', series: '', source: '', ...patch }), stats);
   const shape = (options) => options.map((o) => `${o.label} ${o.count}/${o.total}`);
