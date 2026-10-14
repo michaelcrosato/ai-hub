@@ -1,0 +1,1 @@
+import{N as e}from"./index-CvDPi91_.js";import{r as t}from"./api-mKfdYOFs.js";var n=e({name:`agent-engine`,doc:`Agent Engine showcase: movement, weapons, physics, enemies, doors/keys, audio, looks, animation.`,plugins:t(),startRoom:`hub`,playerPrefab:`player`});export{n as game};
