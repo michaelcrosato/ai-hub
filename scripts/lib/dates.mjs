@@ -28,8 +28,11 @@ export function parseAddedHistory(history) {
       dates.set(file, date);
     }
   }
-  return new Map([...dates].filter(([file, date]) => file?.startsWith('games/') && date)
-    .map(([file, date]) => [file.slice('games/'.length), date]));
+  return new Map(
+    [...dates]
+      .filter(([file, date]) => file?.startsWith('games/') && date)
+      .map(([file, date]) => [file.slice('games/'.length), date]),
+  );
 }
 
 /** Persisted dates always win during scans: a shallow deployment checkout
@@ -41,9 +44,11 @@ export async function gitAddedDates(root, { requireFullHistory = false } = {}) {
       const { stdout } = await run('git', ['rev-parse', '--is-shallow-repository'], { cwd: root });
       if (stdout.trim() !== 'false') throw new Error('Date migration requires a full Git history');
     }
-    const { stdout } = await run('git', [
-      'log', '--reverse', '--name-status', '-z', '--find-renames', '--format=%x00%cI', '--', 'games',
-    ], { cwd: root, maxBuffer: 64 * 1024 * 1024, timeout: 20_000 });
+    const { stdout } = await run(
+      'git',
+      ['log', '--reverse', '--name-status', '-z', '--find-renames', '--format=%x00%cI', '--', 'games'],
+      { cwd: root, maxBuffer: 64 * 1024 * 1024, timeout: 20_000 },
+    );
     return parseAddedHistory(stdout);
   } catch (error) {
     if (requireFullHistory) throw error;
