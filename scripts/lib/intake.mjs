@@ -68,7 +68,12 @@ export const isContainer = (zipName, paths) =>
  */
 export function missingScripts(html, dir, present) {
   const missing = [];
-  for (const m of String(html || '').matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"'?#]+)/gi)) {
+  // Inline engine documentation may contain example script tags. Browsers
+  // treat script/style bodies as raw text, not additional HTML elements.
+  const markup = String(html || '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/(<(script|style)\b(?:[^>"']|"[^"]*"|'[^']*')*>)[\s\S]*?(<\/\2\s*>|$)/gi, '$1$3');
+  for (const m of markup.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"'?#]+)/gi)) {
     const src = m[1].trim();
     if (/^([a-z][a-z0-9+.-]*:|\/\/)/i.test(src)) continue; // a CDN is not the package's job
     // `/assets/x.js` in a built page means "from where this page is served",
