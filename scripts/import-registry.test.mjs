@@ -19,6 +19,39 @@ async function fixture(t) {
   return { root, run: (...args) => JSON.parse(execFileSync(process.execPath, ['scripts/ingest.mjs', ...args, '--json'], { cwd: root, encoding: 'utf8' })) };
 }
 const html = '<title>Same title</title><canvas></canvas><script>let game=1</script>';
+test('an old source joins the hub today, with source chronology preserved separately on rerun', async t => {
+  const { root, run } = await fixture(t);
+  await writeFile(path.join(root, 'input/old.html'), html);
+  await mkdir(path.join(root, 'input/project'));
+  await writeFile(path.join(root, 'input/project/index.html'), '<title>Old project</title><script src="main.js"></script>');
+  await writeFile(path.join(root, 'input/project/main.js'), 'let game=1');
+  const sourceDate = '2025-01-01T00:00:00.000Z';
+  await writeFile(path.join(root, 'meta.json'), JSON.stringify({ schemaVersion: 1, sources: {
+    'old.html': { sourceDate }, project: { sourceDate },
+  } }));
+  const before = Date.now();
+  const result = run('input/old.html', 'input/project', '--metadata', 'meta.json');
+  const after = Date.now();
+  assert.equal(result.counts.pages, 1);
+  assert.equal(result.counts.projects, 1);
+  const readDates = name => readFile(path.join(root, `data/${name}.json`), 'utf8');
+  const addedText = await readDates('added');
+  const added = JSON.parse(addedText);
+  const sourcesText = await readDates('source-dates');
+  const sources = JSON.parse(sourcesText);
+  for (const destination of ['old.html', 'project/index.html']) {
+    assert.ok(Date.parse(added[destination]) >= before && Date.parse(added[destination]) <= after, destination);
+    assert.equal(sources[destination], sourceDate, destination);
+  }
+  const manifest = JSON.parse(await readDates('games'));
+  for (const game of manifest.games) {
+    assert.equal(game.sourceDate, sourceDate);
+    assert.equal(game.added, added[game.builds[0].file]);
+  }
+  assert.equal(run('input/old.html', 'input/project', '--metadata', 'meta.json').counts.unchanged, 2);
+  assert.equal(await readDates('added'), addedText);
+  assert.equal(await readDates('source-dates'), sourcesText);
+});
 test('unchanged reruns preserve files and registry; changed dependency imports', async t => {
   const { root, run } = await fixture(t);
   await mkdir(path.join(root, 'input/game'));

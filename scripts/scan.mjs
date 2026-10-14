@@ -12,15 +12,12 @@
  */
 
 import { readdir, stat, readFile, writeFile, open } from 'node:fs/promises';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parseHead, splitTitle, slugify, compareVersions, rootAbsoluteRefs } from './lib/parse.mjs';
 import { classify, assignSlugs, prettify, INDEX_FILE } from './lib/layout.mjs';
-
-const run = promisify(execFile);
+import { gitAddedDates } from './lib/dates.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const GAMES_DIR = path.join(ROOT, 'games');
@@ -28,6 +25,7 @@ const COVERS_DIR = path.join(ROOT, 'covers');
 const DATA_DIR = path.join(ROOT, 'data');
 const OUT_FILE = path.join(DATA_DIR, 'games.json');
 export const ADDED_FILE = path.join(DATA_DIR, 'added.json');
+export const SOURCE_DATES_FILE = path.join(DATA_DIR, 'source-dates.json');
 const OVERRIDES_FILE = path.join(DATA_DIR, 'overrides.json');
 
 /** Most heads end in the first few KB; a game that inlines a big stylesheet
@@ -155,36 +153,6 @@ export async function pool(items, limit, fn) {
   return out;
 }
 
-/**
- * First-commit dates per file, used only for a game data/added.json has never
- * seen. File mtimes are worthless after a clone — every file is stamped with
- * the checkout time — and Vercel's clone is shallow, which makes every file
- * look as if it arrived in the latest commit. So the date recorded the first
- * time a game was scanned (or imported) always wins.
- */
-async function gitAddedDates() {
-  const dates = new Map();
-  try {
-    const { stdout } = await run(
-      'git',
-      ['log', '--diff-filter=A', '--reverse', '--name-only', '--format=%x00%aI', '--', 'games'],
-      { cwd: ROOT, maxBuffer: 64 * MB, timeout: 20_000 }
-    );
-    for (const chunk of stdout.split('\0')) {
-      const lines = chunk.split('\n').filter(Boolean);
-      if (lines.length < 2) continue;
-      const iso = lines[0].trim();
-      for (const file of lines.slice(1)) {
-        const rel = file.replace(/^games\//, '').trim();
-        if (rel && !dates.has(rel)) dates.set(rel, iso);
-      }
-    }
-  } catch {
-    // No git, no commits yet. Not an error.
-  }
-  return dates;
-}
-
 /** Cabinet text for the shared strip encode: resolution, format, and quality. */
 export function encodeLabel({ width, height, format, quality }) {
   return `${width}×${height} ${format} quality ${quality}`;
@@ -277,12 +245,13 @@ async function localAsset(rel, href, extensions) {
 
 export async function scan({ quiet = false, list = false } = {}) {
   const entries = await walk(GAMES_DIR);
-  const [gitDates, covers, strips, overridesRaw, addedRaw] = await Promise.all([
-    gitAddedDates(),
+  const [gitDates, covers, strips, overridesRaw, addedRaw, sourceRaw] = await Promise.all([
+    gitAddedDates(ROOT),
     coverIndex(),
     loadFrameStrips(),
     readJson(OVERRIDES_FILE, {}),
     readJson(ADDED_FILE, {}),
+    readJson(SOURCE_DATES_FILE, {}),
   ]);
 
   const overrides = { ...overridesRaw };
@@ -291,6 +260,7 @@ export async function scan({ quiet = false, list = false } = {}) {
   // instead of accumulating forever.
   const known = new Set(entries.map((e) => e.rel));
   const added = Object.fromEntries(Object.entries(addedRaw).filter(([rel]) => known.has(rel)));
+  const sourceDates = Object.fromEntries(Object.entries(sourceRaw).filter(([rel]) => known.has(rel)));
   const nowIso = new Date().toISOString();
   const notes = { skipped: [], big: [], rootRefs: [], bigIcons: 0, projectPages: [] };
 
@@ -328,7 +298,8 @@ export async function scan({ quiet = false, list = false } = {}) {
       file: rel,
       path: urlPath('/games/', rel),
       bytes: stats.size,
-      added: added[rel] || (place.made && `${place.made}T12:00:00.000Z`) || gitDates.get(rel) || stats.mtime.toISOString(),
+      added: added[rel] || gitDates.get(rel) || nowIso,
+      sourceDate: sourceDates[rel] || (place.made && `${place.made}T12:00:00.000Z`) || stats.mtime.toISOString(),
       // Head details ride along only until the newest build is chosen.
       head: {
         name: titleName,
@@ -341,6 +312,7 @@ export async function scan({ quiet = false, list = false } = {}) {
       },
     };
     added[rel] = build.added;
+    sourceDates[rel] = build.sourceDate;
 
     if (!groups.has(place.key)) groups.set(place.key, { ...place, builds: [] });
     groups.get(place.key).builds.push(build);
@@ -352,8 +324,9 @@ export async function scan({ quiet = false, list = false } = {}) {
   for (const [key, group] of groups) {
     const slug = slugs.get(key);
     const { builds } = group;
-    // Newest first: by version when both have one, else by date added.
-    builds.sort((a, b) => compareVersions(b.version, a.version) || b.added.localeCompare(a.added));
+    // Select the newest source build even when old and new builds were
+    // imported together. Hub arrival dates control the wall's Newest sort.
+    builds.sort((a, b) => compareVersions(b.version, a.version) || Date.parse(b.sourceDate) - Date.parse(a.sourceDate));
 
     const override = overrides[slug] || {};
     if (override.hidden === true) continue;
@@ -384,6 +357,7 @@ export async function scan({ quiet = false, list = false } = {}) {
       collection: group.collection ? prettify(group.collection) : undefined,
       added: dates[0],
       updated: dates[dates.length - 1],
+      sourceDate: current.sourceDate,
       buildCount: builds.length,
       builds,
       // hub:* meta from the game's own head, then data/overrides.json on top.
@@ -418,6 +392,11 @@ export async function scan({ quiet = false, list = false } = {}) {
     } catch {
       /* read-only checkout — games.json still has usable dates */
     }
+  }
+  const sourceText = JSON.stringify(sortKeys(sourceDates), null, 2) + '\n';
+  if (sourceText !== JSON.stringify(sortKeys(sourceRaw), null, 2) + '\n') {
+    try { await writeFile(SOURCE_DATES_FILE, sourceText, 'utf8'); }
+    catch { /* read-only checkout */ }
   }
 
   if (!quiet) report(manifest, notes, { list });

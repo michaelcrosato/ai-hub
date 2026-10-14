@@ -37,7 +37,7 @@ Nothing is typed in by hand. On every build, `scripts/scan.mjs` reads just the
 | `<meta name="theme-color">` | That cabinet's marquee colour and the light it throws |
 | `<link rel="icon" href="data:…">` | The emblem on its screen (a relative path works in a project folder) |
 | `<meta property="og:image">` | Its cover art, in a project folder that ships the image |
-| file size, the date in its name (or the date first seen) | The File size rail, the Newest sort |
+| file size, the date first added to the hub | The File size rail, the Newest sort |
 
 A game with none of these still works — it gets its filename as a name and a
 colour derived from its slug.
@@ -125,9 +125,10 @@ see [Import registry and structured plans](docs/import-registry.md).
 
 What it does, so you do not have to:
 
-- **Dates.** Each file keeps its own modified date as the day it joined the
-  wall, recorded in `data/added.json`, so *Newest first* is meaningful on day
-  one instead of four hundred games sharing one commit time.
+- **Dates.** `data/added.json` records when each entry joined the hub, so
+  *Newest first* shows the latest imports. Original source timestamps are
+  preserved separately in `data/source-dates.json` and the import registry;
+  importing an older game today does not bury it behind earlier imports.
 - **Duplicates.** A page byte-identical to one already on the wall is skipped
   and reported. Running the same import twice changes nothing.
 - **Clashes.** Nothing is ever overwritten. A second `snake.html` becomes
@@ -151,6 +152,13 @@ What it does, so you do not have to:
 Afterwards it rescans and lists titles shared by more than one tile — often
 the same game saved under different filenames. Those are never merged for you;
 move them into one folder as `v1.html`, `v2.html` if they are builds of one game.
+
+Before publishing a library import, check its genre, shelf (`Game`, `Tech demo`
+or `Tool`), and any claimed source inspiration against the actual runtime.
+Capture and inspect a real screenshot strip at `covers/<slug>/0.jpg`, `1.jpg`
+and `2.jpg`: a title or initial view, followed by two useful game or tool views.
+Use the shared 640×480 JPEG quality 58 format. Loading, blank and error screens
+do not count as screenshots; keep uncertain model details unset.
 
 **Local engine dependencies.** The importer also recognizes Three.js and
 Rapier references from jsDelivr, unpkg, esm.sh, Skypack and JSPM, and rewrites
@@ -437,6 +445,7 @@ sources/          historical source packages; new imports leave originals at inp
 data/
   overrides.json  optional metadata, by slug
   added.json      first-seen dates, maintained automatically
+  source-dates.json original source dates, used to order builds
   games.json      generated every build; gitignored, never edited
 couch/            the Couch: a page of its own, over the same library
 catalogue/        the Catalogue, likewise

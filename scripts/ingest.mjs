@@ -5,8 +5,7 @@
  * Dropping files into games/ by hand still works; this is for the day you have
  * four hundred of them in assorted folders and zips. It
  *
- *   - copies single-file games, keeping each file's own modified date as the
- *     date it joined the wall (so "Newest" means something on day one)
+ *   - records when a game joined the wall separately from its source date
  *   - skips byte-identical copies of a game already on the wall
  *   - unpacks zips: a finished build (dist/, build/, or a plain index.html) is
  *     unpacked into a folder of its own; a package that still needs building is
@@ -28,7 +27,7 @@ import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
-import { scan, pool, mb, ROOT, GAMES_DIR, ADDED_FILE } from './scan.mjs';
+import { scan, pool, mb, ROOT, GAMES_DIR, ADDED_FILE, SOURCE_DATES_FILE } from './scan.mjs';
 import { openZip } from './lib/zip.mjs';
 import { isJunk, isContainer, HTML, chooseWebRoot, packageName, UNINFORMATIVE_NAME } from './lib/intake.mjs';
 import { INDEX_FILE, classify } from './lib/layout.mjs';
@@ -161,6 +160,8 @@ const hashes = new Map(); // sha1 of a page → where it lives in games/
 const claimed = new Set();
 const gameKeys = new Set();
 const addedDates = {};
+const sourceDates = {};
+const importedAt = new Date().toISOString();
 
 const sha1 = (buf) => createHash('sha1').update(buf).digest('hex');
 const posix = (...parts) => parts.filter(Boolean).join('/');
@@ -322,7 +323,8 @@ async function performPage({ data, name, modified, from, subdir, qualifier }) {
   prepared.candidate.singlePage = true;
   remember(prepared, path.posix.dirname(rel), rel);
   hashes.set(hash, rel);
-  if (modified) addedDates[rel] = modified.toISOString();
+  addedDates[rel] = importedAt;
+  if (modified) sourceDates[rel] = modified.toISOString();
   report.pages.push({ from, rel, bytes: data.length, title: titleOf(data) });
 }
 
@@ -419,7 +421,8 @@ async function performProject({ name, files, from, subdir, entry = null }) {
   const entryModified = prepared.candidate.provenance.sourceDate ? new Date(prepared.candidate.provenance.sourceDate) : files.find((f) => f.rel === entryKey)?.modified;
   remember(prepared, dir, `${dir}/index.html`);
   hashes.set(hash, `${dir}/index.html`);
-  if (entryModified) addedDates[`${dir}/index.html`] = entryModified.toISOString();
+  addedDates[`${dir}/index.html`] = importedAt;
+  if (entryModified) sourceDates[`${dir}/index.html`] = entryModified.toISOString();
   report.projects.push({ from, rel: `${dir}/`, files: files.length, bytes, fixed, title: titleOf(entryData) });
   if (leftovers.length) report.leftovers.push({ rel: `${dir}/`, files: leftovers });
 }
@@ -664,16 +667,17 @@ for (const input of inputs) {
   } catch (error) { report.failed.push({ from: shown(input), why: error.message }); }
 }
 
-if (!opts.dryRun && Object.keys(addedDates).length) {
-  let added = {};
+for (const [file, dates] of [[ADDED_FILE, addedDates], [SOURCE_DATES_FILE, sourceDates]]) {
+  if (opts.dryRun || !Object.keys(dates).length) continue;
+  let existing = {};
   try {
-    added = JSON.parse(await readFile(ADDED_FILE, 'utf8'));
+    existing = JSON.parse(await readFile(file, 'utf8'));
   } catch {
     /* first run */
   }
-  Object.assign(added, addedDates);
-  const sorted = Object.fromEntries(Object.entries(added).sort(([a], [b]) => a.localeCompare(b)));
-  await writeFile(ADDED_FILE, JSON.stringify(sorted, null, 2) + '\n', 'utf8');
+  Object.assign(existing, dates);
+  const sorted = Object.fromEntries(Object.entries(existing).sort(([a], [b]) => a.localeCompare(b)));
+  await writeFile(file, JSON.stringify(sorted, null, 2) + '\n', 'utf8');
 }
 
 if (!opts.dryRun && JSON.stringify(registry) !== originalRegistry) {

@@ -13,7 +13,7 @@
 export const NOT_A_FACET = new Set([
   'slug', 'name', 'tagline', 'description', 'title', 'search', 'path', 'cover',
   'frames', 'frameLabel',
-  'icon', 'themeColor', 'version', 'added', 'updated', 'bytes', 'buildCount',
+  'icon', 'themeColor', 'version', 'added', 'updated', 'sourceDate', 'bytes', 'buildCount',
   'builds', 'lang', 'file', 'id', 'label', 'hub', 'hidden', 'addedAt', 'updatedAt',
   // `type` has its own control — the shelf buttons — and `restricted` is a
   // switch, not something to browse by.
