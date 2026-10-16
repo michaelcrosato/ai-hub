@@ -1,5 +1,5 @@
 /**
- * ui/views.js — the three ways into the same library, and the switch between
+ * ui/views.js — six ways into the same library, and the switch between
  * them that every one of them carries.
  *
  *   Wall       the arcade: cabinets on a wall, picked by shelf and filter
@@ -23,6 +23,9 @@ export const VIEWS = [
     hint: 'Every game as a row, to sort, chart and compare',
     glyph: 'M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01',
   },
+  { key: 'atlas', label: 'Atlas', href: '/atlas', hint: 'Explore the library by genre district', glyph: 'M3 6l6-3 6 3 6-3v15l-6 3-6-3-6 3zM9 3v15M15 6v15' },
+  { key: 'timeline', label: 'Timeline', href: '/timeline', hint: 'Travel through the library by date added', glyph: 'M6 3v18M3 6h6M3 12h6M3 18h6M12 6h8M12 12h5M12 18h8' },
+  { key: 'deck', label: 'Deck', href: '/deck', hint: 'Discover one shuffled game at a time', glyph: 'M7 6h13v15H7zM4 18H2V2h13v2M11 11l5 3-5 3z' },
 ];
 
 /**
@@ -63,6 +66,7 @@ export function viewSwitch(current, { className = '' } = {}) {
         class: 'views__link',
         href: view.href,
         title: view.hint,
+        'aria-label': view.label,
         'aria-current': view.key === current ? 'page' : null,
         dataset: { view: view.key },
       },

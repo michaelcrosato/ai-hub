@@ -270,14 +270,14 @@ or not at all. View also sets the size: *One per row* (the default: a wide
 cabinet with its whole blurb beside the screen) or *Three per row*. A phone
 shows one per row either way.
 
-## Two more ways in: the Couch and the Catalogue
+## Six ways into the library
 
 The wall is one way into the library. The switch in the corner of every view
-(**Wall · Couch · Catalogue**) leads to two more, built over the same games
+(**Wall · Couch · Catalogue · Atlas · Timeline · Deck**) leads to five more, built over the same games
 and the same memory of this device: a game starred in one is starred in all,
 and a game played anywhere counts everywhere. An open game travels with you
 when you switch, and so does a search, as far as it is plain words. Hidden
-games stay hidden in all three.
+games stay hidden in all six.
 
 ### The Couch — `/couch`
 
@@ -350,6 +350,38 @@ every attempt at the same game in the order they arrived, then similar games
 and builds. Mark two to four records and **Compare** lines them up side by
 side, differences picked out. **Export** downloads the selection as CSV or
 copies it as a Markdown table.
+
+### The Atlas — `/atlas`
+
+A transit map of the library's genres. Pick a district, then browse its
+departure board to find a game. Map and board pages keep large collections
+manageable, with every entry reachable. Each departure has artwork, Play,
+Details and a favourite control. The selected district lives in the URL.
+
+### The Timeline — `/timeline`
+
+A journal of the library as it grows. Select a month or a day, switch between
+newest and oldest, and browse entries grouped by their arrival date. These are
+dates added to the hub, not the dates the original games were created. Load
+more entries to continue through large days; entries without dates have their
+own section. Date and order selections can be shared as links.
+
+### The Deck — `/deck`
+
+One shuffled game at a time, with artwork and a short description. Play it,
+save it as a favourite, or skip to the next card. Previous retraces your picks;
+finishing the deck offers a fresh deal. The seed and current card live in the
+URL, so reopening a link restores the same order. **Unplayed only** uses this
+device's play history.
+
+All three include text search, Games / All entries / Tech demos & tools /
+Unsure shelves, favourites, details with older builds, and the shared player.
+Press **/** to search and **Escape** to close details. The player's back button
+returns to the current selection. Search, shelf and favourites changes reset
+the view's narrower selection; **Reset selection** clears it all.
+
+Browser checks, with optional Playwright installed: start `pnpm dev`, then run
+`node scripts/explore-browser.mjs`. Pass a deployed site URL to check production.
 
 ## Optional extras
 
@@ -454,6 +486,9 @@ data/
   games.json      generated every build; gitignored, never edited
 couch/            the Couch: a page of its own, over the same library
 catalogue/        the Catalogue, likewise
+atlas/            the Atlas: genre districts and departure boards
+timeline/         the Timeline: a journal of arrivals
+deck/             the Deck: one shuffled discovery at a time
 assets/js/        native ES modules, no bundler
   color.js        theme-color → cabinet lighting, via OKLCH
   art.js          the six procedural screen patterns
@@ -462,7 +497,8 @@ assets/js/        native ES modules, no bundler
   similar.js      other attempts, and "more like this" (pure, tested)
   ui/grid.js      the wall, rendered in batches as you scroll
   ui/player.js    the framed player and the ways out of it, for every view
-  ui/views.js     the switch between the Wall, the Couch and the Catalogue
+  ui/views.js     the switch between all six selection interfaces
+  explore/        Atlas, Timeline, Deck and their shared search/player shell
   couch/          rails, pad and keys, the game page, search (logic tested)
   catalogue/      the query language, tallies, table, record card, compare
 scripts/
