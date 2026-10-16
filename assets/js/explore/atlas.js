@@ -79,6 +79,9 @@ export function createView(root, actions) {
 	let focusAfterRender = null;
 
 	function chooseDistrict(key) {
+		// The router emits only when the URL changes. Re-selecting the current
+		// district must leave both the visible page and its internal index alone.
+		if ((key || "") === (state.query.get("district") || "")) return;
 		gamePage = 0;
 		if (window.matchMedia("(max-width: 720px)").matches)
 			focusAfterRender = "stops-heading";
@@ -261,6 +264,7 @@ export function createView(root, actions) {
 			"li",
 			{
 				class: `atlas-stop${state.selected === game.slug ? " is-selected" : ""}`,
+				"data-atlas-slug": game.slug,
 				style: { "--atlas-line": color },
 			},
 			h(
@@ -507,6 +511,15 @@ export function createView(root, actions) {
 	}
 
 	return {
+		setSelected(slug) {
+			state = { ...state, selected: slug || null };
+			for (const stop of root.querySelectorAll(".atlas-stop")) {
+				stop.classList.toggle(
+					"is-selected",
+					stop.dataset.atlasSlug === state.selected,
+				);
+			}
+		},
 		getPool() {
 			const key = state.query.get("district");
 			return key
