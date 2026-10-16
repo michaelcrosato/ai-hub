@@ -18,16 +18,20 @@ function rank(value) {
 	return (result ^ (result >>> 16)) >>> 0;
 }
 
+function compareSlugs(a, b, seed) {
+	const difference = rank(`${seed}\0${a}`) - rank(`${seed}\0${b}`);
+	return difference || (a < b ? -1 : a > b ? 1 : 0);
+}
+
 /** Stable ranks preserve the order of surviving cards when a filter narrows. */
 export function shuffleDeck(games, seed = DEFAULT_SEED) {
 	const unique = new Map();
 	for (const game of games) {
 		if (game?.slug && !unique.has(game.slug)) unique.set(game.slug, game);
 	}
-	return [...unique.values()].sort((a, b) => {
-		const difference = rank(`${seed}\0${a.slug}`) - rank(`${seed}\0${b.slug}`);
-		return difference || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
-	});
+	return [...unique.values()].sort((a, b) =>
+		compareSlugs(a.slug, b.slug, seed),
+	);
 }
 
 /** Resolve URL state without mutating the catalogue or allowing out-of-bounds cards. */
@@ -39,26 +43,33 @@ export function deckState(
 		done = false,
 		unplayed = false,
 		hasPlayed = () => false,
+		previousCard = "",
 	} = {},
 ) {
 	const ordered = shuffleDeck(games, seed);
 	const cards = ordered.filter((game) => !unplayed || !hasPlayed(game.slug));
-	const found = cards.findIndex((game) => game.slug === card);
-	const oldIndex = ordered.findIndex((game) => game.slug === card);
+	const requested = card || previousCard;
+	const found = cards.findIndex((game) => game.slug === requested);
+	const oldIndex = ordered.findIndex((game) => game.slug === requested);
 	// Playing the focused card removes it from an unplayed deal. Continue after
-	// its old position instead of repeating all the cards already skipped.
-	const nextSurvivor =
-		found < 0 && oldIndex >= 0
-			? ordered.slice(oldIndex + 1).find((game) => cards.includes(game))
-			: null;
-	const removedAtEnd = found < 0 && oldIndex >= 0 && !nextSurvivor;
+	// its old position instead of repeating all the cards already skipped. The
+	// previous anchor also survives removal from the host's favourites pool.
+	const knownMissing =
+		found < 0 &&
+		(oldIndex >= 0 || Boolean(previousCard && previousCard === requested));
+	const nextSurvivor = knownMissing
+		? cards.find((game) => compareSlugs(game.slug, requested, seed) > 0)
+		: null;
+	const removedAtEnd = knownMissing && !nextSurvivor;
 	const exhausted = Boolean(cards.length && (done || removedAtEnd));
 	const index = exhausted
 		? cards.length
 		: nextSurvivor
 			? cards.indexOf(nextSurvivor)
 			: Math.max(0, found);
-	return { cards, index, exhausted, current: cards[index] || null };
+	const current = cards[index] || null;
+	const anchor = found >= 0 || knownMissing ? requested : current?.slug || "";
+	return { cards, index, exhausted, current, anchor };
 }
 
 /** A skip ends at the end; only an explicit redeal starts a new cycle. */
@@ -83,6 +94,7 @@ export function createView(root, actions) {
 	let drawnSlug = null;
 	let wasExhausted = false;
 	let swipeStart = null;
+	let lastQuery = null;
 	root.classList.add("deck-view");
 
 	const count = h("span", { class: "deck-count" }, "0 / 0");
@@ -291,6 +303,13 @@ export function createView(root, actions) {
 			.setAttribute("fill", saved ? "currentColor" : "none");
 	}
 
+	function setSelected(slug) {
+		card.classList.toggle(
+			"deck-card--selected",
+			Boolean(state.current && state.current.slug === slug),
+		);
+	}
+
 	root.addEventListener("keydown", (event) => {
 		if (
 			event.defaultPrevented ||
@@ -336,7 +355,11 @@ export function createView(root, actions) {
 
 	return {
 		getPool: () => state.cards,
+		setSelected,
 		update({ games, query, selected }) {
+			const focused = document.activeElement;
+			const ownedFocus = root.contains(focused);
+			const queryText = query.toString();
 			const seed = query.get("seed") || DEFAULT_SEED;
 			state = deckState(games, {
 				seed,
@@ -344,7 +367,9 @@ export function createView(root, actions) {
 				done: query.get("deckDone") === "1",
 				unplayed: query.get("unplayed") === "1",
 				hasPlayed: (slug) => store.plays(slug) > 0,
+				previousCard: queryText === lastQuery ? state.anchor : "",
 			});
+			lastQuery = queryText;
 			unplayed.checked = query.get("unplayed") === "1";
 			const total = state.cards.length;
 			count.textContent = `${Math.min(state.index + 1, total)} / ${total}`;
@@ -361,10 +386,7 @@ export function createView(root, actions) {
 			redeal.disabled = !total;
 			actionsRow.hidden = !state.current;
 			card.classList.toggle("deck-card--empty", !state.current);
-			card.classList.toggle(
-				"deck-card--selected",
-				Boolean(state.current && state.current.slug === selected),
-			);
+			setSelected(selected);
 
 			if (state.current) {
 				const game = state.current;
@@ -481,6 +503,14 @@ export function createView(root, actions) {
 			currentSeed = seed;
 			wasExhausted = state.exhausted;
 			syncFavourite();
+			if (
+				ownedFocus &&
+				!root.closest("[inert]") &&
+				(!focused.isConnected ||
+					focused.matches(":disabled") ||
+					focused.closest("[hidden]"))
+			)
+				card.focus({ preventScroll: true });
 		},
 	};
 }

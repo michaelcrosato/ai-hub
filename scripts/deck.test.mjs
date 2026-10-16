@@ -99,3 +99,63 @@ test("playing the current card in an unplayed deal advances without repeating ea
 	assert.equal(final.exhausted, true);
 	assert.equal(final.current, null);
 });
+
+test("removing a favourite continues after its rank and retains the cursor across store updates", () => {
+	const seed = "removed-favourite";
+	const ordered = shuffleDeck(games, seed);
+	const card = ordered[7].slug;
+	const before = deckState(games, { seed, card });
+	const remaining = games.filter((game) => game.slug !== card);
+	const after = deckState(remaining, {
+		seed,
+		card,
+		previousCard: before.anchor,
+	});
+	assert.equal(after.current.slug, ordered[8].slug);
+	assert.equal(after.anchor, card);
+	const refreshed = deckState(remaining, {
+		seed,
+		card,
+		previousCard: after.anchor,
+	});
+	assert.equal(refreshed.current.slug, ordered[8].slug);
+	const furtherRemoval = deckState(
+		remaining.filter((game) => game.slug !== after.current.slug),
+		{
+			seed,
+			card,
+			previousCard: refreshed.anchor,
+		},
+	);
+	assert.equal(furtherRemoval.current.slug, ordered[9].slug);
+});
+
+test("removing the first card without URL state advances; removing the final favourite exhausts the deal", () => {
+	const seed = "favourite-bounds";
+	const ordered = shuffleDeck(games, seed);
+	const initial = deckState(games, { seed });
+	const next = deckState(
+		games.filter((game) => game.slug !== initial.current.slug),
+		{
+			seed,
+			previousCard: initial.anchor,
+		},
+	);
+	assert.equal(next.current.slug, ordered[1].slug);
+	const finalCard = ordered.at(-1).slug;
+	const final = deckState(
+		games.filter((game) => game.slug !== finalCard),
+		{
+			seed,
+			card: finalCard,
+			previousCard: finalCard,
+		},
+	);
+	assert.equal(final.exhausted, true);
+	assert.equal(final.current, null);
+	const reset = deckState(
+		games.filter((game) => game.slug !== finalCard),
+		{ seed },
+	);
+	assert.equal(reset.current.slug, ordered[0].slug);
+});
