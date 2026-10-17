@@ -1,0 +1,2 @@
+import {boot} from './harness.mjs';
+const hashes=[];for(const native of [false,true]){const t=performance.now(),{app,game,G}=boot({native});app.start({demo:true,seed:552});const session=app.session;for(let i=0;i<1200&&!session.outcome&&session===app.session;i++)game.advance(.5);if(session.outcome!=='success'||app.demoRecoveries.length)throw Error('Runner failed seed 552');const hash=G.stateHash(app.session.serialize());hashes.push(hash);console.log({native,hash,seconds:(performance.now()-t)/1000});game.dispose();}if(hashes[0]!==hashes[1])throw Error('Runner states differ');
