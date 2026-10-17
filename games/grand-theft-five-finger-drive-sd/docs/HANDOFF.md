@@ -1,6 +1,18 @@
 # Grand Theft Five-Finger Drive-SD — implementation handoff
 
-Release candidate: the game systems, level, expansion fixture and automated checks are implemented. The four-hour soak passes. Production delivery is in progress. The original plan's human/hardware gates are not silently marked passed; see QA.md for exact limits.
+Published release: the game systems, level, expansion fixture and automated checks are implemented. The four-hour soak passes, and production delivery is verified. The original plan's human/hardware/performance gates are not silently marked passed; see QA.md for exact limits. Those open gates prevent an unqualified claim that every acceptance criterion is complete.
+
+## Verified delivery
+
+- Code commit on `main`: `c5c5016462f38daa654de4b3c9a9572792d72d9b`.
+- Tested and published Git tree: `5c7903b2a9441426e99e82748fbb6df0a93da24a`. A later documentation-only commit records this evidence.
+- Vercel production deployment: `dpl_DAJHp5NiAdjtpAMLPcduKXMUWYpC`, READY on 2026-10-17 UTC, exact matching code SHA, no alias error.
+- Deployment hostname: `crosato-arcade-7caseccxn-michaelcrosato-1122s-projects.vercel.app`.
+- Verified standalone game: https://crosato-arcade.vercel.app/games/grand-theft-five-finger-drive-sd/index.html
+- Verified hub player: https://crosato-arcade.vercel.app/#/play/grand-theft-five-finger-drive-sd
+- Live checks: exactly one search result; embedded title; idle attract with visible LIVE DEMO banner; native F9 returns to title; Play → New run starts; native Escape opens Pause; Back to the wall removes the iframe and restores search. Standalone title also loads.
+
+The shell had no GitHub push credentials. The connected GitHub API published the identical tested tree, created the release commit and fast-forwarded `main` with the expected-parent check. Local `main` was synchronized only after verifying identical trees. No force push, unrelated edit, branch or PR was used. The normal main-to-Vercel workflow remained intact. Browser metadata-extension errors are external to the game; no game error was observed in the production smoke checks.
 
 ## Run and resume
 
@@ -32,7 +44,7 @@ Open `index.html` through HTTP. From ai-hub, run `node scripts/dev.mjs`. The gam
 - [x] P9 Final soak: autonomous variants, watchdog, failure reset, mobile mode and silent boot complete. Four simulated hours: 87 wins, no failures, recoveries or errors.
 - [x] P10 Expansion: eight yard stations and The Spare Key. Test registers a new content-only mission ID after core load, completes both vehicle choices, restores and pays once.
 - [ ] P11 Full acceptance: 52 contracts, 21 missions, expansion, replay and the four-hour soak pass. Manual/reference-device and performance limits remain explicitly open in QA.
-- [ ] P12 Delivery: catalogue scan and hub tests pass; commit/push/READY and live iframe checks pending.
+- [x] P12 Delivery: catalogue scan and 234 hub tests pass; source is published to `main`; exact-commit production READY, standalone URL and live iframe/return checks verified.
 
 ## Design changes and resolved defects
 

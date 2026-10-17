@@ -3,10 +3,14 @@
 ## 1. Plan status and implementation handoff
 
 **Project ID:** `grand-theft-five-finger-drive-sd`
+
 **Display name:** `[Grand Theft Five-Finger Drive-SD]`
+
 **Level:** Palm Quay — The Meter Job
+
 **Plan version:** 1.0
-**Status:** Implemented release candidate. See [HANDOFF](HANDOFF.md) and [QA](QA.md) for stage-by-stage evidence, delivery status and exact unmet hardware/manual gates. The original requirements below remain the acceptance baseline.
+
+**Status:** Implemented and published; production smoke checks pass. See [HANDOFF](HANDOFF.md) and [QA](QA.md) for stage-by-stage evidence and the exact unmet hardware/manual/performance gates. The original requirements below remain the acceptance baseline; the goal is not declared fully cleared while those gates remain open.
 
 Build an original urban action game. Plan a heist, move between three crew members, take a vehicle, complete the job, and escape the police. Use pixel art and an isometric view as the main presentation. Use top-down and side-scroll areas to support specific parts of the same mission.
 

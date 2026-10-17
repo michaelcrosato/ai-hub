@@ -1,6 +1,6 @@
 # Verification record
 
-Date: 2026-10-17 UTC. Candidate based on ai-hub `34037cd8e8dc1fb3d3bf7b11701c502b67682b8f`. The final delivery commit and deployment are recorded in HANDOFF.md after release.
+Date: 2026-10-17 UTC. Code release `c5c5016462f38daa654de4b3c9a9572792d72d9b`, based on ai-hub `34037cd8e8dc1fb3d3bf7b11701c502b67682b8f`. Production delivery is verified; see HANDOFF.md. Documentation-only follow-up changes do not alter the tested game.
 
 This is an evidence record. A simulated controller is not a physical DualSense. A browser CPU benchmark is not a display-refresh measurement. AI completion does not establish human pacing.
 
@@ -30,6 +30,7 @@ Run game commands from `games/grand-theft-five-finger-drive-sd`.
 | Browser foreground observation | 1,800.585 seconds, 1,759 visible/focused samples, one interruption/restart, zero engine errors; 41 actors/14 cars. Median 1 FPS, only 86.925 simulated seconds, no full cycle. | `sd-browser-soak.json` |
 | Hub `node --test "scripts/**/*.test.mjs"` | 234/234 passed on merged main; final root suite 117.23 seconds | `hub-release-tests.log` |
 | Hub `node scripts/scan.mjs` | 701 games; exactly one matching entry, correct source, series, engine and relative path | Generated catalogue is not committed |
+| Production smoke checks | Vercel READY for the exact code commit; live hub search, iframe launch, idle demo, F9 interruption, new run, native-key pause and return-to-wall pass. Standalone URL loads. | Deployment and URLs in HANDOFF.md; `sd-production-hub.jpg`, `sd-production-attract.jpg` in scratch |
 
 The corrected four-hour release soak uses the final gameplay rules, including combat regrouping and the Watch Demo input handoff. Definition validation and final cosmetic details were added while it ran; those add no valid-world gameplay mutation. Menu, caption, rig and vehicle-detail changes have targeted contract/browser coverage. The thirty-minute foreground observation was on the integrated candidate before those final presentation changes.
 
@@ -76,9 +77,9 @@ Reviewed city, Records and gantry captures show local art, projected depth, clea
 | A27–A28 | Three-view visual review and audio lifecycle implemented. Browser runtime has no game errors. Browser audio activation, mute, duck and scheduler disposal pass. Physical listening and normal-rate animation/feel remain unverified. |
 | A29–A30 | Content-only new mission, save/restore/payout and replay/diagnostic tools verified. |
 | A31 | Warm CPU p95 varies from 15.1 to 62.1 ms. The 16.7/6 ms, sustained 60 Hz and five-second load targets are not certified in this environment. |
-| A32 | Local scan passes; production hub iframe and direct URL checks pending. |
+| A32 | Local scan passes. Exact-commit Vercel READY, production hub iframe/return flow and standalone URL verified. |
 | A33 | Requested source facts exist separately in README, HTML and SOURCE-INFO. Final chat must repeat them. |
-| A34 | Architecture, authoring, patch provenance and this evidence record supplied. Release details pending. |
+| A34 | Architecture, authoring, patch provenance, this evidence record and verified release details supplied. |
 
 ## Exact remaining external checks
 
