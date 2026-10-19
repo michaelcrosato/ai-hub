@@ -86,6 +86,18 @@ game joined the wall. A later file with the same source and title —
 the newest in front, the older file in its drawer. To keep only the newest,
 delete the older file.
 
+The [2026-10-19 root HTML intake](docs/imports/2026-10-19-root-html-intake.json)
+uses `GameTitle-SOURCE-model-effort-YYYYMMDD-HHMM.html` for new entries. The
+title, inspiration, model and effort are also recorded in `data/overrides.json`,
+so the filename is not used as the display title. Explicit source dates and
+times take precedence; missing times use a documented file-modification or
+export-time fallback in the audit. Arrival dates still record the actual
+import time. Gemini defaults to Gemini 4 Argon and Muse to Muse Wonder 1 unless
+the package states otherwise; missing details remain unknown. Exact duplicates
+keep their existing URLs, and differing packages with uncertain revision
+lineage are retained separately on the Unsure shelf. These names do not use
+the older source-first filename grouping rule above.
+
 ### Folders: collections and projects
 
 A folder under `games/` is one of three things, decided by what is in it:
