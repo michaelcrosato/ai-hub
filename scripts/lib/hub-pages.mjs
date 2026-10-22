@@ -45,8 +45,12 @@ function basename(file) {
 }
 
 function labeled(text, name) {
-  const match = String(text || '').slice(0, 16000).match(new RegExp(`(?:^|\\n|\\s)${name}\\s*:\\s*([^\\n<]{1,300})`, 'i'));
-  return match ? match[1].replace(/\s+/g, ' ').trim() : '';
+  const head = String(text || '').slice(0, 16000);
+  const plain = head.match(new RegExp(`(?:^|\\n|\\s)${name}\\s*:\\s*([^\\n<"]{1,300})`, 'i'));
+  if (plain) return plain[1].replace(/\s+/g, ' ').trim();
+  // Packaged pages often put the same facts in a JSON block: "source": "Grand Theft Auto 5".
+  const quoted = head.match(new RegExp(`"${name}"\\s*:\\s*"([^"\\\\]{1,200})"`, 'i'));
+  return quoted ? quoted[1].replace(/\s+/g, ' ').trim() : '';
 }
 
 function modelFromLine(line) {

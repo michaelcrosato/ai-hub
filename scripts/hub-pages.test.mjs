@@ -74,6 +74,28 @@ test('a template, a shell, and a test are not games', () => {
   }
 });
 
+test('a quoted JSON source is the inspired-by source', () => {
+  const page = `<!doctype html>
+<!--
+{ "sourceInformation": { "date": "2026-10-20 04:38 PDT", "source": "Grand Theft Auto 5", "title": "Grand Theft Good Intentions" } }
+-->
+<html><head><title>Grand Theft Good Intentions</title>
+<meta name="description" content="A complete, original coastal crime caper. Three friends. One ledger. Very questionable good intentions.">
+</head><body></body></html>`;
+  const plan = planHubPage({
+    sourcePath: 'gpt-hub/Grand-Theft-Good-Intentions-Grand-Theft-Auto-5-gpt-6.1-sol-max-20261020-0320.html',
+    pageText: page,
+    sha256: 'good-intentions',
+    modifiedAt: '2026-10-20T10:20:00.000Z',
+    intake: [],
+    installed: [],
+  });
+  assert.equal(plan.action, 'import');
+  assert.equal(plan.overrides.source, 'Grand Theft Auto 5');
+  assert.equal(plan.overrides.series, 'Grand Theft Auto');
+  assert.equal(plan.destination, 'Grand-Theft-Good-Intentions-Grand-Theft-Auto-5-gpt-6.1-sol-max-20261020-0320.html');
+});
+
 test('a build-tree copy of an already imported page is not a second game', () => {
   const plan = planHubPage({
     sourcePath: 'gpt-hub/Starfoxglove/dist/index.html',
