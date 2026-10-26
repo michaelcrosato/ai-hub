@@ -120,6 +120,13 @@ The kit object:
 | `kit.setPixelHeight(lines)` | fixed low-resolution rendering with hard pixels (0 = native), §5 |
 | `kit.toast(text)` | a small notice |
 
+**In an AI Hub session** (the page was opened with `?aihub=1`; see
+`../hub/README.md`) the game is shared with other players, so nothing local may
+stop it: the settings menu opens over a running game instead of pausing it,
+and `kit.pause(true)` logs a warning and does nothing. Keep anything in
+`onPause` that matters (audio, timers) working without it, and don't build
+gameplay on pausing in session mode.
+
 ## 3. Quality tiers
 
 | | low | medium | high | ultra |

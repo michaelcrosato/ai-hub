@@ -4,7 +4,7 @@
  * The hero and the page draw these; node --test reads them directly.
  */
 
-import { playersOf, MULTI } from '../manifest.js';
+import { playersOf, MULTI, sessionOf } from '../manifest.js';
 import { bytes, date, plural } from '../format.js';
 import { parseControls, keysSummary } from './howto.js';
 
@@ -73,6 +73,7 @@ export function pageFacts(game, now = Date.now()) {
     { label: 'Origin', value: originOf(game), note: series },
     modelsOf(game) && { label: 'Model', value: modelsOf(game) },
     playersText(game) && { label: 'Players', value: playersText(game) },
+    sessionOf(game) && { label: 'Hub session', value: sessionOf(game).label },
     game.bytes > 0 && { label: 'Size', value: bytes(game.bytes) },
     game.addedAt > 0 && { label: 'Added', value: date(game.added), note: ago(game.addedAt, now) },
     updated && { label: 'Updated', value: date(game.updated), note: ago(game.updatedAt, now) },

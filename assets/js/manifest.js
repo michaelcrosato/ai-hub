@@ -22,6 +22,8 @@ export const NOT_A_FACET = new Set([
   'q', 'sort', 'fav', 'shelf', 'origin',
   // Worked out here, below, rather than catalogued.
   'lineage', 'rails',
+  // AI Hub session support: shown as one line (sessionOf), never as four facts.
+  'session', 'sessionPlayers', 'sessionMode', 'sessionMinutes',
 ]);
 
 /** Fields that are searched and listed in the drawer but get no rail: the
@@ -61,6 +63,28 @@ export function playersOf(game) {
   if (high > 1) out.push(MULTI);
   for (let n = Math.max(2, low); n <= Math.min(high, MOST_SEATS); n++) out.push(`${n} players`);
   return out;
+}
+
+/** The AI Hub Session Protocol versions this hub can run (lib/hub/README.md). */
+export const SESSION_PROTOCOLS = [1];
+const SESSION_MODES = { versus: 'Versus', 'co-op': 'Co-op', race: 'Race' };
+
+/**
+ * What a game says about playing it in an AI Hub session, read off its
+ * hub:session metas: the protocol, the seats, the mode and the round length,
+ * plus the one line the details show. Null for a game that says nothing.
+ */
+export function sessionOf(game) {
+  const version = Number(game.session);
+  if (!Number.isInteger(version) || version < 1) return null;
+  const [low, high = low] = (String(game.sessionPlayers ?? '').match(/\d+/g) || []).map(Number);
+  const seats = low ? [low, high] : [2, 4];
+  const mode = SESSION_MODES[game.sessionMode] ? game.sessionMode : null;
+  const minutes = Number(game.sessionMinutes) > 0 ? Number(game.sessionMinutes) : null;
+  const parts = [seats[0] === seats[1] ? `${seats[0]} players` : `${seats[0]}–${seats[1]} players`];
+  if (mode) parts.push(SESSION_MODES[mode]);
+  if (minutes) parts.push(`about ${minutes} min`);
+  return { version, seats, mode, minutes, supported: SESSION_PROTOCOLS.includes(version), label: parts.join(' · ') };
 }
 
 /** The bracket a file's size falls in. */

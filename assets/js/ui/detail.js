@@ -14,7 +14,7 @@
 
 import { h, clear, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
-import { NOT_A_FACET } from '../manifest.js';
+import { NOT_A_FACET, sessionOf } from '../manifest.js';
 import { bytes, date, plural } from '../format.js';
 
 const prettyLabel = (key) =>
@@ -29,6 +29,7 @@ function facts(game) {
     ['Size', bytes(game.bytes)],
   ];
   if (game.version) rows.splice(1, 0, ['Current build', `v${game.version}`]);
+  rows.push(['Hub session', sessionOf(game)?.label]);
 
   for (const [key, value] of Object.entries(game)) {
     if (NOT_A_FACET.has(key)) continue;

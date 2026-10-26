@@ -18,6 +18,7 @@ import { buildsOf, dayText, dayToken, sizeText, valuesOf } from './query.js';
 import { keycaps } from './keycaps.js';
 import { byName } from './order.js';
 import { playersText } from './ledger.js';
+import { sessionOf } from '../manifest.js';
 
 const GLYPHS = {
   external: 'M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
@@ -335,6 +336,7 @@ export function createSheet(
             models.length ? models.map((value) => query('model', value)) : h('span', { class: 'nil' }, 'Not named')
           ),
           fact('Players', playersText(entry)),
+          fact('Hub session', sessionOf(entry)?.label),
           fact('Controls', entry.controls && controlsLine(entry.controls)),
           fact(
             'Tags',

@@ -75,7 +75,7 @@ const FLAGS = {
 const NEW_FOR = 7 * DAY;
 
 /** What `has:` can ask about: fields a game may or may not carry. */
-const HAS = ['model', 'source', 'series', 'tagline', 'players', 'controls', 'tags', 'description'];
+const HAS = ['model', 'source', 'series', 'tagline', 'players', 'controls', 'tags', 'description', 'session'];
 
 /** Folded copies of every text field, worked out once per game. */
 const foldedFacts = new WeakMap();
@@ -690,6 +690,7 @@ export const EXAMPLES = [
       ['is:played', 'Played on this device'],
       ['is:new', 'Added this week'],
       ['has:model', 'Names the model that made it'],
+      ['has:session', 'Plays in an AI Hub session'],
     ],
   },
   {

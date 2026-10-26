@@ -395,6 +395,39 @@ the view's narrower selection; **Reset selection** clears it all.
 Browser checks, with optional Playwright installed: start `pnpm dev`, then run
 `node scripts/explore-browser.mjs`. Pass a deployed site URL to check production.
 
+## Playing together: AI Hub sessions
+
+Every new game supports online play for up to four friends, each on their own
+device, through an **AI Hub session**: the hub picks the games (Random Mode),
+keeps the clock, carries the network traffic and keeps score. There is no chat
+and no way for players to message each other; they talk in an app of their
+own.
+
+What a game must do is the **AI Hub Session Protocol**, specified in
+[`lib/hub/README.md`](lib/hub/README.md) and served at
+<https://crosato-arcade.vercel.app/lib/hub/README.md>, so it can be handed to
+whichever agent builds the game. In short: four `hub:session` metas in the
+head, the small `session.js` client pasted in unmodified, and a round played
+from the hub's roster, start signal and network, reported once at the end.
+Outside a session the game plays exactly as it always would.
+
+A game that declares it shows a *Hub session* line in its details
+(`2–4 players · Race · about 4 min`), and the Catalogue finds them all with
+`has:session`. The four fields never become rails.
+
+To test a game against the protocol, open the harness, which loads 1–4 copies
+side by side on a simulated network:
+
+```
+pnpm dev
+http://localhost:4173/lib/hub/harness.html?game=/games/mygame.html&players=4&latency=150&jitter=50&loss=5
+```
+
+`node scripts/hub-check.mjs games/mygame.html` runs the automatic conformance
+checks at 2, 3 and 4 players with Playwright (see the spec, §14). The two
+examples in `lib/hub/examples/` (a versus arena and a race with ghosts) are the
+reference games and pass it.
+
 ## Optional extras
 
 None of this is needed. All of it is ignored if absent.
@@ -522,6 +555,7 @@ scripts/
   lib/intake.mjs  what a package holds, and what never to import
   lib/zip.mjs     a small zip reader, so the project stays dependency-free
   audit3d.mjs     static rules every 3D game must pass (seconds)
+  hub-check.mjs   a game against the session protocol, at 2, 3 and 4 players
   check3d.py      one 3D game in headless browsers, WebGL2 and WebGPU
   sweep3d.py      check3d over many games, grouped by error signature
   matrix3d.py     quality settings, a quality switch, and window sizes
@@ -529,6 +563,7 @@ lib/
   three/          three.js r186, the one copy every 3D game imports
   rapier/         Rapier 0.20 physics
   kit/            the shared 3D kit: boot, input, touch, post, physics
+  hub/            the AI Hub Session Protocol: spec, client, harness, examples
   vendor/         versioned Three.js and Rapier packages for imported games
 ```
 
