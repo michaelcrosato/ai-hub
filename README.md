@@ -428,6 +428,32 @@ checks at 2, 3 and 4 players with Playwright (see the spec, §14). The two
 examples in `lib/hub/examples/` (a versus arena and a race with ghosts) are the
 reference games and pass it.
 
+### A session — `/session`
+
+The session itself: players pick a generated name, take one of four seats,
+and the host starts **Random Mode**. The hub deals every game that declares
+`hub:session` and seats everyone, in an order fixed by the session's seed, and
+none comes round twice until all have been played. Each round is played from
+the protocol's start signal to its result; between rounds a results card shows
+the places and points and the session's table: one point for every player
+beaten, then wins. The seated tab with the lowest seat hosts; if it leaves, the
+next seat takes over, and a round it was running is void.
+
+Until sign-in arrives, sessions run between tabs of one browser, which is how
+to try games together on one machine:
+
+```
+pnpm dev
+http://localhost:4173/session/?transport=local&examples=1#try      (open it in up to four tabs)
+```
+
+`examples=1` adds the two reference games to the deal. The host's address can
+also shorten things for testing: `&limit=20` (a round's limit, seconds),
+`&ready=10` (the ready deadline) and `&results=5` (the results card).
+`node scripts/session-browser.mjs` plays a whole session in four tabs: a player
+who never readies, a host who leaves mid-round, and a round played by those
+left.
+
 ## Optional extras
 
 None of this is needed. All of it is ignored if absent.
@@ -534,6 +560,7 @@ catalogue/        the Catalogue, likewise
 atlas/            the Atlas: genre districts and departure boards
 timeline/         the Timeline: a journal of arrivals
 deck/             the Deck: one shuffled discovery at a time
+session/          a session: friends, Random Mode and the table
 assets/js/        native ES modules, no bundler
   color.js        theme-color → cabinet lighting, via OKLCH
   art.js          the six procedural screen patterns
@@ -546,6 +573,7 @@ assets/js/        native ES modules, no bundler
   explore/        Atlas, Timeline, Deck and their shared search/player shell
   couch/          rails, pad and keys, the game page, search (logic tested)
   catalogue/      the query language, tallies, table, record card, compare
+  session/        seats, names, Random Mode, scoring, the local transport
 scripts/
   scan.mjs        the build; walks games/, writes games.json
   ingest.mjs      bulk import of pages, folders and zips
@@ -556,6 +584,7 @@ scripts/
   lib/zip.mjs     a small zip reader, so the project stays dependency-free
   audit3d.mjs     static rules every 3D game must pass (seconds)
   hub-check.mjs   a game against the session protocol, at 2, 3 and 4 players
+  session-browser.mjs  a whole session in four tabs, end to end
   check3d.py      one 3D game in headless browsers, WebGL2 and WebGPU
   sweep3d.py      check3d over many games, grouped by error signature
   matrix3d.py     quality settings, a quality switch, and window sizes

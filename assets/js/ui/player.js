@@ -37,7 +37,24 @@ const FRAME_ALLOW = [
 
 const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-export function createPlayer(root, { onExit, onRoll, backLabel = 'Back to the wall' }) {
+/**
+ * Options beyond the wall's: `src(build)` names the frame's address (a session
+ * adds ?aihub=1), `onFrame(frame)` hands over each new frame before it loads,
+ * `roll: false` drops the 🎲, and `honorStandalone: false` ignores this
+ * device's plain-tab choices, which a session cannot play through.
+ */
+export function createPlayer(
+  root,
+  {
+    onExit,
+    onRoll,
+    backLabel = 'Back to the wall',
+    src = (build) => build.path,
+    onFrame = null,
+    roll = true,
+    honorStandalone = true,
+  }
+) {
   let session = null;
   let pageTitle = document.title;
   /** The bar: 'open', 'folded' to just the ✕, or 'gone' until a reload. */
@@ -165,7 +182,7 @@ export function createPlayer(root, { onExit, onRoll, backLabel = 'Back to the wa
     Object.entries(paletteVars(palette)).forEach(([k, v]) => root.style.setProperty(k, v));
     clear(root);
 
-    if (store.prefersStandalone(game.slug) || store.dev().alwaysStandalone) {
+    if (honorStandalone && (store.prefersStandalone(game.slug) || store.dev().alwaysStandalone)) {
       const { el: barEl, arc } = exitBar();
       root.append(barEl, standalonePanel(game, build));
       session = { game, build, arc, unbind: [], idle: 0, hold: null };
@@ -174,7 +191,7 @@ export function createPlayer(root, { onExit, onRoll, backLabel = 'Back to the wa
 
     const frame = h('iframe', {
       class: 'player__frame',
-      src: build.path,
+      src: src(build),
       title: game.name,
       allow: FRAME_ALLOW,
       allowfullscreen: true,
@@ -186,6 +203,7 @@ export function createPlayer(root, { onExit, onRoll, backLabel = 'Back to the wa
     root.append(frame, crt, barEl);
 
     session = { game, build, frame, crt, arc, unbind: [], idle: 0, hold: null };
+    onFrame?.(frame);
 
     frame.addEventListener('load', () => {
       crt.classList.add('is-off');
@@ -226,7 +244,7 @@ export function createPlayer(root, { onExit, onRoll, backLabel = 'Back to the wa
       'div',
       { class: 'player__exit' },
       tool('player__back', backLabel, icon(ICONS.back), { onclick: onExit }),
-      tool('player__roll', 'Roll: play another random game', icon(ICONS.dice), { onclick: () => onRoll() }),
+      roll && tool('player__roll', 'Roll: play another random game', icon(ICONS.dice), { onclick: () => onRoll() }),
       tool(
         'player__fold',
         'Tap to fold this bar away, hold to remove it until you reload',
