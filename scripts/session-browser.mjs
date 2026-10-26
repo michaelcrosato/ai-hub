@@ -36,7 +36,7 @@ const context = await browser.newContext({ viewport: { width: 1000, height: 700 
 await context.route('**/data/games.json', (route) => route.fulfill({ json: { games: [] } }));
 const errors = [];
 const pages = {};
-const url = (seat) => `${base}/session/?transport=local&as=${seat}&examples=1&limit=12&ready=8&results=3#e2e`;
+const url = (seat) => `${base}/session?transport=local&as=${seat}&examples=1&limit=12&ready=8&results=3#e2e`;
 const session = (page) => page.evaluate(() => window.__session);
 const log = (text) => console.log(`${(performance.now() / 1000).toFixed(1).padStart(6)}s  ${text}`);
 

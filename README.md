@@ -444,7 +444,7 @@ to try games together on one machine:
 
 ```
 pnpm dev
-http://localhost:4173/session/?transport=local&examples=1#try      (open it in up to four tabs)
+http://localhost:4173/session?transport=local&examples=1#try      (open it in up to four tabs)
 ```
 
 `examples=1` adds the two reference games to the deal. The host's address can
