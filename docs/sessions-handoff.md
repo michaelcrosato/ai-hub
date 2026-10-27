@@ -96,10 +96,15 @@ Tests on the branch:
 
 Michael, in a browser:
 
-1. **Migrations.** In the SQL editor
-   (<https://supabase.com/dashboard/project/ncbiljxbxfrotlszdghi/sql/new>), run
-   `supabase/migrations/0001_accounts.sql`, then `0002_sessions.sql`, both
-   taken from the branch.
+1. **Database.** 0001 and 0002 are already applied. In the SQL editor
+   (<https://supabase.com/dashboard/project/ncbiljxbxfrotlszdghi/sql/new>):
+   - run `supabase/migrations/0003_indexes.sql`;
+   - then run `supabase/tests/rls.sql`. It ends in an error **on purpose**:
+     the message is the report, and it should read
+     "RLS TESTS: ALL … PASSED".
+
+   In a local session, MCP `apply_migration` and `execute_sql` should work
+   too, as long as their confirmation prompt can be answered.
 2. **Google Cloud** → APIs & Services:
    - OAuth consent screen: External, app name "AI Hub", authorized domain
      `crosato-arcade.vercel.app`, privacy URL
