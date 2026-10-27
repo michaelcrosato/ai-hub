@@ -439,20 +439,69 @@ the places and points and the session's table: one point for every player
 beaten, then wins. The seated tab with the lowest seat hosts; if it leaves, the
 next seat takes over, and a round it was running is void.
 
-Until sign-in arrives, sessions run between tabs of one browser, which is how
-to try games together on one machine:
+**Across devices** (`/session`):
+- The host signs in with Google, picks a name, and gets an invite link,
+  `/session#<code>`.
+- Friends open the link, pick a name and play as guests, no account needed.
+  Behind the scenes each guest gets an anonymous account.
+- Each seat shows its connection. The host can remove a player for the rest
+  of the session.
+- Every round is saved: the game, who placed where and the points.
+
+How it works:
+- Presence, round control and the WebRTC handshake go over the session's
+  private Supabase Realtime channel.
+- Game traffic goes straight between the players' browsers (a WebRTC mesh,
+  `assets/js/session/mesh.js`), so a busy game costs the free plan nothing.
+- Where browsers can't connect directly, a Cloudflare TURN relay takes over.
+  Its short-lived credentials come from the `turn` Edge Function.
+- Every player keeps the host's time (`clock.js`), which is how rounds start
+  together.
+
+**Between tabs of one browser**, no accounts, which is how to try games on one
+machine:
 
 ```
 pnpm dev
 http://localhost:4173/session?transport=local&examples=1#try      (open it in up to four tabs)
 ```
 
-`examples=1` adds the two reference games to the deal. The host's address can
-also shorten things for testing: `&limit=20` (a round's limit, seconds),
-`&ready=10` (the ready deadline) and `&results=5` (the results card).
-`node scripts/session-browser.mjs` plays a whole session in four tabs: a player
-who never readies, a host who leaves mid-round, and a round played by those
-left.
+- `examples=1` adds the two reference games to the deal.
+- The host's address can shorten things for testing: `&limit=20` (a round's
+  limit, seconds), `&ready=10` (the ready deadline) and `&results=5` (the
+  results card).
+- `node scripts/session-browser.mjs` plays a whole session in four tabs: a
+  player who never readies, a host who leaves mid-round, and a round played by
+  those left. It then plays a round between two separate browser contexts over
+  the real WebRTC mesh; the script itself stands in for Supabase there.
+
+## Signing in, votes and play time
+
+Nobody needs an account to play. **Sign in** (top corner of every view) uses
+Google, and is only for:
+- 👍 or 👎 on a game: in its details, or offered after you close a game you
+  played for half a minute;
+- your play history on every device: which games, and for how long they were
+  open in front of you;
+- hosting a session.
+
+The hub asks Google for nothing but who you are, and shows nobody your
+Google name or photo. The account menu has *Play with friends*, *Privacy*,
+*Sign out* and *Delete my data*. What is stored is on
+[`/privacy/`](https://crosato-arcade.vercel.app/privacy/).
+
+How it's built:
+- The accounts live in the Supabase project `ai-hub` (ref
+  `ncbiljxbxfrotlszdghi`).
+- `supabase/migrations/` holds the tables, and the row-level security that
+  decides who may read or change each row. Every write goes through a
+  function that checks who is asking.
+- `supabase/tests/rls.sql` checks all of it in one self-cleaning run of the
+  SQL editor.
+- The page code is in `assets/js/account/`. It loads the vendored
+  supabase-js only for a signed-in device.
+- If Supabase is unreachable or paused, sign-in hides and everything else
+  works as before.
 
 ## Optional extras
 
@@ -561,6 +610,8 @@ atlas/            the Atlas: genre districts and departure boards
 timeline/         the Timeline: a journal of arrivals
 deck/             the Deck: one shuffled discovery at a time
 session/          a session: friends, Random Mode and the table
+auth/             where Google sends you back after signing in
+privacy/          what is stored, and how to delete it
 assets/js/        native ES modules, no bundler
   color.js        theme-color → cabinet lighting, via OKLCH
   art.js          the six procedural screen patterns
@@ -573,7 +624,10 @@ assets/js/        native ES modules, no bundler
   explore/        Atlas, Timeline, Deck and their shared search/player shell
   couch/          rails, pad and keys, the game page, search (logic tested)
   catalogue/      the query language, tallies, table, record card, compare
-  session/        seats, names, Random Mode, scoring, the local transport
+  session/        seats, names, Random Mode, scoring; local, Realtime and WebRTC transports
+  account/        sign-in, votes, play time, the account menu
+assets/vendor/    supabase-js, pinned and checked
+supabase/         migrations, RLS tests, the turn Edge Function (not deployed to the site)
 scripts/
   scan.mjs        the build; walks games/, writes games.json
   ingest.mjs      bulk import of pages, folders and zips

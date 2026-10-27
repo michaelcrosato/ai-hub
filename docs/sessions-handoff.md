@@ -73,10 +73,24 @@ Tests on the branch:
 - **Already done:** the project exists, and the `turn` Edge Function is
   deployed (verify_jwt on). It answers STUN only until the Cloudflare secrets
   are set; it was checked to return 401 without a token.
-- **Not done:** neither migration is applied. The MCP `apply_migration` call
-  timed out three times: its confirmation prompt never reached Michael in the
-  cloud session's app. Either run the files in the SQL editor, or retry from a
-  local session where the prompt can be answered.
+- **Done 27 Oct, evening.** Migrations 0001 and 0002 were run in the SQL
+  editor through Claude in Chrome: all seven tables exist with RLS on, and
+  every function answers. MCP `apply_migration` and `execute_sql` can't be
+  used from a cloud session: their confirmation prompt never reaches Michael,
+  so database changes go through the SQL editor.
+- **Advisors.**
+  - Security: only "signed-in users can execute SECURITY DEFINER function",
+    on the ten RPCs. That is intended, since every write goes through them
+    and each checks the caller.
+  - Performance: two uncovered foreign keys, fixed by `0003_indexes.sql`,
+    which still needs running in the SQL editor.
+- **Still to confirm:** `supabase/tests/rls.sql` run in the SQL editor
+  (expected result: "RLS TESTS: ALL … PASSED"); Google and anonymous sign-in
+  on; the TURN secrets set.
+- **How to check from anywhere:** `GET /auth/v1/settings` with the
+  publishable key shows `external.google` and `external.anonymous_users`.
+  `POST /functions/v1/turn` with the legacy anon JWT shows `"relay": true`
+  once the Cloudflare secrets are in.
 
 ## Checklist to finish
 
