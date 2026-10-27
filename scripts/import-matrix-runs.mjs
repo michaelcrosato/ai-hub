@@ -17,7 +17,7 @@ import { link, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/pro
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { planMatrixRun, finalizeMatrixPlans } from './lib/matrix-runs.mjs';
+import { planMatrixRun, finalizeMatrixPlans, matrixPageText } from './lib/matrix-runs.mjs';
 import { slugify } from './lib/parse.mjs';
 import { ROOT, GAMES_DIR } from './scan.mjs';
 
@@ -60,10 +60,7 @@ async function installedPages() {
 }
 
 function excerpt(buf) {
-  const head = buf.subarray(0, Math.min(buf.length, 80_000)).toString('utf8');
-  const at = buf.indexOf('Controls:');
-  if (at > 80_000) return `${head}\n${buf.subarray(at, at + 500).toString('utf8')}`;
-  return head;
+  return matrixPageText(buf);
 }
 
 async function planRuns() {
@@ -264,7 +261,7 @@ const counts = {};
 for (const row of runs) counts[row.action] = (counts[row.action] || 0) + 1;
 const audit = {
   schemaVersion: 1,
-  batchDate: '2026-10-21',
+  batchDate: '2026-10-27',
   preparedAt: new Date().toISOString(),
   dryRun: DRY,
   runsRoot: RUNS,
@@ -274,8 +271,10 @@ const audit = {
   unsupportedLibraries: report.dependencies || [],
   runs,
 };
-const auditPath = path.join(ROOT, 'docs/imports', DRY ? '2026-10-21-matrix-runs-dry-run.json' : '2026-10-21-matrix-runs.json');
-if (!DRY) await writeFile(auditPath, JSON.stringify(audit, null, 2));
+const auditPath = DRY
+  ? path.join(STAGE_ROOT, 'audit-dry-run.json')
+  : path.join(ROOT, 'docs/imports', counts.import ? '2026-10-27-matrix-runs.json' : '2026-10-27-matrix-runs-rerun.json');
+await writeFile(auditPath, JSON.stringify(audit, null, 2));
 console.log(JSON.stringify(audit.counts, null, 2));
 console.log(`  ingest report ${reportFile}`);
-if (!DRY) console.log(`  audit ${auditPath}`);
+console.log(`  audit ${auditPath}`);

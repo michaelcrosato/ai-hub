@@ -226,8 +226,89 @@ function fromPackageName(fileName) {
   return {
     model: match ? match[1] : '',
     effort: match && match[2].toLowerCase() !== 'unknown' ? match[2] : '',
-    source: /star\s*fox\s*64/i.test(fileName || '') ? 'Star Fox 64' : '',
   };
+}
+
+/** Model documentation is not a game. `sourceUrl` on these pages points at it. */
+function isModelDoc(value) {
+  return /developers\.openai\.com\/api\/docs\/models|platform\.openai\.com\/docs\/models/i.test(String(value || ''));
+}
+
+/**
+ * The classic a page names in `"sourceGame": "..."`. A trailing backslash is
+ * a packaging glitch, not part of the title. Model-doc URLs are not read.
+ */
+export function sourceGameOf(text) {
+  const re = /"sourceGame"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  for (const match of String(text || '').matchAll(re)) {
+    let value = '';
+    try {
+      value = JSON.parse(`"${match[1]}"`);
+    } catch {
+      value = match[1];
+    }
+    value = String(value).replace(/\\+\s*$/g, '').replace(/\s+/g, ' ').trim();
+    if (value && !isModelDoc(value)) return value;
+  }
+  return '';
+}
+
+/** Star Fox spelling from the notes, otherwise the title as the page wrote it. */
+export function namedInspiration(raw) {
+  const text = String(raw ?? '').replace(/\s+/g, ' ').trim();
+  if (!text || isModelDoc(text)) return '';
+  if (/star\s*fox\s*64/i.test(text)) return 'Star Fox 64';
+  if (/star\s*fox\b/i.test(text)) return 'Star Fox';
+  return text;
+}
+
+const MODEL_SUFFIX = /-(gpt-6\.1-sol|gpt-6-astra|gpt-6-sol|gpt-6)-(?:max-ultra|xhigh|ultra|high|medium|low|max|unknown)-\d{8}-\d{4}$/i;
+
+/**
+ * Classic left in a packaged name after the page's own title:
+ * `Coast-Cadet-Top-Skater-1997-gpt-6.1-sol-….html` → `Top Skater (1997)`.
+ * Used only when the page names no inspiration.
+ */
+export function classicFromPackage(fileName, name, tagline) {
+  const stem = String(fileName || '').replace(/\.html?$/i, '');
+  const modelAt = stem.search(MODEL_SUFFIX);
+  let rest = modelAt >= 0 ? stem.slice(0, modelAt) : stem;
+  for (const token of [fileToken(name), fileToken(tagline)].filter(Boolean)) {
+    const lower = rest.toLowerCase();
+    const needle = token.toLowerCase();
+    if (lower === needle) return '';
+    if (lower.startsWith(`${needle}-`)) rest = rest.slice(token.length + 1);
+  }
+  if (!rest) return '';
+  let text = rest.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+  text = text.replace(/\bXBOX 360$/i, '(XBOX 360)');
+  const year = text.match(/^(.*\S)\s+((?:19|20)\d{2})$/);
+  if (year) text = `${year[1]} (${year[2]})`;
+  return namedInspiration(text);
+}
+
+/**
+ * Head of the page, plus any later `sourceGame` field and a Controls line.
+ * Exit interviews sit past the first 80 KB on a few packaged files.
+ */
+export function matrixPageText(buf) {
+  const data = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf ?? ''));
+  const headEnd = Math.min(data.length, 80_000);
+  const parts = [data.subarray(0, headEnd).toString('utf8')];
+  const pushAt = (at, len) => {
+    if (at < headEnd) return;
+    parts.push(data.subarray(at, Math.min(data.length, at + len)).toString('utf8'));
+  };
+  pushAt(data.indexOf('Controls:'), 500);
+  const needle = Buffer.from('"sourceGame"');
+  let from = 0;
+  while (from < data.length) {
+    const at = data.indexOf(needle, from);
+    if (at < 0) break;
+    pushAt(at, 400);
+    from = at + needle.length;
+  }
+  return parts.join('\n');
 }
 
 export function controlsOf(text) {
@@ -301,7 +382,11 @@ export function planMatrixRun(run) {
   const requestedEffort = run.finalization?.metrics?.effort || run.finalization?.effort || '';
   const model = modelSlug(requestedModel) || modelSlug(modelFromLine(labeled(preamble, 'Model'))) || modelSlug(packed.model);
   const effort = effortSlug(requestedEffort) || effortSlug(effortFromLine(labeled(preamble, 'Model'))) || effortSlug(packed.effort);
-  const source = sourceTitle(labeled(preamble, 'Source')) || packed.source;
+  // sourceGame, then a Source note, then the classic in the packaged filename.
+  // A model-doc sourceUrl is never the inspiration.
+  const source = namedInspiration(sourceGameOf(pageText))
+    || sourceTitle(labeled(preamble, 'Source'))
+    || classicFromPackage(packagedName, name, tagline);
   const started = runClock(run.finalization);
   const noted = parseSourceClock(labeled(preamble, 'Date'));
   const modified = run.modifiedAt ? new Date(run.modifiedAt) : null;

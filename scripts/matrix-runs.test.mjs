@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { contentHash, planMatrixBatch } from './lib/matrix-runs.mjs';
+import { contentHash, matrixPageText, planMatrixBatch } from './lib/matrix-runs.mjs';
 
 const PAGE = `<!--
 SOURCE INFORMATION
@@ -117,4 +117,106 @@ test('same packaged filename with different bytes stays two Unsure entries', () 
     assert.equal(plan.packagedName, PACKED.slice('workspace/'.length));
   }
   assert.match(plans[1].destination, /^Foxtrail-65-The-Sunbreak-Run-Star-Fox-64-gpt-6\.1-sol-low-20261021-0215\.html$/);
+});
+
+const TOMB_FIN = {
+  metrics: {
+    requestedModel: 'gpt-6-astra',
+    effort: 'xhigh',
+    startedAt: '2026-10-26T06:21:22.713Z',
+  },
+};
+
+test('a packaged page whose only inspiration is sourceGame records that classic, the run model and effort, and is not labelled original', () => {
+  const page = `<!doctype html>
+<html><head>
+<title>Crypt Trip · The Sunken Sun</title>
+<meta name="description" content="A tomb run under a drowned sun.">
+</head><body>
+<p>Controls: WASD to move, Space to jump.</p>
+<script type="application/json" id="gpt-hub-exit-interview">{"identity":{"sourceGame":"Tomb Raider (1996)","sourceUrl":"https://developers.openai.com/api/docs/models/gpt-6-astra"}}</script>
+</body></html>`;
+  const [plan] = planMatrixBatch([{
+    runId: 'tomb',
+    files: ['workspace/Crypt-Trip-The-Sunken-Sun-Wrong-Classic-1990-gpt-6-astra-xhigh-20261026-0532.html'],
+    pageText: page,
+    finalization: TOMB_FIN,
+  }]);
+  assert.equal(plan.action, 'import');
+  assert.equal(plan.overrides.source, 'Tomb Raider (1996)');
+  assert.equal(plan.overrides.model, 'GPT-6 Astra');
+  assert.equal(plan.overrides.effort, 'xhigh');
+  assert.equal(plan.overrides.name, 'Crypt Trip');
+  assert.equal(plan.overrides.tagline, 'The Sunken Sun');
+  assert.equal(plan.dateBasis, 'run startedAt');
+  assert.equal(plan.sourceDate, '2026-10-26T06:21:22.713Z');
+  assert.match(plan.destination, /Tomb-Raider-1996-gpt-6-astra-xhigh-/);
+  assert.doesNotMatch(plan.destination, /(^|-)original(-|\.)/i);
+  assert.doesNotMatch(plan.destination, /Wrong-Classic/);
+  assert.doesNotMatch(JSON.stringify(plan.overrides), /developers\.openai\.com/);
+});
+
+test('a sourceGame past the first 80 KB still reaches the planner through the shipped excerpt', () => {
+  const head = '<!doctype html><html><head><title>Crypt Trip · The Sunken Sun</title></head><body>\n';
+  const tail = '<script type="application/json" id="gpt-hub-exit-interview">{"identity":{"sourceGame":"Tomb Raider (1996)\\\\"}}</script></body></html>';
+  const buf = Buffer.concat([Buffer.from(head), Buffer.alloc(90_000, 32), Buffer.from(tail)]);
+  assert.ok(buf.indexOf('"sourceGame"') > 80_000);
+  const [plan] = planMatrixBatch([{
+    runId: 'late',
+    files: ['workspace/Crypt-Trip-The-Sunken-Sun-Tomb-Raider-1996-gpt-6-astra-xhigh-20261026-0532.html'],
+    pageText: matrixPageText(buf),
+    finalization: TOMB_FIN,
+  }]);
+  assert.equal(plan.action, 'import');
+  assert.equal(plan.overrides.source, 'Tomb Raider (1996)');
+  assert.equal(plan.overrides.model, 'GPT-6 Astra');
+  assert.equal(plan.overrides.effort, 'xhigh');
+  assert.doesNotMatch(plan.destination, /(^|-)original(-|\.)/i);
+});
+
+test('a page with no inspiration field takes the classic from the packaged filename and ignores a model-doc sourceUrl', () => {
+  const page = `<!doctype html>
+<html><head>
+<title>Coast Cadet — Sunset Circuit</title>
+</head><body>
+<script>{"sourceUrl":"https://developers.openai.com/api/docs/models/gpt-6.1-sol","longContextThreshold":272000}</script>
+</body></html>`;
+  const [plan] = planMatrixBatch([{
+    runId: 'coast',
+    files: ['workspace/Coast-Cadet-Top-Skater-1997-gpt-6.1-sol-xhigh-20261024-1635.html'],
+    pageText: page,
+    finalization: {
+      metrics: {
+        requestedModel: 'gpt-6.1-sol',
+        effort: 'xhigh',
+        startedAt: '2026-10-24T20:00:00.000Z',
+      },
+    },
+  }]);
+  assert.equal(plan.action, 'import');
+  assert.equal(plan.overrides.source, 'Top Skater (1997)');
+  assert.equal(plan.overrides.model, 'GPT-6.1 Sol');
+  assert.equal(plan.overrides.effort, 'xhigh');
+  assert.equal(plan.dateBasis, 'run startedAt');
+  assert.match(plan.destination, /Coast-Cadet-Sunset-Circuit-Top-Skater-1997-gpt-6\.1-sol-xhigh-/);
+  assert.doesNotMatch(plan.destination, /(^|-)original(-|\.)/i);
+  assert.doesNotMatch(plan.overrides.source, /openai|sourceUrl|docs\/models/i);
+  assert.doesNotMatch(JSON.stringify(plan.overrides), /developers\.openai\.com/);
+});
+
+test('a run whose HTML is only nested templates, shells, or probes is skipped', () => {
+  const [plan] = planMatrixBatch([{
+    runId: 'nested-only',
+    files: [
+      'workspace/templates/index.html',
+      'workspace/shells/boot.html',
+      'workspace/probes/gpu.html',
+      'workspace/src/template-shell.html',
+    ],
+    pageText: PAGE,
+    finalization: FIN,
+  }]);
+  assert.equal(plan.action, 'skip');
+  assert.equal(plan.reason, 'no packaged game html');
+  assert.equal(plan.destination, undefined);
 });
