@@ -439,7 +439,11 @@ test('the simulated network keeps reliable messages in order and only loses unre
   b.onMessage((from, env) => got.push(env.n));
   for (let n = 0; n < 20; n++) a.send('b', { n }, { reliable: true });
   for (let n = 100; n < 110; n++) a.send('b', { n }, { reliable: false });
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  // Wait for the reliable twenty however busy the machine is (loss 1 drops every
+  // unreliable one before it is scheduled), then a little longer for strays.
+  const deadline = Date.now() + 5_000;
+  while (got.length < 20 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  await new Promise((resolve) => setTimeout(resolve, 30));
   assert.deepEqual(got, Array.from({ length: 20 }, (_, n) => n));
 });
 
