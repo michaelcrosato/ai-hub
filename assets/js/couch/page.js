@@ -16,6 +16,7 @@ import { attemptsAt, similarGames } from '../similar.js';
 import { parseControls, proseParts } from './howto.js';
 import { eyebrow, pageFacts } from './facts.js';
 import { nearest } from './nav.js';
+import { thumbs as rateButtons } from '../account/thumbs.js';
 import { tile, keyRun, keycap, prompt, glide, reducedMotion } from './ui.js';
 import { viewSwitch } from '../ui/views.js';
 
@@ -234,6 +235,7 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
                 prompt('play')
               ),
               fave.button,
+              rateButtons(next.slug, { className: 'page__thumbs' }),
               current &&
                 h(
                   'a',

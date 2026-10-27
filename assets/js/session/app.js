@@ -9,8 +9,14 @@
  * of seconds, so a tab that joins late, or takes over when the host leaves,
  * knows everything. A round whose host leaves dies with it and is void.
  *
- * Phase 2 runs over the local transport (tabs of one browser); the network
- * transport for real sessions has the same shape (see session/local.js).
+ * Three transports with one shape: across devices (session/net.js: Supabase
+ * Realtime for presence and control, a WebRTC mesh for game traffic, rounds
+ * saved to the database), between tabs of one browser (?transport=local,
+ * session/local.js), and a test relay the browser tests inject
+ * (?transport=relay).
+ *
+ * Across devices the host signs in with Google and gets an invite link,
+ * /session#<code>; friends open it and join as guests, no account needed.
  */
 
 import { h, clear } from '../dom.js';
@@ -20,6 +26,7 @@ import { createPlayer } from '../ui/player.js';
 import { createBridge, attachFrame, postTo } from '/lib/hub/bridge.js';
 import { createRound, limitFor, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
+import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
 import { pickNext, eligible } from './pick.js';
 import { scoreRound, addRound, leaderboard } from './score.js';
@@ -38,8 +45,16 @@ const knobs = {
   examples: params.get('examples') === '1',
 };
 const asSeat = Number(params.get('as')) >= 1 && Number(params.get('as')) <= SEATS ? Number(params.get('as')) - 1 : null;
-const code = decodeURIComponent(location.hash.slice(1)) || 'local';
-const key = asSeat !== null ? `seat${asSeat + 1}` : `t${crypto.getRandomValues(new Uint32Array(1))[0].toString(36)}`;
+const transport =
+  params.get('transport') === 'local' ? 'local' : params.get('transport') === 'relay' && window.__sessionRelay ? 'relay' : 'online';
+let code = decodeURIComponent(location.hash.slice(1)) || (transport === 'online' ? '' : 'local');
+let key = asSeat !== null ? `seat${asSeat + 1}` : `t${crypto.getRandomValues(new Uint32Array(1))[0].toString(36)}`;
+/** Online: the seat the database gave, the session's id and the client. */
+let fixedSeat = asSeat;
+let online = null;
+let user = null;
+let problem = null;
+let removed = false;
 
 const app = document.getElementById('session');
 const strip = document.getElementById('strip');
@@ -69,6 +84,7 @@ const player = createPlayer(document.getElementById('player'), {
   onRoll: () => {},
   roll: false,
   honorStandalone: false,
+  askToRate: false,
   backLabel: 'Leave the session',
   src: (build) => `${build.path}${build.path.includes('?') ? '&' : '?'}aihub=1`,
   onFrame: (frame) => attachRound(frame),
@@ -77,8 +93,7 @@ const player = createPlayer(document.getElementById('player'), {
 /* --- who is here ----------------------------------------------------------- */
 
 const seated = () =>
-  net
-    .members()
+  (net?.members() ?? [])
     .filter((m) => Number.isInteger(m.slot) && m.name)
     .sort((a, b) => a.slot - b.slot);
 const hostKey = () => seated()[0]?.key ?? null;
@@ -88,14 +103,14 @@ const mine = () => net?.me();
 function claimSeat() {
   const others = net.members().filter((m) => m.key !== key && Number.isInteger(m.slot));
   const taken = new Set(others.map((m) => m.slot));
-  const slot = asSeat ?? [...Array(SEATS).keys()].find((s) => !taken.has(s));
+  const slot = fixedSeat ?? [...Array(SEATS).keys()].find((s) => !taken.has(s));
   net.update({ slot: slot ?? null, name, status: slot === undefined ? 'full' : 'here' });
 }
 
 /** Two tabs that picked one seat at once: the later one moves. */
 function settleSeat() {
   const me = mine();
-  if (asSeat !== null || !Number.isInteger(me.slot)) return;
+  if (fixedSeat !== null || !Number.isInteger(me.slot)) return;
   const clash = net
     .members()
     .find((m) => m.key !== key && m.slot === me.slot && (m.joinedAt < me.joinedAt || (m.joinedAt === me.joinedAt && m.key < key)));
@@ -105,6 +120,7 @@ function settleSeat() {
 function membersChanged() {
   settleSeat();
   const host = isHost();
+  if (net.clock && net.clock.following !== (host ? null : hostKey())) net.clock.follow(hostKey(), host);
   if (host && !wasHost) takeOver();
   wasHost = host;
   if (host && coordinator && state?.current) {
@@ -145,6 +161,7 @@ function takeOver() {
   if (!state) next.knobs = knobs;
   if (next.phase === 'round' && next.current && next.current.coordinator !== key) {
     next = withRoundRecorded(next, { status: 'void', reason: 'host-left', standings: null, players: [] });
+    saveRound(next.history.at(-1));
     next.nextAt = Date.now() + (next.knobs?.resultsMs ?? knobs.resultsMs);
   }
   publish(next);
@@ -205,6 +222,7 @@ function startRound() {
     onEnd: (record) => {
       coordinator = null;
       publish({ ...withRoundRecorded(state, record), nextAt: Date.now() + (state.knobs?.resultsMs ?? knobs.resultsMs) });
+      saveRound(state.history.at(-1));
       scheduleNext();
     },
   });
@@ -223,6 +241,7 @@ function withRoundRecorded(s, record) {
     status: record.status,
     reason: record.reason,
     rows: [],
+    scores: record.scores ?? null,
   };
   let totals = s.totals;
   if (record.status === 'played' && record.standings) {
@@ -236,6 +255,22 @@ function withRoundRecorded(s, record) {
     totals = addRound(totals, entry.rows);
   }
   return { ...s, phase: 'results', current: null, history: [...s.history, entry], totals };
+}
+
+/** Online: write the round into the session's record (the first member to report it wins). */
+async function saveRound(entry) {
+  if (!online || !entry) return;
+  const { error } = await online.sb.rpc('record_round', {
+    p_session: online.sessionId,
+    p_round: entry.round,
+    p_slug: entry.slug,
+    p_mode: entry.mode ?? null,
+    p_status: entry.status === 'played' ? 'played' : entry.reason === 'skipped' ? 'skipped' : 'void',
+    p_reason: entry.reason,
+    p_scores: entry.scores,
+    p_results: entry.rows.map((r) => ({ user_id: r.key, place: r.place, points: r.points, won: r.win })),
+  });
+  if (error) console.warn('[session] round not saved:', error.message);
 }
 
 function scheduleNext() {
@@ -265,6 +300,7 @@ function attachRound(frame) {
     coordinator: cur.coordinator,
     post: postTo(frame),
     net,
+    clock: net.clock ?? Date,
     onIssue: (i) => console.warn(`[session] ${i.problem}`),
   });
   detach = attachFrame(frame, (msg) => bridge.fromGame(msg));
@@ -287,6 +323,11 @@ function route(from, env) {
     } else if (env.t === 'status' && from === hostKey()) {
       status = env.status;
       render();
+    } else if (env.t === 'kick' && from === hostKey() && env.key === key) {
+      removed = true;
+      closeRound();
+      net.close();
+      render();
     }
     return;
   }
@@ -298,24 +339,46 @@ function route(from, env) {
   if ((!bridge || env.r > bridge.round) && early.length < 200) early.push([from, env]);
 }
 
-function leaveSession() {
+async function leaveSession() {
   closeRound();
+  if (online) await online.sb.rpc('leave_session', { p_session: online.sessionId }).then(() => {}, () => {});
   net?.close();
   location.href = '/';
+}
+
+/** The host removes a player for the rest of the session (online: the database bars them). */
+async function kick(member) {
+  if (!confirm(`Remove ${member.name} from this session?`)) return;
+  if (online) {
+    const { error } = await online.sb.rpc('kick_from_session', { p_session: online.sessionId, p_user: member.key });
+    if (error) return alert(`Could not remove ${member.name}: ${error.message}`);
+  }
+  net.broadcast({ k: 's', t: 'kick', key: member.key });
+  coordinator?.leave(member.key, 'kicked');
 }
 
 /* --- the screens ------------------------------------------------------------- */
 
 const swatch = (slot) => h('span', { class: 'seat__dot', style: { background: SLOT_COLORS[slot] ?? '#888' } });
-const nameOf = (k) => net.members().find((m) => m.key === k)?.name;
+const nameOf = (k) => net?.members().find((m) => m.key === k)?.name;
 
 function render() {
   document.body.dataset.phase = !name ? 'join' : state?.phase ?? 'lobby';
   document.body.dataset.host = isHost() ? '1' : '0';
   document.body.dataset.round = String(state?.current?.round ?? state?.round ?? 0);
-  window.__session = { key, state, status, seat: mine()?.slot ?? null };
+  window.__session = {
+    key,
+    state,
+    status,
+    seat: mine()?.slot ?? null,
+    links: Object.fromEntries((net?.members() ?? []).filter((m) => m.key !== key).map((m) => [m.key, net.link?.(m.key) ?? 'local'])),
+    traffic: bridge ? { ...bridge.stats } : null,
+    clock: net?.clock ? { offset: net.clock.offset, rtt: net.clock.rtt, following: net.clock.following } : null,
+  };
   clear(app);
-  if (!name) app.append(joinScreen());
+  if (removed) app.append(h('section', { class: 'panel' }, h('h2', {}, 'You were removed from this session'), h('a', { class: 'primary', href: '/' }, 'Back to the wall')));
+  else if (!name && transport === 'online' && !code && !(user && !user.guest)) app.append(hostIntro());
+  else if (!name) app.append(joinScreen());
   else if (mine().status === 'full') app.append(h('section', { class: 'panel' }, h('h2', {}, 'This session is full'), h('p', {}, 'Four players are already in it.')));
   else if (state?.phase === 'ended') app.append(endScreen());
   else app.append(lobbyScreen());
@@ -323,23 +386,86 @@ function render() {
   renderResults();
 }
 
+function hostIntro() {
+  return h(
+    'section',
+    { class: 'panel' },
+    h('h2', {}, 'Play together'),
+    h('p', {}, 'Host a session and send your friends the invite link. They join from it without an account. The hub deals the games, keeps time and keeps score. There is no chat, so talk in an app of your own.'),
+    h('button', { type: 'button', class: 'primary', onclick: () => import('../account/auth.js').then((a) => a.signInWithGoogle()).catch(() => alert('Sign-in is unavailable right now.')) }, 'Sign in with Google to host'),
+    h('p', { class: 'hint' }, 'Got an invite link? Open it to join. ', h('a', { href: `${location.pathname}?transport=local&examples=1#try` }, 'Or try a session in this browser.'))
+  );
+}
+
 function joinScreen() {
-  const taken = net.members().map((m) => m.name).filter(Boolean);
+  const taken = net ? net.members().map((m) => m.name).filter(Boolean) : [];
   const choices = nameChoices(`${code}:${key}:${reroll}`, 6, taken);
   return h(
     'section',
     { class: 'panel join' },
-    h('h2', {}, 'Pick your name'),
+    h('h2', {}, transport === 'online' && !code ? 'Pick your name to host' : 'Pick your name'),
+    problem && h('p', { class: 'notice' }, problem),
     h('p', { class: 'hint' }, 'Everyone in the session sees it. Names come from the hub: there is no chat, so talk in an app of your own.'),
     h('div', { class: 'join__names' }, choices.map((choice) => h('button', { type: 'button', class: 'join__name', onclick: () => join(choice) }, choice))),
     h('button', { type: 'button', class: 'link', onclick: () => { reroll++; render(); } }, 'Other names')
   );
 }
 
-function join(choice) {
+async function join(choice) {
+  problem = null;
+  if (transport === 'online' && !net) {
+    try {
+      await joinOnline(choice);
+    } catch (error) {
+      problem = error.message || String(error);
+      render();
+      return;
+    }
+  }
   name = choice;
   claimSeat();
   render();
+}
+
+/** Online: host a new session or take a seat in one, then open its channel and mesh. */
+async function joinOnline(choice) {
+  const { client } = await import('../account/cloud.js');
+  const auth = await import('../account/auth.js');
+  const sb = await client();
+  user = await auth.currentUser();
+  let sessionId;
+  if (!code) {
+    if (!user || user.guest) throw new Error('Sign in with Google to host a session.');
+    const { data, error } = await sb.rpc('create_session', { p_nickname: choice });
+    if (error) throw error;
+    ({ session_id: sessionId, code, slot: fixedSeat } = data[0]);
+    history.replaceState(null, '', `${location.pathname}${location.search}#${code}`);
+  } else {
+    if (!user) user = await auth.signInAsGuest();
+    const { data, error } = await sb.rpc('join_session', { p_code: code, p_nickname: choice });
+    if (error) throw error;
+    ({ session_id: sessionId, slot: fixedSeat } = data[0]);
+  }
+  key = user.id;
+  online = { sb, sessionId };
+  const ice = await sb.functions.invoke('turn', { method: 'POST' }).then(
+    ({ data }) => data?.iceServers,
+    () => null
+  );
+  let relayOnly = false;
+  try {
+    relayOnly = localStorage.getItem('ai-hub:relay-only') === '1';
+  } catch {
+    /* no storage: direct connections allowed */
+  }
+  const relay = await supabaseRelay(sb, sessionId, key);
+  net = createRelayNet({ key, relay, iceServers: ice || [{ urls: 'stun:stun.cloudflare.com:3478' }], relayOnly });
+  wire();
+}
+
+function wire() {
+  net.onMembers(membersChanged);
+  net.onMessage(route);
 }
 
 function lobbyScreen() {
@@ -364,11 +490,13 @@ function lobbyScreen() {
           swatch(slot),
           h('span', { class: 'seat__name' }, m ? m.name : 'Open seat'),
           m?.key === key && h('span', { class: 'seat__tag' }, 'You'),
-          m && m.key === hostKey() && h('span', { class: 'seat__tag' }, 'Host')
+          m && m.key === hostKey() && h('span', { class: 'seat__tag' }, 'Host'),
+          m && m.key !== key && net.link?.(m.key) === 'failed' && h('span', { class: 'seat__tag' }, 'No connection'),
+          m && m.key !== key && isHost() && transport !== 'local' && h('button', { type: 'button', class: 'link seat__kick', onclick: () => kick(m) }, 'Remove')
         );
       })
     ),
-    h(
+    transport === 'online' ? inviteLine() : h(
       'p',
       { class: 'hint' },
       'To add a player on this computer, open this page again in another tab: ',
@@ -386,6 +514,18 @@ function lobbyScreen() {
       : state?.phase === 'lobby' && h('p', { class: 'hint' }, `Waiting for ${nameOf(hostKey()) ?? 'the host'} to start.`),
     host && state?.phase !== 'lobby' && h('button', { type: 'button', class: 'link', onclick: endSession }, 'End the session'),
     standingsTable()
+  );
+}
+
+function inviteLine() {
+  const link = `${location.origin}/session#${code}`;
+  return h(
+    'p',
+    { class: 'invite' },
+    h('span', { class: 'hint' }, 'Invite link: '),
+    h('code', {}, link),
+    ' ',
+    h('button', { type: 'button', onclick: (e) => navigator.clipboard?.writeText(link).then(() => (e.target.textContent = 'Copied')) }, 'Copy')
   );
 }
 
@@ -479,6 +619,7 @@ function renderResults() {
 
 function endSession() {
   clearTimeout(nextTimer);
+  if (online) online.sb.rpc('end_session', { p_session: online.sessionId }).then(() => {}, () => {});
   coordinator?.abort('session-ended');
   coordinator = null;
   publish({ ...state, phase: 'ended', current: null, nextAt: null });
@@ -503,32 +644,32 @@ function endScreen() {
 
 /* --- start ------------------------------------------------------------------ */
 
-function notLocal() {
-  app.append(
-    h(
-      'section',
-      { class: 'panel' },
-      h('h2', {}, 'Playing together is coming'),
-      h('p', {}, 'Sessions across devices arrive with sign-in. Until then, try one on this computer: open each seat in its own tab.'),
-      h('a', { class: 'primary', href: `${location.pathname}?transport=local&examples=1#try` }, 'Try a session in this browser')
-    )
-  );
-}
-
 async function main() {
-  if (params.get('transport') !== 'local') return notLocal();
-  const library = await loadManifest().then((d) => d.games, () => []);
-  pool = knobs.examples ? [...library, ...EXAMPLES] : library;
-  net = createLocalNet({ code, key });
-  net.onMembers(membersChanged);
-  net.onMessage(route);
+  // The library can take a moment: the page works without it, and counts games once it is in.
+  if (knobs.examples) pool = EXAMPLES;
+  loadManifest().then(
+    (d) => {
+      pool = knobs.examples ? [...d.games, ...EXAMPLES] : d.games;
+      render();
+    },
+    () => {}
+  );
+  if (transport === 'local') {
+    net = createLocalNet({ code, key });
+    wire();
+  } else if (transport === 'relay') {
+    net = createRelayNet({ key, relay: window.__sessionRelay(key), iceServers: [] });
+    wire();
+  } else {
+    user = await import('../account/auth.js').then((a) => a.currentUser(), () => null);
+  }
   setInterval(() => {
-    if (isHost() && state) net.broadcast({ k: 's', t: 'state', state });
+    if (net && isHost() && state) net.broadcast({ k: 's', t: 'state', state });
     if (state?.phase === 'results') renderResults();
   }, STATE_EVERY_MS / 2);
   addEventListener('visibilitychange', () => bridge?.visibility(document.hidden));
   render();
-  if (asSeat !== null) {
+  if (asSeat !== null && net) {
     setTimeout(() => {
       if (!name) join(nameChoices(`${code}:${key}:0`, 6, net.members().map((m) => m.name).filter(Boolean))[0]);
     }, DISCOVER_MS);

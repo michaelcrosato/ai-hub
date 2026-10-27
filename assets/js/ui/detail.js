@@ -16,6 +16,7 @@ import { h, clear, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { NOT_A_FACET, sessionOf } from '../manifest.js';
 import { bytes, date, plural } from '../format.js';
+import { thumbs as rateButtons } from '../account/thumbs.js';
 
 const prettyLabel = (key) =>
   key
@@ -129,6 +130,7 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
               icon(ICONS.play, { fill: 'currentColor', stroke: 'none', width: 15, height: 15 }),
               'Play'
             ),
+            rateButtons(game.slug, { className: 'detail__thumbs' }),
             h(
               'a',
               { class: 'detail__aside', href: current.path, target: '_blank', rel: 'noopener' },

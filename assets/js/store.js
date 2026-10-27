@@ -37,6 +37,8 @@ function read() {
 }
 
 let state = read();
+/** A signed-in player's plays from every device, held apart from this device's own. */
+let cloud = { plays: {}, lastPlayed: {}, seconds: {} };
 let pending = 0;
 const listeners = new Set();
 
@@ -69,11 +71,31 @@ export const store = {
 
   faveCount: () => Object.keys(state.faves).length,
 
-  plays: (slug) => state.plays[slug] || 0,
+  plays: (slug) => Math.max(state.plays[slug] || 0, cloud.plays[slug] || 0),
 
-  lastPlayed: (slug) => state.lastPlayed[slug] || 0,
+  lastPlayed: (slug) => Math.max(state.lastPlayed[slug] || 0, cloud.lastPlayed[slug] || 0),
 
-  playedCount: () => Object.keys(state.lastPlayed).length,
+  playedCount: () => new Set([...Object.keys(state.lastPlayed), ...Object.keys(cloud.lastPlayed)]).size,
+
+  /** Seconds played in view, on every device: only known for a signed-in player. */
+  playSeconds: (slug) => cloud.seconds[slug] || 0,
+
+  totalPlaySeconds: () => Object.values(cloud.seconds).reduce((sum, s) => sum + s, 0),
+
+  /**
+   * A signed-in player's history from every device ({ slug: { plays,
+   * lastPlayed, seconds } }). Held in memory, never written into this
+   * device's own record: each count shows the larger of the two.
+   */
+  setCloudPlays(totals) {
+    cloud = { plays: {}, lastPlayed: {}, seconds: {} };
+    for (const [slug, t] of Object.entries(totals || {})) {
+      cloud.plays[slug] = t.plays || 0;
+      cloud.lastPlayed[slug] = t.lastPlayed || 0;
+      cloud.seconds[slug] = t.seconds || 0;
+    }
+    for (const fn of listeners) fn(state);
+  },
 
   recordPlay(slug) {
     state.plays[slug] = (state.plays[slug] || 0) + 1;

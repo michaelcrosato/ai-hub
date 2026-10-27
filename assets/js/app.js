@@ -43,9 +43,10 @@ import { createDetail } from './ui/detail.js';
 import { createPlayer } from './ui/player.js';
 import { createDev } from './ui/dev.js';
 import { viewSwitch } from './ui/views.js';
+import { accountButton } from './account/button.js';
 
 const wallEl = document.getElementById('wall');
-document.querySelector('.sign__side')?.prepend(viewSwitch('wall'));
+document.querySelector('.sign__side')?.prepend(viewSwitch('wall'), accountButton({ className: 'sign__account' }));
 const countEl = document.getElementById('count');
 
 /** The wall as it is now, narrowed (or widened) to one series and game. */

@@ -18,6 +18,7 @@ import { buildsOf, dayText, dayToken, sizeText, valuesOf } from './query.js';
 import { keycaps } from './keycaps.js';
 import { byName } from './order.js';
 import { playersText } from './ledger.js';
+import { thumbs as rateButtons } from '../account/thumbs.js';
 import { sessionOf } from '../manifest.js';
 
 const GLYPHS = {
@@ -296,7 +297,8 @@ export function createSheet(
             h('kbd', { class: 'btn__key' }, 'Enter')
           ),
           faveButton,
-          markButton
+          markButton,
+          rateButtons(entry.slug, { className: 'record__thumbs' })
         ),
         h(
           'p',

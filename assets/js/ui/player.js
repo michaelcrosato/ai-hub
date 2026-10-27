@@ -16,6 +16,8 @@
 import { h, clear, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
+import { startPlay, stopPlay } from '../account/plays.js';
+import { askAfterPlay } from '../account/thumbs.js';
 
 const HOLD_MS = 700;
 const IDLE_MS = 3500;
@@ -40,8 +42,9 @@ const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').match
 /**
  * Options beyond the wall's: `src(build)` names the frame's address (a session
  * adds ?aihub=1), `onFrame(frame)` hands over each new frame before it loads,
- * `roll: false` drops the 🎲, and `honorStandalone: false` ignores this
- * device's plain-tab choices, which a session cannot play through.
+ * `roll: false` drops the 🎲, `honorStandalone: false` ignores this
+ * device's plain-tab choices, which a session cannot play through, and
+ * `askToRate: false` skips the thumbs prompt after a game closes.
  */
 export function createPlayer(
   root,
@@ -53,6 +56,7 @@ export function createPlayer(
     onFrame = null,
     roll = true,
     honorStandalone = true,
+    askToRate = true,
   }
 ) {
   let session = null;
@@ -219,6 +223,7 @@ export function createPlayer(
     pageTitle = document.title;
     document.title = `${game.name} — AI Hub`;
     store.recordPlay(game.slug);
+    startPlay({ slug: game.slug, build: build.id ?? null });
     wake();
 
     if (fromTile && !reducedMotion()) zoomFrom(fromTile);
@@ -290,6 +295,8 @@ export function createPlayer(
     }
     cancelHold();
     clearTimeout(session.idle);
+    const seconds = stopPlay();
+    if (askToRate && !silent) askAfterPlay(session.game, seconds);
     for (const off of session.unbind) {
       try {
         off();

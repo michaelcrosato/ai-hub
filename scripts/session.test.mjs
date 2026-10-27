@@ -142,3 +142,20 @@ test('the local transport shows who is here and carries envelopes to one tab or 
   a.close();
   c.close();
 });
+
+test("the clock takes the host's time from the quickest round trip", async () => {
+  const { offsetFrom, createClock } = await import('../assets/js/session/clock.js');
+  // [sent, host's clock, received]: the host runs 500 ms ahead; the slow sample is skewed.
+  assert.deepEqual(offsetFrom([[1000, 1700, 1400], [2000, 2510, 2020], [3000, 3600, 3300]]), { rtt: 20, offset: 500 });
+  assert.equal(offsetFrom([]), null);
+  let local = 10_000;
+  const clock = createClock({ now: () => local, ask: async () => [local, local + 250, local + 4], samples: 3, every: 1e9 });
+  clock.follow('host', false);
+  await clock.sync();
+  assert.equal(clock.following, 'host');
+  assert.equal(clock.now(), 10_000 + 248);
+  clock.follow('me', true);
+  assert.equal(clock.following, null);
+  assert.equal(clock.now(), 10_000, 'the host is the clock');
+  clock.stop();
+});
