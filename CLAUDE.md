@@ -1,5 +1,13 @@
 # Working in this repo
 
+## Work in progress (remove this note when it is done)
+
+Accounts and cross-device sessions live on the branch
+`claude/epic-hamilton-rj3kpf`, not yet on main. Read
+`docs/sessions-handoff.md` before doing anything with it. Keep that branch:
+don't delete it, and don't merge it until the handoff's checklist says so.
+This is the one exception to the branch rules below.
+
 ## Finish every change on main
 
 - When a `/goal` is complete, or a prompt has changed the repo, commit and
