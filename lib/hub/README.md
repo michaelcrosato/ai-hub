@@ -209,7 +209,9 @@ handler, and in the same handler create or resume your `AudioContext`.
 The gesture is required, not decoration. Safari only unlocks audio for a page
 that the player touched, gamepads stay invisible until a button is pressed,
 and the frame needs focus for the keyboard. Accept any key, any gamepad button,
-a click and a tap.
+a click and a tap. A player who presses something while you are still loading
+has said they are ready: remember it, and call `AIHub.ready()` the moment you
+can (and unlock audio on their next input).
 
 Everyone has 45 seconds from the start of the round. A player who isn't ready
 sits the round out: their game receives `end` with reason `sat-out`, and the
@@ -352,6 +354,12 @@ blend between them (positions linearly, angles the short way round). The
 clock is shared, so no copy has to guess another's delay. Snap instead of
 blending after a teleport (a respawn, a reset), which the sender marks.
 
+Fast bodies close to your own player are the exception: a kart 100 ms in the
+past is drawn a few metres behind where you will bump it. Within a few body
+lengths of you, draw them nearer to *now* (the last sample carried forward by
+its velocity, as for contact), blending back to the 100 ms view with
+distance. What you see is then what you hit.
+
 ## 10. Ending a round
 
 **Race**: every copy calls `AIHub.result({ time })` (milliseconds, lower is
@@ -470,6 +478,10 @@ player and carry on.
 - **Bounded and light.** Aim for rounds of 2–8 minutes. Everyone waits for the
   slowest loader, so be ready within 20 seconds on broadband and keep the page
   under about 25 MB.
+- **Runs where your friends are.** Every player's device has to run the round,
+  so in session mode don't require WebGPU or another feature many browsers
+  lack: fall back to WebGL 2 (lower shadows and effects if you must). Call
+  `AIHub.fail()` only when nothing works.
 - **Normal mode is untouched.** Everything above applies only in session mode.
 
 ## 13. Games with multiplayer of their own
