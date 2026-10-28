@@ -18,10 +18,16 @@ const ASK_TIMEOUT_MS = 2_000;
  * @param relay  { track(meta), onPresence(fn(list)), send(event, payload), on(event, fn), close() }
  */
 export function createRelayNet({ key, relay, iceServers = [], relayOnly = false }) {
-  let me = { key, slot: null, name: null, joinedAt: Date.now(), status: 'joining' };
+  // One player is one account, so a second tab of the same account would answer
+  // every connection meant for it as well. Each tab names itself, and every tab
+  // ranks them the same way (latest joinedAt, then tab name): all but the newest
+  // step aside (see onPresence below).
+  const tab = Math.random().toString(36).slice(2, 10);
+  let me = { key, tab, slot: null, name: null, joinedAt: Date.now(), status: 'joining' };
   let others = [];
   const memberFns = new Set();
   const messageFns = new Set();
+  const supersededFns = new Set();
   const asks = new Map();
   let asked = 0;
   let closed = false;
@@ -74,6 +80,13 @@ export function createRelayNet({ key, relay, iceServers = [], relayOnly = false 
   });
 
   relay.onPresence((list) => {
+    if (closed) return;
+    const mine = (list.find((m) => m.key === key)?.tabs ?? []).filter((t) => t.tab !== tab);
+    if (mine.some((t) => t.at > me.joinedAt || (t.at === me.joinedAt && t.tab > tab))) {
+      supersededFns.forEach((fn) => fn());
+      api.close();
+      return;
+    }
     others = list.filter((m) => m.key !== key);
     mesh.keep(others.map((m) => m.key));
     for (const m of others) if (Number.isInteger(m.slot)) mesh.connect(m.key);
@@ -86,7 +99,7 @@ export function createRelayNet({ key, relay, iceServers = [], relayOnly = false 
     if (to === key) mesh.signal(from, data);
   });
 
-  return {
+  const api = {
     key,
     members,
     me: () => me,
@@ -119,6 +132,11 @@ export function createRelayNet({ key, relay, iceServers = [], relayOnly = false 
       messageFns.add(fn);
       return () => messageFns.delete(fn);
     },
+    /** Called once if this account opens the session in a newer tab; this one then closes. */
+    onSuperseded(fn) {
+      supersededFns.add(fn);
+      return () => supersededFns.delete(fn);
+    },
     close() {
       if (closed) return;
       closed = true;
@@ -127,6 +145,7 @@ export function createRelayNet({ key, relay, iceServers = [], relayOnly = false 
       relay.close();
     },
   };
+  return api;
 }
 
 /** The relay over the session's private Realtime channel. */
@@ -138,7 +157,11 @@ export async function supabaseRelay(sb, sessionId, key) {
   const handlers = new Map();
   let presenceFn = () => {};
   const list = () =>
-    Object.entries(channel.presenceState()).map(([k, metas]) => ({ ...metas[metas.length - 1], key: k }));
+    Object.entries(channel.presenceState()).map(([k, metas]) => ({
+      ...metas[metas.length - 1],
+      key: k,
+      tabs: metas.filter((m) => m.tab).map((m) => ({ tab: m.tab, at: m.joinedAt })),
+    }));
   channel.on('presence', { event: 'sync' }, () => presenceFn(list()));
   for (const event of ['env', 'rtc']) {
     channel.on('broadcast', { event }, ({ payload }) => handlers.get(event)?.(payload));

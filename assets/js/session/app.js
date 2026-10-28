@@ -55,6 +55,7 @@ let online = null;
 let user = null;
 let problem = null;
 let removed = false;
+let superseded = false;
 
 const app = document.getElementById('session');
 const strip = document.getElementById('strip');
@@ -377,6 +378,16 @@ function render() {
   };
   clear(app);
   if (removed) app.append(h('section', { class: 'panel' }, h('h2', {}, 'You were removed from this session'), h('a', { class: 'primary', href: '/' }, 'Back to the wall')));
+  else if (superseded)
+    app.append(
+      h(
+        'section',
+        { class: 'panel' },
+        h('h2', {}, 'This session is open in another tab'),
+        h('p', {}, 'You joined it again somewhere else with the same account, so this tab stepped aside. To play with a second account, use a private window.'),
+        h('button', { type: 'button', class: 'primary', onclick: () => location.reload() }, 'Play here instead')
+      )
+    );
   else if (!name && transport === 'online' && !code && !(user && !user.guest)) app.append(hostIntro());
   else if (!name) app.append(joinScreen());
   else if (mine().status === 'full') app.append(h('section', { class: 'panel' }, h('h2', {}, 'This session is full'), h('p', {}, 'Four players are already in it.')));
@@ -466,6 +477,11 @@ async function joinOnline(choice) {
 function wire() {
   net.onMembers(membersChanged);
   net.onMessage(route);
+  net.onSuperseded?.(() => {
+    superseded = true;
+    closeRound();
+    render();
+  });
 }
 
 function lobbyScreen() {
