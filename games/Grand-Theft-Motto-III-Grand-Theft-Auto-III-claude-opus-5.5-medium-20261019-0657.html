@@ -3,7 +3,7 @@
   GRAND THEFT MOTTO III — an original spiritual successor to Grand Theft Auto III (PS2)
   Date: 2026-10-19 06:57
   SOURCE: Grand Theft Auto III (PlayStation 2, Rockstar Games / DMA Design, 2001)
-  Tech: Three.js r180 (WebGPURenderer, WebGPU only — no fallback; TSL toonOutlinePass + BloomNode), Rapier 3D 0.19.3 (@dimforge/rapier3d-compat),
+  Tech: Three.js r180 (WebGPURenderer: WebGPU, falling back to WebGL 2 where it is missing; TSL toonOutlinePass + BloomNode), Rapier 3D 0.19.3 (@dimforge/rapier3d-compat),
         Web Audio API (procedural SFX + 4 procedural radio stations), Gamepad API (DualSense-first, rumble), vanilla ES modules bundled with esbuild 0.28.2
   Art Direction: stylized cel-shading — MeshToonNodeMaterial 3-band ramp, ink outlines, bloom on neon/headlights, fully procedural low-poly city
   Environment: Claude Code CLI, Ubuntu 26.04 on WSL2 (Linux 6.18), target browser: desktop Chrome/Edge with WebGPU
@@ -22,12 +22,12 @@
 <meta name="hub:session-goal" content="Finish all 7 jobs for the family together">
 <meta name="hub:session-howto" content="WASD move, mouse aim, LMB fire, F car, W/S drive, Space jump">
 <script>
-/*! aihub-session 1.1.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+/*! aihub-session 1.2.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
 (function (root) {
   'use strict';
   if (root.AIHub) return;
 
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
   var HELLO_EVERY_MS = 500;
   var HELLO_TIMEOUT_MS = 10000;
   var MAX_BYTES = 16384;
@@ -55,6 +55,8 @@
     seed: 0,
     limitMs: 0,
     round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
   };
 
   var origin = '*';
@@ -68,6 +70,7 @@
   var pending = {};
   var tokens = BURST;
   var refilled = now();
+  var probeFn = null;
 
   function now() {
     return root.performance && root.performance.now ? root.performance.now() : Date.now();
@@ -120,6 +123,7 @@
       hub.seed = m.seed >>> 0;
       hub.limitMs = m.limitMs;
       hub.round = m.round;
+      hub.splash = m.splash === true;
       if (connecting) connecting.resolve(info());
       return;
     }
@@ -152,6 +156,7 @@
       seed: hub.seed,
       limitMs: hub.limitMs,
       round: hub.round,
+      splash: hub.splash,
     };
   }
 
@@ -185,7 +190,7 @@
     return promise;
   };
 
-  /** Everything is loaded and the player pressed something: call from that input handler. */
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
   hub.ready = function () {
     if (!welcomed || sentReady || ended) return;
     sentReady = true;
@@ -298,6 +303,20 @@
     if (outcome.scores) fields.scores = outcome.scores;
     if (typeof outcome.won === 'boolean') fields.won = outcome.won;
     post('finish', highlights(outcome, fields));
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
   };
 
   /** The game cannot run here (no WebGL, failed load): the hub skips it. */
@@ -535,6 +554,8 @@ var init_state = __esm({
       // boot | touch | title | attract | play | pause | cutscene | end
       time: 0,
       // seconds since boot (real)
+      simT: 0,
+      // seconds this copy has stepped the city (AIHub.probe's world clock)
       clock: 8 * 60,
       // in-game minutes since midnight
       dt: 0,
@@ -599,13 +620,29 @@ function toon(color, opts = {}) {
   if (!opts.unique) matCache.set(key, m);
   return m;
 }
+// A software rasterizer (SwiftShader, llvmpipe: a browser running with GPU acceleration off or blocklisted) draws
+// the full look at one frame every few seconds.
+function softwareGL(renderer) {
+  try {
+    const gl = renderer.backend && renderer.backend.gl;
+    if (!gl) return false;
+    const ext = gl.getExtension("WEBGL_debug_renderer_info");
+    return /swiftshader|llvmpipe|softpipe|software|basic render/i.test(String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || ""));
+  } catch {
+    return false;
+  }
+}
 async function initRenderer() {
   const renderer = new THREE.WebGPURenderer({ antialias: true });
+  // WebGPU first; where a browser has no WebGPU adapter, three.js runs the same scene on its WebGL 2 backend
+  // (in a session and on its own alike), so the game plays wherever WebGL 2 does.
   await renderer.init();
-  if (!SES_ON && (!renderer.backend || !renderer.backend.isWebGPUBackend)) throw new Error("WebGPU backend unavailable");
-  renderer.setPixelRatio(Math.min(devicePixelRatio, 2) * (G.pixelScale || 1));
+  // On a software rasterizer the game drops what costs most and changes least: the sun's shadow map, the outline
+  // and bloom passes, and half the pixels. On a real GPU (WebGPU or WebGL 2) nothing changes.
+  G.lowGfx = !(renderer.backend && renderer.backend.isWebGPUBackend) && softwareGL(renderer);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2) * (G.pixelScale || 1) * (G.lowGfx ? 0.5 : 1));
   renderer.setSize(innerWidth, innerHeight);
-  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.enabled = !G.lowGfx;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1;
@@ -616,11 +653,15 @@ async function initRenderer() {
   scene.fog = new THREE.Fog(9357823, 120, 520);
   const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.2, 1400);
   camera.position.set(0, 60, 80);
-  const outline = uniform(32e-4);
-  const scenePass = toonOutlinePass(scene, camera, new THREE.Color(1052696), outline, 1);
-  const bloomPass = bloom(scenePass, 0.35, 0.45, 0.82);
-  const post = new THREE.PostProcessing(renderer);
-  post.outputNode = scenePass.add(bloomPass);
+  let post, bloomPass = null;
+  if (G.lowGfx) post = { render: () => renderer.render(scene, camera) };
+  else {
+    const outline = uniform(32e-4);
+    const scenePass = toonOutlinePass(scene, camera, new THREE.Color(1052696), outline, 1);
+    bloomPass = bloom(scenePass, 0.35, 0.45, 0.82);
+    post = new THREE.PostProcessing(renderer);
+    post.outputNode = scenePass.add(bloomPass);
+  }
   addEventListener("resize", () => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
@@ -869,16 +910,21 @@ function pollInput() {
   const now = {};
   BTN.forEach((b) => now[b] = false);
   let lx = 0, ly = 0, rx = 0, ry = 0, l2 = 0, r2 = 0;
-  const pad = getPad();
+  const pad = getPad(), padNow = {};
   if (pad) {
     I.padName = pad.id;
     pad.buttons.forEach((b, i) => {
       if (i < BTN.length && b.pressed) {
-        now[BTN[i]] = true;
+        now[BTN[i]] = padNow[BTN[i]] = true;
         I.usingPad = true;
         mark();
       }
     });
+    // Create + Options belongs to the AI Hub (it opens the hub's bar): Options pressed while Create is held
+    // never opens the pause menu, and stays ignored until it is let go.
+    if (now.options && now.share) I.optSwallow = true;
+    else if (!now.options) I.optSwallow = false;
+    if (I.optSwallow) now.options = padNow.options = false;
     lx = dz(pad.axes[0] || 0);
     ly = -dz(pad.axes[1] || 0);
     rx = dz(pad.axes[2] || 0);
@@ -890,12 +936,26 @@ function pollInput() {
       mark();
     }
   }
+  // A key or click that went down and up between two frames still counts for this one (a quick tap on a slow
+  // frame). When the controls change meaning (foot, car, menu), a key held across the change is not a new press:
+  // Esc that opened the pause menu must not also close it as the menu's Back.
+  const fresh = I.downs, freshM = I.mdowns, stale = {}, moved = I.context !== I.lastCtx;
+  I.downs = /* @__PURE__ */ new Set();
+  I.mdowns = /* @__PURE__ */ new Set();
+  I.lastCtx = I.context;
   const km = KEYMAP[I.context];
-  for (const k of I.keys) if (km[k]) now[km[k]] = true;
+  const keys = fresh.size ? /* @__PURE__ */ new Set([...I.keys, ...fresh]) : I.keys;
+  for (const k of keys) if (km[k]) {
+    now[km[k]] = true;
+    if (moved && !fresh.has(k)) stale[km[k]] = true;
+  }
   const mm = MOUSEMAP[I.context];
-  for (const m of I.mouseBtn) if (mm[m] !== void 0) now[mm[m]] = true;
+  for (const m of freshM.size ? /* @__PURE__ */ new Set([...I.mouseBtn, ...freshM]) : I.mouseBtn) if (mm[m] !== void 0) {
+    now[mm[m]] = true;
+    if (moved && !freshM.has(m)) stale[mm[m]] = true;
+  }
   if (I.context !== "menu") {
-    const K = (c) => I.keys.has(c) ? 1 : 0;
+    const K = (c) => keys.has(c) ? 1 : 0;
     const kx = K("KeyD") - K("KeyA");
     const ky = I.context === "foot" ? K("KeyW") - K("KeyS") : 0;
     if (kx) lx = kx;
@@ -919,7 +979,7 @@ function pollInput() {
   BTN.forEach((b) => {
     I.prev[b] = I.btn[b];
     I.btn[b] = now[b];
-    I.pressed[b] = now[b] && !I.prev[b];
+    I.pressed[b] = now[b] && !I.prev[b] && !(stale[b] && !padNow[b]);
   });
   I.lx = lx;
   I.ly = ly;
@@ -927,6 +987,15 @@ function pollInput() {
   I.ry = ry;
   I.l2 = l2;
   I.r2 = r2;
+}
+// The local controls as this frame read them, small, for AIHub.probe(): sticks, triggers and the held buttons.
+function inputProbe() {
+  const r = (v) => Math.round(v * 100) / 100;
+  let b = 0;
+  BTN.forEach((k, i) => {
+    if (I.btn[k]) b |= 1 << i;
+  });
+  return { x: r(I.lx), y: r(I.ly), cx: r(I.rx), cy: r(I.ry), l2: r(I.l2), r2: r(I.r2), b };
 }
 function menuNav(dt) {
   let d = "";
@@ -991,7 +1060,14 @@ var init_input = __esm({
       usingPad: false,
       padName: "",
       keys: /* @__PURE__ */ new Set(),
-      mouseBtn: /* @__PURE__ */ new Set()
+      mouseBtn: /* @__PURE__ */ new Set(),
+      // keys and mouse buttons that went down since the last frame read them
+      downs: /* @__PURE__ */ new Set(),
+      mdowns: /* @__PURE__ */ new Set(),
+      lastCtx: "menu",
+      optSwallow: false,
+      // until then an Esc keydown is ignored: the same Esc already released the pointer lock and opened the menu
+      escMuteUntil: 0
     };
     BTN.forEach((b) => {
       I.btn[b] = false;
@@ -999,7 +1075,7 @@ var init_input = __esm({
       I.pressed[b] = false;
     });
     KEYMAP = {
-      foot: { ShiftLeft: "cross", ShiftRight: "cross", Space: "square", KeyF: "triangle", KeyV: "circle", KeyQ: "l1", KeyE: "r1", KeyC: "r3", Escape: "options", KeyP: "options", KeyM: "touchpad", Tab: "touchpad", ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right", Enter: "cross", KeyR: "l3" },
+      foot: { ShiftLeft: "square", ShiftRight: "square", Space: "cross", KeyF: "triangle", KeyV: "circle", KeyQ: "l1", KeyE: "r1", KeyC: "r3", Escape: "options", KeyP: "options", KeyM: "touchpad", Tab: "touchpad", ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right", KeyR: "l3" },
       car: { KeyT: "up", KeyW: "r2", KeyS: "l2", Space: "r1", KeyF: "triangle", KeyV: "circle", KeyH: "l1", KeyQ: "left", KeyE: "right", KeyC: "r3", Escape: "options", KeyP: "options", KeyM: "touchpad", Tab: "touchpad", ArrowUp: "r2", ArrowDown: "l2", ShiftLeft: "cross", Enter: "cross" },
       menu: { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right", KeyW: "up", KeyS: "down", KeyA: "left", KeyD: "right", Enter: "cross", Space: "cross", Escape: "circle", Backspace: "circle", KeyQ: "l1", KeyE: "r1", KeyP: "options", Tab: "touchpad", KeyM: "touchpad", KeyF: "triangle" }
     };
@@ -1008,8 +1084,8 @@ var init_input = __esm({
       foot: [
         ["Move", "L Stick", "W A S D"],
         ["Camera", "R Stick", "Mouse"],
-        ["Sprint", "\u2715 (hold)", "Shift"],
-        ["Jump", "\u25A1", "Space"],
+        ["Jump", "\u2715", "Space"],
+        ["Sprint", "\u25A1 (hold)", "Shift"],
         ["Enter / jack car", "\u25B3", "F"],
         ["Punch / melee", "\u25CB", "V"],
         ["Aim (lock-on)", "L2", "Right mouse"],
@@ -1017,7 +1093,7 @@ var init_input = __esm({
         ["Previous / next weapon", "L1 / R1", "Q / E"],
         ["Recenter camera", "R3", "C"],
         ["Map", "Touchpad", "M / Tab"],
-        ["Pause", "Options", "Esc / P"]
+        ["Pause & settings", "Options", "Esc / P"]
       ],
       car: [
         ["Accelerate", "R2", "W / \u2191"],
@@ -1036,7 +1112,9 @@ var init_input = __esm({
     };
     addEventListener("keydown", (e) => {
       if (e.code === "Tab" || e.code === "Space" || e.code.startsWith("Arrow")) e.preventDefault();
+      if (e.code === "Escape" && performance.now() < I.escMuteUntil) return;
       I.keys.add(e.code);
+      if (!e.repeat) I.downs.add(e.code);
       I.usingPad = false;
       mark();
     });
@@ -1047,6 +1125,7 @@ var init_input = __esm({
     });
     addEventListener("mousedown", (e) => {
       I.mouseBtn.add(e.button);
+      I.mdowns.add(e.button);
       I.usingPad = false;
       mark();
     });
@@ -1684,7 +1763,7 @@ function buildWorld() {
   G.scene.add(hemi);
   W.hemi = hemi;
   const sun = new THREE.DirectionalLight(16777215, 2.4);
-  sun.castShadow = true;
+  sun.castShadow = !G.lowGfx;
   sun.shadow.mapSize.set(4096, 4096);
   const sc = sun.shadow.camera;
   sc.left = sc.bottom = -140;
@@ -3432,7 +3511,7 @@ var init_player = __esm({
         const fwd = tmp.set(Math.sin(cy), 0, Math.cos(cy)), right = tmp2.set(-Math.cos(cy), 0, Math.sin(cy));
         const dir = new THREE.Vector3().addScaledVector(fwd, my).addScaledVector(right, mx);
         const aiming = ctrl && I.l2 > 0.3 && this.weapon !== "fist";
-        const sprint = ctrl && I.btn.cross && !aiming;
+        const sprint = ctrl && I.btn.square && !aiming;
         const spd = mag * (aiming ? 2.2 : sprint ? 7.8 : 4.4);
         this.state = mag < 0.05 ? "idle" : sprint ? "sprint" : "run";
         if (dir.lengthSq() > 1e-4) dir.normalize();
@@ -3443,7 +3522,7 @@ var init_player = __esm({
         } else if (mag > 0.05) this.yaw += angDiff(this.yaw, Math.atan2(dir.x, dir.z)) * Math.min(1, dt * 12);
         if (this.grounded) {
           this.vy = -1;
-          if (ctrl && I.pressed.square) {
+          if (ctrl && I.pressed.cross) {
             this.vy = 6.2;
             sfx.jump();
           }
@@ -6132,6 +6211,8 @@ function sesCreate(info) {
     rx: false,
     noRel: false,
     loaded: false,
+    // the hub shows its own splash and collects every player's ready: ready the moment the city is built, no prompt
+    splash: info.splash === true,
     wantReady: SES_EARLY,
     readySent: false,
     started: false,
@@ -6160,8 +6241,9 @@ function sesCreate(info) {
   sV = new THREE.Vector3();
   sUp = new THREE.Vector3(0, 1, 0);
 }
-// The ready gesture: any key, button, click or tap. It also unlocks audio. A press that comes in while
-// the city is still being built counts too: the copy readies the moment it has loaded.
+// The ready gesture (only without the hub's splash): any key, button, click or tap. It also unlocks audio. A press
+// that comes in while the city is still being built counts too: the copy readies the moment it has loaded. Under
+// the splash the copy is already ready, and the first input only wakes the audio.
 function sesGesture() {
   try {
     initAudio();
@@ -7284,6 +7366,7 @@ function sesOver(reason, standings) {
   SES.over = true;
   G.lockControls = true;
   if (UI.menu) UI.closeMenu();
+  if (G.mode === "pause") G.mode = "play";
   if (document.pointerLockElement) document.exitPointerLock();
   setEngine(false);
   setRadio(false);
@@ -7340,7 +7423,7 @@ function sesOverlay(kind, a, standings) {
       card.append(row);
     }
   });
-  if (kind === "ready") add("div", "go", SES.readySent || SES.wantReady ? SES.loaded ? "Waiting for the others…" : "Ready — loading Port Motto…" : "Press any key, click or tap when you are ready");
+  if (kind === "ready") add("div", "go", SES.splash ? "Get ready\u2026" : SES.readySent || SES.wantReady ? SES.loaded ? "Waiting for the others…" : "Ready — loading Port Motto…" : "Press any key, click or tap when you are ready");
   ov.append(card);
 }
 function sesSubs(lines) {
@@ -7559,17 +7642,13 @@ var require_main = __commonJS({
     var STEP = 1 / 60;
     async function boot() {
       loadSettings();
-      if (!navigator.gpu && !SES_ON) {
-        fatal("WebGPU is not available in this browser.<br>Please use a current Chrome, Edge or another WebGPU-capable browser.");
-        return;
-      }
       try {
         await RAPIER.init();
         G.RAPIER = RAPIER;
         G.world = new RAPIER.World({ x: 0, y: -18, z: 0 });
         await initRenderer();
       } catch (e) {
-        fatal("Could not start WebGPU: " + (e && e.message ? e.message : e));
+        fatal("Could not start the renderer (WebGPU or WebGL 2): " + (e && e.message ? e.message : e));
         if (SES_ON) window.AIHub.fail("Could not start the renderer: " + (e && e.message ? e.message : e));
         return;
       }
@@ -7629,6 +7708,14 @@ var require_main = __commonJS({
           if (G.mode === "attract" || G.mode === "play") simulate(dt);
         }
       }, startAttract, stopAttract, MISSIONS, startMission };
+      // For the AI Hub harness (lib/hub/README.md §14), in a session and on its own: where the game is, whether its
+      // pause / settings menu is open, a world clock that rises while the city runs, and the controls as read.
+      window.AIHub.probe(() => ({
+        scene: SES && SES.over ? "over" : G.mode === "title" ? UI.menu && UI.menu.cls !== "title" ? "menu" : "title" : G.mode === "attract" || G.mode === "touch" ? "title" : G.mode === "sready" || G.mode === "boot" ? "ready" : G.mode === "end" ? "over" : "play",
+        menu: G.mode === "pause",
+        world: Math.round(G.simT * 1e3) / 1e3,
+        input: inputProbe()
+      }));
       const touchOnly = matchMedia("(any-pointer: coarse)").matches && !matchMedia("(any-pointer: fine)").matches && !(navigator.getGamepads && [...navigator.getGamepads()].some(Boolean));
       if (SES) sesBoot();
       else if (touchOnly && !params.has("notouch")) showTouch();
@@ -7764,6 +7851,21 @@ var require_main = __commonJS({
     addEventListener("click", () => {
       if (G.mode === "play" && !document.pointerLockElement) requestLock();
     });
+    // Esc while the mouse is captured: the browser releases the pointer lock (and may or may not pass the Esc on).
+    // Losing the lock in play opens the pause menu, as Esc would; an Esc that arrives right after it is the same
+    // press, so it is ignored instead of closing the menu again. A lock we let go of ourselves opens nothing.
+    var lockOwned = false;
+    document.addEventListener("pointerlockchange", () => {
+      if (document.pointerLockElement) {
+        lockOwned = true;
+        return;
+      }
+      if (!lockOwned) return;
+      lockOwned = false;
+      if (G.mode !== "play" || I.keys.has("Escape") || I.downs.has("Escape") || (SES && SES.over)) return;
+      I.escMuteUntil = performance.now() + 350;
+      openPause(1);
+    });
     function die(kind, why) {
       if (SES) return sesDie(kind, why);
       if (G.mode !== "play" || G.cheat) return;
@@ -7868,6 +7970,7 @@ var require_main = __commonJS({
       }
     }
     function simulate(dt) {
+      G.simT += dt;
       if (SES && !SES.host) return sesClientSim(dt);
       const P2 = G.player;
       G.clock += dt * (G.mode === "attract" ? 6 : 1);
@@ -8049,6 +8152,10 @@ var require_main = __commonJS({
       const AH = window.AIHub;
       AH.on("start", () => {
         SES.started = true;
+        try {
+          initAudio();
+        } catch {
+        }
       });
       AH.on("message", (d, from) => {
         try {
@@ -8065,7 +8172,10 @@ var require_main = __commonJS({
       AH.on("end", ({ reason, standings }) => sesOver(reason, standings));
       window.__gtmDebug = sesDebug();
       SES.loaded = true;
-      if (SES.wantReady) sesGesture();
+      if (SES.splash) {
+        SES.readySent = true;
+        AH.ready();
+      } else if (SES.wantReady) sesGesture();
       sesOverlay("ready");
     }
     function sesGo() {
