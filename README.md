@@ -418,6 +418,11 @@ A game that declares it shows a *Hub session* line in its details
 (`1–4 players · Race · about 4 min`), and the Catalogue finds them all with
 `has:session`. Those fields never become rails.
 
+Games that play in sessions: **Blaze Cup** (versus, in teams), **Arwingdings**,
+**Merry-Go-Kart 64**, **Brine Line 64** and **Urethane Switchyard** (races and
+score runs on one shared course, rivals solid), and **Grand Theft Motto III**
+(the whole campaign, co-op).
+
 To test a game against the protocol, open the harness, which loads 1–4 copies
 side by side on a simulated network:
 
