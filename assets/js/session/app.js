@@ -785,8 +785,10 @@ const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op' };
 function nextUpCard(cur) {
   const game = pool.find((g) => g.slug === cur.slug);
   const info = game ? sessionOf(game) : null;
-  const others = eligible(pool, cur.players.length).filter((g) => g.slug !== cur.slug);
-  const reel = [...Array(Math.min(7, others.length))].map((_, i) => others[(cur.round * 7 + i * 3) % others.length].name);
+  // The spin passes the other games once each, starting somewhere new every round.
+  const others = [...new Set(eligible(pool, cur.players.length).filter((g) => g.slug !== cur.slug).map((g) => g.name))];
+  const start = others.length ? cur.round % others.length : 0;
+  const reel = [...others.slice(start), ...others.slice(0, start)].filter((n) => n !== cur.name).slice(0, 6);
   return h(
     'div',
     { class: 'results__card is-next' },
