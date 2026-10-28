@@ -13,6 +13,7 @@ import { screenArt } from '../art.js';
 import { frameAt, FRAME_MS } from '../frames.js';
 import { bytes, plural } from '../format.js';
 import { store } from '../store.js';
+import { plainNameOf } from '../manifest.js';
 
 function faveButton(game) {
   const on = store.isFave(game.slug);
@@ -108,7 +109,7 @@ export function stackCabinet(stack, index = 0, href = '#/') {
   const [front] = stack.games;
   const palette = cabinetPalette(front);
   const count = stack.games.length;
-  const names = [...new Set(stack.games.map((game) => game.name))];
+  const names = [...new Set(stack.games.map(plainNameOf))];
   const what =
     stack.level === 'series'
       ? `${plural(stack.titles, 'game')}, ${plural(count, 'attempt')}`

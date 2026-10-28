@@ -98,7 +98,7 @@ test('a byte-identical copy of an installed page is skipped and names that desti
   assert.equal(plan.overrides, undefined);
 });
 
-test('same packaged filename with different bytes stays two Unsure entries', () => {
+test('same packaged filename with different bytes stays two entries, neither marked Unsure', () => {
   const other = PAGE
     .replace('Foxtrail 64', 'Foxtrail 65')
     .replace('01:01 America/Vancouver', '02:15 America/Vancouver')
@@ -112,8 +112,8 @@ test('same packaged filename with different bytes stays two Unsure entries', () 
   assert.notEqual(plans[0].contentHash, plans[1].contentHash);
   assert.notEqual(plans[0].destination, plans[1].destination);
   for (const plan of plans) {
-    assert.equal(plan.overrides.unsure, true);
-    assert.match(plan.overrides.reviewNote, /no successor lineage/);
+    assert.equal(plan.overrides.unsure, undefined);
+    assert.equal(plan.overrides.reviewNote, undefined);
     assert.equal(plan.packagedName, PACKED.slice('workspace/'.length));
   }
   assert.match(plans[1].destination, /^Foxtrail-65-The-Sunbreak-Run-Star-Fox-64-gpt-6\.1-sol-low-20261021-0215\.html$/);

@@ -437,19 +437,15 @@ export function planMatrixRun(run) {
 }
 
 /**
- * Apply duplicate detection, clash suffixes, and Unsure marks.
+ * Apply duplicate detection and clash suffixes. Two runs that packaged the
+ * same filename with different bytes stay two entries; the scan numbers their
+ * names apart (scripts/lib/names.mjs).
  * `installed` entries are `{ sha256, destination }` for pages already on the wall.
  */
 export function finalizeMatrixPlans(plans, installed = []) {
   const byHash = new Map();
   for (const entry of installed) {
     if (entry?.sha256 && entry.destination && !byHash.has(entry.sha256)) byHash.set(entry.sha256, entry.destination);
-  }
-  const names = new Map();
-  for (const plan of plans) {
-    if (!plan.packagedName) continue;
-    if (!names.has(plan.packagedName)) names.set(plan.packagedName, []);
-    names.get(plan.packagedName).push(plan);
   }
   const usedDestinations = new Set();
   const finished = [];
@@ -478,20 +474,10 @@ export function finalizeMatrixPlans(plans, installed = []) {
     }
     usedDestinations.add(destination.toLowerCase());
     byHash.set(plan.contentHash, destination);
-    const siblings = names.get(plan.packagedName) || [];
-    const hashes = new Set(siblings.map((item) => item.contentHash));
-    const unsure = hashes.size > 1;
     finished.push({
       ...plan,
       destination,
       ...(destination !== plan.destination ? { renamed: true } : {}),
-      overrides: unsure
-        ? {
-            ...plan.overrides,
-            unsure: true,
-            reviewNote: 'Same packaged filename as another run, with different bytes and no successor lineage.',
-          }
-        : plan.overrides,
     });
   }
   return finished;

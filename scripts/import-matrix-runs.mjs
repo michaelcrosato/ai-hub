@@ -221,7 +221,6 @@ function recordOf(plan) {
     renamed: Boolean(plan.renamed),
     ingestAction: plan.ingestAction || null,
     overrideStatus: plan.overrideStatus || null,
-    unsure: Boolean(plan.overrides?.unsure),
     metadata: plan.action === 'import' ? plan.overrides : null,
   };
 }
@@ -266,7 +265,7 @@ const audit = {
   dryRun: DRY,
   runsRoot: RUNS,
   filenamePolicy: 'GameTitle-SOURCE-model-effort-YYYYMMDD-HHMM.html from the page title, inspiration, requested model, effort, and the run start. The shared package stamp is not used as the run time.',
-  counts: { runs: ids.length, ...counts, overridesAdded: overrideCounts.added, overridesKept: overrideCounts.kept, unsure: runs.filter((row) => row.unsure).length },
+  counts: { runs: ids.length, ...counts, overridesAdded: overrideCounts.added, overridesKept: overrideCounts.kept },
   ingest: report.counts,
   unsupportedLibraries: report.dependencies || [],
   runs,

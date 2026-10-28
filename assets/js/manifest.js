@@ -11,7 +11,7 @@
 /** Fields that describe a specific game rather than classify it. Never a rail.
  *  The drawer reuses this to decide which fields are worth listing as facts. */
 export const NOT_A_FACET = new Set([
-  'slug', 'name', 'tagline', 'description', 'title', 'search', 'path', 'cover',
+  'slug', 'name', 'plainName', 'tagline', 'description', 'title', 'search', 'path', 'cover',
   'frames', 'frameLabel', 'audioReview',
   'icon', 'themeColor', 'version', 'added', 'updated', 'sourceDate', 'bytes', 'buildCount',
   'builds', 'lang', 'file', 'id', 'label', 'hub', 'hidden', 'addedAt', 'updatedAt',
@@ -230,9 +230,12 @@ export function lineageOf(game) {
   return {
     original: !source && !series,
     series: series || source || ORIGINAL,
-    title: source || String(game.name ?? game.slug ?? '').trim(),
+    title: source || String(plainNameOf(game) ?? game.slug ?? '').trim(),
   };
 }
+
+/** The name before the wall numbered it apart from an older entry's: "Ashbound" for "Ashbound (2)". */
+export const plainNameOf = (game) => game.plainName || game.name;
 
 /** The first step of the Source rail: 'original' or 'inspired'. */
 export const originOf = (game) => (game.lineage.original ? 'original' : 'inspired');

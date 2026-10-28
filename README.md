@@ -42,6 +42,17 @@ Nothing is typed in by hand. On every build, `scripts/scan.mjs` reads just the
 A game with none of these still works — it gets its filename as a name and a
 colour derived from its slug.
 
+### Names on the wall
+
+No two entries show the same name. When names collide (case and accents
+ignored), the oldest entry, the first added to the hub, keeps the plain name
+and later ones are numbered in the order they were added: **Ashbound**,
+**Ashbound (2)**, **Ashbound (3)**. The scan does it on every build, so a
+duplicate needs no manual work, and nothing in the game file or the catalogue
+changes. Search still finds each by its plain name, and attempts at one
+original still stack under it. `pnpm test` fails if two entries ever show the
+same name. See [the 28 Oct curation](docs/curation-2026-10-28.md).
+
 ### Several builds of one game
 
 Two ways, whichever suits the moment:
@@ -95,7 +106,8 @@ export-time fallback in the audit. Arrival dates still record the actual
 import time. Gemini defaults to Gemini 4 Argon and Muse to Muse Wonder 1 unless
 the package states otherwise; missing details remain unknown. Exact duplicates
 keep their existing URLs, and differing packages with uncertain revision
-lineage are retained separately on the Unsure shelf. These names do not use
+lineage are kept as separate entries, numbered apart on the wall (see *Names
+on the wall*). These names do not use
 the older source-first filename grouping rule above.
 
 ### Folders: collections and projects
@@ -172,10 +184,14 @@ and `2.jpg`: a title or initial view, followed by two useful game or tool views.
 Use the shared 640×480 JPEG quality 58 format. Loading, blank and error screens
 do not count as screenshots; keep uncertain model details unset.
 
-When an import's identity is uncertain, set `"unsure": true` and a `reviewNote`
-in its `data/overrides.json` entry. It appears on the **Unsure** shelf on the
-wall and in the Couch, with its own screenshots and URL for comparison. Its
-genre and type stay intact. Remove `unsure` once the identity is resolved.
+Two runs that differ in their bytes are two entries, even when they share a
+name: the wall numbers them apart (*Names on the wall*), so they need no
+review. Only when it is unclear whether an import is a game at all, or which
+game it is, set `"unsure": true` and a `reviewNote` in its
+`data/overrides.json` entry. It appears on the **Unsure** shelf on the wall and
+in the Couch, with its own screenshots and URL for comparison. Its genre and
+type stay intact. Remove `unsure` once the identity is resolved; the shelf
+hides when it is empty.
 
 **Local engine dependencies.** The importer also recognizes Three.js and
 Rapier references from jsDelivr, unpkg, esm.sh, Skypack and JSPM, and rewrites

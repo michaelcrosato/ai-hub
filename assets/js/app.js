@@ -17,7 +17,7 @@
  */
 
 import { h, icon, ICONS } from './dom.js';
-import { loadManifest, deriveFacets, sameKey, originOf, ORIGINAL } from './manifest.js';
+import { loadManifest, deriveFacets, sameKey, originOf, plainNameOf, ORIGINAL } from './manifest.js';
 import { plural } from './format.js';
 import {
   selectGames,
@@ -354,7 +354,7 @@ function renderWall(state) {
     // Among inspired games, which game each one is an attempt at says more
     // than its genre; inside a series every tile is the same genre anyway.
     label: (game) =>
-      state.origin === 'inspired' && !state.source && sameKey(game.lineage.title) !== sameKey(game.name)
+      state.origin === 'inspired' && !state.source && sameKey(game.lineage.title) !== sameKey(plainNameOf(game))
         ? game.lineage.title
         : null,
   });

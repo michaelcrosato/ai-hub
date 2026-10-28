@@ -19,6 +19,7 @@ import { parseHead, splitTitle, slugify, compareVersions, rootAbsoluteRefs } fro
 import { classify, assignSlugs, prettify, INDEX_FILE } from './lib/layout.mjs';
 import { scanAudio, mergeAudio } from './lib/audio-inventory.mjs';
 import { gitAddedDates } from './lib/dates.mjs';
+import { numberNames } from './lib/names.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const GAMES_DIR = path.join(ROOT, 'games');
@@ -379,6 +380,7 @@ export async function scan({ quiet = false, list = false } = {}) {
     games.push(game);
   }
 
+  numberNames(games);
   games.sort((a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' }));
 
   const manifest = {
