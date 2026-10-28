@@ -17,6 +17,13 @@
  *
  * Across devices the host signs in with Google and gets an invite link,
  * /session#<code>; friends open it and join as guests, no account needed.
+ *
+ * Between rounds every seat sees the results, then the next game's splash: a
+ * 10-second countdown that starts the round by itself, Ready (every seat
+ * ready starts it at once) and I need more time (+10 s; while most seats ask,
+ * the countdown holds). The games load underneath and ready up by themselves
+ * (lib/hub/README.md §6); the host's round coordinator starts the round when
+ * the splash is over and every game has loaded.
  */
 
 import { h, clear } from '../dom.js';
@@ -34,17 +41,20 @@ import { scoreRound, addRound, leaderboard, FORMATS, DEFAULT_FORMAT, formatOf, f
 const SEATS = 4;
 const STATE_EVERY_MS = 2_000;
 const DISCOVER_MS = 700;
-/** Between rounds: the results, then the next game's card while it loads underneath. */
-const NEXT_UP_MS = 3_000;
+/** "I need more time" adds this much to the splash's countdown. */
+const MORE_MS = 10_000;
 const RELAY_KEY = 'ai-hub:relay-only';
+/** The controller on the splash: Cross is Ready, Triangle asks for more time. */
+const PAD = { cross: 0, triangle: 3 };
 
 const params = new URLSearchParams(location.search);
 const seconds = (name) => (Number(params.get(name)) > 0 ? Number(params.get(name)) * 1000 : null);
 /** Knobs for trying games quickly: the host's address sets them for the session. */
 const knobs = {
   limitMs: seconds('limit'),
-  readyMs: seconds('ready'),
   resultsMs: seconds('results') ?? 5_000,
+  splashMs: seconds('splash') ?? 10_000,
+  graceMs: seconds('grace'),
   examples: params.get('examples') === '1',
 };
 const asSeat = Number(params.get('as')) >= 1 && Number(params.get('as')) <= SEATS ? Number(params.get('as')) - 1 : null;
@@ -81,11 +91,22 @@ let coordinator = null;    // host only: the running round
 let bridge = null;         // this tab's game frame in the current round
 let detach = null;
 const early = [];          // traffic for a round whose frame isn't open yet
+/** Host only: who asked for more time on the splash. Kept off the shared state, so nobody learns who. */
+let marks = new Set();
+/** This tab's own answer on the splash, which it shows itself. */
+let myAnswer = { round: null, ready: false, more: false, moreAt: 0 };
 
 const player = createPlayer(document.getElementById('player'), {
-  onExit: leaveSession,
-  onRoll: () => {},
-  roll: false,
+  // The host's ✕ ends Random Mode for everyone; a guest's leaves the session.
+  onExit: () => (isHost() ? backToLobby() : leaveSession()),
+  // The host's 🎲 skips to the next game.
+  onRoll: () => isHost() && coordinator?.abort('skipped'),
+  canRoll: () => isHost(),
+  confirmExit: () =>
+    isHost()
+      ? { title: 'End Random Mode for everyone?', detail: 'Everyone goes back to the lobby and keeps their seat. The rounds played so far stay on the table.', action: 'End Random Mode' }
+      : { title: 'Leave the session?', detail: 'The others play on without you.', action: 'Leave the session' },
+  keepFocus: () => !overlay.hidden,
   honorStandalone: false,
   askToRate: false,
   backLabel: 'Leave the session',
@@ -220,7 +241,8 @@ function startRound({ under = false } = {}) {
     mode: info.mode,
     seed: current.seed,
     limitMs: current.limitMs,
-    timings: limits.readyMs ? { readyMs: limits.readyMs } : {},
+    gate: true,
+    timings: limits.graceMs ? { loadGraceMs: limits.graceMs } : {},
     deliver: (to, m) => net.send(to, { k: 'h', r: round, m }),
     onStatus: (s) => {
       status = s;
@@ -238,14 +260,86 @@ function startRound({ under = false } = {}) {
     },
   });
   coordinator = handle;
-  const reveal = under && state.reveal ? state.reveal : { at: hostNow(), until: hostNow() + NEXT_UP_MS, results: false };
+  marks = new Set();
+  const reveal = under && state.reveal ? state.reveal : { at: hostNow(), resultsUntil: hostNow(), results: false };
+  // The splash's countdown runs from the moment the results make way for it.
+  current.splash = { until: Math.max(reveal.resultsUntil, hostNow()) + (limits.splashMs ?? knobs.splashMs), paused: null, ready: [], marked: 0, notice: 0, released: false };
   publish({ ...state, round, cycle: pick.cycle, played: pick.played, phase: 'round', current, reveal, notice: null });
 }
 
-/** When the reveal after a round ends: its results for `resultsMs`, then the next game's card. */
+/** After a round: its results for `resultsMs`, then the next game's splash. */
 function revealFor(s) {
-  const total = (s.knobs?.resultsMs ?? knobs.resultsMs) + NEXT_UP_MS;
-  return { at: hostNow(), until: hostNow() + total, results: s.history.length > 0 };
+  return { at: hostNow(), resultsUntil: hostNow() + (s.knobs?.resultsMs ?? knobs.resultsMs), results: s.history.length > 0 };
+}
+
+/* --- the splash: the host keeps its countdown ------------------------------- */
+
+/** The seats the splash waits on: the round's players who are still in it. */
+function splashSeats(cur = state?.current) {
+  if (!cur) return [];
+  const here = new Set((net?.members() ?? []).map((m) => m.key));
+  const out = new Set((status?.round === cur.round ? status.players : []).filter((p) => p.out).map((p) => p.key));
+  return cur.players.map((p) => p.key).filter((k) => here.has(k) && !out.has(k));
+}
+
+/** A seat pressed Ready or I need more time (host only). */
+function applyPress(who, what, round) {
+  const cur = state?.current;
+  const sp = cur?.splash;
+  if (!isHost() || !sp || sp.released || cur.round !== round || !cur.players.some((p) => p.key === who)) return;
+  let { ready, until, paused, notice } = sp;
+  if (what === 'ready') {
+    ready = [...new Set([...ready, who])];
+    marks.delete(who);
+  } else if (what === 'more') {
+    if (marks.has(who)) marks.delete(who);
+    else {
+      marks.add(who);
+      ready = ready.filter((k) => k !== who);
+      if (paused !== null) paused += MORE_MS;
+      else until += MORE_MS;
+      notice = hostNow();
+    }
+  } else return;
+  const seats = splashSeats(cur);
+  for (const k of marks) if (!seats.includes(k)) marks.delete(k);
+  // More than half asking holds the countdown; fewer than half lets it run again.
+  if (paused === null && marks.size > seats.length / 2) paused = Math.max(0, until - hostNow());
+  else if (paused !== null && marks.size < seats.length / 2) {
+    until = hostNow() + paused;
+    paused = null;
+  }
+  publish({ ...state, current: { ...cur, splash: { ...sp, ready, until, paused, notice, marked: marks.size } } });
+  tickSplash();
+}
+
+/** Host: end the splash when its countdown runs out or every seat is ready. */
+function tickSplash() {
+  const cur = state?.current;
+  const sp = cur?.splash;
+  if (!isHost() || !coordinator || !sp || sp.released || state.phase !== 'round') return;
+  const seats = splashSeats(cur);
+  if (!seats.length) return;
+  const allReady = seats.every((k) => sp.ready.includes(k));
+  if (!allReady && (sp.paused !== null || hostNow() < sp.until)) return;
+  publish({ ...state, reveal: { ...state.reveal, resultsUntil: Math.min(state.reveal?.resultsUntil ?? 0, hostNow()) }, current: { ...cur, splash: { ...sp, released: true } } });
+  coordinator.release();
+}
+
+/** This tab presses a splash button: the host applies it, everyone else tells the host. */
+function press(what) {
+  const cur = state?.current;
+  if (!cur?.splash || cur.splash.released || !cur.players.some((p) => p.key === key)) return;
+  if (myAnswer.round !== cur.round) myAnswer = { round: cur.round, ready: false, more: false, moreAt: 0 };
+  if (what === 'ready') {
+    if (myAnswer.ready) return;
+    myAnswer = { ...myAnswer, ready: true, more: false };
+  } else {
+    myAnswer = { ...myAnswer, ready: false, more: !myAnswer.more, moreAt: hostNow() };
+  }
+  if (isHost()) applyPress(key, what, cur.round);
+  else net.send(hostKey(), { k: 's', t: 'press', r: cur.round, what });
+  renderResults();
 }
 
 /** After a round's results: deal the next game at once, loading under them. */
@@ -354,6 +448,8 @@ function route(from, env) {
     } else if (env.t === 'status' && from === hostKey()) {
       status = env.status;
       render();
+    } else if (env.t === 'press' && isHost()) {
+      applyPress(from, env.what, env.r);
     } else if (env.t === 'kick' && from === hostKey() && env.key === key) {
       removed = true;
       closeRound();
@@ -406,6 +502,7 @@ function render() {
     traffic: bridge ? { ...bridge.stats } : null,
     clock: net?.clock ? { offset: net.clock.offset, rtt: net.clock.rtt, following: net.clock.following } : null,
   };
+  player.refresh();
   clear(app);
   if (removed) app.append(h('section', { class: 'panel' }, h('h2', {}, 'You were removed from this session'), h('a', { class: 'primary', href: '/' }, 'Back to the wall')));
   else if (superseded)
@@ -559,7 +656,7 @@ function lobbyScreen() {
           h('span', { class: 'hint' }, fits ? `${fits} game${fits === 1 ? '' : 's'} fit ${n} player${n === 1 ? '' : 's'}` : `No game fits ${n} player${n === 1 ? '' : 's'} yet`)
         )
       : state?.phase === 'lobby' && h('p', { class: 'hint' }, `Waiting for ${nameOf(hostKey()) ?? 'the host'} to start.`),
-    host && state?.phase !== 'lobby' && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, 'End the session'),
+    host && (state?.phase !== 'lobby' || state.history.length > 0) && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, 'End the session'),
     transport === 'online' && relaySwitch(),
     standingsTable()
   );
@@ -669,15 +766,15 @@ function renderStrip() {
   const cur = state?.current;
   strip.hidden = !(state?.phase === 'round' && cur && player.isOpen());
   if (strip.hidden) return;
-  const bar = document.querySelector('#player .player__exit');
-  if (bar && strip.parentNode !== bar) bar.append(strip);
-  const waiting = status?.phase === 'loading' ? status.players.filter((p) => !p.ready && !p.out).map((p) => p.name) : [];
+  const slot = player.slot();
+  if (slot && strip.parentNode !== slot) slot.append(strip);
+  // Once the splash is over, the games still loading hold up the start.
+  const waiting = status?.phase === 'loading' && cur.splash?.released ? status.players.filter((p) => !p.ready && !p.out).map((p) => p.name) : [];
   // Native append would print a false or null child as text: drop them first.
   strip.append(...[
-    h('span', { class: 'strip__title' }, `${formatProgress(state.format, state.history, state.totals)} · ${cur.name}`),
+    h('span', { class: 'strip__title' }, formatProgress(state.format, state.history, state.totals)),
     waiting.length ? h('span', {}, `Waiting for ${waiting.join(', ')}`) : status?.phase === 'grace' ? h('span', {}, 'Time!') : null,
     isHost() && h('button', { type: 'button', onclick: () => coordinator?.timeUp() }, 'End round'),
-    isHost() && h('button', { type: 'button', onclick: () => coordinator?.abort('skipped') }, 'Skip game'),
   ].filter(Boolean));
 }
 
@@ -699,16 +796,29 @@ const resultText = (row) =>
 let shown = '';
 let lifted = true;
 
-/** Which part of the reveal is on: the last round's results, the next game's card, or nothing. */
+/** "1.1.0" < "1.2.0": a game whose client predates the splash shows its own ready prompt. */
+const olderThan = (version, than) => {
+  const a = String(version || '0').split('.').map(Number);
+  const b = than.split('.').map(Number);
+  for (let i = 0; i < 3; i++) if ((a[i] || 0) !== b[i]) return (a[i] || 0) < b[i];
+  return false;
+};
+
+/** This seat's game is an older one still waiting for its own ready key. */
+function waitsForMyKey() {
+  const me = status?.round === state?.current?.round ? status.players.find((p) => p.key === key) : null;
+  return Boolean(me && me.hello && !me.ready && !me.out && olderThan(me.client, '1.2.0'));
+}
+
+/** Which part of the reveal is on: the last round's results, the next game's splash, or nothing. */
 function revealStage() {
-  const reveal = state?.reveal;
-  if (!reveal || state.phase === 'ended') return 'none';
-  const left = reveal.until - hostNow();
-  // Everyone readied early: the countdown has begun, so lift the card for it.
-  if (status && state.current && status.round === state.current.round && status.phase !== 'loading') return 'none';
-  if (left <= 0) return 'none';
-  if (reveal.results && left > NEXT_UP_MS && state.history.length) return 'results';
-  return state.current ? 'next' : state.history.length ? 'results' : 'none';
+  if (!state || state.phase === 'ended') return 'none';
+  const cur = state.current;
+  // The 3-2-1 has begun: lift the card for it.
+  if (status && cur && status.round === cur.round && status.phase !== 'loading') return 'none';
+  if (state.reveal?.results && state.history.length && hostNow() < state.reveal.resultsUntil) return 'results';
+  if (cur && state.phase === 'round' && cur.splash) return cur.splash.released && waitsForMyKey() ? 'none' : 'splash';
+  return 'none';
 }
 
 function renderResults() {
@@ -719,12 +829,15 @@ function renderResults() {
     clear(overlay);
     overlay.hidden = stage === 'none';
     if (stage === 'results') overlay.append(resultsCard(state.history.at(-1)));
-    if (stage === 'next') overlay.append(nextUpCard(state.current));
+    if (stage === 'splash') {
+      overlay.append(splashCard(state.current));
+      overlay.querySelector('.splash__ready')?.focus({ preventScroll: true });
+    }
   }
-  const left = Math.max(0, Math.ceil((((state?.reveal?.until ?? 0) - (stage === 'results' ? NEXT_UP_MS : 0)) - hostNow()) / 1000));
   const count = overlay.querySelector('.results__count');
-  if (count) count.textContent = stage === 'results' ? `Next game in ${left + Math.round(NEXT_UP_MS / 1000)} s` : '';
-  // The card lifted: hand the keyboard to the game, which is waiting for a key.
+  if (count && stage === 'results') count.textContent = `Next game in ${Math.max(0, Math.ceil((state.reveal.resultsUntil - hostNow()) / 1000))} s`;
+  if (stage === 'splash') updateSplash(state.current);
+  // The card lifted: hand the keyboard to the game.
   if (stage === 'none' && !lifted) document.querySelector('#player iframe')?.focus();
   lifted = stage === 'none';
 }
@@ -780,7 +893,7 @@ function resultsCard(entry) {
       'div',
       { class: 'results__next' },
       h('span', { class: 'hint results__count' }),
-      host && h('button', { type: 'button', class: 'primary', onclick: () => publish({ ...state, reveal: { ...state.reveal, until: hostNow() + NEXT_UP_MS } }) }, 'Next game now'),
+      host && h('button', { type: 'button', class: 'primary', onclick: nextGameNow }, 'Next game now'),
       host && h('button', { type: 'button', onclick: backToLobby }, 'Back to the lobby'),
       host && h('button', { type: 'button', onclick: () => endSession() }, 'End the session')
     )
@@ -789,14 +902,22 @@ function resultsCard(entry) {
 
 const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op' };
 
-/** The next game: a quick spin through the deck that lands on it, then what it takes to win. */
-function nextUpCard(cur) {
+/** Host: skip the rest of the results; the splash starts its countdown now. */
+function nextGameNow() {
+  const cur = state.current;
+  const splash = cur?.splash && !cur.splash.released && cur.splash.paused === null ? { ...cur.splash, until: hostNow() + (state.knobs?.splashMs ?? knobs.splashMs) } : cur?.splash;
+  publish({ ...state, reveal: { ...state.reveal, resultsUntil: hostNow() }, current: cur ? { ...cur, splash } : cur });
+}
+
+/** The next game's splash: a quick spin through the deck that lands on it, what it takes to win, and the countdown. */
+function splashCard(cur) {
   const game = pool.find((g) => g.slug === cur.slug);
   const info = game ? sessionOf(game) : null;
   // The spin passes the other games once each, starting somewhere new every round.
   const others = [...new Set(eligible(pool, cur.players.length).filter((g) => g.slug !== cur.slug).map((g) => g.name))];
   const start = others.length ? cur.round % others.length : 0;
   const reel = [...others.slice(start), ...others.slice(0, start)].filter((n) => n !== cur.name).slice(0, 6);
+  const playing = cur.players.some((p) => p.key === key);
   return h(
     'div',
     { class: 'results__card is-next' },
@@ -812,9 +933,59 @@ function nextUpCard(cur) {
     ),
     info?.goal && h('p', { class: 'next__goal' }, info.goal),
     info?.howto && h('p', { class: 'next__howto' }, info.howto),
-    h('p', { class: 'hint' }, 'Loading… press any key when it asks.'),
+    h('p', { class: 'splash__count', 'aria-live': 'polite' }),
+    playing &&
+      h(
+        'div',
+        { class: 'splash__buttons' },
+        h('button', { type: 'button', class: 'primary splash__ready', onclick: () => press('ready') }, 'Ready', h('small', {}, ' Enter · ✕ Cross')),
+        h('button', { type: 'button', class: 'splash__more', onclick: () => press('more') }, 'I need more time', h('small', {}, ' △ Triangle'))
+      ),
+    h('p', { class: 'hint splash__note', 'aria-live': 'polite' }),
     isHost() && h('div', { class: 'results__next' }, h('button', { type: 'button', onclick: backToLobby }, 'Back to the lobby'))
   );
+}
+
+/** The splash's live parts, every tick: the countdown, who is ready, and the notes. */
+function updateSplash(cur) {
+  const sp = cur?.splash;
+  if (!sp) return;
+  if (myAnswer.round !== cur.round) myAnswer = { round: cur.round, ready: false, more: false, moreAt: 0 };
+  const seats = splashSeats(cur);
+  const readyCount = sp.ready.filter((k) => seats.includes(k)).length;
+  const loading = status?.round === cur.round ? status.players.filter((p) => !p.ready && !p.out).length : 0;
+  const count = overlay.querySelector('.splash__count');
+  if (count) {
+    count.textContent = sp.released
+      ? loading
+        ? `Starting as soon as ${loading === 1 ? 'one more game has' : `${loading} more games have`} loaded…`
+        : 'Starting…'
+      : sp.paused !== null
+        ? 'Paused: most players need more time'
+        : `Starts in ${Math.max(0, Math.ceil((sp.until - hostNow()) / 1000))}`;
+    count.classList.toggle('is-paused', sp.paused !== null && !sp.released);
+  }
+  const ready = overlay.querySelector('.splash__ready');
+  const more = overlay.querySelector('.splash__more');
+  if (ready) {
+    ready.disabled = sp.released || myAnswer.ready;
+    ready.firstChild.textContent = myAnswer.ready ? 'Ready ✓' : 'Ready';
+  }
+  if (more) {
+    more.disabled = sp.released;
+    more.setAttribute('aria-pressed', String(myAnswer.more));
+    more.firstChild.textContent = myAnswer.more ? 'Take back my request' : 'I need more time';
+  }
+  const note = overlay.querySelector('.splash__note');
+  if (note) {
+    const someoneAsked = sp.notice && hostNow() - sp.notice < 4_000 && !(myAnswer.more && Math.abs(sp.notice - myAnswer.moreAt) < 1_500);
+    note.textContent = [
+      `${readyCount} of ${seats.length} ready`,
+      myAnswer.more ? 'You asked for more time' : someoneAsked ? 'A player needs more time' : sp.marked ? `${sp.marked} asking for more time` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+  }
 }
 
 function backToLobby() {
@@ -912,6 +1083,32 @@ function endScreen() {
   );
 }
 
+/**
+ * The controller on the splash: Cross is Ready, Triangle asks for more time.
+ * The pads are read through the game's frame as well, which may be the one
+ * that has focus.
+ */
+let padWas = [];
+function splashPad() {
+  requestAnimationFrame(splashPad);
+  if (revealStage() !== 'splash') {
+    padWas = [];
+    return;
+  }
+  const lists = [];
+  try {
+    lists.push(document.querySelector('#player iframe')?.contentWindow?.navigator?.getGamepads?.() || []);
+  } catch {
+    /* cross-origin */
+  }
+  lists.push(navigator.getGamepads?.() || []);
+  const pad = lists.flatMap((l) => [...l]).find((p) => p && p.connected);
+  const now = pad ? pad.buttons.map((b) => b.pressed) : [];
+  if (now[PAD.cross] && !padWas[PAD.cross]) press('ready');
+  if (now[PAD.triangle] && !padWas[PAD.triangle]) press('more');
+  padWas = now;
+}
+
 /* --- start ------------------------------------------------------------------ */
 
 async function main() {
@@ -936,7 +1133,12 @@ async function main() {
   setInterval(() => {
     if (net && isHost() && state) net.broadcast({ k: 's', t: 'state', state });
   }, STATE_EVERY_MS / 2);
-  setInterval(() => state && renderResults(), 200);
+  setInterval(() => {
+    if (!state) return;
+    tickSplash();
+    renderResults();
+  }, 200);
+  requestAnimationFrame(splashPad);
   addEventListener('visibilitychange', () => bridge?.visibility(document.hidden));
   render();
   if (asSeat !== null && net) {

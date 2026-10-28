@@ -7,10 +7,16 @@
  * hub offer a way out without a single edit to a game file.
  *
  * The hub claims no keys while a game runs: every key belongs to the game.
- * The way out is the bar in the corner, three buttons: back to the wall, roll
- * another game, and ✕. A tap of ✕ folds the bar down to just the ✕ (a tap
- * brings it back); holding it takes the bar away entirely, until the hub is
- * reloaded, for a game that needs every pixel.
+ * The way out is the bar in the corner: ✕ at the far left, 🎲 next to it, ←
+ * at the far right. ✕ closes the game, but only when held until its ring
+ * fills and then confirmed, so a stray click never ends a game. 🎲 rolls
+ * another one. A tap of ← folds the bar down to just the ← (a tap brings it
+ * back); holding it takes the bar away entirely, until the hub is reloaded,
+ * for a game that needs every pixel.
+ *
+ * A controller reaches the bar too: holding Create + Options for a second
+ * hands the bar to it (the D-pad moves, Cross presses, Circle leaves). Games
+ * leave Options alone while Create is held (lib/hub/README.md §12).
  */
 
 import { h, clear, icon, ICONS } from '../dom.js';
@@ -22,6 +28,9 @@ import { askAfterPlay } from '../account/thumbs.js';
 const HOLD_MS = 700;
 const IDLE_MS = 3500;
 const RING = 2 * Math.PI * 10;
+/** Create + Options held this long hands the bar to the controller. */
+const COMBO_MS = 1000;
+const PAD = { cross: 0, circle: 1, create: 8, options: 9, up: 12, down: 13, left: 14, right: 15 };
 
 const FRAME_ALLOW = [
   'fullscreen',
@@ -42,9 +51,12 @@ const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').match
 /**
  * Options beyond the wall's: `src(build)` names the frame's address (a session
  * adds ?aihub=1), `onFrame(frame)` hands over each new frame before it loads,
- * `roll: false` drops the 🎲, `honorStandalone: false` ignores this
- * device's plain-tab choices, which a session cannot play through, and
- * `askToRate: false` skips the thumbs prompt after a game closes.
+ * `canRoll()` says whether the 🎲 shows (asked again on refresh()),
+ * `confirmExit()` words the ✕'s confirmation ({ title, detail, action }),
+ * `keepFocus()` keeps the keyboard on the page while the frame loads (a card
+ * over the game), `honorStandalone: false` ignores this device's plain-tab
+ * choices, which a session cannot play through, and `askToRate: false` skips
+ * the thumbs prompt after a game closes.
  */
 export function createPlayer(
   root,
@@ -54,17 +66,17 @@ export function createPlayer(
     backLabel = 'Back to the wall',
     src = (build) => build.path,
     onFrame = null,
-    roll = true,
+    canRoll = () => true,
+    confirmExit = () => ({ title: 'Close this game?', detail: `${backLabel}.`, action: 'Close the game' }),
+    keepFocus = () => false,
     honorStandalone = true,
     askToRate = true,
   }
 ) {
   let session = null;
   let pageTitle = document.title;
-  /** The bar: 'open', 'folded' to just the ✕, or 'gone' until a reload. */
+  /** The bar: 'open', 'folded' to just the ←, or 'gone' until a reload. */
   let bar = 'open';
-
-  /* --- the ✕: a tap folds the bar, a hold takes it away ------------------- */
 
   function setBar(next) {
     bar = next;
@@ -72,37 +84,89 @@ export function createPlayer(
     root.classList.toggle('is-bare', bar === 'gone');
   }
 
+  /* --- holding: ✕ fills its ring to ask, ← fills its ring to go --------- */
+
   function cancelHold() {
     if (!session?.hold) return;
     cancelAnimationFrame(session.hold.raf);
+    session.hold.arc.setAttribute('stroke-dashoffset', RING);
     session.hold = null;
-    session.arc?.setAttribute('stroke-dashoffset', RING);
   }
 
-  function beginHold(event) {
+  /** Start filling a button's ring; `done` runs when it is full. */
+  function beginHold(button, done) {
     if (!session || session.hold) return;
-    event.preventDefault();
+    const arc = button.querySelector('.arc');
     const started = performance.now();
     const step = (now) => {
       if (!session?.hold) return;
       const progress = Math.min(1, (now - started) / HOLD_MS);
-      session.arc.setAttribute('stroke-dashoffset', String(RING * (1 - progress)));
+      arc.setAttribute('stroke-dashoffset', String(RING * (1 - progress)));
       if (progress >= 1) {
         session.hold.done = true;
-        setBar('gone');
+        done();
         return;
       }
       session.hold.raf = requestAnimationFrame(step);
     };
-    session.hold = { raf: requestAnimationFrame(step), done: false };
+    session.hold = { button, arc, started, onFull: done, raf: requestAnimationFrame(step), done: false };
   }
 
-  /** Let go: a short press was a tap, which folds or unfolds the bar. */
-  function endHold() {
-    if (!session?.hold) return;
-    const held = session.hold.done;
+  /** Let go of a held button: true when it was held long enough, even if a slow page never drew the full ring. */
+  function endHold(button) {
+    const hold = session?.hold;
+    if (!hold || hold.button !== button) return null;
+    const held = hold.done || performance.now() - hold.started >= HOLD_MS;
     cancelHold();
-    if (!held) setBar(bar === 'folded' ? 'open' : 'folded');
+    if (held && !hold.done) hold.onFull();
+    return held;
+  }
+
+  /** ← let go before its ring filled was a tap: fold or unfold the bar. */
+  const releaseFold = (button) => {
+    if (endHold(button) === false) setBar(bar === 'folded' ? 'open' : 'folded');
+  };
+
+  /* --- ✕: held, then confirmed ------------------------------------------ */
+
+  function askToExit() {
+    if (!session || session.ask) return;
+    const words = confirmExit();
+    const close = () => {
+      session?.ask?.remove();
+      if (session) session.ask = null;
+      if (pad.owned) pad.focus(0);
+      else refocusGame();
+    };
+    const card = h(
+      'div',
+      { class: 'player__ask', role: 'alertdialog', 'aria-modal': 'true', 'aria-label': words.title, onkeydown: (e) => e.key === 'Escape' && close() },
+      h(
+        'div',
+        { class: 'player__ask-card' },
+        h('h2', {}, words.title),
+        words.detail && h('p', {}, words.detail),
+        h(
+          'div',
+          { class: 'player__ask-actions' },
+          h('button', { type: 'button', class: 'player__ask-go', onclick: () => { close(); onExit(); } }, words.action),
+          h('button', { type: 'button', class: 'player__ask-stay', onclick: close }, 'Keep playing')
+        )
+      )
+    );
+    session.ask = card;
+    root.append(card);
+    card.querySelector('.player__ask-stay').focus();
+  }
+
+  function refocusGame() {
+    if (!session?.frame || keepFocus()) return;
+    session.frame.focus();
+    try {
+      session.frame.contentWindow?.focus();
+    } catch {
+      /* cross-origin after a redirect */
+    }
   }
 
   /* --- chrome that gets out of the way ---------------------------------- */
@@ -111,7 +175,7 @@ export function createPlayer(
     if (!session) return;
     root.classList.remove('is-idle');
     clearTimeout(session.idle);
-    session.idle = setTimeout(() => root.classList.add('is-idle'), IDLE_MS);
+    session.idle = setTimeout(() => !pad.owned && root.classList.add('is-idle'), IDLE_MS);
   }
 
   /**
@@ -187,9 +251,9 @@ export function createPlayer(
     clear(root);
 
     if (honorStandalone && (store.prefersStandalone(game.slug) || store.dev().alwaysStandalone)) {
-      const { el: barEl, arc } = exitBar();
+      const { el: barEl } = exitBar();
       root.append(barEl, standalonePanel(game, build));
-      session = { game, build, arc, unbind: [], idle: 0, hold: null };
+      session = { game, build, unbind: [], idle: 0, hold: null, ask: null };
       return;
     }
 
@@ -203,21 +267,18 @@ export function createPlayer(
     });
 
     const crt = h('div', { class: 'player__crt', 'aria-hidden': 'true' });
-    const { el: barEl, arc } = exitBar();
+    const { el: barEl } = exitBar();
     root.append(frame, crt, barEl);
 
-    session = { game, build, frame, crt, arc, unbind: [], idle: 0, hold: null };
+    session = { game, build, frame, crt, unbind: [], idle: 0, hold: null, ask: null };
     onFrame?.(frame);
+    cancelAnimationFrame(pad.raf);
+    pad.raf = requestAnimationFrame(pad.tick);
 
     frame.addEventListener('load', () => {
       crt.classList.add('is-off');
       listenInside(frame);
-      frame.focus();
-      try {
-        frame.contentWindow?.focus();
-      } catch {
-        /* cross-origin after a redirect; the corner tab still works */
-      }
+      refocusGame();
     });
 
     pageTitle = document.title;
@@ -229,48 +290,142 @@ export function createPlayer(
     if (fromTile && !reducedMotion()) zoomFrom(fromTile);
   }
 
-  /** Back to where you came from, roll another game, and the ✕ with its hold ring. */
+  /**
+   * ✕ (hold, then confirm), 🎲, a slot for whoever opened the game (a
+   * session's round line), and ← (tap folds, hold hides), left to right.
+   */
   function exitBar() {
-    const arc = h('circle', {
-      class: 'arc',
-      cx: 12,
-      cy: 12,
-      r: 10,
-      'stroke-dasharray': RING,
-      'stroke-dashoffset': RING,
-    });
-    const tool = (cls, label, glyph, props = {}) =>
+    const ring = () =>
       h(
-        'button',
-        { type: 'button', class: `player__tool ${cls}`, 'aria-label': label, title: label, ...props },
-        glyph
+        'svg',
+        { class: 'player__ring', viewBox: '0 0 24 24', 'aria-hidden': 'true' },
+        h('circle', { class: 'arc', cx: 12, cy: 12, r: 10, 'stroke-dasharray': RING, 'stroke-dashoffset': RING })
       );
+    const tool = (cls, label, glyph, props = {}) =>
+      h('button', { type: 'button', class: `player__tool ${cls}`, 'aria-label': label, title: label, ...props }, glyph);
+    /** Pointer and keyboard both hold: a key held down fills the ring like a press. */
+    const holdable = (onFull, onRelease) => ({
+      onpointerdown: (event) => {
+        event.preventDefault();
+        beginHold(event.currentTarget, onFull);
+      },
+      onpointerup: (event) => onRelease(event.currentTarget),
+      onpointerleave: cancelHold,
+      onpointercancel: cancelHold,
+      oncontextmenu: (event) => event.preventDefault(),
+      onkeydown: (event) => {
+        if ((event.key === 'Enter' || event.key === ' ') && !event.repeat) {
+          event.preventDefault();
+          beginHold(event.currentTarget, onFull);
+        }
+      },
+      onkeyup: (event) => {
+        if (event.key === 'Enter' || event.key === ' ') onRelease(event.currentTarget);
+      },
+    });
     const el = h(
       'div',
       { class: 'player__exit' },
-      tool('player__back', backLabel, icon(ICONS.back), { onclick: onExit }),
-      roll && tool('player__roll', 'Roll: play another random game', icon(ICONS.dice), { onclick: () => onRoll() }),
+      tool('player__close', `Hold to close: ${backLabel.toLowerCase()}`, [ring(), icon(ICONS.close)], holdable(askToExit, endHold)),
+      tool('player__roll', 'Roll: play another random game', icon(ICONS.dice), { onclick: () => onRoll(), hidden: !canRoll() }),
+      h('div', { class: 'player__slot' }),
       tool(
         'player__fold',
         'Tap to fold this bar away, hold to remove it until you reload',
-        [h('svg', { class: 'player__ring', viewBox: '0 0 24 24', 'aria-hidden': 'true' }, arc), icon(ICONS.close)],
-        {
-          onpointerdown: beginHold,
-          onpointerup: endHold,
-          onpointerleave: cancelHold,
-          onpointercancel: cancelHold,
-          oncontextmenu: (event) => event.preventDefault(),
-          onkeydown: (event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault();
-              setBar(bar === 'folded' ? 'open' : 'folded');
-            }
-          },
-        }
+        [ring(), icon(ICONS.back)],
+        holdable(() => setBar('gone'), releaseFold)
       )
     );
-    return { el, arc };
+    return { el };
   }
+
+  /* --- the controller: Create + Options hands it the bar ---------------- */
+
+  const pad = {
+    owned: false,
+    at: 0,
+    comboSince: null,
+    was: [],
+    raf: 0,
+    /** Every pad the game and this page can see: the frame's own, then ours. */
+    read() {
+      const lists = [];
+      try {
+        lists.push(session?.frame?.contentWindow?.navigator?.getGamepads?.() || []);
+      } catch {
+        /* a cross-origin frame keeps its pads to itself */
+      }
+      lists.push(navigator.getGamepads?.() || []);
+      for (const list of lists) for (const p of list) if (p && p.connected) return p;
+      return null;
+    },
+    buttons() {
+      const list = [...(session?.ask ? session.ask.querySelectorAll('button') : root.querySelectorAll('.player__exit button'))];
+      return list.filter((b) => !b.hidden && b.offsetParent !== null && !b.disabled);
+    },
+    focus(i) {
+      const list = pad.buttons();
+      if (!list.length) return;
+      pad.at = (i + list.length) % list.length;
+      for (const b of root.querySelectorAll('.is-pad')) b.classList.remove('is-pad');
+      list[pad.at].classList.add('is-pad');
+      list[pad.at].focus({ preventScroll: true });
+    },
+    take() {
+      pad.owned = true;
+      pad.before = bar;
+      root.classList.add('has-pad');
+      root.classList.remove('is-idle', 'is-folded', 'is-bare');
+      pad.focus(0);
+    },
+    leave() {
+      pad.owned = false;
+      cancelHold();
+      root.classList.remove('has-pad');
+      for (const b of root.querySelectorAll('.is-pad')) b.classList.remove('is-pad');
+      session?.ask?.querySelector('.player__ask-stay')?.click();
+      setBar(pad.before ?? bar);
+      wake();
+      refocusGame();
+    },
+    tick() {
+      pad.raf = requestAnimationFrame(pad.tick);
+      if (!session) return;
+      const p = pad.read();
+      const now = p ? p.buttons.map((b) => b.pressed) : [];
+      const down = (i) => now[i] && !pad.was[i];
+      if (!pad.owned) {
+        if (now[PAD.create] && now[PAD.options]) {
+          pad.comboSince ??= performance.now();
+          if (performance.now() - pad.comboSince >= COMBO_MS) {
+            pad.comboSince = null;
+            pad.take();
+          }
+        } else pad.comboSince = null;
+      } else {
+        const list = pad.buttons();
+        if (down(PAD.left) || down(PAD.up)) pad.focus(pad.at - 1);
+        if (down(PAD.right) || down(PAD.down)) pad.focus(pad.at + 1);
+        const button = list[pad.at];
+        if (down(PAD.cross) && button) {
+          // The ✕ and ← keep their hold under Cross too.
+          if (button.matches('.player__close, .player__fold')) {
+            beginHold(button, button.matches('.player__close') ? askToExit : () => { setBar('gone'); pad.leave(); });
+          } else button.click();
+        }
+        if (!now[PAD.cross] && pad.was[PAD.cross] && session.hold) {
+          const held = session.hold.button;
+          if (held.matches('.player__fold')) releaseFold(held);
+          else endHold(held);
+        }
+        if (down(PAD.circle)) {
+          if (session.ask) session.ask.querySelector('.player__ask-stay').click();
+          else pad.leave();
+        }
+      }
+      pad.was = now;
+    },
+  };
 
   function zoomFrom(tile) {
     const rect = tile.getBoundingClientRect();
@@ -294,6 +449,11 @@ export function createPlayer(
       return;
     }
     cancelHold();
+    cancelAnimationFrame(pad.raf);
+    if (pad.owned) {
+      pad.owned = false;
+      root.classList.remove('has-pad');
+    }
     clearTimeout(session.idle);
     const seconds = stopPlay();
     if (askToRate && !silent) askAfterPlay(session.game, seconds);
@@ -360,5 +520,12 @@ export function createPlayer(
     isOpen: () => Boolean(session),
     current: () => session?.game || null,
     currentBuild: () => session?.build || null,
+    /** Where a caller's own line goes in the bar, between the 🎲 and the ←. */
+    slot: () => root.querySelector('.player__slot'),
+    /** Ask canRoll() again: a session's host can change mid-game. */
+    refresh() {
+      const roll = root.querySelector('.player__roll');
+      if (roll) roll.hidden = !canRoll();
+    },
   };
 }
