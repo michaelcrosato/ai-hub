@@ -2,11 +2,9 @@
 
 ## Work in progress (remove this note when it is done)
 
-Accounts and cross-device sessions live on the branch
-`claude/epic-hamilton-rj3kpf`, not yet on main. Read
-`docs/sessions-handoff.md` before doing anything with it. Keep that branch:
-don't delete it, and don't merge it until the handoff's checklist says so.
-This is the one exception to the branch rules below.
+Accounts and cross-device sessions are on main and live. Two things remain,
+listed in `docs/sessions-handoff.md`: the Cloudflare TURN key and Michael's
+checks on real devices. Read it before touching accounts or sessions.
 
 ## Finish every change on main
 
