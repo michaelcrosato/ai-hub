@@ -28,6 +28,7 @@ import { staticHandler } from './lib/serve.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXAMPLES = ['/lib/hub/examples/arena.html', '/lib/hub/examples/race.html'];
+const PAGE_MS = 300_000;
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -126,8 +127,14 @@ try {
       page.on('console', (m) => m.text().startsWith('[AIHub]') && warnings.push(m.text()));
       const url = `${base}/lib/hub/harness.html?${new URLSearchParams({ game, players: n, latency: 150, jitter: 50, loss: 5, auto: 1, scenario, play: 8000 })}`;
       await page.goto(url);
-      await page.waitForSelector('body[data-complete="true"]', { timeout: 120_000 });
-      const report = await page.evaluate(() => window.__hubCheck);
+      // The harness times every step itself; this only catches a page that stopped answering.
+      // Four copies of a 3D game on software WebGL can take minutes.
+      const finished = await page.waitForSelector('body[data-complete="true"]', { timeout: PAGE_MS }).then(() => true, () => false);
+      const report = (await page.evaluate(() => window.__hubCheck).catch(() => null)) || { pass: false, checks: [] };
+      if (!finished) {
+        report.pass = false;
+        report.checks.push({ name: `the harness finished within ${PAGE_MS / 1000} s`, pass: false, detail: `stopped after: ${report.checks.at(-1)?.name ?? 'nothing'}` });
+      }
       const extra = [
         { name: 'no client warnings (oversized or too many sends, misuse)', pass: !warnings.length, detail: [...new Set(warnings)].slice(0, 4).join('; ') },
         { name: 'harness page has no errors', pass: !pageErrors.length, detail: pageErrors.join('; ') },
