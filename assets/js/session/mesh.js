@@ -8,12 +8,17 @@
  * first makes the offer, so two never cross. Offers, answers and candidates
  * travel through `signal(to, data)`; the session's channel carries them.
  *
- * A connection that fails is retried a few times. If it never opens, the
- * pair simply can't trade game traffic, and the round goes on without it.
+ * A connection that fails, or hasn't opened after CONNECT_MS, is retried a few
+ * times, and every retry goes through the TURN relay only: a direct path that
+ * got halfway once (a phone on mobile data) tends to stall the same way again.
+ * A fresh offer always gets a fresh connection on the answering side. If it
+ * never opens, the pair simply can't trade game traffic, and the round goes on
+ * without it.
  */
 
 const RETRIES = 3;
 const RETRY_MS = 3_000;
+const CONNECT_MS = 12_000;
 /** Past this much queued, unreliable sends are skipped instead of piling up. */
 const BUFFER_LIMIT = 1 << 20;
 
@@ -23,14 +28,16 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
 
   const offerer = (key) => me < key;
 
-  function peer(key) {
+  function peer(key, tries = 0) {
     let p = peers.get(key);
     if (p) return p;
-    const pc = new RTC({ iceServers, iceTransportPolicy: relayOnly ? 'relay' : 'all' });
+    const relay = relayOnly || tries > 0;
+    const pc = new RTC({ iceServers, iceTransportPolicy: relay ? 'relay' : 'all' });
     const r = pc.createDataChannel('r', { negotiated: true, id: 0, ordered: true });
     const u = pc.createDataChannel('u', { negotiated: true, id: 1, ordered: false, maxRetransmits: 0 });
-    p = { key, pc, r, u, queued: [], remote: false, tries: 0, state: 'connecting' };
+    p = { key, pc, r, u, queued: [], remote: false, tries, state: 'connecting' };
     peers.set(key, p);
+    p.timer = setTimeout(() => peers.get(key) === p && p.state !== 'open' && retry(p), CONNECT_MS);
     for (const channel of [r, u]) {
       channel.onmessage = ({ data }) => {
         let env;
@@ -78,8 +85,7 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
     }
     setTimeout(() => {
       if (closed || peers.has(p.key)) return;
-      const next = peer(p.key);
-      next.tries = tries;
+      const next = peer(p.key, tries);
       if (offerer(p.key)) offer(next);
     }, RETRY_MS);
   }
@@ -88,6 +94,7 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
     const p = peers.get(key);
     if (!p) return;
     peers.delete(key);
+    clearTimeout(p.timer);
     try {
       p.pc.close();
     } catch {
@@ -106,7 +113,11 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
     /** An offer, answer or candidate from `from`, via the session's channel. */
     async signal(from, data) {
       if (closed || !data) return;
-      const p = peer(from);
+      // A new offer means the other side started over (a retry or a reload):
+      // answer it on a new connection, through the relay like theirs.
+      const old = peers.get(from);
+      if (data.sdp?.type === 'offer' && old?.remote) drop(from, false);
+      const p = peer(from, old?.remote && data.sdp?.type === 'offer' ? old.tries + 1 : 0);
       try {
         if (data.sdp) {
           await p.pc.setRemoteDescription(data.sdp);
@@ -135,6 +146,10 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
     },
     state: (key) => peers.get(key)?.state ?? 'none',
     drop,
+    /** Drop the connections to anyone not in `keys` (they left; a return starts afresh). */
+    keep(keys) {
+      for (const key of [...peers.keys()]) if (!keys.includes(key)) drop(key);
+    },
     /** How each connection runs: 'direct' or 'relay', from the browser's own stats. */
     async route(key) {
       const p = peers.get(key);

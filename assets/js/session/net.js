@@ -75,6 +75,7 @@ export function createRelayNet({ key, relay, iceServers = [], relayOnly = false 
 
   relay.onPresence((list) => {
     others = list.filter((m) => m.key !== key);
+    mesh.keep(others.map((m) => m.key));
     for (const m of others) if (Number.isInteger(m.slot)) mesh.connect(m.key);
     changed();
   });
