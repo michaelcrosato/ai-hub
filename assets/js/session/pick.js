@@ -27,6 +27,16 @@ export function eligible(games, n) {
 }
 
 /**
+ * The games a session deals from. The reference examples join the library when
+ * the host asks for them (?examples=1), and also while no library game supports
+ * sessions, so that "Play with friends" always has something to play.
+ */
+export function sessionPool(library, examples, wanted = false) {
+  const any = library.some((game) => sessionOf(game)?.supported);
+  return wanted || !any ? [...library, ...examples] : library;
+}
+
+/**
  * The next game, and the cycle and played list that follow it.
  * Null when nothing fits `n` players.
  */

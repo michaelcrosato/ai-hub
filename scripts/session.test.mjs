@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { nameChoices, isNickname, ADJECTIVES, ANIMALS } from '../assets/js/session/names.js';
-import { eligible, pickNext } from '../assets/js/session/pick.js';
+import { eligible, pickNext, sessionPool } from '../assets/js/session/pick.js';
 import { placesOf, scoreRound, addRound, leaderboard } from '../assets/js/session/score.js';
 import { createLocalNet } from '../assets/js/session/local.js';
 
@@ -39,6 +39,15 @@ test('Random Mode only deals games that declare a supported session and seat the
   assert.deepEqual(eligible(games, 2).map((g) => g.slug), ['fits']);
   assert.deepEqual(eligible(games, 3).map((g) => g.slug), ['fits', 'three-only']);
   assert.deepEqual(eligible(games, 5), []);
+});
+
+test('the reference examples fill in while no library game supports sessions, or when the host asks for them', () => {
+  const examples = [game('example')];
+  const plain = [game('no-session', { session: undefined })];
+  const ready = [game('fits')];
+  assert.deepEqual(sessionPool(plain, examples).map((g) => g.slug), ['no-session', 'example']);
+  assert.deepEqual(sessionPool(ready, examples).map((g) => g.slug), ['fits']);
+  assert.deepEqual(sessionPool(ready, examples, true).map((g) => g.slug), ['fits', 'example']);
 });
 
 test('Random Mode plays every game once before any comes round again, in an order set by the seed', () => {

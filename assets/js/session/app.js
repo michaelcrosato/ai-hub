@@ -28,7 +28,7 @@ import { createRound, limitFor, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
-import { pickNext, eligible } from './pick.js';
+import { pickNext, eligible, sessionPool } from './pick.js';
 import { scoreRound, addRound, leaderboard } from './score.js';
 
 const SEATS = 4;
@@ -646,10 +646,10 @@ function endScreen() {
 
 async function main() {
   // The library can take a moment: the page works without it, and counts games once it is in.
-  if (knobs.examples) pool = EXAMPLES;
+  pool = EXAMPLES;
   loadManifest().then(
     (d) => {
-      pool = knobs.examples ? [...d.games, ...EXAMPLES] : d.games;
+      pool = sessionPool(d.games, EXAMPLES, knobs.examples);
       render();
     },
     () => {}

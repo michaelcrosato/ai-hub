@@ -447,8 +447,8 @@ next seat takes over, and a round it was running is void.
 - Each seat shows its connection. The host can remove a player for the rest
   of the session.
 - Every round is saved: the game, who placed where and the points.
-- No game in the library declares `hub:session` yet, so until one does, host
-  from `/session?examples=1` to deal the two reference games.
+- While no game in the library declares `hub:session`, the two reference
+  games are dealt instead, so a session always has something to play.
 
 How it works:
 - Presence, round control and the WebRTC handshake go over the session's
