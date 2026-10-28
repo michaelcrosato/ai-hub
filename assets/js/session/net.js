@@ -156,6 +156,10 @@ export async function supabaseRelay(sb, sessionId, key) {
   });
   const handlers = new Map();
   let presenceFn = () => {};
+  // A dropped connection (a phone's screen going off, a network change) rejoins
+  // the channel on its own, but without this tab's presence: the others would
+  // stop seeing it while it still sees them. So every rejoin tracks it again.
+  let tracked = null;
   const list = () =>
     Object.entries(channel.presenceState()).map(([k, metas]) => ({
       ...metas[metas.length - 1],
@@ -168,12 +172,14 @@ export async function supabaseRelay(sb, sessionId, key) {
   }
   await new Promise((resolve, reject) => {
     channel.subscribe((status, error) => {
-      if (status === 'SUBSCRIBED') resolve();
-      else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') reject(error || new Error(status));
+      if (status === 'SUBSCRIBED') {
+        if (tracked) channel.track(tracked);
+        resolve();
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') reject(error || new Error(status));
     });
   });
   return {
-    track: (meta) => channel.track(meta),
+    track: (meta) => channel.track((tracked = meta)),
     onPresence: (fn) => {
       presenceFn = fn;
       fn(list());

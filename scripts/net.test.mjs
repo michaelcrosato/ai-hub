@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createRelayNet } from '../assets/js/session/net.js';
+import { createRelayNet, supabaseRelay } from '../assets/js/session/net.js';
 
 /** A stand-in for the session's Realtime channel: presence is pushed by the test. */
 function fakeRelay() {
@@ -67,4 +67,24 @@ test('other players, and a lone tab, never step aside', () => {
   assert.equal(out, false);
   assert.deepEqual(net.members().map((m) => m.key), ['guest', 'michael']);
   net.close();
+});
+
+test('after a dropped connection rejoins the channel, this tab is tracked again', async () => {
+  let subscribed;
+  const tracks = [];
+  const channel = {
+    on: () => channel,
+    subscribe(fn) {
+      subscribed = fn;
+      fn('SUBSCRIBED');
+    },
+    track: (meta) => tracks.push(meta),
+    presenceState: () => ({}),
+  };
+  const sb = { realtime: { setAuth: async () => {} }, channel: () => channel };
+  const relay = await supabaseRelay(sb, 'session-1', 'guest');
+  assert.deepEqual(tracks, []);
+  relay.track({ name: 'Jolly Walrus', slot: 1 });
+  subscribed('SUBSCRIBED');
+  assert.deepEqual(tracks, [{ name: 'Jolly Walrus', slot: 1 }, { name: 'Jolly Walrus', slot: 1 }]);
 });
