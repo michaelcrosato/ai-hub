@@ -318,6 +318,7 @@ function openRound(cur) {
   const game = pool.find((g) => g.slug === cur.slug) || normalize({ slug: cur.slug, name: cur.name, path: cur.path, type: 'Game' });
   pendingRound = cur;
   player.open(game, { path: cur.path });
+  renderStrip();
 }
 
 let pendingRound = null;
@@ -658,19 +659,26 @@ function standingsTable({ before = null } = {}) {
   );
 }
 
-/** Over the game while a round runs: who we're waiting for, and the host's controls. */
+/**
+ * Over the game while a round runs: who we're waiting for, and the host's
+ * controls. It rides in the player's own corner bar, so a session looks like
+ * playing alone with the table added on.
+ */
 function renderStrip() {
   clear(strip);
   const cur = state?.current;
   strip.hidden = !(state?.phase === 'round' && cur && player.isOpen());
   if (strip.hidden) return;
+  const bar = document.querySelector('#player .player__exit');
+  if (bar && strip.parentNode !== bar) bar.append(strip);
   const waiting = status?.phase === 'loading' ? status.players.filter((p) => !p.ready && !p.out).map((p) => p.name) : [];
-  strip.append(
+  // Native append would print a false or null child as text: drop them first.
+  strip.append(...[
     h('span', { class: 'strip__title' }, `${formatProgress(state.format, state.history, state.totals)} · ${cur.name}`),
-    waiting.length ? h('span', {}, `Waiting for ${waiting.join(', ')}`) : status?.phase === 'grace' && h('span', {}, 'Time!'),
+    waiting.length ? h('span', {}, `Waiting for ${waiting.join(', ')}`) : status?.phase === 'grace' ? h('span', {}, 'Time!') : null,
     isHost() && h('button', { type: 'button', onclick: () => coordinator?.timeUp() }, 'End round'),
-    isHost() && h('button', { type: 'button', onclick: () => coordinator?.abort('skipped') }, 'Skip game')
-  );
+    isHost() && h('button', { type: 'button', onclick: () => coordinator?.abort('skipped') }, 'Skip game'),
+  ].filter(Boolean));
 }
 
 const REASONS = {
