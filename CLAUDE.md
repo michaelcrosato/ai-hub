@@ -1,5 +1,10 @@
 # Working in this repo
 
+## Work in progress (remove this note when it is done)
+
+The party-session work is not finished. `docs/party-sessions-handoff.md`
+says where it stands and holds the `/goal` that finishes it.
+
 ## Finish every change on main
 
 - When a `/goal` is complete, or a prompt has changed the repo, commit and
