@@ -66,8 +66,8 @@ const overlay = document.getElementById('results');
 
 /** The two reference games, for a session with nothing else to play. */
 const EXAMPLES = [
-  { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Versus: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'versus', sessionMinutes: '2', sessionGoal: 'First to ten stars wins', sessionHowto: 'Move with arrows or WASD, a gamepad stick, or hold a finger down' },
-  { slug: 'hub-example-race', name: 'Comet Dash', tagline: 'Race with ghosts', path: '/lib/hub/examples/race.html', themeColor: '#0f1b2e', sessionMode: 'race', sessionMinutes: '1', sessionGoal: 'Fastest to the end of the course wins', sessionHowto: 'Steer with ← → or A D, a gamepad stick, or drag a finger' },
+  { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Versus: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'versus', sessionMinutes: '2', sessionGoal: 'First to ten stars wins', sessionHowto: 'Move: arrows, WASD or a stick · sprint: Space or Cross · or hold a finger' },
+  { slug: 'hub-example-race', name: 'Comet Dash', tagline: 'Race with ghosts', path: '/lib/hub/examples/race.html', themeColor: '#0f1b2e', sessionMode: 'race', sessionMinutes: '1', sessionGoal: 'Fastest to the end of the course wins', sessionHowto: 'Steer: ← →, A D or a stick · boost: Space or Cross · or drag a finger' },
 ].map((g) => normalize({ ...g, type: 'Game', session: '1', sessionPlayers: '2-4', builds: [{ id: 'current', path: g.path }] }));
 
 let pool = [];

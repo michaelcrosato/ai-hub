@@ -48,6 +48,7 @@
   <label>Jitter <input type="number" id="jitter" min="0" value="20"> ms</label>
   <label>Loss <input type="number" id="loss" min="0" max="50" value="0"> %</label>
   <button id="restart" type="button">New round</button>
+  <button id="release" type="button" title="End the splash now: the round starts once every game has loaded">Start now</button>
   <button id="timeup" type="button">Time up</button>
   <label>Remove <select id="who"></select></label>
   <button id="remove" type="button">Remove player</button>
@@ -71,6 +72,9 @@ const $ = (id) => document.getElementById(id);
 const auto = params.get('auto') === '1';
 const scenario = params.get('scenario') || 'standard';
 const playMs = Number(params.get('play')) || 6000;
+/** Like the hub, the harness shows a splash and collects ready itself; ?splash=0 leaves the ready prompt to the game, as older hubs did. */
+const splash = params.get('splash') !== '0';
+const SPLASH_MS = 10_000;
 
 for (const [id, key] of [['game', 'game'], ['players', 'players'], ['latency', 'latency'], ['jitter', 'jitter'], ['loss', 'loss']]) {
   if (params.has(key)) $(id).value = params.get(key);
@@ -157,7 +161,7 @@ async function newRound() {
   grid.style.gridTemplateColumns = n > 1 ? '1fr 1fr' : '1fr';
   grid.style.gridTemplateRows = n > 2 ? '1fr 1fr' : '1fr';
 
-  const state = { round, n, metas, mode, limitMs, seed, players, cells: [], hubEnd, status: null, record: null, hidden: false };
+  const state = { round, n, metas, mode, limitMs, seed, players, cells: [], hubEnd, status: null, record: null, hidden: false, splashUntil: splash ? performance.now() + SPLASH_MS : null };
   current = state;
   log(`round ${round}: ${n} player${n > 1 ? 's' : ''}, seed ${seed}, limit ${Math.round(limitMs / 1000)} s, mode ${mode || '(from hello)'}`);
 
@@ -168,6 +172,7 @@ async function newRound() {
     mode,
     seed,
     limitMs,
+    gate: splash,
     deliver: (key, m) => hubEnd.send(key, { k: 'h', r: round, m }),
     onStatus: (s) => { state.status = s; render(state); },
     onEnd: (record) => {
@@ -219,7 +224,16 @@ async function newRound() {
   }
   renderWho(state);
   render(state);
+  // By hand, the splash lifts by itself after ten seconds, as in a session; the conformance run releases it itself.
+  if (splash && !auto) setTimeout(() => releaseRound(state), SPLASH_MS);
   return state;
+}
+
+function releaseRound(state = current) {
+  if (!state || state !== current || state.coordinator.released) return;
+  state.splashUntil = null;
+  log('splash over: the round starts once every game has loaded');
+  state.coordinator.release();
 }
 
 function endCurrent() {
@@ -263,6 +277,7 @@ function render(state) {
     cell.el.classList.toggle('is-out', !!p.out || cell.gone);
   }
   const lines = [`Round ${s.round} · ${s.mode || 'mode unknown'} · phase ${s.phase}`, `Host: player ${s.host} · seed ${state.seed}`];
+  if (s.gate && !s.released) lines.push(`Splash: ${state.splashUntil ? `${Math.max(0, Math.ceil((state.splashUntil - performance.now()) / 1000))} s left` : 'held'} (Start now ends it)`);
   if (state.record) {
     const name = (id) => s.players[id]?.name ?? `#${id}`;
     lines.push(`Ended ${state.record.status} (${state.record.reason})`);
@@ -273,6 +288,7 @@ function render(state) {
 }
 
 $('restart').onclick = () => newRound();
+$('release').onclick = () => releaseRound();
 $('timeup').onclick = () => current?.coordinator.timeUp();
 $('remove').onclick = () => {
   const cell = current?.cells.find((c) => c.key === $('who').value);
@@ -329,6 +345,134 @@ function tap(cell) {
   return true;
 }
 
+/** What the game says about itself through AIHub.probe(): { scene, menu, world, input }, or null. */
+function probeOf(cell) {
+  try {
+    return cell.frame.contentWindow?.AIHub?.inspect?.() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Hold a key down in a frame for a while, then let go. */
+async function holdKey(cell, key, ms) {
+  const doc = cell.frame.contentDocument;
+  const win = cell.frame.contentWindow;
+  const target = doc.activeElement && doc.activeElement !== doc.documentElement ? doc.activeElement : doc.body || doc.documentElement;
+  const code = key === ' ' ? 'Space' : key === 'Escape' ? 'Escape' : key.startsWith('Arrow') ? key : `Key${key.toUpperCase()}`;
+  const init = { key, code, bubbles: true, cancelable: true, view: win };
+  target.dispatchEvent(new win.KeyboardEvent('keydown', init));
+  await sleep(ms);
+  target.dispatchEvent(new win.KeyboardEvent('keyup', init));
+}
+
+/** hub-check gives every frame an emulated standard gamepad (window.__pad); by hand there is none. */
+const padOf = (cell) => {
+  try {
+    return cell.frame.contentWindow?.__pad ?? null;
+  } catch {
+    return null;
+  }
+};
+
+async function holdPad(cell, change, ms) {
+  const pad = padOf(cell);
+  pad.set(change);
+  await sleep(ms);
+  pad.reset();
+  await sleep(120);
+}
+
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const worldOf = (cell) => Number(probeOf(cell)?.world);
+
+/**
+ * Wait for the input the game reads to settle, press, and see whether it changed.
+ * The probe's input is read while the press is held.
+ */
+async function moves(cell, press) {
+  await sleep(250);
+  const before = probeOf(cell)?.input;
+  let during;
+  await press(() => (during = probeOf(cell)?.input));
+  return { changed: during !== undefined && !same(before, during), before, during };
+}
+
+/** Keyboard, then the controller, on one copy: the left stick and a button must reach the game's input. */
+async function controlChecks(check, cell) {
+  const key = await moves(cell, async (sample) => {
+    const doc = cell.frame.contentDocument, win = cell.frame.contentWindow;
+    const target = doc.activeElement && doc.activeElement !== doc.documentElement ? doc.activeElement : doc.body;
+    for (const k of ['ArrowRight', 'd']) target.dispatchEvent(new win.KeyboardEvent('keydown', { key: k, code: k === 'd' ? 'KeyD' : k, bubbles: true, cancelable: true, view: win }));
+    await sleep(400);
+    sample();
+    for (const k of ['ArrowRight', 'd']) target.dispatchEvent(new win.KeyboardEvent('keyup', { key: k, code: k === 'd' ? 'KeyD' : k, bubbles: true, cancelable: true, view: win }));
+  });
+  check('the keyboard moves the player', key.changed, `input ${JSON.stringify(key.before)} → ${JSON.stringify(key.during)} with → / D held`);
+  if (!padOf(cell)) return check('a standard gamepad plays the game', true, 'skipped: run through scripts/hub-check.mjs for the emulated gamepad');
+  const stickCheck = await moves(cell, async (sample) => {
+    padOf(cell).set({ axes: { 0: 1 } });
+    await sleep(400);
+    sample();
+    padOf(cell).reset();
+  });
+  check('a standard gamepad: the left stick moves the player', stickCheck.changed, `input ${JSON.stringify(stickCheck.before)} → ${JSON.stringify(stickCheck.during)}`);
+  // Cross, R2, Square, R1, L2, Circle: one of them is the game's main action.
+  let acted = null;
+  for (const button of [0, 7, 2, 5, 6, 1]) {
+    const press = await moves(cell, async (sample) => {
+      padOf(cell).set({ buttons: { [button]: 1 } });
+      await sleep(300);
+      sample();
+      padOf(cell).reset();
+    });
+    if (press.changed) {
+      acted = button;
+      break;
+    }
+  }
+  check('a standard gamepad: a face button or trigger acts', acted !== null, acted === null ? 'none of Cross, R2, Square, R1, L2, Circle changed the input' : `button ${acted}`);
+}
+
+/**
+ * The settings menu on one copy: Esc and Options open it over the running game,
+ * the world keeps moving on every copy while it is open, and Create + Options
+ * belongs to the hub's bar, not the game.
+ */
+async function settingsChecks(check, state, cell) {
+  const others = state.cells.filter((c) => c !== cell && !c.gone);
+  await holdKey(cell, 'Escape', 80);
+  const opened = await until(() => probeOf(cell)?.menu === true, 1500);
+  check('Esc opens the settings menu in a session', opened, JSON.stringify(probeOf(cell)));
+  const w0 = [cell, ...others].map(worldOf);
+  const sent0 = cell.bridge.stats.sent;
+  await sleep(1500);
+  const w1 = [cell, ...others].map(worldOf);
+  const still = probeOf(cell)?.menu === true;
+  check('the world keeps moving while the menu is open', still && w1.every((w, i) => w > w0[i]),
+    `world ${w0.map((w) => w.toFixed?.(2)).join(',')} → ${w1.map((w) => w.toFixed?.(2)).join(',')}${still ? '' : ' (the menu closed by itself)'}`);
+  if (state.n > 1) check('the copy with its menu open keeps playing over the network', cell.bridge.stats.sent > sent0, `sent ${sent0} → ${cell.bridge.stats.sent}`);
+  await holdKey(cell, 'Escape', 80);
+  check('Esc closes the menu again', await until(() => probeOf(cell)?.menu === false, 1500), JSON.stringify(probeOf(cell)));
+  if (!padOf(cell)) return;
+  await holdPad(cell, { buttons: { 9: 1 } }, 150);
+  const padOpened = await until(() => probeOf(cell)?.menu === true, 1500);
+  check('Options opens the settings menu', padOpened, JSON.stringify(probeOf(cell)));
+  await holdPad(cell, { buttons: { 9: 1 } }, 150);
+  if (probeOf(cell)?.menu) await holdPad(cell, { buttons: { 1: 1 } }, 150);
+  check('Options or Circle closes it', await until(() => probeOf(cell)?.menu === false, 1500), JSON.stringify(probeOf(cell)));
+  const pad = padOf(cell);
+  pad.set({ buttons: { 8: 1 } });
+  await sleep(150);
+  pad.set({ buttons: { 8: 1, 9: 1 } });
+  await sleep(1100);
+  const grabbed = probeOf(cell)?.menu === true;
+  pad.reset();
+  await sleep(150);
+  if (probeOf(cell)?.menu) await holdKey(cell, 'Escape', 80);
+  check('Options held with Create is left to the hub', !grabbed, grabbed ? 'the game opened its menu on Create + Options' : '');
+}
+
 async function conformance() {
   const checks = [];
   const check = (name, pass, detail = '') => {
@@ -362,28 +506,44 @@ async function conformance() {
       return;
     }
 
-    await sleep(600);
-    for (const cell of state.cells) {
-      poke(cell, ' ');
-      tap(cell);
+    if (splash) {
+      // The splash collects ready: every game readies up by itself once loaded, with no prompt and no key.
+      const loaded = await until(() => state.status?.players.every((p) => p.ready), 20_000);
+      check('ready without a key press (the hub’s splash asks the players)', loaded, state.status?.players.filter((p) => !p.ready).map((p) => p.key).join(', '));
+      releaseRound(state);
+    } else {
+      await sleep(600);
+      for (const cell of state.cells) {
+        poke(cell, ' ');
+        tap(cell);
+      }
     }
     const started = await until(() => state.status?.phase !== 'loading', 15_000);
-    check('ready on a key press or tap', started && state.status.players.every((p) => p.ready), state.status?.players.filter((p) => !p.ready).map((p) => p.key).join(', ') || state.status?.phase);
+    check(splash ? 'the round starts when the splash ends' : 'ready on a key press or tap', started && state.status.players.every((p) => p.ready), state.status?.players.filter((p) => !p.ready).map((p) => p.key).join(', ') || state.status?.phase);
     if (!started || state.record) return;
 
     await until(() => state.status.phase === 'playing' || state.record, TIMINGS.countdownMs + 2000);
     const arrows = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'a', 'd', 'w', 's'];
-    const playUntil = performance.now() + playMs;
-    let left = false;
-    while (performance.now() < playUntil && !state.record) {
-      for (const cell of state.cells) if (!cell.gone) poke(cell, arrows[Math.floor(Math.random() * arrows.length)]);
-      if (!left && performance.now() > playUntil - playMs / 2) {
-        left = true;
-        if (scenario === 'host-leave') removeCell(state.cells[0]);
-        else if (n >= 3) removeCell(state.cells[n - 1]);
+    const randomly = async (ms) => {
+      const end = performance.now() + ms;
+      while (performance.now() < end && !state.record) {
+        for (const cell of state.cells) if (!cell.gone) poke(cell, arrows[Math.floor(Math.random() * arrows.length)]);
+        await sleep(150);
       }
-      await sleep(150);
+    };
+    await randomly(Math.min(1500, playMs / 4));
+
+    const probed = state.cells.every((c) => probeOf(c) && !probeOf(c).error);
+    check('every copy probes its state (AIHub.probe)', probed, state.cells.map((c) => `${c.key}: ${JSON.stringify(probeOf(c))}`).join('; '));
+    if (probed && !state.record) {
+      await sleep(400);
+      await controlChecks(check, state.cells[n - 1]);
+      if (!state.record) await settingsChecks(check, state, state.cells[0]);
     }
+
+    if (scenario === 'host-leave') removeCell(state.cells[0]);
+    else if (n >= 3) removeCell(state.cells[n - 1]);
+    await randomly(playMs / 2);
     const remaining = state.cells.filter((c) => !c.gone);
     check('game traffic flows both ways', remaining.every((c) => c.bridge.stats.sent > 0 && c.bridge.stats.received > 0) || n === 1,
       remaining.map((c) => `${c.key} ↑${c.bridge.stats.sent} ↓${c.bridge.stats.received}`).join(' '));

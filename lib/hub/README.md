@@ -29,10 +29,10 @@ Every new game must:
    it would be without this protocol, including any multiplayer of its own.
 4. **In session mode, skip the title screen, menus, in-game lobbies and room
    codes**, call `AIHub.connect()`, and build the match from its `players` (§4–5).
-5. **Load fast, then ready up with a gesture**: the hub loads you under the
-   last round's results, so show the ready prompt within a few seconds; ask for
-   any key, button, click or tap, and call `AIHub.ready()` from that input
-   handler (§6).
+5. **Load fast, then ready up by yourself**: the hub loads you under the last
+   round's results and shows its own splash with your name, goal and controls
+   while you load. When `info.splash` is true, call `AIHub.ready()` the moment
+   the match can start, with no prompt of your own (§6).
 6. **Start on the shared clock**: play begins when `AIHub.time() >= 0` (§7).
 7. **Network only through the hub**: `AIHub.send()` and the `message` event,
    JSON only, at most 16 KB a message and 20 messages a second (§8).
@@ -54,11 +54,19 @@ Every new game must:
 14. **No interruptions**: no `alert`, `confirm`, `prompt`, popups, new tabs or
     navigation, and no saved unlocks or upgrades that carry into a round (§12).
 15. **Work with 2, 3 and 4 players**, one per device, and with 1 when the game
-    has rivals or a clock to beat; keyboard and gamepad, and touch where the
-    game allows it; rounds of about 2–8 minutes; ready within 20 seconds on
-    broadband (§12).
-16. **Pass the harness** at 2, 3 and 4 players on a bad network, with a player
-    leaving and a time-up, and with the host leaving (§14).
+    has rivals or a clock to beat; rounds of about 2–8 minutes; ready within
+    20 seconds on broadband (§12).
+16. **Play fully with keyboard and mouse, and with a controller**: a PS5
+    DualSense or any pad in the browser's standard mapping, for the menus, the
+    settings and play, in a session and out of it. Touch is optional (§12).
+17. **Open your settings with Esc or Options, over the running game**, and
+    never pause the shared world for it; ignore Options while Create is held,
+    which is the hub's (§12).
+18. **Probe your state for the harness** with `AIHub.probe()`: scene, menu,
+    world clock and the input you read (§14).
+19. **Pass the harness** at 2, 3 and 4 players on a bad network, with a player
+    leaving and a time-up, and with the host leaving, and on its own with a
+    controller and with a keyboard (§14).
 
 To ask an agent for it, add this to the game's prompt:
 
@@ -67,8 +75,10 @@ To ask an agent for it, add this to the game's prompt:
 > v1): add the hub:session meta tags, paste session.js in unmodified, implement
 > hub mode (connect → ready → start → play → result/finish → end) with the mode
 > you choose (versus or co-op in a host-run world, or race on a shared course
-> with solid rivals), report stats and awards, and test it in harness.html with
-> 1, 2, 3 and 4 players. The game must still play normally on its own.
+> with solid rivals), report stats and awards, play fully with keyboard and
+> mouse and with a standard gamepad, open settings with Esc or Options without
+> pausing, probe your state, and test it in harness.html with 1, 2, 3 and 4
+> players. The game must still play normally on its own.
 
 §15 sets out what the hub does around a round (scoring, awards, the session's
 formats, the transitions), so a game can fit in.
@@ -81,10 +91,12 @@ formats, the transitions), so a game can fit in.
 hub                                   your game (one copy per player)
 ───                                   ───────────────────────────────
 loads the game with ?aihub=1  ──────▶ AIHub.connect()         says hello
-welcome: me, host, players, seed ───▶ build the match, load everything
-                                      "Press any key when ready"
-                              ◀────── AIHub.ready()           (from the key press)
-everyone ready (or 45 s gone)
+welcome: me, host, players, seed,
+         splash: true         ──────▶ build the match, load everything
+                              ◀────── AIHub.ready()           (loaded: no prompt)
+the splash: name, goal, controls,
+10 s, players press Ready
+splash over, every game loaded
 start: in 3 s                 ──────▶ countdown; play when AIHub.time() >= 0
                                       AIHub.send() ⇄ 'message' between copies
                               ◀────── leave: a player is gone (any time)
@@ -131,7 +143,7 @@ top of `<head>`, before any script that uses it:
 
 ```html
 <script>
-/*! aihub-session 1.1.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+/*! aihub-session 1.2.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
 (function (root) { … })(…);
 </script>
 ```
@@ -184,6 +196,7 @@ may stay, in a menu that does not pause anything (§12).
 | `seed` | an unsigned 32-bit number, the same for every copy |
 | `limitMs` | the round's hard limit after the start |
 | `round` | the round number in the session |
+| `splash` | `true` when the hub shows the round's splash and collects every player's ready (§6) |
 
 - **Ids** are small integers, `0` to `N-1`, the same on every copy. Index arrays
   by them; spawn points and starting order follow them.
@@ -202,20 +215,31 @@ may stay, in a menu that does not pause anything (§12).
 
 ## 6. Ready
 
-When the game has loaded everything, show the roster and one line: *Press any
-key, click or tap when you are ready*. Call `AIHub.ready()` from that input's
-handler, and in the same handler create or resume your `AudioContext`.
+**Under the hub's splash** (`info.splash` is `true`, which is every round the
+AI Hub runs): the hub shows its own card over your game while it loads, with
+your game's name, `hub:session-goal` and `hub:session-howto`, a 10-second
+countdown and two buttons, *Ready* and *I need more time* (§15). The players
+answer it, not your game. So:
 
-The gesture is required, not decoration. Safari only unlocks audio for a page
-that the player touched, gamepads stay invisible until a button is pressed,
-and the frame needs focus for the keyboard. Accept any key, any gamepad button,
-a click and a tap. A player who presses something while you are still loading
-has said they are ready: remember it, and call `AIHub.ready()` the moment you
-can (and unlock audio on their next input).
+- Show no ready prompt of your own: no "press any key", no "click to start".
+- Call `AIHub.ready()` as soon as the match can start. It means *loaded*.
+- Then wait for `start`; nothing your page shows before it is seen.
+- Create or resume your `AudioContext` on `start`, and again on the player's
+  first input: the hub page was touched, so most browsers allow it, but Safari
+  may want a touch inside your frame.
 
-Everyone has 45 seconds from the start of the round. A player who isn't ready
-sits the round out: their game receives `end` with reason `sat-out`, and the
-others receive `leave`.
+The round starts when the splash ends (its countdown runs out, or every player
+pressed Ready) and every game has said `ready`. A game still loading by then
+gets 20 more seconds; after that its player sits the round out: their game
+receives `end` with reason `sat-out`, and the others receive `leave`. A splash
+can be held for as long as most players need, so there is no other deadline.
+
+**Without a splash** (`info.splash` is `false`: an older hub, or the harness
+with `&splash=0`): when the game has loaded everything, show the roster and
+one line, *Press any key, click or tap when you are ready*, and call
+`AIHub.ready()` from that input's handler, creating or resuming your
+`AudioContext` in the same handler. Accept any key, any gamepad button, a
+click and a tap. Everyone has 45 seconds from the start of the round.
 
 **Load fast.** The hub opens your page while the last round's results are still
 on screen, and lifts them about eight seconds later: whatever loads in that
@@ -473,8 +497,7 @@ player and carry on.
 - **Player counts.** Work with 2, 3 and 4 players. One player is optional
   (against the clock or computer rivals) and the harness allows it; declare it
   with `hub:session-players` `1-4`.
-- **One player per device**, on the device's usual controls: keyboard and mouse,
-  gamepad, and touch where the game allows it.
+- **One player per device**, on the device's usual controls (below).
 - **Bounded and light.** Aim for rounds of 2–8 minutes. Everyone waits for the
   slowest loader, so be ready within 20 seconds on broadband and keep the page
   under about 25 MB.
@@ -482,7 +505,51 @@ player and carry on.
   so in session mode don't require WebGPU or another feature many browsers
   lack: fall back to WebGL 2 (lower shadows and effects if you must). Call
   `AIHub.fail()` only when nothing works.
-- **Normal mode is untouched.** Everything above applies only in session mode.
+- **Normal mode is untouched.** Everything above applies only in session mode,
+  except the controls and the menu below, which hold everywhere.
+
+### Controls
+
+Every session game plays fully with **keyboard and mouse**, and fully with a
+**controller**: a PS5 DualSense, or any pad the browser reports in its
+standard mapping (`gamepad.mapping === 'standard'`). Fully means the menus
+(title, options, any choice before play), the settings and play itself, in a
+session and out of it. Touch is optional.
+
+| DualSense | Standard index | Use it for |
+|---|---|---|
+| Cross | button 0 | confirm in menus; the main action (jump, accelerate, fire) |
+| Circle | button 1 | back in menus |
+| Square, Triangle | buttons 2, 3 | secondary actions |
+| L1, R1 | buttons 4, 5 | |
+| L2, R2 | buttons 6, 7 (also analogue `value`) | brake and gas, aim and fire |
+| Create | button 8 | nothing on its own (below) |
+| Options | button 9 | open and close the settings or pause menu |
+| L3, R3 | buttons 10, 11 | |
+| D-pad | buttons 12–15 (up, down, left, right) | menus; movement where it fits |
+| Left stick | axes 0, 1 | move, steer |
+| Right stick | axes 2, 3 | camera, aim |
+
+- Read `navigator.getGamepads()` every frame, take the first connected pad, and
+  treat a button as pressed on the frame it goes down. Gamepads appear after
+  their first press: nothing needs one plugged in at load.
+- **Create + Options is the hub's.** Held together for a second it opens the
+  hub's corner bar to the controller. Ignore Options while Create is held, so
+  the combo never opens your menu as well.
+- `hub:session-howto` names the keys; the hub's splash shows it. Keep the
+  controller sensible rather than listed: Cross for the main action, the left
+  stick to move.
+
+### The settings menu
+
+In a session, **Esc** or **Options** opens your game's settings or pause menu
+over the running game, exactly as it opens on its own, and the same key
+(or Circle) closes it. The shared world never stops for it: the host keeps
+simulating and sending, every copy keeps receiving, and the player whose menu
+is open simply idles (their player stands still or coasts) until they close
+it. Only settings that change this device belong in it (§4); "Quit" or
+"Restart" go, or do nothing in a session. Out of a session the menu may pause
+the game, as it always did.
 
 ## 13. Games with multiplayer of their own
 
@@ -525,13 +592,40 @@ harness.html?game=mygame.html&players=4&latency=150&jitter=50&loss=5
   frame's bar shows its state and messages sent and received.
 - `&limit=20` shortens the round's limit to 20 seconds; `&seed=7` fixes the seed.
 
+Like the hub, the harness shows a splash: each round waits ten seconds (or
+**Start now**) before it starts, and the games ready up by themselves meanwhile.
+`&splash=0` runs a round the old way, with the game's own ready prompt.
+
+**The probe.** The harness can only check what it can see, so a game tells it
+where it is. Register one function, in a session and out of it:
+
+```js
+AIHub.probe(() => ({
+  scene: 'play',          // 'title' | 'menu' | 'ready' | 'play' | 'over': where the game is
+  menu: settingsOpen,      // is the settings or pause menu open?
+  world: simSeconds,       // grows while the world runs, on every copy (any number that keeps rising)
+  input: { x, y, fire },   // the local player's controls as the game read them this frame
+}));
+```
+
+`AIHub.inspect()` returns what it gives, as JSON. `input` is whatever your game
+reads from the devices, after its own mapping: neutral when nothing is held,
+different while a key, the stick or a button is held. Keep it small.
+
 **Conformance run:** add `&auto=1`. The harness presses keys and taps inside
 each frame (the game must be served from the same origin), plays for a few
 seconds with random input, removes a player when there are three or more,
 calls time, and checks:
 
 - the head metas, and that hello agrees with them;
-- every copy says hello, and readies on a key press or a tap;
+- every copy says hello, and readies with no key press under the splash;
+- every copy probes its state;
+- on one copy, the keyboard reaches the player's input, and so do the left
+  stick and a face button or trigger of a standard gamepad (when run by
+  `hub-check`, which emulates one);
+- on the host's copy, Esc and Options open the settings menu, the world keeps
+  moving on every copy while it is open, the copy keeps sending, Esc and
+  Options or Circle close it, and Create + Options does not open it;
 - game traffic flows both ways;
 - the round ends with a valid result, and every copy is told;
 - no protocol problems (oversized or too many messages, bad standings);
@@ -544,8 +638,11 @@ headless browser to wait on. A game is ready when the run passes at 2, 3 and 4
 players with `latency=150&jitter=50&loss=5`, and with `scenario=host-leave`.
 
 In the AI Hub repository, `node scripts/hub-check.mjs <game path>` runs all of
-these with Playwright, and also catches dialogs or sockets opened before the
-page finished loading.
+these with Playwright, gives every frame an emulated DualSense
+(`window.__pad`), catches dialogs or sockets opened before the page finished
+loading, and then plays the game on its own: with only the controller, Cross
+until it plays and Options to open and close its menu, then with only the
+keyboard, Enter or Space and Esc.
 
 ## 15. Around a round: what the hub does
 
@@ -586,17 +683,24 @@ Ties go to more wins, then the better average place, and otherwise stay ties.
 ### Between rounds
 
 Fast is the point. From one round's last whistle to the next round's
-countdown takes about ten seconds, plus however long the slowest player takes
-to press a key:
+countdown takes about fifteen seconds, less when everyone presses Ready:
 
 1. **Results**, the moment a round ends, over the game: places, points, your
    stats and awards, and the table moving (about 5 seconds).
-2. **Next up**: a quick spin through the deck lands on the next game and shows
-   its name, its mode, `hub:session-goal` and `hub:session-howto` (about 3
-   seconds). The next game has been loading underneath since the results
-   appeared.
-3. **Ready**: the card lifts on your ready prompt; everyone presses a key, and
-   the 3-2-1 begins.
+2. **The splash**: a quick spin through the deck lands on the next game and
+   shows its name, its mode, `hub:session-goal` and `hub:session-howto`, with
+   a 10-second countdown that starts the round by itself. The next game has
+   been loading underneath since the results appeared.
+   - **Ready** (Enter, or Cross on a controller): when every player has
+     pressed it, the round starts at once.
+   - **I need more time** (Triangle): adds 10 seconds, and tells the others
+     *A player needs more time* without saying who. While more than half the
+     players are asking, the countdown holds (*Paused: most players need more
+     time*) until fewer than half are. Pressing it again, or Ready, takes it
+     back.
+3. **Start**: the splash lifts and the 3-2-1 begins, as soon as every game has
+   loaded; a game still loading gets up to 20 seconds more, then its player
+   sits the round out.
 
 The host can jump ahead (**Next game now**), skip a game, or end the session.
 At the end, a final screen crowns the winner with the session awards and the
@@ -615,9 +719,11 @@ open, and `kit.pause(true)` is ignored with a warning. Don't rely on pausing.
 
 ## 17. Versions
 
-This is protocol **1**, client **1.1.0**. Client 1.1.0 added `stats` and
+This is protocol **1**, client **1.2.0**. Client 1.1.0 added `stats` and
 `awards` to `result()` and `finish()`; games on 1.0.0 keep working and simply
-report none. Changes within version 1 only add:
+report none. Client 1.2.0 added `splash`, `probe()` and `inspect()`: games on
+1.0.0 and 1.1.0 keep working with their own ready prompt, which the hub's
+splash uncovers for them when it ends. Changes within version 1 only add:
 new optional fields and events that older games can ignore. A change that
 would break a game becomes protocol 2, with its own `hub:session` value, and
 the hub keeps running version 1 games.
@@ -630,8 +736,8 @@ the hub keeps running version 1 games.
 |---|---|
 | `AIHub.active` | `true` in session mode |
 | `AIHub.connect({ mode, seats })` | → `Promise<info \| null>`; `null` means play normally |
-| `AIHub.me`, `.host`, `.isHost`, `.players`, `.mode`, `.seed`, `.limitMs`, `.round` | the round, after `connect()` |
-| `AIHub.ready()` | from the ready gesture's handler; once |
+| `AIHub.me`, `.host`, `.isHost`, `.players`, `.mode`, `.seed`, `.limitMs`, `.round`, `.splash` | the round, after `connect()` |
+| `AIHub.ready()` | once: as soon as loaded when `splash`, otherwise from the ready gesture's handler |
 | `AIHub.on(event, fn)` | returns a function that removes the handler |
 | `AIHub.send(data, { to, reliable })` | `to` a player id, or everyone else when omitted; `reliable` defaults to `true`; returns `false` when dropped |
 | `AIHub.time()` | ms since the start; negative during the countdown; `-Infinity` before `start` |
@@ -639,6 +745,8 @@ the hub keeps running version 1 games.
 | `AIHub.result({ time \| score, stats?, awards? })` | race; once, about yourself |
 | `AIHub.finish({ standings, scores?, won?, stats?, awards? })` | versus, co-op; the host only; once |
 | `AIHub.fail(message)` | the game cannot run here |
+| `AIHub.probe(fn)` | for the harness: `fn()` returns `{ scene, menu, world, input }`; in or out of a session |
+| `AIHub.inspect()` | what the probe returns, as JSON, or `null` |
 
 | Event | Arguments |
 |---|---|
@@ -659,8 +767,8 @@ the game's frame and the page holding it, as `{ aihub: 1, type, … }`.
 | From | type | Fields | Rule |
 |---|---|---|---|
 | game | `hello` | `v: 1, client, mode, seats` | every 500 ms until welcomed; after 10 s the game plays alone |
-| hub | `welcome` | `me, host, players, mode, seed, limitMs, round` | once |
-| game | `ready` | | once, within 45 s of the round's start |
+| hub | `welcome` | `me, host, players, mode, seed, limitMs, round, splash?` | once |
+| game | `ready` | | once: loaded (`splash`), or within 45 s of the round's start from a gesture |
 | hub | `start` | `in` | milliseconds until play begins |
 | game | `send` | `data, to?, reliable` | after welcome, until end; ≤ 16 KB; ≤ 20/s, bursts of 40 |
 | hub | `message` | `from, data` | |
@@ -677,12 +785,12 @@ only its parent, and after the welcome posts only to the welcome's origin.
 ## Appendix C. session.js
 
 ```js
-/*! aihub-session 1.1.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+/*! aihub-session 1.2.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
 (function (root) {
   'use strict';
   if (root.AIHub) return;
 
-  var VERSION = '1.1.0';
+  var VERSION = '1.2.0';
   var HELLO_EVERY_MS = 500;
   var HELLO_TIMEOUT_MS = 10000;
   var MAX_BYTES = 16384;
@@ -710,6 +818,8 @@ only its parent, and after the welcome posts only to the welcome's origin.
     seed: 0,
     limitMs: 0,
     round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
   };
 
   var origin = '*';
@@ -723,6 +833,7 @@ only its parent, and after the welcome posts only to the welcome's origin.
   var pending = {};
   var tokens = BURST;
   var refilled = now();
+  var probeFn = null;
 
   function now() {
     return root.performance && root.performance.now ? root.performance.now() : Date.now();
@@ -775,6 +886,7 @@ only its parent, and after the welcome posts only to the welcome's origin.
       hub.seed = m.seed >>> 0;
       hub.limitMs = m.limitMs;
       hub.round = m.round;
+      hub.splash = m.splash === true;
       if (connecting) connecting.resolve(info());
       return;
     }
@@ -807,6 +919,7 @@ only its parent, and after the welcome posts only to the welcome's origin.
       seed: hub.seed,
       limitMs: hub.limitMs,
       round: hub.round,
+      splash: hub.splash,
     };
   }
 
@@ -840,7 +953,7 @@ only its parent, and after the welcome posts only to the welcome's origin.
     return promise;
   };
 
-  /** Everything is loaded and the player pressed something: call from that input handler. */
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
   hub.ready = function () {
     if (!welcomed || sentReady || ended) return;
     sentReady = true;
@@ -953,6 +1066,20 @@ only its parent, and after the welcome posts only to the welcome's origin.
     if (outcome.scores) fields.scores = outcome.scores;
     if (typeof outcome.won === 'boolean') fields.won = outcome.won;
     post('finish', highlights(outcome, fields));
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
   };
 
   /** The game cannot run here (no WebGL, failed load): the hub skips it. */

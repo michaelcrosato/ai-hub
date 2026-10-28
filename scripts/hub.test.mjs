@@ -77,7 +77,7 @@ test('the client is inactive without ?aihub=1 in a frame, and connect() answers 
 test('the client says hello until welcomed, then resolves with the round', async () => {
   const { hub, posted, fromHub, clock } = await loadClient();
   const info = hub.connect({ mode: 'versus', seats: [2, 4] });
-  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.1.0', mode: 'versus', seats: [2, 4] });
+  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.2.0', mode: 'versus', seats: [2, 4] });
   assert.equal(posted[0].origin, '*');
   clock.advance(1_000);
   assert.equal(posted.length, 3);
@@ -86,6 +86,7 @@ test('the client says hello until welcomed, then resolves with the round', async
   assert.equal(round.me, 1);
   assert.equal(round.isHost, false);
   assert.equal(round.players.length, 2);
+  assert.equal(round.splash, false, 'a hub that shows no splash leaves the ready prompt to the game');
   assert.equal(hub.seed, 42);
   clock.advance(2_000);
   assert.equal(posted.length, 3, 'no hello after the welcome');
@@ -178,7 +179,7 @@ test('the client seeds the same generator on every device, one stream per label'
 
 /* --- the round (lib/hub/round.js) ------------------------------------------- */
 
-function setup({ n = 3, mode = 'versus', limitMs = 60_000 } = {}) {
+function setup({ n = 3, mode = 'versus', limitMs = 60_000, gate = false } = {}) {
   const clock = fakeClock();
   const sent = [];
   const ended = [];
@@ -191,6 +192,7 @@ function setup({ n = 3, mode = 'versus', limitMs = 60_000 } = {}) {
     seed: 99,
     limitMs,
     clock,
+    gate,
     deliver: (key, msg) => sent.push([key, msg]),
     onEnd: (record) => ended.push(record),
   });
@@ -245,6 +247,51 @@ test("the host's finish ends a versus round; players already gone are placed las
   assert.deepEqual(to('k2', 'end')[0], { round: 7, type: 'end', reason: 'finished', standings: [[1], [0, 2], [3]] });
   assert.equal(to('k3', 'end').length, 0, 'nothing goes to a player who left');
   assert.equal(round.record.issues.length, 2);
+});
+
+test('a gated round tells the games the hub collects ready, and starts only when the hub releases it', () => {
+  const { round, clock, to, allHello, allReady } = setup({ n: 3, gate: true });
+  allHello();
+  assert.equal(to('k1', 'welcome')[0].splash, true);
+  allReady();
+  clock.advance(120_000);
+  assert.equal(round.phase, 'loading', 'a splash held for as long as the players need: no deadline runs out');
+  assert.equal(to('k0', 'leave').length, 0);
+  round.release();
+  assert.equal(round.phase, 'countdown');
+  assert.equal(to('k2', 'start')[0].at, clock.now() + 3_000);
+});
+
+test('released, a gated round waits up to twenty seconds for a game still loading, then starts without it', () => {
+  const { round, clock, to, players } = setup({ n: 3, gate: true });
+  for (const p of players) round.receive(p.key, { type: 'hello', v: 1, mode: 'versus', client: '1.2.0' });
+  round.receive('k0', { type: 'ready' });
+  round.receive('k1', { type: 'ready' });
+  round.release();
+  clock.advance(19_000);
+  assert.equal(round.phase, 'loading');
+  clock.advance(1_000);
+  assert.deepEqual(to('k0', 'leave').map((m) => [m.id, m.reason]), [[2, 'not-ready']]);
+  assert.deepEqual(to('k2', 'end').map((m) => m.reason), ['sat-out']);
+  assert.equal(round.phase, 'countdown');
+});
+
+test('a slow game that loads within the grace starts the round with everyone, and one that never said hello sits out', () => {
+  const late = setup({ n: 2, gate: true });
+  late.allHello();
+  late.round.receive('k0', { type: 'ready' });
+  late.round.release();
+  late.clock.advance(8_000);
+  late.round.receive('k1', { type: 'ready' });
+  assert.equal(late.round.phase, 'countdown');
+  assert.equal(late.to('k0', 'leave').length, 0);
+
+  const silent = setup({ n: 2, gate: true });
+  silent.round.receive('k0', { type: 'hello', v: 1, mode: 'versus' });
+  silent.round.receive('k0', { type: 'ready' });
+  silent.round.release();
+  silent.clock.advance(20_000);
+  assert.deepEqual(silent.to('k0', 'leave').map((m) => [m.id, m.reason]), [[1, 'not-ready']]);
 });
 
 test('a player who never says hello sits out; one who never readies is told it sat out', () => {
@@ -449,9 +496,25 @@ test('the simulated network keeps reliable messages in order and only loses unre
 
 /* --- the spec, the examples and the catalogue --------------------------------- */
 
+test('the client reports the splash, and hands the harness whatever the game probes', async () => {
+  const { hub, fromHub } = await loadClient();
+  assert.equal(hub.inspect(), null, 'nothing to inspect until the game probes');
+  let world = 0;
+  hub.probe(() => ({ scene: 'play', menu: false, world: ++world, input: { x: 1 } }));
+  assert.deepEqual(hub.inspect(), { scene: 'play', menu: false, world: 1, input: { x: 1 } });
+  hub.probe(() => {
+    throw new Error('not built yet');
+  });
+  assert.equal(hub.inspect().error, 'not built yet', 'a probe that throws says why instead of breaking the harness');
+  const info = hub.connect({ mode: 'versus', seats: [2, 4] });
+  fromHub({ ...WELCOME, splash: true });
+  assert.equal((await info).splash, true);
+  assert.equal(hub.splash, true);
+});
+
 test('the spec and both examples carry the client byte for byte', async () => {
   const client = await read('lib/hub/session.js');
-  assert.match(client, /^\/\*! aihub-session 1\.1\.0 /);
+  assert.match(client, /^\/\*! aihub-session 1\.2\.0 /);
   for (const file of ['lib/hub/README.md', 'lib/hub/examples/arena.html', 'lib/hub/examples/race.html']) {
     assert.ok((await read(file)).includes(client), `${file} must contain lib/hub/session.js unchanged`);
   }
