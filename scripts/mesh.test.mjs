@@ -88,3 +88,28 @@ test('players who left are dropped, so a return starts a new connection', async 
   assert.equal(made.length, 3);
   mesh.close();
 });
+
+test('switching to relay only starts every connection over through the relay, on both sides', async () => {
+  const { RTC, made } = fakeRTC();
+  const sent = [];
+  const mesh = createMesh({ me: 'a', RTC, signal: (to, data) => sent.push([to, data]), onMessage() {} });
+  mesh.connect('b');
+  await flush();
+  assert.equal(made[0].config.iceTransportPolicy, 'all');
+  mesh.relayOnly(true);
+  await flush();
+  assert.equal(made[0].closed, true);
+  assert.equal(made[1].config.iceTransportPolicy, 'relay');
+  assert.deepEqual(sent.filter(([, d]) => d.restart), [['b', { restart: true }]]);
+  assert.equal(sent.filter(([, d]) => d.sdp?.type === 'offer').length, 2, 'the offerer offers again');
+
+  const { RTC: RTC2, made: made2 } = fakeRTC();
+  const other = createMesh({ me: 'b', RTC: RTC2, signal() {}, onMessage() {} });
+  await other.signal('a', { sdp: { type: 'offer', sdp: 'one' } });
+  await other.signal('a', { restart: true });
+  assert.equal(made2[0].closed, true, 'asked to restart, the other side drops its connection too');
+  assert.equal(made2.length, 2);
+  mesh.close();
+  other.close();
+});
+

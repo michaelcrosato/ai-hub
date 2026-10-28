@@ -94,7 +94,7 @@ try {
   await waitFor(pages[1], () => ['countdown', 'playing'].includes(window.__session?.status?.phase), null, 20_000);
   log(`round 1 started without seat 4: ${(await session(pages[1])).state.current.name}`);
   await play([pages[1], pages[2], pages[3]], 5_000);
-  await waitFor(pages[2], phaseIs, 'results', 40_000);
+  await waitFor(pages[2], () => (window.__session?.state?.history.length ?? 0) >= 1, null, 40_000);
   let state = (await session(pages[2])).state;
   const r1 = state.history[0];
   assert.equal(r1.status, 'played', `round 1 was ${r1.status} (${r1.reason})`);
@@ -220,13 +220,15 @@ async function meshSession() {
     await waitFor(pagesBySeat[1], () => ['countdown', 'playing'].includes(window.__session?.status?.phase), null, 20_000);
     log(`mesh: round 1 started (${(await session(pagesBySeat[1])).state.current.name})`);
     await play([pagesBySeat[1], pagesBySeat[2]], 4_000);
+    // Read the traffic while the round runs: the next round's frame opens the moment it ends.
+    const during = await Promise.all([session(pagesBySeat[1]), session(pagesBySeat[2])]);
+    for (const s of during) assert.ok(s.traffic.sent > 0 && s.traffic.received > 0, `game traffic both ways over the mesh: ${JSON.stringify(s.traffic)}`);
     await waitFor(pagesBySeat[2], () => (window.__session?.state?.history.length ?? 0) >= 1, null, 40_000);
-    const [host, guest] = await Promise.all([session(pagesBySeat[1]), session(pagesBySeat[2])]);
+    const [, guest] = await Promise.all([session(pagesBySeat[1]), session(pagesBySeat[2])]);
     assert.equal(guest.state.history[0].status, 'played', `mesh round was ${guest.state.history[0].status} (${guest.state.history[0].reason})`);
-    for (const s of [host, guest]) assert.ok(s.traffic.sent > 0 && s.traffic.received > 0, `game traffic both ways over the mesh: ${JSON.stringify(s.traffic)}`);
     assert.equal(guest.clock.following, 'seat1', "the guest keeps the host's time");
     assert.ok(Number.isFinite(guest.clock.rtt), 'and measured it over the mesh');
-    log(`mesh: round played; traffic ${JSON.stringify(guest.traffic)}, clock offset ${guest.clock.offset.toFixed(1)} ms (rtt ${guest.clock.rtt} ms)`);
+    log(`mesh: round played; traffic ${JSON.stringify(during[1].traffic)}, clock offset ${guest.clock.offset.toFixed(1)} ms (rtt ${guest.clock.rtt} ms)`);
   } finally {
     for (const ctx of contexts) await ctx.close();
   }

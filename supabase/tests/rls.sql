@@ -168,8 +168,9 @@ begin
   -- ---- recording rounds ---------------------------------------------------------
   perform set_config('request.jwt.claims', json_build_object('sub', friend, 'role', 'authenticated', 'is_anonymous', false)::text, true);
   b := public.record_round(sid, 1, 'snake', 'race', 'played', 'finished', '{"0": 9000}'::jsonb,
-    jsonb_build_array(jsonb_build_object('user_id', friend, 'place', 1, 'points', 1, 'won', true),
-                      jsonb_build_object('user_id', host, 'place', 2, 'points', 0, 'won', false),
+    jsonb_build_array(jsonb_build_object('user_id', friend, 'place', 1, 'points', 1, 'won', true,
+                                         'stats', jsonb_build_object('goals', 3), 'awards', jsonb_build_array(jsonb_build_object('title', 'Hat-trick'))),
+                      jsonb_build_object('user_id', host, 'place', 2, 'points', 0, 'won', false, 'stats', jsonb_build_array(1, 2)),
                       jsonb_build_object('user_id', extra2, 'place', 1, 'points', 3, 'won', true)));
   if b then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a member could not record a round'; end if;
   perform set_config('request.jwt.claims', json_build_object('sub', host, 'role', 'authenticated', 'is_anonymous', false)::text, true);
@@ -177,6 +178,11 @@ begin
   if not b then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a round was recorded twice'; end if;
   select count(*) into n from public.round_results where session_id = sid;
   if n = 2 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: round results hold ' || n || ' rows, not the 2 seated players'; end if;
+  select count(*) into n from public.round_results
+    where session_id = sid and user_id = friend and stats ->> 'goals' = '3' and awards -> 0 ->> 'title' = 'Hat-trick';
+  if n = 1 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a player''s stats and awards were not kept'; end if;
+  select count(*) into n from public.round_results where session_id = sid and user_id = host and stats is null;
+  if n = 1 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: stats that are not an object were kept'; end if;
 
   -- ---- ending, and deleting an account -----------------------------------------
   perform set_config('request.jwt.claims', json_build_object('sub', friend, 'role', 'authenticated', 'is_anonymous', false)::text, true);

@@ -90,6 +90,14 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
     }, RETRY_MS);
   }
 
+  /** Start a connection over, on a new one; `tell` asks the other side to do the same. */
+  function restart(key, tell) {
+    drop(key);
+    if (tell) signal(key, { restart: true });
+    const p = peer(key);
+    if (offerer(key)) offer(p);
+  }
+
   function drop(key, tell = true) {
     const p = peers.get(key);
     if (!p) return;
@@ -113,6 +121,10 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
     /** An offer, answer or candidate from `from`, via the session's channel. */
     async signal(from, data) {
       if (closed || !data) return;
+      if (data.restart) {
+        if (peers.has(from)) restart(from, false);
+        return;
+      }
       // A new offer means the other side started over (a retry or a reload):
       // answer it on a new connection, through the relay like theirs.
       const old = peers.get(from);
@@ -146,6 +158,12 @@ export function createMesh({ me, iceServers = [], relayOnly = false, signal, onM
     },
     state: (key) => peers.get(key)?.state ?? 'none',
     drop,
+    /** Send everything through the TURN relay only (hiding this device's address), or stop: every connection starts over. */
+    relayOnly(on) {
+      if (closed || relayOnly === on) return;
+      relayOnly = on;
+      for (const key of [...peers.keys()]) restart(key, true);
+    },
     /** Drop the connections to anyone not in `keys` (they left; a return starts afresh). */
     keep(keys) {
       for (const key of [...peers.keys()]) if (!keys.includes(key)) drop(key);

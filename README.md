@@ -406,14 +406,17 @@ own.
 What a game must do is the **AI Hub Session Protocol**, specified in
 [`lib/hub/README.md`](lib/hub/README.md) and served at
 <https://crosato-arcade.vercel.app/lib/hub/README.md>, so it can be handed to
-whichever agent builds the game. In short: four `hub:session` metas in the
-head, the small `session.js` client pasted in unmodified, and a round played
-from the hub's roster, start signal and network, reported once at the end.
-Outside a session the game plays exactly as it always would.
+whichever agent builds the game. In short: the `hub:session` metas in the head
+(seats, mode, round length, how to win, the controls), the small `session.js`
+client pasted in unmodified, everyone in one shared world where each copy owns
+its own player, and a round reported once at the end with its stats and
+awards. Outside a session the game plays exactly as it always would. The spec
+also sets the hub's side (§15): points, awards, the session formats and the
+transitions between games.
 
 A game that declares it shows a *Hub session* line in its details
-(`2–4 players · Race · about 4 min`), and the Catalogue finds them all with
-`has:session`. The four fields never become rails.
+(`1–4 players · Race · about 4 min`), and the Catalogue finds them all with
+`has:session`. Those fields never become rails.
 
 To test a game against the protocol, open the harness, which loads 1–4 copies
 side by side on a simulated network:
@@ -423,21 +426,28 @@ pnpm dev
 http://localhost:4173/lib/hub/harness.html?game=/games/mygame.html&players=4&latency=150&jitter=50&loss=5
 ```
 
-`node scripts/hub-check.mjs games/mygame.html` runs the automatic conformance
-checks at 2, 3 and 4 players with Playwright (see the spec, §14). The two
+`node scripts/hub-check.mjs games/mygame.html --players 1,2,3,4` runs the
+automatic conformance checks with Playwright (see the spec, §14). The two
 examples in `lib/hub/examples/` (a versus arena and a race with ghosts) are the
-reference games and pass it.
+plain reference games and pass it; the session games above are the full ones.
 
 ### A session — `/session`
 
 The session itself: players pick a generated name, take one of four seats,
-and the host starts **Random Mode**. The hub deals every game that declares
-`hub:session` and seats everyone, in an order fixed by the session's seed, and
-none comes round twice until all have been played. Each round is played from
-the protocol's start signal to its result; between rounds a results card shows
-the places and points and the session's table: one point for every player
-beaten, then wins. The seated tab with the lowest seat hosts; if it leaves, the
-next seat takes over, and a round it was running is void.
+the host picks how to win (**Party**: 8 rounds and three bonus awards worth 3
+points each; **Sprint**: 5 rounds; **First to 12**; **Endless**) and starts
+**Random Mode**. The hub deals every game that declares `hub:session` and
+seats everyone, in an order fixed by the session's seed, and none comes round
+twice until all have been played. Each round is played from the protocol's
+start signal to its result. The moment it ends, the results land over it
+(places, points, the game's stats and awards, the table moving) while the next
+game is already loading underneath; a quick spin of the deck then shows the
+next game, how to win it and its controls, and lifts on its ready prompt:
+about ten seconds from one game to the next. The table: one point for every
+player beaten, then wins, then average place. When the format says so, a final
+screen crowns the winner with a podium and the session awards (Showstopper,
+Hot streak, Steady hand). The seated tab with the lowest seat hosts; if it
+leaves, the next seat takes over, and a round it was running is void.
 
 **Across devices** (`/session`):
 - The host signs in with Google, picks a name, and gets an invite link,
@@ -446,9 +456,15 @@ next seat takes over, and a round it was running is void.
   Behind the scenes each guest gets an anonymous account.
 - Each seat shows its connection. The host can remove a player for the rest
   of the session.
-- Every round is saved: the game, who placed where and the points.
+- Every round is saved: the game, who placed where, the points, and each
+  player's stats and awards.
+- **Relay only** in the lobby sends all of a player's connections through the
+  TURN relay, so the others never see that device's IP address (remembered in
+  the browser, as `localStorage['ai-hub:relay-only']`).
 - While no game in the library declares `hub:session`, the two reference
   games are dealt instead, so a session always has something to play.
+- A session nobody ended is ended after a day without activity (an hourly
+  job, `supabase/migrations/0005_end_stale_sessions.sql`).
 
 How it works:
 - Presence, round control and the WebRTC handshake go over the session's
@@ -512,8 +528,7 @@ Known limits:
   user's own votes, plays and sessions, and Google's tokens are not kept.
   The real fix is serving games from a separate custom domain.
 - Peer-to-peer play shows players' IP addresses to each other (`/privacy/`
-  says so). `localStorage['ai-hub:relay-only'] = '1'` forces every
-  connection through the TURN relay; there is no button for it yet.
+  says so), unless a player turns on **Relay only** in the lobby.
 
 ## Optional extras
 

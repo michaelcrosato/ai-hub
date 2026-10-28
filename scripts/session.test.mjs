@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { nameChoices, isNickname, ADJECTIVES, ANIMALS } from '../assets/js/session/names.js';
 import { eligible, pickNext, sessionPool } from '../assets/js/session/pick.js';
-import { placesOf, scoreRound, addRound, leaderboard } from '../assets/js/session/score.js';
+import { placesOf, scoreRound, addRound, leaderboard, formatOver, formatProgress, sessionAwards, finalTable } from '../assets/js/session/score.js';
 import { createLocalNet } from '../assets/js/session/local.js';
 
 const game = (slug, extra = {}) => ({ slug, name: slug, type: 'Game', session: '1', sessionPlayers: '2-4', sessionMode: 'race', ...extra });
@@ -105,6 +105,58 @@ test('the table adds rounds up and ranks by points, then wins, then average plac
     ['b', 2, 1, 2],
     ['c', 0, 0, 2],
   ]);
+});
+
+/** A played round of the given rows, as the session's history keeps it. */
+const played = (rows) => ({ status: 'played', rows: rows.map(([key, place, points, win, awards = []]) => ({ key, place, points, win, awards })) });
+const tableOf = (history) =>
+  history.reduce((t, e) => (e.status === 'played' ? addRound(t, e.rows.map((r) => ({ ...r, name: r.key, slot: 0 }))) : t), {});
+
+test('a session ends by its format: rounds that counted, a points target, or never', () => {
+  const history = [played([['a', 1, 1, true], ['b', 2, 0, false]]), { status: 'void', rows: [] }];
+  assert.equal(formatOver('sprint', history, tableOf(history)), false);
+  const five = [...Array(5)].map(() => played([['a', 1, 1, true], ['b', 2, 0, false]]));
+  assert.equal(formatOver('sprint', [...five, { status: 'void', rows: [] }], tableOf(five)), true);
+  assert.equal(formatOver('party', five, tableOf(five)), false);
+  assert.equal(formatOver('first12', five, { a: { points: 11 } }), false);
+  assert.equal(formatOver('first12', five, { a: { points: 12 } }), true);
+  assert.equal(formatOver('endless', [...five, ...five], tableOf(five)), false);
+  assert.equal(formatProgress('party', five, tableOf(five)), 'Round 6 of 8');
+  assert.equal(formatProgress('sprint', five.slice(0, 4), tableOf(five)), 'Final round');
+  assert.equal(formatProgress('first12', five, tableOf(five)), 'First to 12: a has 5');
+});
+
+test('session awards go to the most game awards, the longest win streak and the best average place; ties share', () => {
+  const history = [
+    played([['a', 1, 2, true, [{ title: 'Hat-trick' }]], ['b', 2, 1, false], ['c', 3, 0, false]]),
+    played([['a', 1, 2, true], ['b', 2, 1, false, [{ title: 'Fastest lap' }]], ['c', 3, 0, false]]),
+    played([['b', 1, 2, true, [{ title: 'Untouchable' }, { title: 'Combo king' }]], ['a', 2, 1, false], ['c', 3, 0, false]]),
+  ];
+  const awards = sessionAwards(history, tableOf(history));
+  assert.deepEqual(awards.map((x) => [x.title, x.keys]), [
+    ['Showstopper', ['b']],
+    ['Hot streak', ['a']],
+    ['Steady hand', ['a']],
+  ]);
+  const level = [played([['a', 1, 1, true], ['b', 1, 1, true], ['c', 3, 0, false]])];
+  assert.deepEqual(sessionAwards(level, tableOf(level)).map((x) => [x.title, x.keys]), [['Steady hand', ['a', 'b']]]);
+  const all = [played([['a', 1, 0, true], ['b', 1, 0, true]])];
+  assert.deepEqual(sessionAwards(all, tableOf(all)), [], 'an award every player shares is no award');
+});
+
+test('the final table adds the bonus for each session award and shares places only on a full tie', () => {
+  const totals = {
+    a: { key: 'a', name: 'Ana', points: 6, wins: 2, rounds: 3, placeSum: 4 },
+    b: { key: 'b', name: 'Bo', points: 5, wins: 1, rounds: 3, placeSum: 5 },
+    c: { key: 'c', name: 'Cy', points: 5, wins: 1, rounds: 3, placeSum: 5 },
+  };
+  const awards = [{ title: 'Showstopper', keys: ['b'] }, { title: 'Hot streak', keys: ['b'] }];
+  assert.deepEqual(finalTable(totals, awards, 3).map((r) => [r.key, r.points, r.bonus, r.place]), [
+    ['b', 11, 6, 1],
+    ['a', 6, 0, 2],
+    ['c', 5, 0, 3],
+  ]);
+  assert.deepEqual(finalTable(totals, [], 3).map((r) => [r.key, r.place]), [['a', 1], ['b', 2], ['c', 2]]);
 });
 
 /** BroadcastChannel stand-in: every channel of one name hears every other. */

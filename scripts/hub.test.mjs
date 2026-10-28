@@ -77,7 +77,7 @@ test('the client is inactive without ?aihub=1 in a frame, and connect() answers 
 test('the client says hello until welcomed, then resolves with the round', async () => {
   const { hub, posted, fromHub, clock } = await loadClient();
   const info = hub.connect({ mode: 'versus', seats: [2, 4] });
-  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.0.0', mode: 'versus', seats: [2, 4] });
+  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.1.0', mode: 'versus', seats: [2, 4] });
   assert.equal(posted[0].origin, '*');
   clock.advance(1_000);
   assert.equal(posted.length, 3);
@@ -374,7 +374,7 @@ function bridgeSetup() {
 
 test('the bridge forwards the first hello, and refuses game traffic before the welcome', () => {
   const { bridge, net, issues } = bridgeSetup();
-  bridge.fromGame({ aihub: 1, type: 'hello', v: 1, client: '1.0.0', mode: 'race', seats: [2, 4] });
+  bridge.fromGame({ aihub: 1, type: 'hello', v: 1, client: '1.1.0', mode: 'race', seats: [2, 4] });
   bridge.fromGame({ aihub: 1, type: 'hello', v: 1 });
   bridge.fromGame({ aihub: 1, type: 'send', data: { a: 1 } });
   bridge.fromGame({ aihub: 1, type: 'shout' });
@@ -451,7 +451,7 @@ test('the simulated network keeps reliable messages in order and only loses unre
 
 test('the spec and both examples carry the client byte for byte', async () => {
   const client = await read('lib/hub/session.js');
-  assert.match(client, /^\/\*! aihub-session 1\.0\.0 /);
+  assert.match(client, /^\/\*! aihub-session 1\.1\.0 /);
   for (const file of ['lib/hub/README.md', 'lib/hub/examples/arena.html', 'lib/hub/examples/race.html']) {
     assert.ok((await read(file)).includes(client), `${file} must contain lib/hub/session.js unchanged`);
   }
@@ -470,8 +470,18 @@ test('both examples declare session support in their heads', async () => {
 test('a game’s session support reads as one line, and none of its fields becomes a rail', () => {
   assert.equal(sessionOf({}), null);
   assert.equal(sessionOf({ session: 'yes' }), null);
-  const game = { session: '1', sessionPlayers: '2–4', sessionMode: 'race', sessionMinutes: '4' };
-  assert.deepEqual(sessionOf(game), { version: 1, seats: [2, 4], mode: 'race', minutes: 4, supported: true, label: '2–4 players · Race · about 4 min' });
+  const game = { session: '1', sessionPlayers: '2–4', sessionMode: 'race', sessionMinutes: '4', sessionGoal: 'First over the line', sessionHowto: 'Steer ← →' };
+  assert.deepEqual(sessionOf(game), {
+    version: 1,
+    seats: [2, 4],
+    mode: 'race',
+    minutes: 4,
+    goal: 'First over the line',
+    howto: 'Steer ← →',
+    supported: true,
+    label: '2–4 players · Race · about 4 min',
+  });
+  assert.equal(sessionOf({ session: '1', sessionGoal: 'x'.repeat(90) }).goal.length, 60);
   assert.equal(sessionOf({ session: '2' }).supported, false);
   assert.equal(sessionOf({ session: '1', sessionPlayers: '4' }).label, '4 players');
   for (const key of Object.keys(game)) assert.ok(NOT_A_FACET.has(key));

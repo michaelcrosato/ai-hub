@@ -22,8 +22,8 @@ export const NOT_A_FACET = new Set([
   'q', 'sort', 'fav', 'shelf', 'origin',
   // Worked out here, below, rather than catalogued.
   'lineage', 'rails',
-  // AI Hub session support: shown as one line (sessionOf), never as four facts.
-  'session', 'sessionPlayers', 'sessionMode', 'sessionMinutes',
+  // AI Hub session support: shown as one line (sessionOf), never as separate facts.
+  'session', 'sessionPlayers', 'sessionMode', 'sessionMinutes', 'sessionGoal', 'sessionHowto',
 ]);
 
 /** Fields that are searched and listed in the drawer but get no rail: the
@@ -71,8 +71,9 @@ const SESSION_MODES = { versus: 'Versus', 'co-op': 'Co-op', race: 'Race' };
 
 /**
  * What a game says about playing it in an AI Hub session, read off its
- * hub:session metas: the protocol, the seats, the mode and the round length,
- * plus the one line the details show. Null for a game that says nothing.
+ * hub:session metas: the protocol, the seats, the mode, the round length, how
+ * to win and the controls, plus the one line the details show. Null for a
+ * game that says nothing.
  */
 export function sessionOf(game) {
   const version = Number(game.session);
@@ -84,7 +85,17 @@ export function sessionOf(game) {
   const parts = [seats[0] === seats[1] ? `${seats[0]} players` : `${seats[0]}–${seats[1]} players`];
   if (mode) parts.push(SESSION_MODES[mode]);
   if (minutes) parts.push(`about ${minutes} min`);
-  return { version, seats, mode, minutes, supported: SESSION_PROTOCOLS.includes(version), label: parts.join(' · ') };
+  const line = (text, most) => String(text ?? '').trim().slice(0, most) || null;
+  return {
+    version,
+    seats,
+    mode,
+    minutes,
+    goal: line(game.sessionGoal, 60),
+    howto: line(game.sessionHowto, 80),
+    supported: SESSION_PROTOCOLS.includes(version),
+    label: parts.join(' · '),
+  };
 }
 
 /** The bracket a file's size falls in. */

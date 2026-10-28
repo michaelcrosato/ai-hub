@@ -29,11 +29,14 @@ import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
 import { pickNext, eligible, sessionPool } from './pick.js';
-import { scoreRound, addRound, leaderboard } from './score.js';
+import { scoreRound, addRound, leaderboard, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, finalTable } from './score.js';
 
 const SEATS = 4;
 const STATE_EVERY_MS = 2_000;
 const DISCOVER_MS = 700;
+/** Between rounds: the results, then the next game's card while it loads underneath. */
+const NEXT_UP_MS = 3_000;
+const RELAY_KEY = 'ai-hub:relay-only';
 
 const params = new URLSearchParams(location.search);
 const seconds = (name) => (Number(params.get(name)) > 0 ? Number(params.get(name)) * 1000 : null);
@@ -41,7 +44,7 @@ const seconds = (name) => (Number(params.get(name)) > 0 ? Number(params.get(name
 const knobs = {
   limitMs: seconds('limit'),
   readyMs: seconds('ready'),
-  resultsMs: seconds('results') ?? 10_000,
+  resultsMs: seconds('results') ?? 5_000,
   examples: params.get('examples') === '1',
 };
 const asSeat = Number(params.get('as')) >= 1 && Number(params.get('as')) <= SEATS ? Number(params.get('as')) - 1 : null;
@@ -75,7 +78,6 @@ let state = null;          // the session, as the host last published it
 let status = null;         // the current round's coordinator status
 let wasHost = false;
 let coordinator = null;    // host only: the running round
-let nextTimer = 0;
 let bridge = null;         // this tab's game frame in the current round
 let detach = null;
 const early = [];          // traffic for a round whose frame isn't open yet
@@ -144,8 +146,10 @@ function freshState() {
     history: [],
     phase: 'lobby',
     current: null,
-    nextAt: null,
+    reveal: null,
     notice: null,
+    format: DEFAULT_FORMAT,
+    final: null,
     knobs,
   };
 }
@@ -163,10 +167,10 @@ function takeOver() {
   if (next.phase === 'round' && next.current && next.current.coordinator !== key) {
     next = withRoundRecorded(next, { status: 'void', reason: 'host-left', standings: null, players: [] });
     saveRound(next.history.at(-1));
-    next.nextAt = Date.now() + (next.knobs?.resultsMs ?? knobs.resultsMs);
+    next.reveal = revealFor(next);
   }
   publish(next);
-  if (state.phase === 'results') scheduleNext();
+  dealNext();
 }
 
 function applyState() {
@@ -182,8 +186,11 @@ function applyState() {
 
 /* --- rounds: the host's side ----------------------------------------------- */
 
-function startRound() {
-  clearTimeout(nextTimer);
+/**
+ * Deal the next game and start its round. From the lobby the next game's card
+ * shows while it loads; after a round, it loads under that round's results.
+ */
+function startRound({ under = false } = {}) {
   if (!isHost() || !state) return;
   const players = seated().map((m) => ({ key: m.key, slot: m.slot, name: m.name }));
   const pick = pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played });
@@ -206,7 +213,7 @@ function startRound() {
     players,
     coordinator: key,
   };
-  coordinator = createRound({
+  const handle = createRound({
     round,
     players,
     hostKey: key,
@@ -221,14 +228,40 @@ function startRound() {
       render();
     },
     onEnd: (record) => {
+      if (coordinator !== handle) return;
       coordinator = null;
-      publish({ ...withRoundRecorded(state, record), nextAt: Date.now() + (state.knobs?.resultsMs ?? knobs.resultsMs) });
-      saveRound(state.history.at(-1));
-      scheduleNext();
+      const next = withRoundRecorded(state, record);
+      saveRound(next.history.at(-1));
+      if (formatOver(next.format, next.history, next.totals)) return endSession(next);
+      publish({ ...next, reveal: revealFor(next) });
+      dealNext();
     },
   });
-  publish({ ...state, round, cycle: pick.cycle, played: pick.played, phase: 'round', current, nextAt: null, notice: null });
+  coordinator = handle;
+  const reveal = under && state.reveal ? state.reveal : { at: hostNow(), until: hostNow() + NEXT_UP_MS, results: false };
+  publish({ ...state, round, cycle: pick.cycle, played: pick.played, phase: 'round', current, reveal, notice: null });
 }
+
+/** When the reveal after a round ends: its results for `resultsMs`, then the next game's card. */
+function revealFor(s) {
+  const total = (s.knobs?.resultsMs ?? knobs.resultsMs) + NEXT_UP_MS;
+  return { at: hostNow(), until: hostNow() + total, results: s.history.length > 0 };
+}
+
+/** After a round's results: deal the next game at once, loading under them. */
+function dealNext() {
+  if (isHost() && state?.phase === 'results') startRound({ under: true });
+}
+
+/** Drop the running round without recording it (back to the lobby, or the session ended). */
+function discardRound(reason = 'skipped') {
+  const handle = coordinator;
+  coordinator = null;
+  handle?.abort(reason);
+}
+
+/** The session's time: the host's clock, so every tab lifts the reveal together. */
+const hostNow = () => net?.clock?.now?.() ?? Date.now();
 
 /** The state with the current round written into the history and the table. */
 function withRoundRecorded(s, record) {
@@ -241,8 +274,10 @@ function withRoundRecorded(s, record) {
     mode: cur.mode,
     status: record.status,
     reason: record.reason,
+    won: record.won,
     rows: [],
     scores: record.scores ?? null,
+    before: Object.fromEntries(leaderboard(s.totals).map((row, i) => [row.key, i + 1])),
   };
   let totals = s.totals;
   if (record.status === 'played' && record.standings) {
@@ -250,7 +285,8 @@ function withRoundRecorded(s, record) {
     for (const [id, r] of scored) {
       const p = record.players.find((q) => q.id === id);
       const raw = record.results?.[id] ?? (record.scores ? { score: record.scores[id] } : null);
-      entry.rows.push({ key: keyOf(id), name: p.name, slot: p.slot, place: r.place, points: r.points, win: r.win, out: p.out, ...(raw || {}) });
+      const awards = (record.awards || []).filter((a) => a.id === id).map(({ title, detail }) => (detail ? { title, detail } : { title }));
+      entry.rows.push({ key: keyOf(id), name: p.name, slot: p.slot, place: r.place, points: r.points, win: r.win, out: p.out, ...(raw || {}), stats: record.stats?.[id] ?? null, awards });
     }
     entry.rows.sort((a, b) => a.place - b.place || a.slot - b.slot);
     totals = addRound(totals, entry.rows);
@@ -269,18 +305,11 @@ async function saveRound(entry) {
     p_status: entry.status === 'played' ? 'played' : entry.reason === 'skipped' ? 'skipped' : 'void',
     p_reason: entry.reason,
     p_scores: entry.scores,
-    p_results: entry.rows.map((r) => ({ user_id: r.key, place: r.place, points: r.points, won: r.win })),
+    p_results: entry.rows.map((r) => ({ user_id: r.key, place: r.place, points: r.points, won: r.win, stats: r.stats ?? null, awards: r.awards?.length ? r.awards : null })),
   });
   if (error) console.warn('[session] round not saved:', error.message);
 }
 
-function scheduleNext() {
-  clearTimeout(nextTimer);
-  if (!state?.nextAt) return;
-  nextTimer = setTimeout(() => {
-    if (isHost() && state.phase === 'results') startRound();
-  }, Math.max(0, state.nextAt - Date.now()));
-}
 
 /* --- rounds: every seat's side --------------------------------------------- */
 
@@ -520,16 +549,68 @@ function lobbyScreen() {
     ),
     state?.notice && h('p', { class: 'notice' }, state.notice),
     inRound && h('p', { class: 'notice' }, `${cur.name} is being played. You join from the next round.`),
+    formatPicker(),
     host && state?.phase === 'lobby'
       ? h(
           'div',
           { class: 'lobby__start' },
-          h('button', { type: 'button', class: 'primary', id: 'start', disabled: !fits || undefined, onclick: startRound }, 'Start Random Mode'),
+          h('button', { type: 'button', class: 'primary', id: 'start', disabled: !fits || undefined, onclick: () => startRound() }, 'Start Random Mode'),
           h('span', { class: 'hint' }, fits ? `${fits} game${fits === 1 ? '' : 's'} fit ${n} player${n === 1 ? '' : 's'}` : `No game fits ${n} player${n === 1 ? '' : 's'} yet`)
         )
       : state?.phase === 'lobby' && h('p', { class: 'hint' }, `Waiting for ${nameOf(hostKey()) ?? 'the host'} to start.`),
-    host && state?.phase !== 'lobby' && h('button', { type: 'button', class: 'link', onclick: endSession }, 'End the session'),
+    host && state?.phase !== 'lobby' && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, 'End the session'),
+    transport === 'online' && relaySwitch(),
     standingsTable()
+  );
+}
+
+/** How this session is won: the host picks before the first round; everyone sees it. */
+function formatPicker() {
+  const chosen = state?.format ?? DEFAULT_FORMAT;
+  const editable = isHost() && state?.phase === 'lobby' && !state.history.length;
+  if (!editable) return h('p', { class: 'hint format-line' }, `${formatOf(chosen).label}: ${formatOf(chosen).blurb}.`);
+  return h(
+    'fieldset',
+    { class: 'formats' },
+    h('legend', {}, 'How to win'),
+    Object.entries(FORMATS).map(([id, format]) =>
+      h(
+        'label',
+        { class: `format${id === chosen ? ' is-chosen' : ''}` },
+        h('input', { type: 'radio', name: 'format', value: id, checked: id === chosen, onchange: () => publish({ ...state, format: id }) }),
+        h('span', { class: 'format__name' }, format.label),
+        h('span', { class: 'format__blurb' }, format.blurb)
+      )
+    )
+  );
+}
+
+/** Relay only: every connection goes through the TURN relay, so nobody sees this device's address. */
+function relaySwitch() {
+  let on = false;
+  try {
+    on = localStorage.getItem(RELAY_KEY) === '1';
+  } catch {
+    /* no storage: the switch still works for this page */
+  }
+  return h(
+    'label',
+    { class: 'relay-switch' },
+    h('input', {
+      type: 'checkbox',
+      checked: on,
+      onchange: (e) => {
+        try {
+          if (e.target.checked) localStorage.setItem(RELAY_KEY, '1');
+          else localStorage.removeItem(RELAY_KEY);
+        } catch {
+          /* kept for this page only */
+        }
+        net?.relayOnly?.(e.target.checked);
+      },
+    }),
+    h('span', { class: 'relay-switch__name' }, 'Relay only'),
+    h('span', { class: 'hint' }, 'Reach the others only through the relay server, so they never see your IP address. It can add a little lag.')
   );
 }
 
@@ -545,19 +626,33 @@ function inviteLine() {
   );
 }
 
-function standingsTable() {
+function standingsTable({ before = null } = {}) {
   const rows = leaderboard(state?.totals || {});
   if (!rows.length) return null;
+  const move = (row, i) => {
+    const was = before?.[row.key];
+    if (!was || was === i + 1) return null;
+    return h('span', { class: `move ${was > i + 1 ? 'is-up' : 'is-down'}` }, was > i + 1 ? `▲${was - i - 1}` : `▼${i + 1 - was}`);
+  };
   return h(
     'table',
     { class: 'table' },
     h('caption', {}, `Standings after ${state.history.length} round${state.history.length === 1 ? '' : 's'}`),
-    h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Player'), h('th', {}, 'Points'), h('th', {}, 'Wins'), h('th', {}, 'Rounds'))),
+    h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Player'), h('th', {}, 'Points'), h('th', {}, 'Wins'), h('th', {}, 'Awards'), h('th', {}, 'Rounds'))),
     h(
       'tbody',
       {},
       rows.map((row, i) =>
-        h('tr', {}, h('td', {}, String(i + 1)), h('td', {}, swatch(row.slot), ' ', row.name), h('td', {}, String(row.points)), h('td', {}, String(row.wins)), h('td', {}, String(row.rounds)))
+        h(
+          'tr',
+          {},
+          h('td', {}, String(i + 1), ' ', move(row, i)),
+          h('td', {}, swatch(row.slot), ' ', row.name),
+          h('td', {}, String(row.points)),
+          h('td', {}, String(row.wins)),
+          h('td', {}, String(row.awards || 0)),
+          h('td', {}, String(row.rounds))
+        )
       )
     )
   );
@@ -571,7 +666,7 @@ function renderStrip() {
   if (strip.hidden) return;
   const waiting = status?.phase === 'loading' ? status.players.filter((p) => !p.ready && !p.out).map((p) => p.name) : [];
   strip.append(
-    h('span', { class: 'strip__title' }, `Round ${cur.round} · ${cur.name}`),
+    h('span', { class: 'strip__title' }, `${formatProgress(state.format, state.history, state.totals)} · ${cur.name}`),
     waiting.length ? h('span', {}, `Waiting for ${waiting.join(', ')}`) : status?.phase === 'grace' && h('span', {}, 'Time!'),
     isHost() && h('button', { type: 'button', onclick: () => coordinator?.timeUp() }, 'End round'),
     isHost() && h('button', { type: 'button', onclick: () => coordinator?.abort('skipped') }, 'Skip game')
@@ -591,67 +686,216 @@ const REASONS = {
 const resultText = (row) =>
   Number.isFinite(row.time) ? `${(row.time / 1000).toFixed(2)} s` : Number.isFinite(row.score) ? String(row.score) : '';
 
+/* --- between rounds: the results, then the next game -------------------------- */
+
+let shown = '';
+let lifted = true;
+
+/** Which part of the reveal is on: the last round's results, the next game's card, or nothing. */
+function revealStage() {
+  const reveal = state?.reveal;
+  if (!reveal || state.phase === 'ended') return 'none';
+  const left = reveal.until - hostNow();
+  // Everyone readied early: the countdown has begun, so lift the card for it.
+  if (status && state.current && status.round === state.current.round && status.phase !== 'loading') return 'none';
+  if (left <= 0) return 'none';
+  if (reveal.results && left > NEXT_UP_MS && state.history.length) return 'results';
+  return state.current ? 'next' : state.history.length ? 'results' : 'none';
+}
+
 function renderResults() {
-  clear(overlay);
-  overlay.hidden = state?.phase !== 'results';
-  if (overlay.hidden) return;
-  const last = state.history.at(-1);
-  const left = Math.max(0, Math.ceil(((state.nextAt ?? Date.now()) - Date.now()) / 1000));
-  overlay.append(
+  const stage = revealStage();
+  const id = `${stage}:${state?.round}:${state?.history.length}`;
+  if (id !== shown) {
+    shown = id;
+    clear(overlay);
+    overlay.hidden = stage === 'none';
+    if (stage === 'results') overlay.append(resultsCard(state.history.at(-1)));
+    if (stage === 'next') overlay.append(nextUpCard(state.current));
+  }
+  const left = Math.max(0, Math.ceil((((state?.reveal?.until ?? 0) - (stage === 'results' ? NEXT_UP_MS : 0)) - hostNow()) / 1000));
+  const count = overlay.querySelector('.results__count');
+  if (count) count.textContent = stage === 'results' ? `Next game in ${left + Math.round(NEXT_UP_MS / 1000)} s` : '';
+  // The card lifted: hand the keyboard to the game, which is waiting for a key.
+  if (stage === 'none' && !lifted) document.querySelector('#player iframe')?.focus();
+  lifted = stage === 'none';
+}
+
+const MEDALS = ['🥇', '🥈', '🥉'];
+/** "Ana", "Ana and Bo", "Ana, Bo and Cy". */
+const names = (list) => (list.length > 1 ? `${list.slice(0, -1).join(', ')} and ${list.at(-1)}` : list[0] ?? '');
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const statsLine = (stats) =>
+  stats ? Object.entries(stats).map(([name, value]) => `${name} ${typeof value === 'number' ? Math.round(value * 100) / 100 : value}`).join(' · ') : '';
+
+function headline(entry) {
+  if (entry.status !== 'played') return `No points this round: ${REASONS[entry.reason] ?? entry.reason}.`;
+  const winners = entry.rows.filter((r) => r.place === 1);
+  if (entry.mode === 'co-op') return entry.won ? 'The team did it!' : 'So close. The team fell short.';
+  if (winners.length === entry.rows.length && winners.length > 1) return 'Dead heat!';
+  if (winners.length > 1) return `${names(winners.map((r) => r.name))} share the win!`;
+  return winners.length ? `${winners[0].name} wins!` : 'Round over';
+}
+
+function resultsCard(entry) {
+  const host = isHost();
+  return h(
+    'div',
+    { class: 'results__card is-results' },
+    h('p', { class: 'eyebrow' }, `Round ${entry.round} · ${entry.name}`),
+    h('h2', { class: 'results__headline' }, headline(entry)),
+    entry.status === 'played' &&
+      h(
+        'ol',
+        { class: 'results__rows' },
+        entry.rows.map((row, i) =>
+          h(
+            'li',
+            { style: { '--i': i } },
+            h('span', { class: 'results__place' }, row.place <= 3 && entry.mode !== 'co-op' ? MEDALS[row.place - 1] : String(row.place)),
+            swatch(row.slot),
+            h(
+              'span',
+              { class: 'results__who' },
+              h('span', { class: 'results__name' }, row.name, row.out ? ` (${row.out === 'not-ready' ? 'sat out' : 'left'})` : ''),
+              row.awards?.length > 0 &&
+                h('span', { class: 'results__awards' }, row.awards.map((a) => h('span', { class: 'award', title: a.detail || '' }, '🏅 ', a.title, a.detail ? h('small', {}, ` ${a.detail}`) : null))),
+              row.stats && h('span', { class: 'results__stats' }, statsLine(row.stats))
+            ),
+            h('span', { class: 'results__score' }, resultText(row)),
+            h('span', { class: 'results__points' }, `+${row.points}`)
+          )
+        )
+      ),
+    standingsTable({ before: entry.before }),
     h(
       'div',
-      { class: 'results__card' },
-      h('p', { class: 'eyebrow' }, `Round ${last.round}`),
-      h('h2', {}, last.name),
-      last.status === 'played'
-        ? h(
-            'ol',
-            { class: 'results__rows' },
-            last.rows.map((row) =>
-              h(
-                'li',
-                {},
-                h('span', { class: 'results__place' }, String(row.place)),
-                swatch(row.slot),
-                h('span', { class: 'results__name' }, row.name, row.out ? ` (${row.out === 'not-ready' ? 'sat out' : 'left'})` : ''),
-                h('span', { class: 'results__score' }, resultText(row)),
-                h('span', { class: 'results__points' }, `+${row.points}`)
-              )
-            )
-          )
-        : h('p', { class: 'notice' }, `No points this round: ${REASONS[last.reason] ?? last.reason}.`),
-      standingsTable(),
-      h(
-        'div',
-        { class: 'results__next' },
-        h('span', { class: 'hint' }, `Next game in ${left} s`),
-        isHost() && h('button', { type: 'button', class: 'primary', onclick: startRound }, 'Next game now'),
-        isHost() && h('button', { type: 'button', onclick: () => { clearTimeout(nextTimer); publish({ ...state, phase: 'lobby', nextAt: null }); } }, 'Back to the lobby'),
-        isHost() && h('button', { type: 'button', onclick: endSession }, 'End the session')
-      )
+      { class: 'results__next' },
+      h('span', { class: 'hint results__count' }),
+      host && h('button', { type: 'button', class: 'primary', onclick: () => publish({ ...state, reveal: { ...state.reveal, until: hostNow() + NEXT_UP_MS } }) }, 'Next game now'),
+      host && h('button', { type: 'button', onclick: backToLobby }, 'Back to the lobby'),
+      host && h('button', { type: 'button', onclick: () => endSession() }, 'End the session')
     )
   );
 }
 
-function endSession() {
-  clearTimeout(nextTimer);
+const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op' };
+
+/** The next game: a quick spin through the deck that lands on it, then what it takes to win. */
+function nextUpCard(cur) {
+  const game = pool.find((g) => g.slug === cur.slug);
+  const info = game ? sessionOf(game) : null;
+  const others = eligible(pool, cur.players.length).filter((g) => g.slug !== cur.slug);
+  const reel = [...Array(Math.min(7, others.length))].map((_, i) => others[(cur.round * 7 + i * 3) % others.length].name);
+  return h(
+    'div',
+    { class: 'results__card is-next' },
+    h('p', { class: 'eyebrow' }, `Next up · ${formatProgress(state.format, state.history, state.totals)}`),
+    h('div', { class: 'reel', 'aria-hidden': 'true' }, h('div', { class: 'reel__strip', style: { '--n': reel.length } }, reel.map((n) => h('span', {}, n)), h('span', { class: 'is-it' }, cur.name))),
+    h('h2', { class: 'next__name' }, cur.name),
+    h(
+      'p',
+      { class: 'next__mode' },
+      h('span', { class: 'chip' }, MODE_LINES[cur.mode] ?? 'Game'),
+      ' ',
+      `${cur.players.length} player${cur.players.length === 1 ? '' : 's'}`
+    ),
+    info?.goal && h('p', { class: 'next__goal' }, info.goal),
+    info?.howto && h('p', { class: 'next__howto' }, info.howto),
+    h('p', { class: 'hint' }, 'Loading… press any key when it asks.'),
+    isHost() && h('div', { class: 'results__next' }, h('button', { type: 'button', onclick: backToLobby }, 'Back to the lobby'))
+  );
+}
+
+function backToLobby() {
+  discardRound('skipped');
+  publish({ ...state, phase: 'lobby', current: null, reveal: null });
+}
+
+/** End the session: everyone sees the final table, with the session's awards. */
+function endSession(from = state) {
+  discardRound('session-ended');
   if (online) online.sb.rpc('end_session', { p_session: online.sessionId }).then(() => {}, () => {});
-  coordinator?.abort('session-ended');
-  coordinator = null;
-  publish({ ...state, phase: 'ended', current: null, nextAt: null });
+  const format = formatOf(from.format);
+  const awards = sessionAwards(from.history, from.totals);
+  const table = finalTable(from.totals, awards, format.bonus);
+  publish({ ...from, phase: 'ended', current: null, reveal: null, final: { awards, table, bonus: format.bonus } });
 }
 
 function endScreen() {
+  const final = state.final ?? { awards: [], table: finalTable(state.totals || {}, [], 0), bonus: 0 };
+  const rows = final.table;
+  const champions = rows.filter((r) => r.place === 1);
+  const nameOfKey = (k) => rows.find((r) => r.key === k)?.name ?? '';
+  // The top three in table order, drawn second–first–third; a shared place shares its medal.
+  const podium = [rows[1], rows[0], rows[2]];
   return h(
     'section',
-    { class: 'panel' },
-    h('h2', {}, 'Session over'),
-    standingsTable() || h('p', { class: 'hint' }, 'No rounds were played.'),
+    { class: 'panel finale' },
+    h('p', { class: 'eyebrow' }, `${formatOf(state.format).label} · ${plural(state.history.filter((e) => e.status === 'played').length, 'round')}`),
+    h('h2', {}, rows.length ? (champions.length > 1 ? `${names(champions.map((r) => r.name))} share the crown!` : `${champions[0].name} wins the session!`) : 'Session over'),
+    rows.length > 0 &&
+      h(
+        'div',
+        { class: 'podium' },
+        podium.map((row, i) =>
+          row
+            ? h(
+                'div',
+                { class: `podium__step is-${['second', 'first', 'third'][i]}` },
+                h('span', { class: 'podium__medal' }, MEDALS[row.place - 1] ?? ''),
+                swatch(row.slot),
+                h('span', { class: 'podium__name' }, row.name),
+                h('span', { class: 'podium__points' }, `${row.points} pts`)
+              )
+            : h('div', { class: 'podium__step is-empty' })
+        )
+      ),
+    final.awards.length > 0 &&
+      h(
+        'ul',
+        { class: 'finale__awards' },
+        final.awards.map((a) =>
+          h('li', {}, h('strong', {}, `🏆 ${a.title}`), ` ${names(a.keys.map(nameOfKey))} — ${a.detail}`, final.bonus ? h('span', { class: 'bonus' }, ` +${final.bonus}`) : null)
+        )
+      ),
+    rows.length
+      ? h(
+          'table',
+          { class: 'table' },
+          h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Player'), h('th', {}, 'Points'), final.bonus ? h('th', {}, 'Bonus') : null, h('th', {}, 'Wins'), h('th', {}, 'Awards'))),
+          h(
+            'tbody',
+            {},
+            rows.map((row) =>
+              h(
+                'tr',
+                {},
+                h('td', {}, String(row.place)),
+                h('td', {}, swatch(row.slot), ' ', row.name),
+                h('td', {}, String(row.points)),
+                final.bonus ? h('td', {}, row.bonus ? `+${row.bonus}` : '') : null,
+                h('td', {}, String(row.wins)),
+                h('td', {}, String(row.awards || 0))
+              )
+            )
+          )
+        )
+      : h('p', { class: 'hint' }, 'No rounds were played.'),
     h(
       'ol',
       { class: 'history' },
       state.history.map((e) =>
-        h('li', {}, `Round ${e.round}: ${e.name} — `, e.status === 'played' ? `won by ${e.rows.filter((r) => r.place === 1).map((r) => r.name).join(' and ')}` : 'no points')
+        h(
+          'li',
+          {},
+          `Round ${e.round}: ${e.name} — `,
+          e.status === 'played'
+            ? e.mode === 'co-op'
+              ? e.won ? 'the team won' : 'the team fell short'
+              : `won by ${names(e.rows.filter((r) => r.place === 1).map((r) => r.name))}`
+            : 'no points'
+        )
       )
     ),
     h('a', { class: 'primary', href: '/' }, 'Back to the wall')
@@ -681,8 +925,8 @@ async function main() {
   }
   setInterval(() => {
     if (net && isHost() && state) net.broadcast({ k: 's', t: 'state', state });
-    if (state?.phase === 'results') renderResults();
   }, STATE_EVERY_MS / 2);
+  setInterval(() => state && renderResults(), 200);
   addEventListener('visibilitychange', () => bridge?.visibility(document.hidden));
   render();
   if (asSeat !== null && net) {

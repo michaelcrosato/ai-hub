@@ -106,6 +106,7 @@ export function createRelayNet({ key, relay, iceServers = [], relayOnly = false 
     clock,
     link: (other) => mesh.state(other),
     route: (other) => mesh.route(other),
+    relayOnly: (on) => mesh.relayOnly(on),
     update(fields) {
       me = { ...me, ...fields };
       relay.track(me);
