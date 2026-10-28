@@ -1,4 +1,6 @@
--- RLS tests for supabase/migrations/0001_accounts.sql and 0002_sessions.sql.
+-- RLS tests for supabase/migrations/0001_accounts.sql, 0002_sessions.sql and
+-- the migrations after them (0007 moved the SECURITY DEFINER bodies to the
+-- schema `private`; the last checks fail until it is applied).
 --
 -- Run in the Supabase SQL editor (or execute_sql). It makes throwaway users,
 -- acts as each one the way the hub's pages would, checks every rule, and then
@@ -213,7 +215,27 @@ begin
     failed := failed + 1; report := report || E'\nFAIL: delete_my_account refused a fresh sign-in: ' || sqlerrm;
   end;
 
+  -- ---- what the Data API can reach (0007) --------------------------------------
   execute 'reset role';
+  select count(*) into n
+  from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+  where s.nspname = 'public' and p.prosecdef and has_function_privilege('authenticated', p.oid, 'execute');
+  if n = 0 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: ' || n || ' SECURITY DEFINER functions in public are callable by signed-in users (apply 0007)'; end if;
+  select count(*) into n
+  from pg_proc p join pg_namespace s on s.oid = p.pronamespace
+  where s.nspname = 'private' and has_function_privilege('anon', p.oid, 'execute');
+  if n = 0 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: anon can call ' || n || ' functions in private'; end if;
+  select count(*) into n from pg_class c join pg_namespace s on s.oid = c.relnamespace
+  where s.nspname = 'public' and c.relkind = 'r' and has_table_privilege('anon', c.oid, 'select');
+  if n = 0 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: anon can read ' || n || ' tables in public'; end if;
+  begin
+    execute 'set local role anon';
+    perform 1 from public.feedback limit 1;
+    failed := failed + 1; report := report || E'\nFAIL: anon read the votes table';
+  exception when insufficient_privilege then passed := passed + 1;
+  end;
+  execute 'reset role';
+
   if failed = 0 then
     raise exception 'RLS TESTS: ALL % PASSED (everything rolled back)', passed;
   else
