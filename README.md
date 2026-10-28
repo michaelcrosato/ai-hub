@@ -447,6 +447,8 @@ next seat takes over, and a round it was running is void.
 - Each seat shows its connection. The host can remove a player for the rest
   of the session.
 - Every round is saved: the game, who placed where and the points.
+- No game in the library declares `hub:session` yet, so until one does, host
+  from `/session?examples=1` to deal the two reference games.
 
 How it works:
 - Presence, round control and the WebRTC handshake go over the session's
@@ -501,7 +503,17 @@ How it's built:
 - The page code is in `assets/js/account/`. It loads the vendored
   supabase-js only for a signed-in device.
 - If Supabase is unreachable or paused, sign-in hides and everything else
-  works as before.
+  works as before. The free project pauses after about a week without use;
+  resume it from the Supabase dashboard.
+
+Known limits:
+- Games run on the hub's own origin, so a game could read the signed-in
+  user's Supabase token. Row-level security confines the damage to that
+  user's own votes, plays and sessions, and Google's tokens are not kept.
+  The real fix is serving games from a separate custom domain.
+- Peer-to-peer play shows players' IP addresses to each other (`/privacy/`
+  says so). `localStorage['ai-hub:relay-only'] = '1'` forces every
+  connection through the TURN relay; there is no button for it yet.
 
 ## Optional extras
 

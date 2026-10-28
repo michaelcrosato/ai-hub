@@ -1,11 +1,5 @@
 # Working in this repo
 
-## Work in progress (remove this note when it is done)
-
-Accounts and cross-device sessions are on main and live. Two things remain,
-listed in `docs/sessions-handoff.md`: the Cloudflare TURN key and Michael's
-checks on real devices. Read it before touching accounts or sessions.
-
 ## Finish every change on main
 
 - When a `/goal` is complete, or a prompt has changed the repo, commit and
