@@ -5719,8 +5719,8 @@ class Race {
     } else for (const k of this.karts) if (!k.human) k.rubber = 0.96 + 0.04 * k.ai.skill;
     // Physics
     this.acc = Math.min(this.acc + dt, 0.1);
-    while (this.acc >= STEP) { if (this.net) this.net.predict(this.acc - STEP); this.step(STEP); this.acc -= STEP; }
-    if (this.net) this.net.predict(this.acc);
+    while (this.acc >= STEP) { if (this.net) this.net.predict(this.acc - STEP, STEP); this.step(STEP); this.acc -= STEP; }
+    if (this.net) this.net.predict(this.acc, 0);
     // Visuals
     for (const k of this.karts) { if (k.remote) this.net.visual(k, dt); else k.updateVisual(dt, this.clock); }
     this.items.updateVisual(dt, this.clock);
@@ -6665,6 +6665,7 @@ class HubNet {
     this.started = false; this.loaded = false; this.wantReady = !!HubBoot.gesture; this.readySent = false;
     this.ended = null; this.reported = false; this.silentChecked = false;
     this.seq = 0; this.events = []; this.sendT = 0; this.tombs = new Set(); this.objs = new Map(); this.objT = {};
+    this.simT = 0; this.pace = {}; // race time simulated here; each sender's race time per second of the shared clock
     this.stats = { bumps: 0, itemHits: 0, timesHit: 0, placeChanges: 0, wasLast: false, bumpCd: 0, place: 0, cand: 0, candT: 0 };
     this._p = {}; this._q = {}; this._n = {}; this._d = {};
     AIHub.on('start', () => { this.started = true; });
@@ -6762,8 +6763,9 @@ class HubNet {
     }
     return out;
   }
-  // Where the race logic sees a remote kart: predicted to `lagS` seconds before now
-  predict(lagS) {
+  // Where the race logic sees a remote kart: predicted to `lagS` seconds before now (`stepS`: race time simulated here)
+  predict(lagS, stepS) {
+    this.simT += stepS;
     const now = AIHub.time();
     if (!isFinite(now) || !this.race) return;
     const race = this.race, W = race.world, T = now - lagS * 1000;
@@ -6858,7 +6860,7 @@ class HubNet {
     const t = AIHub.time();
     if (!isFinite(t)) return;
     if (this.present.size < 2) { this.events = []; return; } // nobody else to tell
-    const msg = { t: 's', at: Math.round(t), k: [], o: [] };
+    const msg = { t: 's', at: Math.round(t), rt: +this.simT.toFixed(3), k: [], o: [] };
     for (const k of this.race.karts) if (!k.remote && !k.out) msg.k.push(this.packKart(k));
     for (const o of this.race.items.objs) if (!o.dead && !o.remote && OBJ_T.includes(o.type) && OBJ_S.includes(o.state) && msg.o.length < 120) msg.o.push(this.packObj(o));
     const reliable = this.events.length > 0;
@@ -6883,6 +6885,13 @@ class HubNet {
   onSnap(m, from) {
     if (!Number.isFinite(m.at)) return;
     const race = this.race, W = race.world;
+    // pace: how much race time the sender lives per second of the shared clock (below 1 on a device that cannot keep
+    // up), so its karts and items are not carried ahead of where they really are
+    const pc = this.pace[from] || (this.pace[from] = { at: m.at, rt: m.rt, rate: 1 });
+    if (Number.isFinite(m.rt) && m.at - pc.at >= 200) {
+      if (Number.isFinite(pc.rt) && m.at - pc.at < 3000) pc.rate = lerp(pc.rate, clamp((m.rt - pc.rt) / ((m.at - pc.at) / 1000), 0.05, 1.2), 0.5);
+      pc.at = m.at; pc.rt = m.rt;
+    }
     if (Array.isArray(m.k)) for (const e of m.k) {
       const k = race.karts[e[0]];
       if (!k || k.out || !Array.isArray(e) || e.length < 19) continue;
@@ -6898,13 +6907,7 @@ class HubNet {
       B.splice(i, 0, c);
       const p = B[i - 1];
       if (p && c.at - p.at < 600) c.yr = clamp(angDiff(p.yaw, c.yaw) / ((c.at - p.at) / 1000), -4, 4);
-      // pace: how much race time the sender's kart lives per second of the shared clock (below 1 on a device that
-      // cannot keep up), so a slow device's kart is not carried ahead of where it really is
-      c.rate = p ? p.rate : 1;
-      if (p) {
-        const dt = (c.at - p.at) / 1000, d = Math.hypot(c.x - p.x, c.z - p.z), sp = (Math.hypot(c.vx, c.vz) + Math.hypot(p.vx, p.vz)) / 2;
-        if (dt > 0.02 && dt < 0.5 && sp > 3 && d < 14 && c.rescue < 0 && p.rescue < 0) c.rate = lerp(p.rate, clamp(d / (sp * dt), 0.05, 1.15), 0.5);
-      }
+      c.rate = pc.rate;
       if (W.kind === 'track') { const L = W.locate(c.x, c.z, c.y, k.ns.si, {}); k.ns.si = L.i; c.s = L.s; }
       while (B.length > 8) B.shift();
       if (was) {
@@ -6920,8 +6923,7 @@ class HubNet {
   // Another copy's items: it lists all of them every time, so whatever it stops listing is gone
   objects(m, from) {
     const race = this.race, I = race.items, karts = race.karts, now = AIHub.time();
-    const own = karts.find((q) => q.player === from), B = own ? own.ns.buf : [];
-    const lag = (isFinite(now) ? clamp((now - m.at) / 1000, 0, 0.3) : 0) * (B.length ? B[B.length - 1].rate : 1); // in the sender's race time
+    const lag = (isFinite(now) ? clamp((now - m.at) / 1000, 0, 0.3) : 0) * (this.pace[from] ? this.pace[from].rate : 1); // in the sender's race time
     const seen = new Set(), orbits = new Map();
     for (const k of karts) if (k.remote) { if (k.held && k.held.src === from) k.held = null; k.orbit = k.orbit.filter((o) => o.src !== from); }
     for (const e of m.o) {
@@ -7244,6 +7246,7 @@ async function bootSession(info, bootMsg) {
   await new Promise((r) => setTimeout(r, 0));
   if (net.ended) { bootMsg.textContent = net.ended === 'sat-out' ? 'You sat this one out' : 'Round over'; return; }
   App.race = net.build();
+  window.__mgk = { race: App.race, net }; // session-only handle for automated tests (harness / hub-check)
   UI.go('race');
   document.getElementById('boot').remove();
   requestAnimationFrame(frame);
