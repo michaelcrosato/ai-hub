@@ -17,7 +17,7 @@ export const RELEASES = Object.freeze({
   '1.0.0': '6fc9b691a78c237944ba0e972f506079e9906fbcc6b83e3d6acb8e832f88bb19',
   '1.1.0': '6625a3a55ed0380baf268d593dd24e85f6c49fcd00d524fc308ae0fd4b484272',
   '1.2.0': '2d6e9bd677210500e7683deaa88dace3f70b28295f85b0525a1811b2bc9bd088',
-  '1.3.0': '93f79315ae958a530a0293bb1eec726c442be53d93c84fb65d042dcf2bdcc3f6',
+  '1.3.0': '32ed0ff62e4e0880bc78db850a0cff8dd7c9277d34ef76cafc60d535d41761db',
 });
 
 const BANNER = '/*! aihub-session ';

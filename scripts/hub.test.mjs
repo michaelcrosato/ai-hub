@@ -60,7 +60,8 @@ async function loadClient({ search = '?aihub=1', framed = true } = {}) {
     localStorage: saved,
     sessionStorage: saved,
     Element: Object.assign(function Element() {}, { prototype: { requestFullscreen: realRequest } }),
-    document: {},
+    document: { documentElement: { tag: 'html' }, events: [], dispatchEvent(e) { this.events.push(e.type); } },
+    Event: function Event(type) { this.type = type; },
   };
   window.parent = framed ? parent : window;
   // Each sandbox gets its own Math, so a client that seeds Math.random seeds only its own page.
@@ -104,7 +105,7 @@ test('the client says hello until welcomed, then resolves with the round', async
   assert.deepEqual(posted.slice(3).map((p) => [p.msg.type, p.origin]), [['ready', 'https://hub.test']]);
 });
 
-test('the client gives up after ten seconds with no hub, and plays solo with its own storage and Math.random', async () => {
+test('the client gives up after ten seconds with no hub, and plays solo with its own Math.random', async () => {
   const { hub, clock, window, math } = await loadClient({ search: '?aihub=1&aihub-seed=9' });
   assert.equal(window.localStorage.getItem('unlocks'), null);
   const info = hub.connect({ mode: 'parallel' });
@@ -113,7 +114,13 @@ test('the client gives up after ten seconds with no hub, and plays solo with its
   assert.equal(hub.active, false);
   assert.equal(hub.seeded, false);
   assert.equal(math.random, Math.random, 'Math.random is the real one again');
-  assert.equal(window.localStorage.getItem('unlocks'), 'all of them', 'and so is the storage');
+  assert.equal(window.localStorage.getItem('unlocks'), null, 'the empty storage stays: what the game writes never lands on the real saves');
+  const own = await loadClient({ search: '?aihub=1' });
+  const mine = () => 0.5;
+  own.math.random = mine;
+  own.hub.connect();
+  own.clock.advance(10_600);
+  assert.equal(own.math.random, mine, 'a Math.random the game set itself is left alone');
 });
 
 test('the client ignores messages that are not from its parent', async () => {
@@ -175,6 +182,17 @@ test('the client lets only the host finish, once, and a racer report once', asyn
   host.hub.finish({ standings: [[0], [1]], scores: { 0: 10, 1: 4 } });
   host.hub.finish({ standings: [[1], [0]] });
   assert.deepEqual(host.posted.filter((p) => p.msg.type === 'finish').map((p) => p.msg.standings), [[[0], [1]]]);
+});
+
+test('an outcome field that is not JSON is left out, not the whole outcome', async () => {
+  const { hub, posted, fromHub, warnings } = await loadClient();
+  hub.connect();
+  fromHub({ ...WELCOME, me: 0 });
+  const cycle = { name: 'loop' };
+  cycle.self = cycle;
+  hub.finish({ standings: [[0], [1]], scores: { 0: 5, 1: 2 }, stats: { 0: cycle } });
+  assert.deepEqual(posted.filter((p) => p.msg.type === 'finish').map(({ msg: { aihub, ...m } }) => m), [{ type: 'finish', standings: [[0], [1]], scores: { 0: 5, 1: 2 } }]);
+  assert.ok(warnings.some((w) => /stats is not JSON/.test(w)));
 });
 
 test('a result is judged on the numbers the game gave: NaN, Infinity, null and empty text are no time', async () => {
@@ -246,19 +264,22 @@ test('in a session the game gets an empty storage of its own, so every round sta
   assert.equal(solo.window.localStorage.getItem('unlocks'), 'all of them', 'outside a session the real storage is left alone');
 });
 
-test('in a session a game that asks for fullscreen gets the hub’s whole page, so the hub’s cards stay on top', async () => {
-  const { window, posted } = await loadClient();
+test('in a session a game that asks for fullscreen gets the hub’s whole page, and its own toggle still works', async () => {
+  const { hub, window, posted, fromHub } = await loadClient();
+  hub.connect();
+  posted.length = 0;
   const canvas = Object.create(window.Element.prototype);
-  assert.equal(await canvas.requestFullscreen(), undefined);
-  await window.document.exitFullscreen();
+  const toggle = () => (window.document.fullscreenElement ? window.document.exitFullscreen() : canvas.requestFullscreen());
+  assert.equal(await toggle(), undefined);
+  fromHub({ aihub: 1, type: 'fullscreen', on: true });
+  assert.deepEqual(window.document.fullscreenElement, { tag: 'html' }, 'the hub’s page is in fullscreen, as far as the game can tell');
+  assert.deepEqual(window.document.events, ['fullscreenchange']);
+  await toggle();
+  fromHub({ aihub: 1, type: 'fullscreen', on: false });
+  assert.equal(window.document.fullscreenElement, null);
   assert.deepEqual(posted.map((p) => p.msg), [{ aihub: 1, type: 'fullscreen', on: true }, { aihub: 1, type: 'fullscreen', on: false }]);
   const solo = await loadClient({ search: '' });
   assert.equal(solo.window.Element.prototype.requestFullscreen, solo.realRequest, 'outside a session the game’s own fullscreen is left alone');
-  const lost = await loadClient();
-  lost.hub.connect();
-  lost.clock.advance(10_600);
-  assert.equal(lost.window.Element.prototype.requestFullscreen, lost.realRequest, 'and a page that finds no hub gets it back');
-  assert.equal(lost.window.document.exitFullscreen, undefined);
 });
 
 test('the client keeps every welcome field and passes on events it has never heard of', async () => {
@@ -629,7 +650,7 @@ test('progress reaches this hub and every other player over the network, about o
   bridge.fromGame({ aihub: 1, type: 'progress', score: 'lots' });
   bridge.fromGame({ aihub: 1, type: 'progress', score: 140 });
   assert.deepEqual(progress.map(([, p]) => p.score), [120, 140]);
-  assert.deepEqual(issues, ['progress before welcome', 'progress more than twice a second', 'progress needs a finite score']);
+  assert.deepEqual(issues, ['progress before welcome', 'progress needs a finite score'], 'a report too close to the last is dropped quietly: the next one carries the newest score');
 
   bridge.fromNet('a', { k: 'p', r: 4, f: 0, d: { score: 77, label: 'Floor 3' } });
   bridge.fromNet('c', { k: 'p', r: 4, f: 0, d: { score: 99 } });

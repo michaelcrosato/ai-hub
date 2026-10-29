@@ -74,6 +74,7 @@ export function pickNext(games, { seed, n, cycle = 0, played = [], webgpu = fals
     lineages.get(key).push(game);
   }
   const done = new Set(played);
+  const lastSlug = played.at(-1);
   const order = (c) => shuffleDeck([...lineages].map(([slug, builds]) => ({ slug, builds })), `${seed}:${c}:${want}`);
   let next = order(cycle).find((lineage) => !lineage.builds.some((game) => done.has(game.slug)));
   if (!next) {
@@ -81,7 +82,9 @@ export function pickNext(games, { seed, n, cycle = 0, played = [], webgpu = fals
     cycle += 1;
     const again = new Set([...lineages.values()].flat().map((game) => game.slug));
     played = played.filter((slug) => !again.has(slug));
-    next = order(cycle)[0];
+    // Not the game just played, while the deck has another.
+    const fresh = order(cycle);
+    next = fresh.find((lineage) => !lineage.builds.some((game) => game.slug === lastSlug)) ?? fresh[0];
   }
   const game = shuffleDeck(next.builds, `${seed}:${cycle}:${next.slug}`)[0];
   return { game, cycle, played: [...played, game.slug] };

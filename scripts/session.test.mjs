@@ -268,6 +268,20 @@ test('a source with many builds is one game in the deal: one build of it, and no
   assert.deepEqual([...dealt.slice(4)].sort(), ['fox', 'golf', 'kart', 'wave']);
 });
 
+test('a deck that starts again never deals the game just played first', () => {
+  const games = [game('blaze', {}), game('urethane', {})];
+  for (const seed of ['s', 7, 'party', 42, 'e2e']) {
+    let state = { cycle: 0, played: [] };
+    const dealt = [];
+    for (let i = 0; i < 12; i++) {
+      const next = pickNext(games, { seed, n: 2, ...state });
+      dealt.push(next.game.slug);
+      state = { cycle: next.cycle, played: next.played };
+    }
+    assert.ok(dealt.every((slug, i) => i === 0 || slug !== dealt[i - 1]), `seed ${seed}: ${dealt.join(' ')}`);
+  }
+});
+
 test('a seat with nothing but a touch screen gets the games tagged touch, while any fit', () => {
   const games = [game('keys', { tags: ['3d'] }), game('taps', { tags: ['touch', 'retro'] })];
   assert.deepEqual(eligible(games, 2, { touchOnly: true }).map((g) => g.slug), ['taps']);

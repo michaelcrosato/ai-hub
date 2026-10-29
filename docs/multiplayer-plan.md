@@ -193,7 +193,7 @@ Playwright. Nothing here needs cc-matrix.
    cannot run here is noted and skipped, with no model spent on it: a
    WebGPU-only game in a browser without WebGPU is caught even when its title
    screen shows (it asked for an adapter, got none, and drew nothing with
-   WebGL). On a machine without a GPU, SwiftShader gives such games a
+   WebGL or a 2D canvas). On a machine without a GPU, SwiftShader gives such games a
    software adapter (`--browser-args`, tested here).
 2. **Tool, no model** (`retrofit.mjs prepare`): the client and the
    side-by-side metas go first in `<head>`, after `<meta charset>`, before
@@ -370,7 +370,7 @@ games or so a night.
   the share of dealt rounds actually played is the measure of the whole
   thing. And builds that need WebGPU but don't say so are found by
   `hub-check` in a browser without it (they ask for an adapter, get none and
-  draw nothing with WebGL) and marked in `data/overrides.json`.
+  draw nothing with WebGL or 2D) and marked in `data/overrides.json`.
 - **What the platform needs**: TURN credentials only for a player seated in
   a live session (today any signed-in account, anonymous ones included, can
   mint them, and relayed traffic past 1,000 GB a month is billed); a plain
@@ -495,6 +495,9 @@ Measured or read in this audit (Oct 29, 2026):
 - **cc-matrix**: 25 runs (22 Star Fox 64, 3 Mario Kart 64), $105.81 reported
   spend (Claude Code and Grok only), none on the hub, none using the network;
   13 of 17 "WebGPU, no fallback" builds show a WebGPU-required message.
+- **Fullscreen**: in Chromium, a click inside a same-origin game frame lets
+  the hub page take fullscreen when the frame asks by message, and the frame
+  hears it back.
 - **Database**: `session_rounds.mode` allowed only versus, co-op and race, so
   a side-by-side round would not have been saved; 0008 was checked on
   Postgres 16 against 0002's table.

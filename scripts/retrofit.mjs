@@ -40,7 +40,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,7 +52,9 @@ import { lineageKey } from '../assets/js/session/pick.js';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LEDGER = path.join(ROOT, '.cache', 'retrofit.jsonl');
 const OVERRIDES = path.join(ROOT, 'data', 'overrides.json');
-const BEFORE = '.before-retrofit';
+/** The original beside the game while it is checked: a leading _ keeps the scan from ever listing it. */
+const BEFORE = '_before-retrofit.';
+const backupOf = (target) => path.join(path.dirname(target), BEFORE + path.basename(target));
 const NOTE = 'side by side:';
 
 const argv = process.argv.slice(2);
@@ -88,6 +90,9 @@ const run = (cmd, args, { input, timeoutMs = 0, shell = false, cwd = ROOT } = {}
 const rel = (file) => path.relative(ROOT, file);
 const isProject = (page) => path.basename(page) === 'index.html';
 const TEXT = /\.(html?|m?js|css|json|txt|md)$/i;
+/** A new file a try may add to a project: code, not an agent's notes. */
+const CODE = /\.(html?|m?js|css)$/i;
+const exists = (file) => stat(file).then(() => true, () => false);
 
 async function catalogue() {
   try {
@@ -110,11 +115,16 @@ async function resolveGame(arg) {
   }
 }
 
-/** Every text file in a project folder, by path: what a try may change, and what a reset puts back. */
+/**
+ * Every text file in a project folder, by path: what a try may change, and what
+ * a reset puts back. Hidden files and folders (an agent's own notes) are not
+ * the game's.
+ */
 async function textFiles(dir, out = new Map()) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory() && entry.name !== 'node_modules') await textFiles(full, out);
+    if (entry.isDirectory()) await textFiles(full, out);
     else if (TEXT.test(entry.name)) out.set(full, await readFile(full, 'utf8'));
   }
   return out;
@@ -164,7 +174,10 @@ function noteGame(page, note) {
     else if (String(entry.sessionNote || '').startsWith(NOTE)) delete entry.sessionNote;
     if (Object.keys(entry).length) overrides[game.slug] = entry;
     else delete overrides[game.slug];
-    await writeFile(OVERRIDES, `${JSON.stringify(overrides, null, 2)}\n`);
+    // Written whole, then moved into place: a reader never sees half a file.
+    const next = `${OVERRIDES}.${process.pid}.tmp`;
+    await writeFile(next, `${JSON.stringify(overrides, null, 2)}\n`);
+    await rename(next, OVERRIDES);
   });
   return writing;
 }
@@ -178,8 +191,38 @@ async function noted(page) {
 
 /* --- one game ---------------------------------------------------------------- */
 
+/** What to undo if the run is stopped (Ctrl-C, a kill): each game in hand puts itself back. */
+const inHand = new Set();
+let stopping = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, async () => {
+    stopping = true;
+    console.log(`\n${signal}: putting back the ${inHand.size} game${inHand.size === 1 ? '' : 's'} in hand`);
+    await Promise.all([...inHand].map((undo) => undo().catch(() => {})));
+    process.exit(130);
+  });
+}
+
+/** A run cut short before it could clean up left the original beside the game: put the game back from it. */
+async function recover(page) {
+  const project = isProject(page);
+  const home = path.dirname(page);
+  const backup = project ? backupOf(home) : backupOf(page);
+  if (!(await exists(backup))) return;
+  if (project) {
+    const kept = await textFiles(backup);
+    for (const file of (await textFiles(home)).keys()) if (!kept.has(path.join(backup, path.relative(home, file)))) await rm(file, { force: true });
+    await cp(backup, home, { recursive: true, force: true });
+  } else {
+    await cp(backup, page);
+  }
+  await rm(backup, { recursive: true, force: true });
+  console.log(`restored ${rel(page)}: an earlier run was cut short`);
+}
+
 async function retrofitOne(arg, agents, prompt) {
   const page = await resolveGame(arg);
+  await recover(page);
   const originalText = await readFile(page, 'utf8');
   const client = await readFile(path.join(ROOT, 'lib/hub/session.js'), 'utf8');
   const prepared = prepareSideBySide(originalText, { client, minutes: Number(value('minutes', 4)) });
@@ -196,22 +239,25 @@ async function retrofitOne(arg, agents, prompt) {
   if (already) return { game: rel(page), outcome: 'skipped', reason: `noted before (${already}); --again to retry` };
   if (flag('dry-run')) return { game: rel(page), outcome: 'dry-run', tiers: agents.length };
 
-  // A page this browser cannot draw cannot be checked here: spend nothing on it.
+  // A page this browser cannot run cannot be checked here: spend nothing on it.
   const draws = await hubCheck([`/${rel(page)}`, '--draws-only']);
   if (!draws.pass) {
     await log({ outcome: 'environment', failed: draws.failed });
-    await noteGame(page, `cannot be checked here, the page does not draw in this browser (${today}); try a browser with WebGPU`);
-    return { game: rel(page), outcome: 'environment', reason: 'the page does not draw in this browser' };
+    await noteGame(page, `cannot be checked here, the page does not run in this browser (${today}); try a browser with WebGPU`);
+    return { game: rel(page), outcome: 'environment', reason: 'the page does not run in this browser' };
   }
 
-  // The original, served beside the game for hub-check's comparison, and gone again at the end.
-  const original = page.replace(/\.html?$/i, `${BEFORE}.html`);
   // The game's own files as they were: its page, or for a project every text file in its folder.
+  const project = isProject(page);
   const home = path.dirname(page);
-  const before = isProject(page) ? await textFiles(home) : new Map([[page, originalText]]);
+  const before = project ? await textFiles(home) : new Map([[page, originalText]]);
+  // The original, served beside the game for hub-check's comparison: the page, or the whole
+  // project folder, so the original page loads the original scripts.
+  const backup = project ? backupOf(home) : backupOf(page);
+  const original = project ? path.join(backup, 'index.html') : backup;
   /** Put the game back as it was, dropping any new text file a try left in its folder. */
   const resetGame = async () => {
-    if (isProject(page)) for (const file of (await textFiles(home)).keys()) if (!before.has(file) && file !== original) await rm(file, { force: true });
+    if (project) for (const file of (await textFiles(home)).keys()) if (!before.has(file)) await rm(file, { force: true });
     for (const [file, text] of before) await writeFile(file, text);
   };
   // The agent's copy of the game, in a folder of its own outside the repository.
@@ -220,7 +266,7 @@ async function retrofitOne(arg, agents, prompt) {
   const freshCopy = async () => {
     await rm(work, { recursive: true, force: true });
     await mkdir(work, { recursive: true });
-    if (isProject(page)) await cp(home, work, { recursive: true, filter: (from) => from !== original });
+    if (project) await cp(home, work, { recursive: true });
     await writeFile(workPage, prepared.text);
   };
   const budget = Number(value('budget', 150));
@@ -228,9 +274,20 @@ async function retrofitOne(arg, agents, prompt) {
   let spent = 0;
   let lastFailed = [];
   let kept = false;
+  let tries = 0;
+  let agentDown = 0;
+  let agentError = '';
+  const undo = async () => {
+    if (!kept) await resetGame();
+    await rm(backup, { recursive: true, force: true });
+    await rm(work, { recursive: true, force: true });
+    await rm(`${work}.prompt.md`, { force: true });
+  };
+  inHand.add(undo);
 
   try {
-    await writeFile(original, originalText);
+    if (project) await cp(home, backup, { recursive: true });
+    else await writeFile(backup, originalText);
     for (const [tier, agent] of agents.entries()) {
       let notes = '';
       for (let attempt = 1; attempt <= 2; attempt++) {
@@ -255,6 +312,8 @@ async function retrofitOne(arg, agents, prompt) {
         } else {
           reply = await run(agent, [], { shell: true, input: text, timeoutMs, cwd: work });
         }
+        if (stopping) return { game: rel(page), outcome: 'stopped' };
+        tries++;
         const { cost, text: words } = readReply(reply.out);
         spent += cost ?? 0;
         const seconds = Math.round((Date.now() - started) / 1000);
@@ -264,19 +323,26 @@ async function retrofitOne(arg, agents, prompt) {
           await noteGame(page, `unfit (${today}): ${unfit}`);
           return { game: rel(page), outcome: 'unfit', reason: unfit };
         }
-        // The try's page, and every text file it changed, copied back into the game for the checks.
-        const after = isProject(page) ? await textFiles(work) : new Map([[workPage, await readFile(workPage, 'utf8')]]);
+        // The try's page, and every file it changed (or new code it added), copied back into the game for the checks.
+        const after = project ? await textFiles(work) : new Map(await readFile(workPage, 'utf8').then((t) => [[workPage, t]], () => []));
         let changed = 0;
         for (const [file, t] of after) {
           const target = path.join(home, path.relative(work, file));
           const was = target === page ? prepared.text : before.get(target);
+          if (was === undefined && !CODE.test(file)) continue;
           if (t !== was) changed += changedLines(was ?? '', t);
           else if (target !== page) continue;
           await mkdir(path.dirname(target), { recursive: true });
           await writeFile(target, t);
         }
+        const down = reply.code !== 0 && !changed;
+        if (down) {
+          agentDown++;
+          agentError = `the agent exited with ${reply.code} and changed nothing${reply.err.trim() ? `: ${reply.err.trim().slice(-200)}` : ''}`;
+        }
         const problems = [
-          ...(reply.code !== 0 && !changed ? [`the agent exited with ${reply.code} and changed nothing${reply.err.trim() ? `: ${reply.err.trim().slice(-200)}` : ''}`] : []),
+          ...(down ? [agentError] : []),
+          ...(after.has(workPage) ? [] : ['the try deleted the page']),
           ...checkRetrofit(await gameText(page)),
           ...(changed > budget ? [`changed ${changed} lines, more than the ${budget} allowed: change only what the steps need`] : []),
         ];
@@ -291,15 +357,18 @@ async function retrofitOne(arg, agents, prompt) {
         notes = checked.failed.slice(0, 12).map((f) => `- ${f}`).join('\n');
       }
     }
+    // An agent that never ran (not installed, signed out, rate-limited) says nothing about the game: no note.
+    if (tries && agentDown === tries) {
+      await log({ outcome: 'agent', reason: agentError });
+      return { game: rel(page), outcome: 'agent', reason: agentError };
+    }
     await log({ outcome: 'gave-up', tiers: agents.length, spent });
     await noteGame(page, `failed every tier (${today}): ${lastFailed.slice(0, 2).join('; ')}`);
     return { game: rel(page), outcome: 'gave-up' };
   } finally {
     // Whatever happened, a game that did not pass is exactly as it was, and nothing is left behind.
-    if (!kept) await resetGame();
-    await rm(original, { force: true });
-    await rm(work, { recursive: true, force: true });
-    await rm(`${work}.prompt.md`, { force: true });
+    inHand.delete(undo);
+    await undo();
   }
 }
 
@@ -315,21 +384,23 @@ const scored = (text) => /\bscore\b|\blives\b|game ?over|gameOver|you win|victor
 
 async function pick() {
   const overrides = JSON.parse(await readFile(OVERRIDES, 'utf8'));
-  const games = (await catalogue()).map(normalize).filter((g) => {
-    const o = overrides[g.slug] || {};
-    return (g.type ?? 'Game') === 'Game' && !o.hidden && !o.restricted && !sessionOf(g) && !String(o.sessionNote || '').startsWith(NOTE);
-  });
+  const note = (g) => String(overrides[g.slug]?.sessionNote || '');
+  const games = (await catalogue()).map(normalize).filter((g) => (g.type ?? 'Game') === 'Game' && !overrides[g.slug]?.hidden && !overrides[g.slug]?.restricted);
+  // Titles first, as the deal counts them (lineageKey): a title with a build in sessions is
+  // done, and one found unfit (no score, no finish) stays so, whichever build was tried.
   const lineages = new Map();
   for (const g of games) {
     const k = lineageKey(g);
     if (!lineages.has(k)) lineages.set(k, []);
     lineages.get(k).push(g);
   }
+  for (const [k, builds] of lineages) if (builds.some((g) => sessionOf(g) || note(g).startsWith(`${NOTE} unfit`))) lineages.delete(k);
   const wave1 = value('wave', null) === '1';
   const out = [];
   for (const builds of lineages.values()) {
     const rated = [];
-    for (const g of builds) {
+    // A build already tried (failed, or not runnable here) waits for --again; another build of its title may go first.
+    for (const g of builds.filter((b) => !note(b).startsWith(NOTE))) {
       const page = path.join(ROOT, decodeURI(g.path).slice(1));
       const text = await gameText(page).catch(() => '');
       const r = { page, size: text.length, minified: looksMinified(text), webgpu: needsWebGPU(text), scored: scored(text) };
@@ -394,17 +465,23 @@ async function main() {
     .replaceAll('{{budget}}', String(Number(value('budget', 150))));
   const queue = [...targets];
   const results = [];
+  let agentStreak = 0;
   const worker = async () => {
     for (let arg = queue.shift(); arg; arg = queue.shift()) {
       const result = await retrofitOne(arg, agents, prompt).catch((e) => ({ game: arg, outcome: 'error', reason: e.message }));
       results.push(result);
+      agentStreak = result.outcome === 'agent' ? agentStreak + 1 : 0;
+      if (agentStreak >= 3 && queue.length) {
+        console.log(`The agent failed to run on three games in a row, so the run stops here (${queue.length} left): check the --agent command works on its own.`);
+        queue.length = 0;
+      }
       console.log(`${result.outcome.toUpperCase().padEnd(11)} ${result.game}${result.reason ? `: ${result.reason}` : ''}${result.tier !== undefined ? ` (tier ${result.tier + 1}, try ${result.attempt}, ${result.changed} lines)` : ''}`);
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, Number(value('jobs', 1))) }, worker));
   const count = (o) => results.filter((r) => r.outcome === o).length;
   console.log(
-    `\n${count('pass')} passed, ${count('unfit')} unfit, ${count('gave-up')} gave up, ${count('environment')} not drawable here, ${count('skipped')} skipped, ${count('error')} errors — every try is in .cache/retrofit.jsonl`
+    `\n${count('pass')} passed, ${count('unfit')} unfit, ${count('gave-up')} gave up, ${count('environment')} not runnable here, ${count('agent')} where the agent did not run, ${count('skipped')} skipped, ${count('error')} errors — every try is in .cache/retrofit.jsonl`
   );
 }
 

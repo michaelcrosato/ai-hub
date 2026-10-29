@@ -28,7 +28,7 @@
  * on a game before spending a model on it, since a page this browser cannot
  * run cannot be checked here. A WebGPU-only game without WebGPU is caught even
  * when its title screen shows: it asked for an adapter, got none, and drew
- * nothing with WebGL. --browser-args passes flags to Chromium; on a machine
+ * nothing with WebGL or a 2D canvas instead. --browser-args passes flags to Chromium; on a machine
  * without a GPU, SwiftShader gives such games a software adapter:
  *   --browser-args "--enable-unsafe-webgpu --enable-features=Vulkan --use-vulkan=swiftshader --use-webgpu-adapter=swiftshader --use-angle=swiftshader"
  *
@@ -137,11 +137,12 @@ function watch() {
 
   // What the page asked of the graphics stack: a WebGPU adapter it never got, and
   // no WebGL drawing instead, means this browser cannot run it (a title screen may still show).
-  const gfx = (window.__gfx = { askedForWebGPU: false, gotAdapter: false, webgl: false });
+  const gfx = (window.__gfx = { askedForWebGPU: false, gotAdapter: false, webgl: false, twoD: false });
   if (navigator.gpu?.requestAdapter) {
     const ask = navigator.gpu.requestAdapter.bind(navigator.gpu);
     Object.defineProperty(navigator.gpu, 'requestAdapter', {
       configurable: true,
+      writable: true,
       value: async (...a) => {
         gfx.askedForWebGPU = true;
         const adapter = await ask(...a);
@@ -150,12 +151,15 @@ function watch() {
       },
     });
   }
-  const getContext = HTMLCanvasElement.prototype.getContext;
-  HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
-    const context = getContext.call(this, type, ...rest);
-    if (context && /^(webgl2?|experimental-webgl)$/.test(type)) gfx.webgl = true;
-    return context;
-  };
+  for (const Canvas of [window.HTMLCanvasElement, window.OffscreenCanvas].filter(Boolean)) {
+    const getContext = Canvas.prototype.getContext;
+    Canvas.prototype.getContext = function (type, ...rest) {
+      const context = getContext.call(this, type, ...rest);
+      if (context && /^(webgl2?|experimental-webgl)$/.test(type)) gfx.webgl = true;
+      if (context && type === '2d') gfx.twoD = true;
+      return context;
+    };
+  }
 
   if (!/[?&]aihub=/.test(location.search)) return;
   const seen = (window.__hubViolations = []);
@@ -387,8 +391,10 @@ async function stillWorks(game, before, { bare = false } = {}) {
     check('on its own: the session client is there and inactive', after.hub && after.hub.active === false, JSON.stringify(after.hub));
     check('on its own: Math.random is left alone', after.hub && after.hub.seeded === false, JSON.stringify(after.hub));
   }
-  const noWebGPU = after.gfx?.askedForWebGPU && !after.gfx.gotAdapter && !after.gfx.webgl;
-  check('on its own: this browser can run it', !noWebGPU, noWebGPU ? 'it asked for WebGPU, this browser has no adapter, and nothing drew with WebGL instead' : '');
+  const g = after.gfx;
+  const noWebGPU = g?.askedForWebGPU && !g.gotAdapter && !g.webgl && !g.twoD;
+  const asked = g ? `WebGPU ${g.askedForWebGPU ? (g.gotAdapter ? 'asked, adapter' : 'asked, no adapter') : 'not asked'}; WebGL ${g.webgl ? 'yes' : 'no'}; 2D ${g.twoD ? 'yes' : 'no'}` : 'not seen';
+  check('on its own: this browser can run it', !noWebGPU, noWebGPU ? `it asked for WebGPU, this browser has no adapter, and drew nothing with WebGL or 2D instead (${asked})` : asked);
   check('on its own: it draws its screen', after.drawn, `${after.bytes} bytes of screenshot, a blank screen is ${blank}`);
   // Drawing is all a bare page is asked: its own errors are the original's business.
   if (!bare) check(`on its own: no errors${before ? ' the original did not have' : ''}`, !fresh.length, fresh.slice(0, 3).join('; '));

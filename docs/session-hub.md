@@ -144,6 +144,7 @@ to the welcome's origin.
 | hub | `end` | `reason, standings?` | last |
 | game | `error` | `message, fatal` | `AIHub.fail()` |
 | game | `fullscreen` | `on` | whenever the game calls `requestFullscreen()` or `exitFullscreen()` in a session: the page puts itself in fullscreen, so its board and cards stay over the game |
+| hub | `fullscreen` | `on` | whenever the page goes in or out of fullscreen: the client keeps the game's `document.fullscreenElement` right and fires `fullscreenchange` |
 
 Side by side, the page's address carries the round's seed
 (`?aihub=1&aihub-seed=…`), and the client seeds `Math.random` with it before

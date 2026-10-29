@@ -31,7 +31,7 @@ import { h, clear } from '../dom.js';
 import { loadManifest, normalize, sessionOf } from '../manifest.js';
 import { fnv1a } from '../color.js';
 import { createPlayer } from '../ui/player.js';
-import { createBridge, attachFrame, postTo } from '/lib/hub/bridge.js';
+import { createBridge, attachFrame, postTo, cleanProgress } from '/lib/hub/bridge.js';
 import { createRound, limitFor, rankRace, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
@@ -474,14 +474,16 @@ function openRound(cur) {
 }
 
 let pendingRound = null;
+let toGame = null;
 function attachRound(frame) {
   const cur = pendingRound;
   if (!cur) return;
+  toGame = postTo(frame);
   bridge = createBridge({
     key,
     round: cur.round,
     coordinator: cur.coordinator,
-    post: postTo(frame),
+    post: toGame,
     net,
     clock: net.clock ?? Date,
     onIssue: (i) => console.warn(`[session] ${i.problem}`),
@@ -499,10 +501,14 @@ function fullscreen(on) {
   else if (!on && document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
 }
 
+// The game hears when the page goes in or out of fullscreen, so its own toggle stays right.
+document.addEventListener('fullscreenchange', () => toGame?.({ aihub: 1, type: 'fullscreen', on: Boolean(document.fullscreenElement) }));
+
 function closeRound() {
   detach?.();
   detach = null;
   bridge = null;
+  toGame = null;
   if (player.isOpen()) player.close({ silent: true });
 }
 
@@ -527,6 +533,13 @@ function route(from, env) {
   }
   if (env.k === 'c') {
     if (coordinator && state?.current?.round === env.r) coordinator.receive(from, env.m);
+    return;
+  }
+  if (env.k === 'p') {
+    // The scoreboard, and on the host the round, hear progress whatever became of this page's own game.
+    const cur = state?.current;
+    const p = cleanProgress(env.d);
+    if (p && cur?.round === env.r && cur.players[env.f]?.key === from) noteProgress(env.r, env.f, p);
     return;
   }
   if (bridge && env.r === bridge.round) return bridge.fromNet(from, env);
