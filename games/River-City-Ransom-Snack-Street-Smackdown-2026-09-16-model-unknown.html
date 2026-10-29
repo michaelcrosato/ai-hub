@@ -2,6 +2,496 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="6">
+<meta name="hub:session-goal" content="Fastest to beat Big Cheese and grab the lunch box">
+<meta name="hub:session-howto" content="Move ← → ↑ ↓ or WASD, J punch, K kick, Space jump, E use">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#111a26">
 <meta name="description" content="Snack Street Smackdown: a complete, original pixel-art street brawler. One file. Play offline.">
@@ -288,9 +778,9 @@ function placeAtCheckpoint(){
  if(g.cleared[1]){player.x=1850;g.active=1;banner('THE LAST LUNCH','THE SCHOOL IS AHEAD. STOCK UP AT THE VAN.',2.8);}else if(g.cleared[0]){player.x=748;g.active=0;banner('TAKE A SNACK BREAK','FOOD HEALS. THE DOJO MAKES YOU STRONGER.',2.8);}else{player.x=100;g.active=0;startEncounter(0);}
  player.y=238;camera=clamp(player.x-178,0,WORLD-W);
 }
-function startGame(resume=false){audio.init();const saved=resume?validSave():null;g=newState();player=freshPlayer();if(saved){Object.assign(player,saved.p);Object.assign(g,saved.g);g.cleared=[...saved.g.cleared];player.hp=Math.max(35,player.hp);}else saveStore.remove(SAVEKEY);
+function startGame(resume=false){if(joining||sessionDone)return;audio.init();const saved=resume?validSave():null;g=newState();player=freshPlayer();if(saved){Object.assign(player,saved.p);Object.assign(g,saved.g);g.cleared=[...saved.g.cleared];player.hp=Math.max(35,player.hp);}else saveStore.remove(SAVEKEY);
  mode='playing';hideOverlay();$('titleScreen').hidden=true;placeAtCheckpoint();saveCheckpoint();clearInput();canvas.focus({preventScroll:true});syncUI();audio.sfx('click');}
-function retry(){g.deaths++;g.score=Math.max(0,g.score-150);player.cash=Math.floor(player.cash*.8);player.hp=player.maxhp;mode='playing';hideOverlay();placeAtCheckpoint();saveCheckpoint();clearInput();canvas.focus({preventScroll:true});syncUI();}
+function retry(){if(sessionDone)return;g.deaths++;g.score=Math.max(0,g.score-150);player.cash=Math.floor(player.cash*.8);player.hp=player.maxhp;mode='playing';hideOverlay();placeAtCheckpoint();saveCheckpoint();clearInput();canvas.focus({preventScroll:true});syncUI();}
 function enemy(type,x,y,name){const table={punk:[40,6,44,170],swift:[35,5,63,195],bruiser:[74,10,34,285],thrower:[42,7,44,220],boss:[350,12,38,1400]};const [hp,damage,speed,cash]=table[type];return {id:++uid,type,x,y,z:0,vz:0,vx:0,face:-1,hp,maxhp:hp,damage,speed,cash,name,attack:null,cooldown:rand(.7,1.6),stun:0,down:0,inv:0,walk:0,moving:false,dead:false,life:0,warn:0,state:'approach',phase:1,pattern:0,special:3.8,preferred:Math.random()>.5?1:-1};}
 function startEncounter(i){
  if(g.started[i])return;g.started[i]=true;g.active=i;g.fighting=true;g.clearWait=0;attackGap=1.6;projectiles=[];
@@ -456,7 +946,7 @@ const stock={food:[
 function showOverlay(html,small=false){focusBefore=document.activeElement;$('modal').innerHTML=html;$('modal').className='modal'+(small?' small':'');$('overlay').hidden=false;canvas.tabIndex=-1;$('touchPanel').classList.remove('playing');clearInput();requestAnimationFrame(()=>{const b=$('modal').querySelector('[autofocus],.primary,button');if(b)b.focus({preventScroll:true});});}
 function hideOverlay(){$('overlay').hidden=true;$('modal').innerHTML='';canvas.tabIndex=0;dialogKind='';}
 function resumePlay(){hideOverlay();mode='playing';clearInput();audio.init();canvas.focus({preventScroll:true});syncUI();}
-function openPause(){if(mode!=='playing'&&dialogKind!=='restart'&&dialogKind!=='guide')return;mode='paused';dialogKind='pause';showOverlay(`<div class="tag">THE STREET CAN WAIT</div><h2 id="modalTitle">TAKE FIVE.</h2><p>Your game is paused. Your last cleared block is saved on this device.</p><div class="stats-grid"><div class="stat-box"><small>HEALTH</small><strong>${player.hp} / ${player.maxhp}</strong></div><div class="stat-box"><small>CASH</small><strong>${money(player.cash)}</strong></div><div class="stat-box"><small>POWER / DEFENSE</small><strong>${player.power} / ${player.guard}</strong></div><div class="stat-box"><small>SNACK ATTACK</small><strong>${player.spin?'LEARNED':'NOT LEARNED'}</strong></div></div><div class="buttons"><button class="primary" id="resumeButton">RESUME &gt;</button><button class="secondary" id="pauseHelp">HOW TO PLAY</button><button class="secondary" id="restartButton">NEW RUN</button><button class="secondary" id="pauseSound">${muted?'SOUND ON':'MUTE SOUND'}</button></div>`,true);$('resumeButton').onclick=resumePlay;$('pauseHelp').onclick=openHelp;$('restartButton').onclick=confirmRestart;$('pauseSound').onclick=()=>{toggleSound();$('pauseSound').textContent=muted?'SOUND ON':'MUTE SOUND';};syncUI();}
+function openPause(){if(sessionDone)return;if(mode!=='playing'&&dialogKind!=='restart'&&dialogKind!=='guide')return;mode='paused';dialogKind='pause';showOverlay(`<div class="tag">THE STREET CAN WAIT</div><h2 id="modalTitle">TAKE FIVE.</h2><p>Your game is paused. Your last cleared block is saved on this device.</p><div class="stats-grid"><div class="stat-box"><small>HEALTH</small><strong>${player.hp} / ${player.maxhp}</strong></div><div class="stat-box"><small>CASH</small><strong>${money(player.cash)}</strong></div><div class="stat-box"><small>POWER / DEFENSE</small><strong>${player.power} / ${player.guard}</strong></div><div class="stat-box"><small>SNACK ATTACK</small><strong>${player.spin?'LEARNED':'NOT LEARNED'}</strong></div></div><div class="buttons"><button class="primary" id="resumeButton">RESUME &gt;</button><button class="secondary" id="pauseHelp">HOW TO PLAY</button><button class="secondary" id="restartButton">NEW RUN</button><button class="secondary" id="pauseSound">${muted?'SOUND ON':'MUTE SOUND'}</button></div>`,true);$('resumeButton').onclick=resumePlay;$('pauseHelp').onclick=openHelp;$('restartButton').onclick=confirmRestart;$('pauseSound').onclick=()=>{toggleSound();$('pauseSound').textContent=muted?'SOUND ON':'MUTE SOUND';};syncUI();}
 function confirmRestart(){mode='paused';dialogKind='restart';showOverlay('<div class="tag">BACK TO THE MARKET?</div><h2 id="modalTitle">START OVER?</h2><p>This starts a new run. Your current checkpoint will be replaced. Your best score stays saved.</p><div class="buttons"><button class="primary" id="cancelRestart">KEEP PLAYING</button><button class="secondary" id="confirmRestart">START NEW RUN</button></div>',true);$('cancelRestart').onclick=resumePlay;$('confirmRestart').onclick=()=>startGame(false);}
 function openHelp(){if(mode==='gameover'||mode==='victory')return;audio.init();helpBack=mode==='shop'?'shop':dialogKind==='pause'?'pause':mode==='title'?'title':'playing';mode='paused';dialogKind='guide';showOverlay(`<button class="close-modal" id="closeGuide" aria-label="Close help">×</button><div class="tag">A FEW WORDS BEFORE THE FISTS</div><h2 id="modalTitle">STREET SMARTS.</h2><p>Clear three blocks. Beat Big Cheese at the school. Get the lunch box to bring back the lunch money.</p><div class="guide-grid"><div class="control"><kbd>WASD</kbd> / arrow keys: move</div><div class="control"><kbd>J</kbd> / Z: punch combo</div><div class="control"><kbd>K</kbd> / X: kick</div><div class="control"><kbd>SPACE</kbd> / C: jump</div><div class="control"><kbd>E</kbd>Pick up, throw, or shop</div><div class="control"><kbd>SHIFT</kbd>Run</div><div class="control"><kbd>Q</kbd>Spin attack (learn at the dojo)</div><div class="control"><kbd>ESC</kbd> / P: pause</div></div><p class="guide-tip">Hold J for a three-punch combo. Jump, then press K for a flying kick. Move up or down to line up with a foe. Jump or step aside when you see “!”.</p><p>Coins come to you when you get close. Press E near a shop door to buy food or skills. Punch wooden crates for food. Press E again to throw a held weapon.</p><p style="font-size:10px;color:#93a9af">Touch controls appear on touch screens. Gamepad: stick / D-pad to move, A to jump, X to punch, B to kick, Y to use, LB to spin, RB to run, Start to pause. M: sound. F: full screen.</p><div class="buttons"><button class="primary" id="gotIt">GOT IT &gt;</button></div>`);$('closeGuide').onclick=closeGuide;$('gotIt').onclick=closeGuide;syncUI();}
 function closeGuide(){if(helpBack==='shop'){openShop(shopType);return;}if(helpBack==='pause'){openPause();return;}if(helpBack==='title'){hideOverlay();mode='title';updateTitle();syncUI();return;}resumePlay();}
@@ -468,10 +958,11 @@ function renderShop(msg=''){
  requestAnimationFrame(()=>{if(mode!=='shop'||dialogKind!=='shop')return;const valid=$('modal').querySelector(`button[data-item="${shopIndex}"]:not(:disabled)`)||$('modal').querySelector('button[data-item]:not(:disabled)')||$('leaveShop');if(valid)valid.focus({preventScroll:true});});
 }
 function buyItem(index){if(mode!=='shop')return;const item=stock[shopType][index];if(!item)return;if(!item.can()){audio.sfx('no');return;}if(player.cash<item.price){$('shopMessage').textContent='Not enough cash. Beat more foes and come back.';audio.sfx('no');return;}player.cash-=item.price;g.spent+=item.price;shopIndex=index;const msg=item.buy();audio.sfx('heal');saveCheckpoint();renderShop(msg);announce(msg);syncUI();}
-function gameOver(){mode='gameover';dialogKind='gameover';showOverlay(`<div class="tag">EVEN HEROES NEED A SNACK</div><h2 id="modalTitle">OUT TO LUNCH.</h2><p>Get up at the start of this block with full health. Keep your skills. Lose 20% of your cash.</p><div class="stats-grid"><div class="stat-box"><small>RETRY BLOCK</small><strong>${String(g.active+1).padStart(2,'0')}</strong></div><div class="stat-box"><small>CASH AFTER RETRY</small><strong>${money(Math.floor(player.cash*.8))}</strong></div></div><div class="buttons"><button class="primary" id="retryButton">GET BACK UP &gt;</button><button class="secondary" id="quitButton">TITLE SCREEN</button></div>`,true);$('retryButton').onclick=retry;$('quitButton').onclick=titleMenu;syncUI();}
+function gameOver(){mode='gameover';dialogKind='gameover';showOverlay(`<div class="tag">EVEN HEROES NEED A SNACK</div><h2 id="modalTitle">OUT TO LUNCH.</h2><p>Get up at the start of this block with full health. Keep your skills. Lose 20% of your cash.</p><div class="stats-grid"><div class="stat-box"><small>RETRY BLOCK</small><strong>${String(g.active+1).padStart(2,'0')}</strong></div><div class="stat-box"><small>CASH AFTER RETRY</small><strong>${money(Math.floor(player.cash*.8))}</strong></div></div><div class="buttons"><button class="primary" id="retryButton">GET BACK UP &gt;</button>${sessionRun?'':'<button class="secondary" id="quitButton">TITLE SCREEN</button>'}</div>`,true);$('retryButton').onclick=retry;if(!sessionRun)$('quitButton').onclick=titleMenu;syncUI();}
 function winGame(){if(mode!=='playing'||!g.finishReady)return;
+ if(sessionRun){sessionDone=true;AIHub.result({time:AIHub.time()});}
  for(const d of drops)if(d.type==='coin'){player.cash+=d.value;g.earned+=d.value;}drops=[];g.score+=Math.floor(player.cash/10)+Math.max(0,600-Math.floor(g.time));const newBest=g.score>best.score;if(newBest){best={score:g.score,time:g.time};saveStore.set(BESTKEY,best);}saveStore.remove(SAVEKEY);mode='victory';dialogKind='victory';audio.sfx('clear');const rank=g.deaths===0?(g.time<240?'S':'A'):g.deaths<3?'B':'C';
- showOverlay(`<div class="tag">${newBest?'NEW BEST SCORE!':'LUNCH MONEY RECOVERED!'} &nbsp; / &nbsp; RANK ${rank}</div><h2 id="modalTitle">LUNCH IS SERVED!</h2><p>Big Cheese is out. The lunch money is back.<br>The neighborhood can eat in peace.</p><div class="stats-grid"><div class="stat-box"><small>SCORE</small><strong>${g.score.toLocaleString()}</strong></div><div class="stat-box"><small>TIME</small><strong>${clock(g.time)}</strong></div><div class="stat-box"><small>FOES BEATEN</small><strong>${g.kills}</strong></div><div class="stat-box"><small>BEST COMBO</small><strong>${g.maxCombo} HITS</strong></div></div><p class="guide-tip">You found ${money(g.earned)} and spent ${money(g.spent)} at local shops. That's a good lunch break.</p><div class="buttons"><button class="primary" id="againButton">ANOTHER ROUND &gt;</button><button class="secondary" id="winTitle">TITLE SCREEN</button></div>`);$('againButton').onclick=()=>startGame(false);$('winTitle').onclick=titleMenu;announce('You won. Lunch money recovered. Rank '+rank+'. Score '+g.score);syncUI();}
+ showOverlay(`<div class="tag">${newBest?'NEW BEST SCORE!':'LUNCH MONEY RECOVERED!'} &nbsp; / &nbsp; RANK ${rank}</div><h2 id="modalTitle">LUNCH IS SERVED!</h2><p>Big Cheese is out. The lunch money is back.<br>The neighborhood can eat in peace.</p><div class="stats-grid"><div class="stat-box"><small>SCORE</small><strong>${g.score.toLocaleString()}</strong></div><div class="stat-box"><small>TIME</small><strong>${clock(g.time)}</strong></div><div class="stat-box"><small>FOES BEATEN</small><strong>${g.kills}</strong></div><div class="stat-box"><small>BEST COMBO</small><strong>${g.maxCombo} HITS</strong></div></div><p class="guide-tip">You found ${money(g.earned)} and spent ${money(g.spent)} at local shops. That's a good lunch break.</p>${sessionRun?'':'<div class="buttons"><button class="primary" id="againButton">ANOTHER ROUND &gt;</button><button class="secondary" id="winTitle">TITLE SCREEN</button></div>'}`);if(!sessionRun){$('againButton').onclick=()=>startGame(false);$('winTitle').onclick=titleMenu;}announce('You won. Lunch money recovered. Rank '+rank+'. Score '+g.score);syncUI();}
 function updateTitle(){let s=validSave();$('startButton').innerHTML=(s?'CONTINUE':'LET\'S EAT')+' <span aria-hidden="true">&gt;</span>';$('newRunButton').hidden=!s;$('bestLabel').textContent=best.score?'BEST SCORE '+best.score.toLocaleString()+' / '+clock(best.time):'A GOOD OLD-FASHIONED LUNCH BREAK.';}
 function titleMenu(){if(g&&player&&!player.dead&&mode!=='victory')saveCheckpoint();hideOverlay();mode='title';$('titleScreen').hidden=false;clearInput();updateTitle();syncUI();}
 function syncUI(){
@@ -556,8 +1047,18 @@ function pollGamepad(){let pad;try{pad=[...(navigator.getGamepads?navigator.getG
 }
 $('startButton').onclick=()=>startGame(!!validSave());$('newRunButton').onclick=()=>startGame(false);$('helpButton').onclick=openHelp;$('soundButton').onclick=toggleSound;$('fullButton').onclick=fullscreen;
 document.addEventListener('fullscreenchange',()=>{$('fullButton').setAttribute('aria-label',document.fullscreenElement?'Leave full screen':'Full screen');});
-function frame(ts){if(!lastTime)lastTime=ts;const delta=Math.min((ts-lastTime)/1000,.1);lastTime=ts;worldTime+=delta;pollGamepad();accumulator+=delta;let steps=0;while(accumulator>=1/60&&steps++<6){if(mode==='playing')updateGame(1/60);pressed.clear();accumulator-=1/60;}audio.tick();render();requestAnimationFrame(frame);}
+function frame(ts){if(!lastTime)lastTime=ts;const delta=Math.min((ts-lastTime)/1000,.1);lastTime=ts;worldTime+=delta;pollGamepad();accumulator+=delta;let steps=0;while(accumulator>=1/60&&steps++<6){if(mode==='playing'&&sessionPlays())updateGame(1/60);pressed.clear();accumulator-=1/60;}if(sessionRun&&AIHub.time()>=0)AIHub.progress({score:g.score,label:g.finishReady?'Get the lunch box':'Blocks cleared '+g.cleared.filter(Boolean).length+' of 3'});audio.tick();render();requestAnimationFrame(frame);}
+// Side by side: the hub owns the start, the clock and the end. Outside a session none of this changes the game.
+let joining=AIHub.active,sessionRun=false,sessionDone=false;
+const sessionPlays=()=>!sessionRun||(AIHub.time()>=0&&!sessionDone);
+function sessionStart(){
+ sessionRun=true;startGame(false);
+ AIHub.on('time-up',()=>{AIHub.result({score:g.score});sessionDone=true;});
+ AIHub.on('end',()=>{sessionDone=true;if(audio.ctx)audio.ctx.suspend().catch(()=>{});});
+ AIHub.ready();
+}
 makeWorld();refreshSound();updateTitle();syncUI();requestAnimationFrame(frame);
+if(AIHub.active){$('titleScreen').hidden=true;AIHub.connect({mode:'parallel',seats:[1,4]}).then(info=>{joining=false;if(info)sessionStart();else titleMenu();});}
 // A read-only state view is useful for browser checks. It does not change gameplay.
 window.snackStreet={get state(){return {mode,player:player?{x:player.x,y:player.y,hp:player.hp,maxhp:player.maxhp,cash:player.cash,power:player.power,guard:player.guard,spin:player.spin,weapon:player.weapon,attack:player.attack?.kind}:null,stage:g?.active,cleared:g?[...g.cleared]:null,enemies:enemies.filter(e=>!e.dead).map(e=>({id:e.id,name:e.name,type:e.type,x:e.x,y:e.y,hp:e.hp,phase:e.phase,attack:e.attack?.kind})),score:g?.score,time:g?.time,combo:g?.maxCombo,props:props.filter(p=>!p.broken).map(p=>({type:p.type,x:p.x,y:p.y})),drops:drops.length,projectiles:projectiles.length,dialog:dialogKind,finishReady:g?.finishReady};}};
 

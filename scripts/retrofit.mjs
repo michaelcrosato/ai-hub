@@ -150,13 +150,14 @@ function readReply(out) {
 
 async function hubCheck(args) {
   const browser = value('browser-args', null);
-  const { out } = await run(process.execPath, [path.join(ROOT, 'scripts/hub-check.mjs'), ...args, ...(browser ? ['--browser-args', browser] : []), '--json']);
+  const { code, out, err } = await run(process.execPath, [path.join(ROOT, 'scripts/hub-check.mjs'), ...args, ...(browser ? ['--browser-args', browser] : []), '--json']);
   try {
     const report = JSON.parse(out.slice(out.indexOf('{')));
     const failed = report.runs.flatMap((r) => r.checks.filter((c) => !c.pass).map((c) => `${r.players} players ${r.scenario}: ${c.name}${c.detail ? ` (${c.detail})` : ''}`));
     return { pass: report.pass, failed };
   } catch {
-    return { pass: false, failed: [`hub-check did not report: ${out.slice(-300)}`] };
+    // Its stdout is only the report, so a crash or a hang says why on stderr.
+    return { pass: false, failed: [`hub-check did not report (exit ${code}): ${(err || out).trim().slice(-300)}`] };
   }
 }
 

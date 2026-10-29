@@ -222,15 +222,52 @@ Playwright. Nothing here needs cc-matrix.
    agent prints one. Nothing is committed for the owner: what passed is
    reviewed, a few are played, and it goes in by batches of about fifty.
 
-**Pilot first**: about thirty varied wave-1 games (2D and 3D, single file and
-project folder, small and large), plus five minified and five WebGPU-only
-games to size the later tracks. Read the pass rate, the cost per game and the
-minutes per game; play a few that passed; then the rest of wave 1 in batches.
+**Pilot first**: done on Oct 29 with 32 wave-1 games (2D and 3D, single file
+and project folder, small and large); its figures are in *What it costs*. The
+minified and WebGPU-only tracks are not sized yet: five of each go with the
+first batch of the rest of wave 1.
 
 ### What it costs
 
-The pilot sets the real figure; this is the estimate it replaces. List
-prices per million tokens (Anthropic, Oct 2026):
+**The pilot** (Oct 29, 2026, from the owner's computer): every seventh game
+of `pick --wave 1`, 32 in all, two at a time, Haiku 5.5 then Sonnet 5.5,
+`--max-cost 1`. It took 1 h 35 min.
+
+| | Games | |
+|---|---|---|
+| Passed | 26 of 32 (81%) | 24 on Haiku 5.5 (19 on the first try), 2 on Sonnet 5.5 (DuckTales Pennywing, Form Lab); 7 of the 10 project folders |
+| Unfit | 2 | Third Avenue (a life sim with no finish or round-sized score), Baseball Stars (nine innings take 25–35 minutes) |
+| Gave up | 4 | see below |
+
+Cost: **$16.96 in all; $0.39 a game (median), $0.53 on average**; a game
+that passed cost $0.33 (median), at most $1.18. A Haiku 5.5 try cost $0.28
+(median, 45 tries), seven times the estimate below; a Sonnet 5.5 try $0.50
+(9 tries). Agent time was 4.4 minutes a game (median). At these rates the
+rest of wave 1 (about 200 games) costs about $110 and takes about ten hours
+at two at a time.
+
+Why the four failed:
+
+- **TESIII Ash and Oath** (222 KB), **Break Point** and **Little Orbit**
+  (a 4.2 MB project folder): after the agent's edit, `hub-check` printed
+  no report at all, on every try (Little Orbit's last try, on Sonnet 5.5,
+  also never called `AIHub.connect`). `retrofit.mjs` dropped hub-check's
+  stderr, so the ledger says only "did not report"; it now keeps it, and
+  the next run says why. $1.07–$1.47 each.
+- **Myth of Zela**: in the host-leave scenario the edited game threw
+  "THREE is not defined" and its copies never said hello. $1.01.
+
+What to change before the next batch: an unfit game cost $0.70, because
+Haiku 5.5 exited twice without a word before Sonnet 5.5 said it was unfit,
+so a tier-1 exit that changes nothing should end the game's Haiku tries.
+Games that pause on `blur` (Slick and Skid) pause in the harness, where two
+copies share one page; in a session each player has a window of their own.
+Three passing games (Starflock, Slick and Skid, Gloomkeep) were played in
+the harness with 2 players: a full side-by-side round each, every check
+passed.
+
+**The estimate the pilot replaced.** List prices per million tokens
+(Anthropic, Oct 2026):
 
 | Model | Input | Output | Cache read | Cache write (1 h) |
 |---|---|---|---|---|
@@ -359,10 +396,11 @@ games or so a night.
 
 **Next**
 
-- **The retrofit pilot**, from the owner's computer, right after migrations
-  0007 and 0008 (both in the handoff's `/goal`): about thirty varied games
-  from wave 1. Its pass rate and cost per game settle the tiers and the cap
-  (row 4 of *Open decisions*); the games that pass are dealt from then on.
+- **The rest of wave 1**, in batches of about fifty, from the owner's
+  computer. The pilot (*What it costs*) passed 26 of 32 games for $16.96;
+  those 26 are dealt now. First, end a game's Haiku 5.5 tries when one exits
+  without changing anything, and rerun the three games hub-check gave no
+  report on, now that it says why.
 
 Then the hub alone, no game changes:
 
@@ -478,7 +516,7 @@ layout: an ai-hub change, made when the first cc-matrix builds come in.
 | 1 | Decisions 3 and 4 | Decided Oct 29: state, not video, and no video anywhere (remote couch pinned); dedicated servers prepared in the games now, built when wanted |
 | 2 | Side by side as "best attempt in the window", with *Again* | Yes: after the pilot, before wave 1 is dealt; no game changes |
 | 3 | WebGPU-only games: drop "no fallback" in cc-matrix, or rely on `hub:webgpu`? | Both work; dropping it lets every friend play every new game |
-| 4 | Retrofit tiers and cap | Haiku 5.5, then Sonnet 5.5, $1 a game; confirm after the pilot |
+| 4 | Retrofit tiers and cap | Confirmed by the pilot: Haiku 5.5, then Sonnet 5.5, $1 a game. 81% passed, 92% of them on Haiku 5.5; $0.39 a game (median); no game passed past $1.18 |
 | 5 | Which builds first | One build of each title, readable and without WebGPU: wave 1, 228 games (`pick --wave 1`) |
 | 6 | Phones | Built the cheap way: a seat with only a touch screen is dealt touch-tagged games while any fit; no work per game |
 | 7 | Live scoreboard on or off by default | On, folded with a tap, remembered per device (built) |

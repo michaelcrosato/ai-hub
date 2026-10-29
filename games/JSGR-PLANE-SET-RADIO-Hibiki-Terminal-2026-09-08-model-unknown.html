@@ -1,7 +1,497 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta charset="utf-8">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="5">
+<meta name="hub:session-goal" content="Most points: paint 8 walls, then reach the van in time">
+<meta name="hub:session-howto" content="Move WASD or arrows. Space jumps, Shift boosts, E paints walls and hands in">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#192632"><meta name="description" content="Plane Set Radio. A complete, offline 3D skate-and-paint game in one file. Eight walls. One pirate signal.">
 <title>PLANE SET RADIO — Hibiki Terminal</title>
 <script type="importmap">
@@ -364,6 +854,7 @@ function syncPickups(){for(const q of pickups){const g=q.g;if(g.visible){_q4.set
 const $=id=>document.getElementById(id), fxCanvas=$('fx'), fx=fxCanvas.getContext('2d');
 let mode='menu',freeMode=false,relayMode=false,runKind='mission',sim=0,elapsed=0,menuTime=0,toastTime=0,radioTime=0,shake=0,hitFlash=0,paintSession=null,nearTarget=null,wayTarget=null,camYaw=0,camPitch=.43,camZoom=0,manualCamera=0,eye=V(5,5.6,45),camTarget=V(13,2.8,31),fov=63,overlayReturn='play',helpFrom=null,countTime=0,countBeep=4,countKey='',tutorialPhase=0,hudTimer=0,heat=0,grindSound=0,relayIndex=0,resultAt=0,reducedMotion=matchMedia('(prefers-reduced-motion: reduce)').matches;
 let inMove={x:0,y:0},boostHeld=false;
+let sessionRun=false,sessionOver=false,clockAt=0;
 const store={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
 // Street heat: how hard the mission run pushes back. Standard is the original balance; each heat keeps its own best.
 const HEATS={chill:{label:'CHILL',time:330,guard:.85,hurt:.6,lock:2.1,key:'-chill',line:'Eight walls. Five and a half minutes. Slower patrols.'},standard:{label:'STANDARD',time:270,guard:1,hurt:1,lock:1.65,key:'',line:'Eight walls. Four minutes, thirty seconds. One signal.'},riot:{label:'RIOT',time:225,guard:1.15,hurt:1.35,lock:1.3,key:'-riot',line:'Eight walls. Three minutes, forty-five. Faster patrols.'}},HEAT_ORDER=['chill','standard','riot'];
@@ -403,10 +894,10 @@ function updateEnemies(dt){for(let g of guards){g.cool-=dt;let dx=p.x-g.x,dz=p.z
 function clearEnemies(){guards.forEach(g=>{g.sk.root.visible=false;guardPool.push(g)});drones.forEach(d=>{d.g.visible=false;d.ring.visible=false;dronePool.push(d)});guards.length=0;drones.length=0;heat=0}
 function resetLevel(){for(let t of targets){t.done=false;t.paint.visible=false;t.paint.alpha=1;t.marker.visible=true}for(let q of pickups){q.active=true;q.g.visible=true;q.cool=0}for(let v of traffic){v.g.z=48;v.p.z=v.c.z=48}particlePool.forEach(q=>{q.life=0});relayIndex=0;for(let r of relayRings)r.g.visible=false;beacon.visible=false;clearEnemies()}
 function hideOverlays(){['pauseOverlay','helpOverlay','resultOverlay','mapOverlay'].forEach(id=>$(id).style.display='none');navClear();document.activeElement?.blur?.();kit.input.settle()}
-function start(kind='mission'){hideOverlays();AudioSys.init();AudioSys.pause(false);runKind=kind;freeMode=kind==='free';relayMode=kind==='relay';mode='countdown';countTime=freeMode?.9:3.3;countBeep=4;countKey='';elapsed=0;resetLevel();Object.assign(p,{x:0,y:0,z:34,vx:0,vy:0,vz:0,heading:PI,ground:true,coyote:0,jumpBuffer:0,health:100,boost:1,paint:20,score:0,timer:diff.time,tags:0,records:0,combo:1,chain:0,tricks:0,grind:null,railLock:0,airTime:0,spin:0,trickCool:0,invuln:0,safe:V(0,0,34),bestChain:1,grindDistance:0});paintSession=null;toastTime=0;radioTime=0;tutorialPhase=0;$('radio').classList.remove('show');$('toast').style.opacity=0;$('spray').style.display='none';$('menu').style.display='none';$('menuTape').style.display='none';$('countdown').style.display='grid';document.body.classList.add('playing');$('timer-label').textContent=freeMode?'NO CLOCK. NO PATROLS.':relayMode?'RELAY TIME':'SIGNAL REMAINING';$('goal-line').textContent=freeMode?'Explore, paint, and find your flow.':relayMode?'Skate through the green rings in order.':'Follow the green arrows.';$('objective-title').textContent=relayMode?'SIGNAL RELAY':'PAINT THE DISTRICT';$('best-line').firstChild.textContent=relayMode?'BEST TIME ':'BEST ';setStyle($('tutorial'),'display','block');setTutorial();if(relayMode){for(let t of targets)t.marker.visible=false;updateRings()}camZoom=0;resetCamera();updateHUD();hero.root.visible=true;setTouch()}
+function start(kind='mission'){if(AIHub.active){if(sessionRun)return;sessionRun=true}hideOverlays();AudioSys.init();AudioSys.pause(false);runKind=kind;freeMode=kind==='free';relayMode=kind==='relay';mode='countdown';countTime=freeMode?.9:3.3;countBeep=4;countKey='';elapsed=0;resetLevel();Object.assign(p,{x:0,y:0,z:34,vx:0,vy:0,vz:0,heading:PI,ground:true,coyote:0,jumpBuffer:0,health:100,boost:1,paint:20,score:0,timer:diff.time,tags:0,records:0,combo:1,chain:0,tricks:0,grind:null,railLock:0,airTime:0,spin:0,trickCool:0,invuln:0,safe:V(0,0,34),bestChain:1,grindDistance:0});paintSession=null;toastTime=0;radioTime=0;tutorialPhase=0;$('radio').classList.remove('show');$('toast').style.opacity=0;$('spray').style.display='none';$('menu').style.display='none';$('menuTape').style.display='none';$('countdown').style.display='grid';document.body.classList.add('playing');$('timer-label').textContent=freeMode?'NO CLOCK. NO PATROLS.':relayMode?'RELAY TIME':'SIGNAL REMAINING';$('goal-line').textContent=freeMode?'Explore, paint, and find your flow.':relayMode?'Skate through the green rings in order.':'Follow the green arrows.';$('objective-title').textContent=relayMode?'SIGNAL RELAY':'PAINT THE DISTRICT';$('best-line').firstChild.textContent=relayMode?'BEST TIME ':'BEST ';setStyle($('tutorial'),'display','block');setTutorial();if(relayMode){for(let t of targets)t.marker.visible=false;updateRings()}camZoom=0;resetCamera();updateHUD();hero.root.visible=true;setTouch()}
 function finish(win,reason=''){if(mode!=='play')return;cancelPaint(true);mode='result';p.invuln=0;resultAt=performance.now();kit.input.settle();p.grind=null;p.vx=p.vz=p.vy=0;setStyle(H.interact,'display','none');setStyle($('tutorial'),'display','none');setStyle($('waypoint'),'display','none');let grade,newBest;
  if(relayMode){let time=elapsed;grade=time<=32?'S':time<=42?'A':time<=58?'B':'C';newBest=!(bestRelay>0)||time<bestRelay;if(newBest){bestRelay=time;store.set('plane-set-radio-relay',String(time))}$('rl-score').textContent='RELAY TIME';$('rl-time').textContent='STREET SCORE';$('rl-tags').textContent='RELAYS';$('result-eyebrow').textContent='BROADCAST 02 / RELAY COMPLETE';$('result-title').innerHTML='SIGNAL<br>CARRIED.';$('result-copy').textContent='Ten relays. One clean line across Hibiki.';$('result-score').textContent=relayText(time);$('result-time').textContent=Math.floor(p.score).toLocaleString();$('result-tags').textContent=relayIndex+' / '+relayRings.length;$('result-breakdown').textContent='S 0:32 · A 0:42 · B 0:58 / Best chain ×'+p.bestChain;$('result-best').textContent=(newBest?'NEW BEST TIME / ':'BEST TIME / ')+relayText(bestRelay)}
- else{let street=Math.floor(p.score),bonus=win?Math.floor(p.timer)*60:0,total=street+bonus;p.score=total;grade=win?(total>=65000?'S':total>=42000?'A':total>=26000?'B':'C'):'—';newBest=total>bestScore;if(newBest){bestScore=total;bestGrade=win?grade:'';store.set('plane-set-radio-best'+diff.key,String(total));store.set('plane-set-radio-grade'+diff.key,bestGrade)}$('rl-score').textContent='TOTAL SCORE';$('rl-time').textContent='TIME LEFT';$('rl-tags').textContent='WALLS PAINTED';$('result-eyebrow').textContent=(win?'BROADCAST 01 / TRANSMISSION COMPLETE':'BROADCAST 01 / SIGNAL LOST')+' · '+diff.label;$('result-title').innerHTML=win?'THE CITY<br>IS YOURS.':'SIGNAL<br>LOST.';$('result-copy').textContent=win?'Eight walls. One very loud message.':reason;$('result-score').textContent=total.toLocaleString();$('result-time').textContent=timeText(p.timer);$('result-tags').textContent=p.tags+' / 8';$('result-breakdown').textContent='Street '+street.toLocaleString()+' + time '+bonus.toLocaleString()+' / Best chain ×'+p.bestChain;$('result-best').textContent=newBest?'NEW BEST / '+bestScore.toLocaleString():'PERSONAL BEST / '+bestScore.toLocaleString()}
+ else{let street=Math.floor(p.score),bonus=win?Math.floor(p.timer)*60:0,total=street+bonus;p.score=total;if(AIHub.active)AIHub.result({score:total});grade=win?(total>=65000?'S':total>=42000?'A':total>=26000?'B':'C'):'—';newBest=total>bestScore;if(newBest){bestScore=total;bestGrade=win?grade:'';store.set('plane-set-radio-best'+diff.key,String(total));store.set('plane-set-radio-grade'+diff.key,bestGrade)}$('rl-score').textContent='TOTAL SCORE';$('rl-time').textContent='TIME LEFT';$('rl-tags').textContent='WALLS PAINTED';$('result-eyebrow').textContent=(win?'BROADCAST 01 / TRANSMISSION COMPLETE':'BROADCAST 01 / SIGNAL LOST')+' · '+diff.label;$('result-title').innerHTML=win?'THE CITY<br>IS YOURS.':'SIGNAL<br>LOST.';$('result-copy').textContent=win?'Eight walls. One very loud message.':reason;$('result-score').textContent=total.toLocaleString();$('result-time').textContent=timeText(p.timer);$('result-tags').textContent=p.tags+' / 8';$('result-breakdown').textContent='Street '+street.toLocaleString()+' + time '+bonus.toLocaleString()+' / Best chain ×'+p.bestChain;$('result-best').textContent=newBest?'NEW BEST / '+bestScore.toLocaleString():'PERSONAL BEST / '+bestScore.toLocaleString()}
  $('grade').textContent=grade;$('result-records').textContent='RECORDS '+p.records+'/3';$('resultOverlay').style.display='flex';navClear();if(win){AudioSys.sfx('win');emit(V(p.x,p.y+3,p.z),LIME,45,12);kit.input.rumble(.5,320)}else{AudioSys.sfx('error');kit.input.rumble(.6,400)}updateHUD()}
 function mainMenu(){hideOverlays();cancelPaint(true);resetLevel();mode='menu';relayMode=false;document.body.classList.remove('playing');$('menu').style.display='block';$('menuTape').style.display='block';$('countdown').style.display='none';hero.root.visible=true;hero.root.x=19;hero.root.y=.18;hero.root.z=35;hero.root.ry=-.8;eye=V(5,5.6,45);camTarget=V(13,2.8,31);AudioSys.pause(false);updateMenuBest();setTouch()}
 function pause(which='pauseOverlay'){if(mode!=='play'&&mode!=='countdown')return;overlayReturn=mode;mode='pause';kit.input.settle();navClear();AudioSys.pause(true);$(which).style.display='flex';$('safeBtn').disabled=overlayReturn!=='play';if(which==='pauseOverlay')$('pauseSummary').textContent='Hibiki Terminal · '+(freeMode?'Free skate':relayMode?'Signal relay · '+relayIndex+'/'+relayRings.length+' rings · '+relayText(elapsed):diff.label.toLowerCase()+' heat · '+p.tags+'/8 walls · '+timeText(p.timer)+' left');if(which==='mapOverlay')drawMap($('bigmap'),true)}
@@ -416,6 +907,8 @@ function showHelp(){if(mode==='menu'){helpFrom='menu';$('helpOverlay').style.dis
 function closeHelp(){$('helpOverlay').style.display='none';navClear();kit.input.settle();if(helpFrom==='pause'){$('pauseOverlay').style.display='flex';return}if(helpFrom==='map'){$('mapOverlay').style.display='flex';drawMap($('bigmap'),true);return}if(helpFrom==='game')resume()}
 function timeText(t){let s=Math.ceil(Math.max(0,t));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
 function relayText(t){let tenths=Math.floor(Math.max(0,t)*10),m=Math.floor(tenths/600),rest=tenths-m*600;return m+':'+String(Math.floor(rest/10)).padStart(2,'0')+'.'+(rest%10)}
+// In a session the run's clock is the hub's, so a pause costs time as it does on the scoreboard.
+function clockStep(dt){if(!AIHub.active)return dt;let t=AIHub.time(),d=(t-clockAt)/1000;clockAt=t;return d}
 function updatePlayer(dt){p.invuln=Math.max(0,p.invuln-dt);p.railLock=Math.max(0,p.railLock-dt);p.trickCool-=dt;p.spin=Math.max(0,p.spin-dt);p.jumpBuffer=Math.max(0,p.jumpBuffer-dt);if(p.chain>0){p.chain-=dt;if(p.chain<=0)p.combo=1}let boosting=boostHeld&&p.boost>.015;
  if(paintSession){let s=paintSession;s.age+=dt;s.time-=dt;p.boost=Math.min(1,p.boost+dt*.2);if(s.time<=0){cancelPaint();toast('TRY THAT WALL AGAIN','MATCH THE ARROWS',1.5)}return}
  let ix=inMove.x,iz=-inMove.y;let il=Math.hypot(ix,iz);if(il>1){ix/=il;iz/=il}let wx=ix*Math.cos(camYaw)+iz*Math.sin(camYaw),wz=iz*Math.cos(camYaw)-ix*Math.sin(camYaw);
@@ -432,8 +925,8 @@ function updateWorld(dt){sim+=dt;for(let t of targets)if(!t.done){t.marker.y=t.p
  for(let v of traffic){if(mode==='menu'||mode==='play'){let dz=v.dir*v.speed*dt;v.g.z+=dz;if(v.g.z<-16||v.g.z>53)v.dir*=-1;v.p.z=v.c.z=v.g.z;if(mode==='play'&&!p.grind){if(p.y>=3.5&&inside(p.x,p.z,v.p))p.z+=dz;else if(p.y<3.5&&inside(p.x,p.z,v.c,.5))shoveOut(v.c,dz)}}}
  for(let n of npcs){n.sk.root.z=n.z+Math.sin(sim*.18+n.phase)*5;n.sk.root.ry=Math.cos(sim*.18+n.phase)>0?0:PI;pose(n.sk,sim+n.phase,2.2)}beacon.ry+=dt*.7;beacon.children.forEach((n,i)=>n.y=.8+Math.sin(sim*3+i)*.23);if(relayMode&&relayIndex<relayRings.length){let rg=relayRings[relayIndex].g;rg.sx=rg.sy=rg.sz=1+Math.sin(sim*6)*.06}
 }
-function update(dt){if(mode==='menu'){menuTime+=dt;updateWorld(dt);return}if(mode==='pause')return;if(mode==='countdown'){updateWorld(dt);countTime-=dt;let n=Math.ceil(Math.max(0,countTime-.45));if(n!==countBeep){countBeep=n;AudioSys.sfx('count',n<=0?0:n)}let cd=countTime>.55?(freeMode?'FREE':Math.ceil(countTime-.45))+'<small>'+(relayMode?'SIGNAL RELAY':'HIBIKI TERMINAL')+'</small>':'GO!<small>MAKE SOME NOISE.</small>';if(cd!==countKey){countKey=cd;$('countdown').innerHTML=cd}if(countTime<=0){mode='play';$('countdown').style.display='none';radio(freeMode?'No clock. No patrols. Explore the district, paint the walls, and find your line.':relayMode?'Relay run! Carry the signal through ten rings, then home to the van. Rails and boost are the fast line.':'Kite, you are live in Hibiki! Paint the eight green marks. Then bring the signal back to our van.',6)}return}if(mode==='result'){updateWorld(dt);return}
- elapsed+=dt;if(!freeMode&&!relayMode){p.timer-=dt;if(p.timer<=0){p.timer=0;finish(false,'Time is up. The district still needs your signal.');return}}updatePlayer(dt);updateWorld(dt);if(relayMode)checkRelay();else if(!freeMode)updateEnemies(dt);if(toastTime>0){toastTime-=dt;if(toastTime<=0)$('toast').style.opacity=0}if(radioTime>0){radioTime-=dt;if(radioTime<=0)$('radio').classList.remove('show')}shake=Math.max(0,shake-dt*2.6);hitFlash=Math.max(0,hitFlash-dt*2.1);if(elapsed>16)setStyle($('tutorial'),'display','none');if(paintSession)setStyle($('stroke-time'),'width',(paintSession.time/9*100).toFixed(1)+'%');AudioSys.update(Math.hypot(p.vx,p.vz),!!p.grind);
+function update(dt){if(mode==='menu'){menuTime+=dt;updateWorld(dt);return}if(mode==='pause')return;if(mode==='countdown'){updateWorld(dt);countTime=AIHub.active?(AIHub.time()===-Infinity?countTime:-AIHub.time()/1000):countTime-dt;let n=Math.ceil(Math.max(0,countTime-.45));if(n!==countBeep){countBeep=n;AudioSys.sfx('count',n<=0?0:n)}let cd=countTime>.55?(freeMode?'FREE':Math.ceil(countTime-.45))+'<small>'+(relayMode?'SIGNAL RELAY':'HIBIKI TERMINAL')+'</small>':'GO!<small>MAKE SOME NOISE.</small>';if(cd!==countKey){countKey=cd;$('countdown').innerHTML=cd}if(countTime<=0){mode='play';$('countdown').style.display='none';radio(freeMode?'No clock. No patrols. Explore the district, paint the walls, and find your line.':relayMode?'Relay run! Carry the signal through ten rings, then home to the van. Rails and boost are the fast line.':'Kite, you are live in Hibiki! Paint the eight green marks. Then bring the signal back to our van.',6)}return}if(mode==='result'){updateWorld(dt);return}
+ elapsed+=dt;if(!freeMode&&!relayMode){p.timer-=clockStep(dt);if(p.timer<=0){p.timer=0;finish(false,'Time is up. The district still needs your signal.');return}}updatePlayer(dt);updateWorld(dt);if(relayMode)checkRelay();else if(!freeMode)updateEnemies(dt);if(toastTime>0){toastTime-=dt;if(toastTime<=0)$('toast').style.opacity=0}if(radioTime>0){radioTime-=dt;if(radioTime<=0)$('radio').classList.remove('show')}shake=Math.max(0,shake-dt*2.6);hitFlash=Math.max(0,hitFlash-dt*2.1);if(elapsed>16)setStyle($('tutorial'),'display','none');if(paintSession)setStyle($('stroke-time'),'width',(paintSession.time/9*100).toFixed(1)+'%');AudioSys.update(Math.hypot(p.vx,p.vz),!!p.grind);
 }
 const camDesired=V(),camLook=V();
 function updateCamera(dt){if(mode==='menu'){eye.x=5+Math.sin(menuTime*.1)*1.3;eye.y=5.6+Math.sin(menuTime*.2)*.2;eye.z=45;camTarget.x=13;camTarget.y=2.8;camTarget.z=31;fov=63;hero.root.x=19;hero.root.y=.18;hero.root.z=35;hero.root.ry=-.8;pose(hero,sim,0);heroShadow.x=hero.root.x;heroShadow.z=hero.root.z;heroShadow.y=.17;heroShadow.sx=2.7;heroShadow.sz=1;heroShadow.sy=2.1;heroShadow.alpha=.7;hero.arms[0].a.rz=-.35;hero.arms[1].a.rx=-.35;return}if(mode==='pause')return;manualCamera=Math.max(0,manualCamera-dt);let speed=Math.hypot(p.vx,p.vz);if(mode==='result'){camYaw+=dt*.11;camPitch=.32}if(mode==='play'&&manualCamera<=0&&speed>4&&!paintSession&&inMove.y>-.4){let behind=p.heading+PI;camYaw+=angle(camYaw,behind)*Math.min(dt*1.1,1)}let camDist=15+speed*.055+camZoom;const d=camDesired,l=camLook;
@@ -505,7 +998,7 @@ function handleMenu(root,dt){const inp=kit.input,id=root.id;
  const items=navItems(root),primary=root.querySelector('.primary'),cur=items.indexOf(nav.el);
  if(step&&items.length){if(cur>=0&&axis==='x'&&nav.el.type==='range'){const r=nav.el;r.value=String(clamp(Number(r.value)+dir*5,Number(r.min),Number(r.max)));r.dispatchEvent(new Event('input',{bubbles:true}))}else navFocus(cur<0?(items.includes(primary)?primary:items[0]):items[(cur+dir+items.length)%items.length])}
  if(confirm){if(id==='resultOverlay'&&performance.now()-resultAt<900)return;const target=cur>=0?nav.el:primary;if(target&&target.type!=='range')target.click()}}
-function handleInput(dt){setTouch();const inp=kit.input,mv=inp.vector('move');inMove.x=mv.x;inMove.y=mv.y;boostHeld=inp.down('boost');
+function handleInput(dt){setTouch();if(sessionOver)return;const inp=kit.input,mv=inp.vector('move');inMove.x=mv.x;inMove.y=mv.y;boostHeld=inp.down('boost');
  if(inp.pressed('mute'))toggleSound();
  const root=menuRoot();if(root){handleMenu(root,dt);return}if(nav.el)navClear();
  if(mode!=='play'&&mode!=='countdown')return;
@@ -535,14 +1028,14 @@ window.addEventListener('blur',()=>{if(mode==='play'||mode==='countdown')pause()
 const unlockAudio=()=>{const c=AudioSys.ctx;if(c&&AudioSys.active&&c.state==='suspended')c.resume().catch(()=>{})};
 addEventListener('pointerdown',unlockAudio,true);addEventListener('keydown',unlockAudio,true);
 // The kit's settings panel pauses the loop: hold the run in the game's own pause menu and stop the music.
-kit.onPause(on=>{if(on){if(mode==='play'||mode==='countdown')pause();AudioSys.pause(true)}else if(mode!=='pause')AudioSys.pause(false)});
+kit.onPause(on=>{if(on){if(mode==='play'||mode==='countdown')pause();AudioSys.pause(true)}else if(mode!=='pause'&&!sessionOver)AudioSys.pause(false)});
 kit.input.onSourceChange(applyPrompts);
 
 // Expose a read-only snapshot for local checks. Game state stays in this file.
 window.PSR={getState:()=>({mode,freeMode,relayMode,position:{x:p.x,y:p.y,z:p.z},speed:Math.hypot(p.vx,p.vz),ground:p.ground,grinding:!!p.grind,score:Math.floor(p.score),time:relayMode?elapsed:p.timer,health:p.health,paint:p.paint,tags:p.tags,relays:relayIndex,heat,records:p.records,draws:renderer.info.render.calls,backend:kit.backend}),version:'2.0.0'};
 
 // Fixed-size steps keep rail capture and collisions stable at different frame rates.
-function frame(dt){handleInput(dt);let remaining=dt;while(remaining>0){let step=Math.min(remaining,1/90);update(step);remaining-=step}updateCamera(dt);syncNode(dynamic,scene);syncSparks();syncPickups();camera.position.set(eye.x,eye.y,eye.z);camera.lookAt(camTarget.x,camTarget.y,camTarget.z);if(camera.fov!==fov){camera.fov=fov;camera.updateProjectionMatrix()}camera.updateMatrixWorld();renderer.render(scene,camera);hudTimer+=dt;if(hudTimer>.065){updateHUD();hudTimer=0}drawWaypoint();drawFX()}
+function frame(dt){handleInput(dt);let remaining=dt;while(remaining>0){let step=Math.min(remaining,1/90);update(step);remaining-=step}if(AIHub.active)AIHub.progress({score:Math.floor(p.score),label:p.tags+'/8 walls · '+timeText(p.timer)});updateCamera(dt);syncNode(dynamic,scene);syncSparks();syncPickups();camera.position.set(eye.x,eye.y,eye.z);camera.lookAt(camTarget.x,camTarget.y,camTarget.z);if(camera.fov!==fov){camera.fov=fov;camera.updateProjectionMatrix()}camera.updateMatrixWorld();renderer.render(scene,camera);hudTimer+=dt;if(hudTimer>.065){updateHUD();hudTimer=0}drawWaypoint();drawFX()}
 
 // Warm every pipeline before the first frame: relay rings, finished tags, the beacon and the sparks.
 kit.loading.progress(.85,'Warming up the paint…');
@@ -552,7 +1045,17 @@ camera.position.set(eye.x,eye.y,eye.z);camera.lookAt(camTarget.x,camTarget.y,cam
 try{await renderer.compileAsync(scene,camera)}catch(e){console.warn('Pipeline warm-up skipped',e)}
 resetLevel();
 applyPrompts();
-mainMenu();
+if(AIHub.active){
+ $('menu').style.display=$('menuTape').style.display='none';
+ const info=await AIHub.connect({mode:'parallel',seats:[1,4]});
+ if(info){
+  AIHub.on('time-up',()=>{if(mode==='play')finish(false,'Time is up. The district still needs your signal.');else AIHub.result({score:Math.floor(p.score)})});
+  AIHub.on('end',()=>{sessionOver=true;if(mode==='pause')resume();if(mode==='play')finish(false,'The round is over.');AudioSys.pause(true)});
+  ['retryBtn','menuBtn','resultRetry','resultFree','resultMenu'].forEach(id=>$(id).style.display='none');
+  start('mission');
+  AIHub.ready();
+ }else mainMenu();
+}else mainMenu();
 kit.start(frame);
 </script>
 </body></html>

@@ -986,6 +986,38 @@ class Mossbell {
     this.save();
   }
 
+  /** Side by side: the hub has the round, so the title is skipped and play waits for the hub's clock. */
+  startRound() {
+    AIHub.on('time-up', () => AIHub.result({ score: this.hubProgress().score }));
+    AIHub.on('end', () => this.endRound());
+    this.startNew(true);
+    AIHub.ready();
+  }
+
+  /** Side by side: the round is over. Stop input and sound, and leave the final screen with no "play again". */
+  endRound() {
+    this.stopped = true;
+    this.sound.setTrack(null);
+    this.sound.hold(true);
+    for (const b of document.querySelectorAll('#app button')) b.disabled = true;
+  }
+
+  /** Side by side: play waits for the hub's countdown; outside a session it never waits. */
+  waitingForStart() {
+    return AIHub.active && AIHub.time() < 0;
+  }
+
+  /** Side by side: how far the quest has come, a number that only grows, and a short label for the scoreboard. */
+  hubProgress() {
+    const phase = this.phase;
+    const sub = phase === 'bells' ? this.bells : phase === 'wardens' ? this.wardens : phase === 'boss' ? Math.round(9 * (1 - this.boss.hp / this.boss.maxHp)) : 0;
+    const label = {
+      bells: `Chimes ${this.bells} / 3`, gate: 'Gate open', chest: 'Forged blade', wardens: `Wardens ${this.wardens} / 2`,
+      bossApproach: 'Inner seal open', boss: 'Ember Warden', relic: 'Ember Bell', done: 'Shrine restored',
+    }[phase];
+    return { score: Object.keys(PHASE_TITLES).indexOf(phase) * 10 + sub, label };
+  }
+
   openPause() {
     if (this.mode !== 'play') return;
     this.mode = 'pause';
@@ -1310,12 +1342,13 @@ class Mossbell {
   /* ------------------------------------------------------------ the frame */
 
   frame(dt) {
+    if (this.stopped) return; // the hub has ended the round: the final screen stays as it is
     this.time += dt;
     const input = this.input;
     if (input.pressed('mute')) this.toggleMute();
     if (this.mode === 'play') {
       if (input.pressed('pause')) this.openPause();
-      else this.playFrame(dt);
+      else if (!this.waitingForStart()) this.playFrame(dt);
     } else {
       this.menuFrame();
     }
@@ -1370,6 +1403,7 @@ class Mossbell {
     if (this.uiTimer <= 0) {
       this.uiTimer = 0.08;
       this.updateUI();
+      AIHub.progress(this.hubProgress());
     }
     this.sound.setTrack(this.mode !== 'play' ? null : this.bossActive ? 'boss' : p.z < -20 ? 'shrine' : 'meadow');
   }
@@ -2481,6 +2515,10 @@ class Mossbell {
       ? 'Rootkey Vault cleared: Heart Container and Ember Charm found.'
       : 'The Rootkey Vault still sleeps somewhere off the path.';
     u.completeBest.textContent = record ? `New best on ${label}: ${fmtTime(this.elapsed)}` : `Best on ${label}: ${fmtTime(prev)}`;
+    if (AIHub.active) {
+      AIHub.result({ time: AIHub.time() });
+      u.complete.querySelector('.menu-buttons').classList.add('hidden'); // no "play again" in a session
+    }
     u.complete.classList.remove('hidden');
     this.kit.touch?.suspend(true, 'game');
     this.focusDefault(u.complete);
@@ -2532,10 +2570,13 @@ const kit = await boot({
 });
 
 const game = new Mossbell(kit);
+// Side by side: join the round before building, so the world is built after the hub's welcome. No hub: play as before.
+const round = AIHub.active ? await AIHub.connect({ mode: 'parallel', seats: [1, 4] }) : null;
 game.build();
 game.bindUi();
 game.applyState(null);
-game.showTitle();
+if (round) game.startRound();
+else game.showTitle();
 window.__mossbell = game;
 
 kit.onPause((paused) => game.onKitPause(paused));

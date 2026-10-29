@@ -846,6 +846,7 @@ function openFinale() {
     return;
   }
   frontier.markMilestone('finale');
+  AIHub.result({ score: sessionScore() });
   const left = ECHOES.length - echoes.recordedCount;
   const coda = below.revealed
     ? ' You have already read it, beneath the Stillpoint.'
@@ -953,6 +954,7 @@ function playFrame(dt) {
     const sheltered = below.inside;
     soundscape.setWeather(sheltered ? 0 : environment.sample.precipitation, sheltered ? 0 : environment.sample.windKph);
     hud.setLookHint(overlay === null && input.source === 'keyboard' && !coarseOnly && !input.pointerLocked);
+    AIHub.progress({ score: sessionScore(), label: `${relays.actualCompletedCount}/3 relays · ${frontier.completedContractCount} filed` });
   }
 }
 
@@ -962,8 +964,8 @@ function frame(dt) {
   telemetryClock += dt;
   slowClock += dt;
 
-  if (state === 'play') playFrame(dt);
-  else titleFrame(dt);
+  if (state !== 'play') titleFrame(dt);
+  else if (sessionLive()) playFrame(dt);
 
   world.streamAround(player.worldPosition);
   below.update(dt);
@@ -979,7 +981,7 @@ function frame(dt) {
   }
 
   // Behind the pause menu and the results screen the picture stands still: draw it once, then rest the GPU.
-  const frozen = overlay === 'pause' || overlay === 'victory';
+  const frozen = overlay === 'pause' || overlay === 'victory' || sessionEnded;
   if (frozen && frozenFrameDrawn) return;
   frozenFrameDrawn = frozen;
   render.render();
@@ -1021,6 +1023,30 @@ Object.defineProperty(window, '__STILLPOINT_TEST__', {
   },
 });
 
+/* ------------------------------------------------------------- session */
+
+// Side by side: every copy starts from the same seed on the hub's clock and reports only its own score.
+let sessionEnded = false;
+
+/** Relays and contracts 100 each, field guide entries 10, Whisperglass echoes 50. */
+const sessionScore = () =>
+  relays.actualCompletedCount * 100 + frontier.completedContractCount * 100 + frontier.knownGuideCount * 10 + echoes.recordedCount * 50;
+
+/** Outside a round the field always runs; in one it waits for the hub's clock and stops when the hub ends it. */
+const sessionLive = () => !AIHub.active || (AIHub.time() >= 0 && !sessionEnded);
+
+/** A round opens on the field itself: no title screen, and the hub's clock starts play. */
+function startSession() {
+  AIHub.on('time-up', () => AIHub.result({ score: sessionScore() }));
+  AIHub.on('end', () => {
+    sessionEnded = true;
+    soundscape.setSuspended(true);
+  });
+  state = 'title'; // enterField is the title's Enter button; the round goes straight to it
+  enterField();
+  AIHub.ready();
+}
+
 /* -------------------------------------------------------------- start */
 
 kit.start(frame);
@@ -1029,4 +1055,6 @@ hud.setBootStatus('Generating the frontier basin…');
 await world.whenReady(12000);
 kit.loading.progress(1, 'Field systems online');
 kit.loading.done();
-showTitle();
+const session = AIHub.active ? await AIHub.connect({ mode: 'parallel', seats: [1, 4] }) : null;
+if (session) startSession();
+else showTitle();

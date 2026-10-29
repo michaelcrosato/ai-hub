@@ -413,7 +413,7 @@ function routeAt(s,out){s=clamp(s,0,ROUTE_L);let i=1;while(i<ROUTE.length-1&&ROU
 const IN={moveX:0,moveY:0,steerX:0,steerY:0,lookX:0,lookY:0,lift:0,brake:false,boost:false,fire:false,scan:false};
 const G={mode:'brief',caseId:store.get('case',7)===8?8:7,diff:DIFFS[store.get('diff','officer')]?store.get('diff','officer'):'officer',phase:0,t:0,visualT:0,player:null,enemies:[],bolts:[],traces:[],missiles:[],particles:[],ally:null,hauler:null,scan:0,scanned:false,dock:0,lock:null,lockTime:0,shotCD:0,missileCD:0,damageFlash:0,hitFlash:0,radioTimer:0,radioOn:false,scanBeep:0,kills:0,warning:false,clearCall:false,stats:{},lastHint:'',hintTime:0,pausedAt:0,boostOn:false,grade:'',newBest:false,hurtDir:[0,0,1],hurtT:0,alarm:0};
 const D=()=>DIFFS[G.diff];
-let enemyID=0;
+let enemyID=0,sessionOver=false;
 function setPhase(n){G.phase=n;renderObjective();document.querySelectorAll('.step').forEach((x,i)=>{x.className='step'+(i<n?' done':i===n?' active':'');});syncTouchButtons();}
 function renderObjective(){const p=PHASES[G.caseId][G.phase];$('phaseLabel').textContent=p[0];$('objTitle').textContent=p[1];$('objText').textContent=fmt(p[2]);}
 function signal(text,key,who='CONTROL / NIGHT DESK'){G.radioTimer=Math.max(8,text.length*.067);G.radioOn=true;$('radioName').textContent=who;$('radioText').textContent=text;$('radio').classList.add('show');sound.radio();if(key)sound.speak(key);}
@@ -422,7 +422,7 @@ function reset(){G.player={pos:[0,31,174],vel:[0,0,0],yaw:0,pitch:-.065,roll:0,h
 function clearInput(){IN.lookX=IN.lookY=0;}
 function requestMouse(){if(input.source!=='keyboard')return;input.lockPointer();}
 function blurOverlayFocus(){const a=document.activeElement;if(a&&a!==document.body&&a.closest&&a.closest('.overlay,#brief'))a.blur();}
-function launch(){reset();if(G.caseId===8)startCase8();G.mode='play';blurOverlayFocus();$('brief').classList.add('hide');$('pause').classList.add('hide');$('result').classList.add('hide');$('flightUI').classList.remove('hide');$('mouseNote').classList.add('hide');sound.start();requestMouse();input.settle();
+function launch(){if(sessionOver||AIHub.active&&AIHub.time()<0)return;reset();if(G.caseId===8)startCase8();G.mode='play';blurOverlayFocus();$('brief').classList.add('hide');$('pause').classList.add('hide');$('result').classList.add('hide');$('flightUI').classList.remove('hide');$('mouseNote').classList.add('hide');sound.start();requestMouse();input.settle();
  if(G.caseId===7)signal('Kestrel 09, check the amber truck at East Dock. Hold the scan until the cargo is identified.','intro');
  else signal('Kestrel 09, a Vanta hauler just lifted off East Dock with no flight plan. It is running for the north service portal. Catch it.',null);
  syncUI();placePills();}
@@ -430,7 +430,7 @@ function pauseGame(){if(G.mode!=='play')return;G.mode='pause';G.pausedAt=perform
 function resumeGame(){if(G.mode!=='pause')return;G.mode='play';clearInput();blurOverlayFocus();$('pause').classList.add('hide');sound.resume();requestMouse();input.settle();syncUI();}
 // Back to the briefing: clear the finished flight so no frozen gunships, shots or smoke hang
 // in the backdrop behind the title (the original left them there).
-function briefing(){reset();G.mode='brief';clearInput();$('brief').classList.remove('hide');$('pause').classList.add('hide');$('result').classList.add('hide');$('flightUI').classList.add('hide');if(document.pointerLockElement)document.exitPointerLock();sound.stopVoice();sound.resume();G.radioOn=false;$('radio').classList.remove('show');renderBrief();syncUI();focusDefault();}
+function briefing(){if(sessionOver)return;reset();G.mode='brief';clearInput();$('brief').classList.remove('hide');$('pause').classList.add('hide');$('result').classList.add('hide');$('flightUI').classList.add('hide');if(document.pointerLockElement)document.exitPointerLock();sound.stopVoice();sound.resume();G.radioOn=false;$('radio').classList.remove('show');renderBrief();syncUI();focusDefault();}
 const GRADE_RANK={C:1,B:2,A:3,S:4};
 function rating(){const c=CASE_INFO[G.caseId],acc=G.stats.shots?G.stats.hits/G.stats.shots:0;let s=0;if(G.player.hull>=75)s+=2;else if(G.player.hull>=45)s+=1;if(G.t<=c.par)s+=2;else if(G.t<=c.par*1.35)s+=1;if(acc>=.35)s+=1;return s>=5?'S':s>=4?'A':s>=2?'B':'C';}
 function resultStamp(win){if(win)return(G.caseId===7?'CARGO SEIZED':'HAULER GROUNDED')+' / RATING '+G.grade+' / '+G.kills+' HOSTILES STOPPED'+(G.newBest?' / NEW BEST':'');return 'NEW AIRCRAFT READY / '+(input.source==='gamepad'?'PRESS A TO RETRY':input.source==='touch'?'TAP FLY AGAIN':'PRESS R TO RETRY');}
@@ -449,6 +449,8 @@ function finish(win,reason=''){if(G.mode!=='play')return;G.mode=win?'win':'fail'
  $('nextBtn').classList.toggle('hide',!(win&&c===7));
  signal(win?'Good work, Nine. Another quiet night on paper.':reason,win?'win':'fail');
  input.rumble(win?.3:.8,win?160:420);
+ // Side by side: a finished run reports its time (the hub's clock); a lost run is ranked by its last progress.
+ if(AIHub.active){sessionOver=true;if(win)AIHub.result({time:AIHub.time()});}
  syncUI();focusDefault();}
 function damagePlayer(n){if(G.mode!=='play'||n<=0)return;n*=D().taken;G.player.hull-=n;G.damageFlash=Math.min(1,G.damageFlash+.5);sound.hit();input.rumble(clamp(n/12,.25,.9),140);if(G.player.hull<=0){G.player.hull=0;finish(false,'Your gunship was lost. Slide or change height to avoid enemy fire. Use '+K().brake+' to stop before a wall.');}}
 function damageAlly(n){if(G.mode!=='play'||G.caseId!==7||G.phase<1||G.phase>2)return;G.ally.hull-=n;if(G.ally.hull<65&&!G.warning){G.warning=true;signal('The arrest team is under fire. Protect the blue van.','warning','GROUND TEAM / UNIT 04');}if(G.ally.hull<=0){G.ally.hull=0;finish(false,'The arrest van was lost. Stay close to the blue marker and stop the gunships that attack the team.');}}
@@ -824,9 +826,19 @@ kit.start(dt=>{
  while(accumulator>=STEP&&steps<15){tick(STEP);accumulator-=STEP;steps++;}
  if(G.mode==='brief')sound.update(0,0,false);
  uDamage.value=G.damageFlash;
+ if(AIHub.active&&G.mode==='brief')launch();
+ if(AIHub.active&&G.mode==='play')AIHub.progress({score:G.phase,label:PHASES[G.caseId][G.phase][0]});
  renderScene(dt);post.render();drawHUD(dt);frames++;
 });
 focusDefault();
+
+// Side by side: the hub opens the round, so the title is skipped and the run waits for the clock (launch above).
+// No hub after all: the title stays.
+if(AIHub.active){
+ $('brief').classList.add('hide');
+ AIHub.connect({mode:'parallel',seats:[1,4]}).then(info=>{if(info)AIHub.ready();else $('brief').classList.remove('hide');});
+ AIHub.on('end',()=>{sessionOver=true;if(G.mode!=='win'&&G.mode!=='fail')G.mode='over';clearInput();sound.stopVoice();if(sound.master)sound.master.gain.value=0;['replayBtn','nextBtn','briefBtn','quitBtn'].forEach(id=>$(id).classList.add('hide'));});
+}
 
 // Read-only diagnostics support offline verification without adding game controls.
 window.hoverDuty=Object.freeze({snapshot:()=>({mode:G.mode,caseId:G.caseId,difficulty:G.diff,phase:G.phase,time:G.t,position:G.player?[...G.player.pos]:null,velocity:G.player?[...G.player.vel]:null,yaw:G.player?.yaw,pitch:G.player?.pitch,hull:G.player?.hull,ammo:G.player?.ammo,heat:G.player?.heat,scan:G.scan,scanned:G.scanned,lock:G.lock?.id??null,lockTime:G.lockTime,dock:G.dock,kills:G.kills,ally:G.ally?{...G.ally,pos:[...G.ally.pos]}:null,hauler:G.hauler?{pos:[...G.hauler.pos],s:G.hauler.s,route:ROUTE_L,state:G.hauler.state,pods:G.hauler.pods.map(p=>p.hp)}:null,enemies:G.enemies.map(e=>({id:e.id,kind:e.kind,pos:[...e.pos],hp:e.hp,dead:e.dead})),stats:{...G.stats},audio:sound.ctx?{state:sound.ctx.state,muted:sound.muted,events:sound.events,voices:Object.keys(sound.voices).length}:null,graphics:{frames,backend:kit.backend,worldVertices,width:kit.size.width,height:kit.size.height},compact,pointerLocked:document.pointerLockElement===canvas})});

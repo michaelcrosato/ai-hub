@@ -154,6 +154,8 @@ let mode = 'title';
 let level = levelById(prefs.level);
 let builtLevelId = null;
 let sim = null; // the run being played
+let session = false; // side by side in an AI Hub round
+let sessionEnded = false;
 let attract = null; // the title screen's idle vault
 let completeDelay = 0;
 let autosave = 0;
@@ -336,6 +338,10 @@ function closeShop() {
 function onComplete(stats) {
   store.remove(RUN_KEY);
   renderComplete(stats);
+  if (session) {
+    AIHub.result({ time: AIHub.time() });
+    for (const el of [ui.next, ui.replay, $('titleButton')]) el.classList.add('hidden');
+  }
   // The results card follows a beat later (see the loop), so the finish lands first.
 }
 
@@ -502,10 +508,10 @@ ui.cont.addEventListener('click', () => {
 $('pauseButton').addEventListener('click', openPause);
 $('resumeButton').addEventListener('click', resume);
 $('restartButton').addEventListener('click', () => {
-  if (mode === 'paused' && sim) startRun(level, sim.diff.id, null);
+  if (mode === 'paused' && sim && !session) startRun(level, sim.diff.id, null);
 });
 $('quitButton').addEventListener('click', () => {
-  if (mode === 'paused') quitToTitle();
+  if (mode === 'paused' && !session) quitToTitle();
 });
 $('closeUpgrade').addEventListener('click', closeShop);
 ui.next.addEventListener('click', () => {
@@ -818,12 +824,18 @@ function stepSim(dt) {
     if (sec !== lastTick && sec <= 10) audio.sfx('tick');
     lastTick = sec;
   }
+  if (session) AIHub.progress({ score: sessionScore(), label: SESSION_LABELS[sim.phase] || 'Vault' });
   autosave += dt;
   if (autosave >= AUTOSAVE_EVERY) {
     autosave = 0;
     saveRun();
   }
 }
+
+const SESSION_PHASES = ['gear', 'guardian', 'crown', 'escape', 'complete'];
+const SESSION_LABELS = { gear: 'Finding the relic', guardian: 'Facing the guardian', crown: 'Claiming the prize', escape: 'Escaping!', complete: 'Escaped' };
+/** How far along the vault the run is: the phase reached, then treasure found. */
+const sessionScore = () => SESSION_PHASES.indexOf(sim.phase) * 100 + sim.getTreasurePercent();
 
 let frames = 0;
 function frame(dt, t) {
@@ -834,7 +846,9 @@ function frame(dt, t) {
 
   if (m0 === 'play' && sim) {
     if (inp.pressed('pause')) openPause();
-    else {
+    else if (session && (sessionEnded || AIHub.time() < 0)) {
+      // waiting for the hub's start, or the round is over
+    } else {
       zoomInput(dt);
       stepSim(dt);
       if (sim.completed && mode === 'play') {
@@ -876,4 +890,18 @@ kit.touch?.setShown('interact', false);
 renderSound();
 renderTitle();
 setMode('title');
+if (AIHub.active) {
+  session = !!(await AIHub.connect({ mode: 'parallel', seats: [1, 4] }));
+  if (session) {
+    AIHub.on('time-up', () => {
+      if (sim && !sim.completed) AIHub.result({ score: sessionScore() });
+    });
+    AIHub.on('end', () => {
+      sessionEnded = true;
+      audio.setPaused(true);
+    });
+    startRun(levelById(prefs.level), prefs.difficulty, null);
+    AIHub.ready();
+  }
+}
 kit.start(frame);
