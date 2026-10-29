@@ -1,7 +1,8 @@
 -- RLS tests for supabase/migrations/0001_accounts.sql, 0002_sessions.sql and
 -- the migrations after them (0007 moved the SECURITY DEFINER bodies to the
 -- schema `private`; the last checks fail until it is applied; 0009 decides in
--- every policy what a guest may read; two of its three checks fail without it).
+-- every policy what a guest may read, and 0010 keeps those reads fast; two of
+-- the three checks for 0009 fail without it).
 --
 -- Run in the Supabase SQL editor (or execute_sql). It makes throwaway users,
 -- acts as each one the way the hub's pages would, checks every rule, and then
