@@ -566,8 +566,13 @@ function render() {
     status,
     seat: mine()?.slot ?? null,
     links: Object.fromEntries((net?.members() ?? []).filter((m) => m.key !== key).map((m) => [m.key, net.link?.(m.key) ?? 'local'])),
-    traffic: bridge ? { ...bridge.stats } : null,
-    progress: boardRound === state?.current?.round ? Object.fromEntries(progressById) : {},
+    // Live, not as of the last render: a host with nothing new to draw mid-round still counts.
+    get traffic() {
+      return bridge ? { ...bridge.stats } : null;
+    },
+    get progress() {
+      return boardRound === state?.current?.round ? Object.fromEntries(progressById) : {};
+    },
     clock: net?.clock ? { offset: net.clock.offset, rtt: net.clock.rtt, following: net.clock.following } : null,
   };
   player.refresh();
