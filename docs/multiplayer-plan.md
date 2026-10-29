@@ -380,8 +380,10 @@ games or so a night.
   agent on its own copy of the game, spend capped, every failure put back);
   `hub-check --retrofit`, `--draws-only` (which knows a WebGPU-only game this
   browser cannot run), `--record` and `--browser-args`.
-- Migration 0008: a round's mode may be any short word (applied from the
-  owner's computer with 0007: the `/goal` in `docs/party-sessions-handoff.md`).
+- Migration 0008: a round's mode may be any short word. Applied Oct 29 with
+  0007, then 0009 and 0010, which make every policy say what a guest may read
+  (a guest sees a session only while seated); `supabase/tests/rls.sql` passes
+  live (42 checks), and both advisors show nothing from our migrations.
 - The links a game builder is given are GitHub's (`raw.githubusercontent.com`,
   the `main` branch), so they outlast any change of host; the site itself
   stays where it is.

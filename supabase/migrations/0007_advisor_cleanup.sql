@@ -2,9 +2,9 @@
 -- hub's pages call changes name, arguments or behaviour: same functions, same
 -- results, same errors.
 --
--- NOT YET APPLIED (written 2026-10-28 in a session that could not reach the
--- live database). Apply it in the ai-hub SQL editor, then run
--- supabase/tests/rls.sql and both advisors (docs/party-sessions-handoff.md).
+-- Written 2026-10-28 in a session that could not reach the live database;
+-- applied 2026-10-29 in the ai-hub SQL editor, then supabase/tests/rls.sql
+-- and both advisors were run.
 -- Checked on a local Postgres 16 with stand-ins for Supabase's auth, realtime
 -- and cron: 0001–0007 apply in order, rls.sql passes all 39 checks (its last
 -- three fail without this migration), and Supabase's own advisor lints

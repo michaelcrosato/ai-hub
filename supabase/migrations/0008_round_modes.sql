@@ -7,8 +7,8 @@
 -- hyphens, so a mode added later needs no migration. Additive: it only widens
 -- what a row may hold; no row, function or policy changes.
 --
--- NOT YET APPLIED (written 2026-10-29). Apply it after 0007, in the ai-hub SQL
--- editor (docs/party-sessions-handoff.md), then run supabase/tests/rls.sql.
+-- Applied 2026-10-29 after 0007, in the ai-hub SQL editor; then
+-- supabase/tests/rls.sql was run.
 
 alter table public.session_rounds drop constraint if exists session_rounds_mode_check;
 alter table public.session_rounds add constraint session_rounds_mode_check check (mode ~ '^[a-z][a-z-]{0,15}$');
