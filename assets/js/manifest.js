@@ -23,7 +23,7 @@ export const NOT_A_FACET = new Set([
   // Worked out here, below, rather than catalogued.
   'lineage', 'rails',
   // AI Hub session support: shown as one line (sessionOf), never as separate facts.
-  'session', 'sessionPlayers', 'sessionMode', 'sessionMinutes', 'sessionGoal', 'sessionHowto',
+  'session', 'sessionPlayers', 'sessionMode', 'sessionMinutes', 'sessionGoal', 'sessionHowto', 'sessionNote', 'webgpu',
 ]);
 
 /** Fields that are searched and listed in the drawer but get no rail: the
@@ -67,7 +67,7 @@ export function playersOf(game) {
 
 /** The AI Hub Session Protocol versions this hub can run (lib/hub/README.md). */
 export const SESSION_PROTOCOLS = [1];
-const SESSION_MODES = { versus: 'Versus', 'co-op': 'Co-op', race: 'Race' };
+const SESSION_MODES = { versus: 'Versus', 'co-op': 'Co-op', race: 'Race', parallel: 'Side by side' };
 
 /**
  * What a game says about playing it in an AI Hub session, read off its

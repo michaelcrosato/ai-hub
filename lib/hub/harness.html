@@ -64,7 +64,7 @@
 </main>
 <script type="module">
 import { createBridge, attachFrame, postTo, createLocalNetwork } from './bridge.js';
-import { createRound, limitFor, MODES, TIMINGS } from './round.js';
+import { createRound, limitFor, MODES, SELF_REPORTED, TIMINGS } from './round.js';
 
 const NAMES = ['Red Fox', 'Blue Otter', 'Green Heron', 'Gold Lynx'];
 const params = new URLSearchParams(location.search);
@@ -74,6 +74,8 @@ const scenario = params.get('scenario') || 'standard';
 const playMs = Number(params.get('play')) || 6000;
 /** Like the hub, the harness shows a splash and collects ready itself; ?splash=0 leaves the ready prompt to the game, as older hubs did. */
 const splash = params.get('splash') !== '0';
+/** ?retrofit=1: an existing game upgraded to side by side, which need not probe (README, "Side by side"). */
+const retrofit = params.get('retrofit') === '1';
 const SPLASH_MS = 10_000;
 
 for (const [id, key] of [['game', 'game'], ['players', 'players'], ['latency', 'latency'], ['jitter', 'jitter'], ['loss', 'loss']]) {
@@ -109,9 +111,11 @@ async function metasOf(url) {
   }
 }
 
-const gameUrl = (game) => {
+/** Side by side, the seed rides in the address: the client seeds Math.random with it before the game's scripts run. */
+const gameUrl = (game, { mode, seed } = {}) => {
   const url = new URL(game, location.href);
   url.searchParams.set('aihub', '1');
+  if (mode === 'parallel') url.searchParams.set('aihub-seed', String(seed >>> 0));
   return url.href;
 };
 
@@ -203,7 +207,7 @@ async function newRound() {
     grid.append(el);
 
     const endpoint = net.endpoint(p.key);
-    const cell = { ...p, el, label, frame, endpoint, violations: [], instrumented: true, gone: false };
+    const cell = { ...p, el, label, frame, endpoint, violations: [], instrumented: true, gone: false, progress: [] };
     const post = postTo(frame);
     cell.bridge = createBridge({
       key: p.key,
@@ -215,11 +219,19 @@ async function newRound() {
       },
       net: endpoint,
       onIssue: (i) => log(`${p.key} ✗ ${i.problem}`),
+      onFullscreen: (on) => log(`${p.key} asked for fullscreen ${on ? 'on' : 'off'}: the hub's page takes it`),
+      // The scoreboard's feed: this cell's own progress, as its bridge passes it on.
+      onProgress: (id, report) => {
+        if (id !== cell.bridge?.me) return;
+        cell.progress.push({ at: performance.now(), ...report });
+        state.coordinator.progress(id, report.score);
+        render(state);
+      },
     });
     endpoint.onMessage((from, env) => cell.bridge.fromNet(from, env));
     cell.detach = attachFrame(frame, (msg) => cell.bridge.fromGame(msg));
     frame.addEventListener('load', () => instrument(cell), { once: true });
-    frame.src = gameUrl(game);
+    frame.src = gameUrl(game, { mode, seed });
     state.cells.push(cell);
   }
   renderWho(state);
@@ -272,6 +284,8 @@ function render(state) {
     else if (p.ready) bits.push('ready');
     else if (p.hello) bits.push('welcomed');
     else bits.push('loading');
+    const last = cell.progress.at(-1);
+    if (last && !p.result) bits.push(`progress ${last.score}${last.label ? ` (${last.label})` : ''}`);
     bits.push(`↑${cell.bridge.stats.sent} ↓${cell.bridge.stats.received}`);
     cell.label.querySelector('.cell__state').textContent = bits.join(' · ');
     cell.el.classList.toggle('is-out', !!p.out || cell.gone);
@@ -449,9 +463,12 @@ async function settingsChecks(check, state, cell) {
   await sleep(1500);
   const w1 = [cell, ...others].map(worldOf);
   const still = probeOf(cell)?.menu === true;
-  check('the world keeps moving while the menu is open', still && w1.every((w, i) => w > w0[i]),
-    `world ${w0.map((w) => w.toFixed?.(2)).join(',')} → ${w1.map((w) => w.toFixed?.(2)).join(',')}${still ? '' : ' (the menu closed by itself)'}`);
-  if (state.n > 1) check('the copy with its menu open keeps playing over the network', cell.bridge.stats.sent > sent0, `sent ${sent0} → ${cell.bridge.stats.sent}`);
+  // Side by side shares no world, so a game may pause for its menu there: nobody else waits on it.
+  if (state.coordinator.mode !== 'parallel') {
+    check('the world keeps moving while the menu is open', still && w1.every((w, i) => w > w0[i]),
+      `world ${w0.map((w) => w.toFixed?.(2)).join(',')} → ${w1.map((w) => w.toFixed?.(2)).join(',')}${still ? '' : ' (the menu closed by itself)'}`);
+    if (state.n > 1) check('the copy with its menu open keeps playing over the network', cell.bridge.stats.sent > sent0, `sent ${sent0} → ${cell.bridge.stats.sent}`);
+  }
   await holdKey(cell, 'Escape', 80);
   check('Esc closes the menu again', await until(() => probeOf(cell)?.menu === false, 1500), JSON.stringify(probeOf(cell)));
   if (!padOf(cell)) return;
@@ -533,8 +550,14 @@ async function conformance() {
     };
     await randomly(Math.min(1500, playMs / 4));
 
+    const side = state.coordinator.mode === 'parallel';
+    if (side) {
+      const seeded = state.cells.every((c) => c.frame.contentWindow?.AIHub?.seeded === true);
+      check('side by side: Math.random is seeded, the same on every copy', seeded, state.cells.map((c) => `${c.key}: client ${c.frame.contentWindow?.AIHub?.version ?? '?'} seeded ${c.frame.contentWindow?.AIHub?.seeded}`).join('; '));
+    }
     const probed = state.cells.every((c) => probeOf(c) && !probeOf(c).error);
-    check('every copy probes its state (AIHub.probe)', probed, state.cells.map((c) => `${c.key}: ${JSON.stringify(probeOf(c))}`).join('; '));
+    // A retrofitted old game (&retrofit=1) need not probe: the input and menu checks then have nothing to read.
+    if (probed || !retrofit) check('every copy probes its state (AIHub.probe)', probed, state.cells.map((c) => `${c.key}: ${JSON.stringify(probeOf(c))}`).join('; '));
     if (probed && !state.record) {
       await sleep(400);
       await controlChecks(check, state.cells[n - 1]);
@@ -545,13 +568,20 @@ async function conformance() {
     else if (n >= 3) removeCell(state.cells[n - 1]);
     await randomly(playMs / 2);
     const remaining = state.cells.filter((c) => !c.gone);
-    check('game traffic flows both ways', remaining.every((c) => c.bridge.stats.sent > 0 && c.bridge.stats.received > 0) || n === 1,
-      remaining.map((c) => `${c.key} ↑${c.bridge.stats.sent} ↓${c.bridge.stats.received}`).join(' '));
+    if (side) {
+      check('side by side: no game traffic', state.cells.every((c) => c.bridge.stats.sent === 0),
+        state.cells.map((c) => `${c.key} ↑${c.bridge.stats.sent}`).join(' '));
+      check('side by side: every copy reports its progress', remaining.every((c) => c.progress.length > 0 || state.status?.players.find((p) => p.key === c.key)?.result),
+        remaining.map((c) => `${c.key}: ${c.progress.length} report${c.progress.length === 1 ? '' : 's'}`).join(', '));
+    } else {
+      check('game traffic flows both ways', remaining.every((c) => c.bridge.stats.sent > 0 && c.bridge.stats.received > 0) || n === 1,
+        remaining.map((c) => `${c.key} ↑${c.bridge.stats.sent} ↓${c.bridge.stats.received}`).join(' '));
+    }
 
     if (!state.record) state.coordinator.timeUp();
     const ended = await until(() => state.record, TIMINGS.graceMs + 2000);
     const record = state.record;
-    if (scenario === 'host-leave' && state.coordinator.mode !== 'race') {
+    if (scenario === 'host-leave' && !SELF_REPORTED.includes(state.coordinator.mode)) {
       check('host leaving voids the round', ended && record.status === 'void' && record.endReason === 'host-left', record ? `${record.status} (${record.reason})` : 'no end');
     } else {
       check('the round ends with a valid result', ended && record.status === 'played', record ? `${record.status} (${record.reason})` : 'no end within the grace period');

@@ -413,26 +413,37 @@ Browser checks, with optional Playwright installed: start `pnpm dev`, then run
 
 ## Playing together: AI Hub sessions
 
-Every new game supports online play for up to four friends, each on their own
-device, through an **AI Hub session**: the hub picks the games (Random Mode),
-keeps the clock, carries the network traffic and keeps score. There is no chat
-and no way for players to message each other; they talk in an app of their
-own.
+Every game can be played with up to three friends, each on their own device,
+through an **AI Hub session**: the hub deals the games (Random Mode), keeps
+the clock, carries the network traffic and keeps score. There is no chat and
+no way for players to message each other; they talk in an app of their own.
 
 What a game must do is the **AI Hub Session Protocol**, specified in
 [`lib/hub/README.md`](lib/hub/README.md) and served at
-<https://crosato-arcade.vercel.app/lib/hub/README.md>, so it can be handed to
-whichever agent builds the game. In short: the `hub:session` metas in the head
-(seats, mode, round length, how to win, the controls), the small `session.js`
-client pasted in unmodified, everyone in one shared world where each copy owns
-its own player, and a round reported once at the end with its stats and
-awards. Outside a session the game plays exactly as it always would. The spec
-also sets the hub's side (§15): points, awards, the session formats and the
-transitions between games.
+<https://crosato-arcade.vercel.app/lib/hub/README.md>. That page is the
+whole interface: it is the one thing handed to whichever agent builds a game.
+A game declares the one mode it plays best together:
+
+- **Side by side** (`parallel`): everyone plays their own copy, from the same
+  start, on the same clock; the hub draws a live scoreboard from each copy's
+  progress. Every game with a score or a finish can do it, with no networking,
+  and it is how the existing library joins sessions.
+- **Race**: one course, each copy running its own player, the others solid
+  rivals in it.
+- **Versus** and **co-op**: one world, run by the host's copy.
+
+In short: the `hub:session` metas in the head, the small `session.js` client
+pasted in unmodified as the first script, a round reported with its stats and
+awards, and outside a session the game plays exactly as it always would. What
+the hub does around a round (points, awards, formats, the deal, the
+scoreboard, what travels where) is in
+[`docs/session-hub.md`](docs/session-hub.md). The plan behind all of it, and
+why, is [`docs/multiplayer-plan.md`](docs/multiplayer-plan.md).
 
 A game that declares it shows a *Hub session* line in its details
-(`1–4 players · Race · about 4 min`), and the Catalogue finds them all with
-`has:session`. Those fields never become rails.
+(`1–4 players · Side by side · about 4 min`), and the Catalogue finds them all
+with `has:session`. Those fields never become rails. A side-by-side game is
+not a multiplayer game on the wall: each player plays alone.
 
 Games that play in sessions: **Blaze Cup** (versus, in teams), **Arwingdings**,
 **Merry-Go-Kart 64**, **Brine Line 64** and **Urethane Switchyard** (races and
@@ -447,10 +458,63 @@ pnpm dev
 http://localhost:4173/lib/hub/harness.html?game=/games/mygame.html&players=4&latency=150&jitter=50&loss=5
 ```
 
-`node scripts/hub-check.mjs games/mygame.html --players 1,2,3,4` runs the
-automatic conformance checks with Playwright (see the spec, §14). The two
-examples in `lib/hub/examples/` (a versus arena and a race with ghosts) are the
-plain reference games and pass it; the session games above are the full ones.
+`node scripts/hub-check.mjs games/mygame.html` runs the automatic conformance
+checks with Playwright: a side-by-side game at 1 and 2 players, a race or a
+shared world at 2, 3 and 4 on a bad network, each with a player leaving, then
+the game on its own. `--record` writes the verdict into `data/overrides.json`,
+where a failing game gets `"session": "0"` and is never dealt. The three
+examples in `lib/hub/examples/` (**Starfall**, side by side; a race with
+ghosts; a versus arena) are the plain reference games and pass it; the
+session games above are the full ones.
+
+### Bringing the library to sessions
+
+Two scripts keep thousands of games on the protocol without editing them by
+hand:
+
+```bash
+node scripts/hub-client.mjs                         # which client every game carries
+node scripts/hub-client.mjs --write games/claude    # upgrade the unmodified ones, a batch at a time
+```
+
+A pasted client is replaced only when it is exactly a released one (its hash
+is in `scripts/lib/hub-client.mjs`), so an edited copy is listed and left
+alone. Clients only add, so an older one keeps working; upgrade when games
+should use something new.
+
+```bash
+node scripts/retrofit.mjs pick --wave 1 > wave1.txt     # one build of each title: readable, no WebGPU needed
+node scripts/retrofit.mjs run $(head -30 wave1.txt) --jobs 2 \
+  --agent "claude -p --model claude-haiku-5-5 --max-turns 30 --permission-mode acceptEdits --output-format json" \
+  --agent "claude -p --model claude-sonnet-5-5 --max-turns 30 --permission-mode acceptEdits --output-format json"
+```
+
+`retrofit.mjs` brings an existing game to side by side, game by game:
+
+- It first asks whether this browser can run the game at all
+  (`hub-check --draws-only`), and spends nothing on one it can't: a WebGPU-only
+  game in a browser without WebGPU, even when its title screen shows. On a
+  machine without a GPU, `--browser-args` with SwiftShader's flags (in
+  `scripts/hub-check.mjs`) gives such games a software adapter.
+- A tool step puts the client and the metas first in its head (`prepare`).
+- A model, cheapest first, wires the score, the end and the session steps from
+  the prompt in [`lib/hub/retrofit.md`](lib/hub/retrofit.md), which quotes the
+  protocol's side-by-side section word for word. It works on a copy of the
+  game in a folder of its own, so it can change nothing else and two jobs
+  never meet.
+- The static check (`check`), a budget of 150 changed lines, and
+  `hub-check --retrofit` judge it: two players with one leaving, then the game
+  on its own compared with the original.
+- Each model gets a second try with what failed, then the next one does, up to
+  `--max-cost` dollars a game.
+- A game that passes keeps its changes for you to review. Any other is put back
+  exactly as it was, with a `sessionNote` in `data/overrides.json` saying why,
+  so later runs skip it (`--again` retries).
+
+Every try lands in `.cache/retrofit.jsonl` with its cost when the agent prints
+one. Run a pilot of about thirty varied games, read the pass rate and cost per
+game, play a few that passed, then do the rest in waves. Nothing is committed
+for you: commit what passed in batches of about fifty.
 
 ### A session — `/session`
 
@@ -482,8 +546,11 @@ leaves, the next seat takes over, and a round it was running is void.
 - **Relay only** in the lobby sends all of a player's connections through the
   TURN relay, so the others never see that device's IP address (remembered in
   the browser, as `localStorage['ai-hub:relay-only']`).
-- While no game in the library declares `hub:session`, the two reference
-  games are dealt instead, so a session always has something to play.
+- While no game in the library declares `hub:session`, the reference games
+  are dealt instead, so a session always has something to play.
+- Side-by-side games far outnumber the ones played together, so the deal
+  alternates between the two, and a side-by-side round shows a live
+  scoreboard over the game, top right, folded with a tap.
 - A session nobody ended is ended after a day without activity (an hourly
   job, `supabase/migrations/0005_end_stale_sessions.sql`).
 
@@ -685,7 +752,9 @@ scripts/
   lib/intake.mjs  what a package holds, and what never to import
   lib/zip.mjs     a small zip reader, so the project stays dependency-free
   audit3d.mjs     static rules every 3D game must pass (seconds)
-  hub-check.mjs   a game against the session protocol, at 2, 3 and 4 players
+  hub-check.mjs   a game against the session protocol, for its mode; --record keeps the verdict
+  hub-client.mjs  every game's pasted session client, upgraded by script
+  retrofit.mjs    an existing game brought to side by side: tool, model, checks
   session-browser.mjs  a whole session in four tabs, end to end
   check3d.py      one 3D game in headless browsers, WebGL2 and WebGPU
   sweep3d.py      check3d over many games, grouped by error signature

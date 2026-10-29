@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { nameChoices, isNickname, ADJECTIVES, ANIMALS } from '../assets/js/session/names.js';
 import { eligible, pickNext, sessionPool } from '../assets/js/session/pick.js';
-import { placesOf, scoreRound, addRound, leaderboard, formatOver, formatProgress, sessionAwards, finalTable } from '../assets/js/session/score.js';
+import { placesOf, scoreRound, addRound, leaderboard, liveOrder, formatOver, formatProgress, sessionAwards, finalTable } from '../assets/js/session/score.js';
 import { createLocalNet } from '../assets/js/session/local.js';
 
 const game = (slug, extra = {}) => ({ slug, name: slug, type: 'Game', session: '1', sessionPlayers: '2-4', sessionMode: 'race', ...extra });
@@ -219,4 +219,73 @@ test("the clock takes the host's time from the quickest round trip", async () =>
   assert.equal(clock.following, null);
   assert.equal(clock.now(), 10_000, 'the host is the clock');
   clock.stop();
+});
+
+test('the deal alternates games played together with side-by-side ones, so a few shared worlds are not buried', () => {
+  const together = ['race1', 'race2'].map((s) => game(s));
+  const side = Array.from({ length: 30 }, (_, i) => game(`side${i}`, { sessionMode: 'parallel' }));
+  let state = { seed: 7, n: 3, cycle: 0, played: [] };
+  const dealt = [];
+  for (let i = 0; i < 10; i++) {
+    const next = pickNext([...side, ...together], state);
+    dealt.push(next.game.slug);
+    state = { ...state, cycle: next.cycle, played: next.played };
+  }
+  assert.deepEqual(dealt.map((slug) => slug.startsWith('race')), [true, false, true, false, true, false, true, false, true, false]);
+  const sides = dealt.filter((slug) => slug.startsWith('side'));
+  assert.equal(new Set(sides).size, sides.length, 'the together deck starting over brings no side-by-side game round again');
+  assert.deepEqual(new Set(dealt.slice(0, 4).filter((slug) => slug.startsWith('race'))), new Set(['race1', 'race2']));
+  const alone = pickNext(side, { seed: 7, n: 2 });
+  assert.ok(alone.game.slug.startsWith('side'), 'with one deck, the deal is that deck');
+});
+
+test('a game that needs WebGPU is dealt only when every seat has it', () => {
+  const games = [game('gl'), game('gpu', { webgpu: 'required' })];
+  assert.deepEqual(eligible(games, 2).map((g) => g.slug), ['gl']);
+  assert.deepEqual(eligible(games, 2, { webgpu: true }).map((g) => g.slug), ['gl', 'gpu']);
+  const dealt = new Set();
+  let state = { seed: 3, n: 2, cycle: 0, played: [] };
+  for (let i = 0; i < 6; i++) {
+    const next = pickNext(games, state);
+    dealt.add(next.game.slug);
+    state = { ...state, cycle: next.cycle, played: next.played };
+  }
+  assert.deepEqual([...dealt], ['gl']);
+});
+
+test('a source with many builds is one game in the deal: one build of it, and no repeat until the deck is through', () => {
+  const lineage = (title) => ({ series: title, title, original: false });
+  const fox = Array.from({ length: 40 }, (_, i) => game(`fox${i}`, { sessionMode: 'parallel', lineage: lineage('Star Fox 64') }));
+  const others = ['kart', 'golf', 'wave'].map((s) => game(s, { sessionMode: 'parallel', lineage: lineage(s) }));
+  let state = { seed: 11, n: 2, cycle: 0, played: [] };
+  const dealt = [];
+  for (let i = 0; i < 8; i++) {
+    const next = pickNext([...fox, ...others], state);
+    dealt.push(next.game.slug.startsWith('fox') ? 'fox' : next.game.slug);
+    state = { ...state, cycle: next.cycle, played: next.played };
+  }
+  assert.deepEqual([...dealt.slice(0, 4)].sort(), ['fox', 'golf', 'kart', 'wave']);
+  assert.deepEqual([...dealt.slice(4)].sort(), ['fox', 'golf', 'kart', 'wave']);
+});
+
+test('a seat with nothing but a touch screen gets the games tagged touch, while any fit', () => {
+  const games = [game('keys', { tags: ['3d'] }), game('taps', { tags: ['touch', 'retro'] })];
+  assert.deepEqual(eligible(games, 2, { touchOnly: true }).map((g) => g.slug), ['taps']);
+  assert.deepEqual(eligible(games, 2).map((g) => g.slug), ['keys', 'taps']);
+  // With no touch game in the pool the session still deals, rather than nothing at all.
+  assert.deepEqual(eligible([games[0]], 2, { touchOnly: true }).map((g) => g.slug), ['keys']);
+  assert.equal(pickNext([games[0]], { seed: 's', n: 2, touchOnly: true })?.game.slug, 'keys');
+});
+
+test('the live scoreboard orders players as the round will rank them', () => {
+  const rows = [
+    { id: 0, progress: { score: 300, label: 'Floor 3' } },
+    { id: 1, result: { score: 500 } },
+    { id: 2, out: 'left', progress: { score: 900 } },
+    { id: 3 },
+    { id: 4, result: { time: 61_000 } },
+    { id: 5, progress: { score: 300 } },
+    { id: 6, result: { time: 59_500 } },
+  ];
+  assert.deepEqual(liveOrder(rows).map((r) => r.id), [6, 4, 1, 0, 5, 3, 2]);
 });

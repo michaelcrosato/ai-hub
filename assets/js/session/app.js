@@ -22,8 +22,9 @@
  * 10-second countdown that starts the round by itself, Ready (every seat
  * ready starts it at once) and I need more time (+10 s; while most seats ask,
  * the countdown holds). The games load underneath and ready up by themselves
- * (lib/hub/README.md §6); the host's round coordinator starts the round when
- * the splash is over and every game has loaded.
+ * (lib/hub/README.md, "Ready, start and the clock"); the host's round
+ * coordinator starts the round when the splash is over and every game has
+ * loaded.
  */
 
 import { h, clear } from '../dom.js';
@@ -31,12 +32,12 @@ import { loadManifest, normalize, sessionOf } from '../manifest.js';
 import { fnv1a } from '../color.js';
 import { createPlayer } from '../ui/player.js';
 import { createBridge, attachFrame, postTo } from '/lib/hub/bridge.js';
-import { createRound, limitFor, SLOT_COLORS } from '/lib/hub/round.js';
+import { createRound, limitFor, rankRace, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
 import { pickNext, eligible, sessionPool } from './pick.js';
-import { scoreRound, addRound, leaderboard, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, finalTable } from './score.js';
+import { scoreRound, addRound, leaderboard, liveOrder, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, finalTable } from './score.js';
 
 const SEATS = 4;
 const STATE_EVERY_MS = 2_000;
@@ -74,11 +75,12 @@ const app = document.getElementById('session');
 const strip = document.getElementById('strip');
 const overlay = document.getElementById('results');
 
-/** The two reference games, for a session with nothing else to play. */
+/** The reference games, one per kind of round, for a session with nothing else to play. */
 const EXAMPLES = [
   { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Versus: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'versus', sessionMinutes: '2', sessionGoal: 'First to ten stars wins', sessionHowto: 'Move: arrows, WASD or a stick · sprint: Space or Cross · or hold a finger' },
   { slug: 'hub-example-race', name: 'Comet Dash', tagline: 'Race with ghosts', path: '/lib/hub/examples/race.html', themeColor: '#0f1b2e', sessionMode: 'race', sessionMinutes: '1', sessionGoal: 'Fastest to the end of the course wins', sessionHowto: 'Steer: ← →, A D or a stick · boost: Space or Cross · or drag a finger' },
-].map((g) => normalize({ ...g, type: 'Game', session: '1', sessionPlayers: '2-4', builds: [{ id: 'current', path: g.path }] }));
+  { slug: 'hub-example-parallel', name: 'Starfall', tagline: 'Side by side: one minute of falling stars', path: '/lib/hub/examples/parallel.html', themeColor: '#15103a', sessionMode: 'parallel', sessionPlayers: '1-4', sessionMinutes: '1', sessionGoal: 'Most points in one minute: catch stars, dodge rocks', sessionHowto: 'Move: ← →, A D or a stick · dash: Space or Cross · or drag a finger' },
+].map((g) => normalize({ sessionPlayers: '2-4', ...g, type: 'Game', session: '1', tags: ['touch'], builds: [{ id: 'current', path: g.path }] }));
 
 let pool = [];
 let net = null;
@@ -110,9 +112,19 @@ const player = createPlayer(document.getElementById('player'), {
   honorStandalone: false,
   askToRate: false,
   backLabel: 'Leave the session',
-  src: (build) => `${build.path}${build.path.includes('?') ? '&' : '?'}aihub=1`,
+  src: (build) => roundSrc(build.path, pendingRound),
   onFrame: (frame) => attachRound(frame),
 });
+
+/**
+ * The game's address in a round. Side by side, the seed rides in it too: the
+ * client seeds Math.random with it before the game's own scripts run, so every
+ * copy starts the same (lib/hub/README.md, "Side by side").
+ */
+function roundSrc(path, cur) {
+  const join = path.includes('?') ? '&' : '?';
+  return cur?.mode === 'parallel' ? `${path}${join}aihub=1&aihub-seed=${cur.seed >>> 0}` : `${path}${join}aihub=1`;
+}
 
 /* --- who is here ----------------------------------------------------------- */
 
@@ -121,6 +133,8 @@ const seated = () =>
     .filter((m) => Number.isInteger(m.slot) && m.name)
     .sort((a, b) => a.slot - b.slot);
 const hostKey = () => seated()[0]?.key ?? null;
+/** What the seated players' browsers can run, for the deal and the lobby's count alike. */
+const seatsCan = () => ({ webgpu: seated().every((m) => m.gpu === true), touchOnly: seated().some((m) => m.touch === true) });
 const isHost = () => hostKey() === key;
 const mine = () => net?.me();
 
@@ -128,8 +142,28 @@ function claimSeat() {
   const others = net.members().filter((m) => m.key !== key && Number.isInteger(m.slot));
   const taken = new Set(others.map((m) => m.slot));
   const slot = fixedSeat ?? [...Array(SEATS).keys()].find((s) => !taken.has(s));
-  net.update({ slot: slot ?? null, name, status: slot === undefined ? 'full' : 'here' });
+  net.update({ slot: slot ?? null, name, status: slot === undefined ? 'full' : 'here', gpu: webgpu, touch: touchOnly });
 }
+
+/** Nothing but a touch screen to play with: the deal then keeps to games tagged touch. */
+const touchOnly = matchMedia('(pointer: coarse)').matches && !matchMedia('(any-pointer: fine)').matches;
+
+/**
+ * Whether this browser can play a game that needs WebGPU (hub:webgpu
+ * "required"): an adapter, not just the API. Every seat says so in its
+ * presence, and the deal skips such games unless every seat can.
+ */
+let webgpu = false;
+(async () => {
+  try {
+    const adapter = await navigator.gpu?.requestAdapter();
+    // A software adapter (SwiftShader) has the API but not the speed to play on.
+    webgpu = Boolean(adapter) && !(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter);
+  } catch {
+    webgpu = false;
+  }
+  if (net && name) net.update({ gpu: webgpu });
+})();
 
 /** Two tabs that picked one seat at once: the later one moves. */
 function settleSeat() {
@@ -186,12 +220,36 @@ function takeOver() {
   let next = state ? { ...state } : freshState();
   if (!state) next.knobs = knobs;
   if (next.phase === 'round' && next.current && next.current.coordinator !== key) {
-    next = withRoundRecorded(next, { status: 'void', reason: 'host-left', standings: null, players: [] });
+    next = withRoundRecorded(next, scoreLeftRound(next.current) ?? { status: 'void', reason: 'host-left', standings: null, players: [] });
     saveRound(next.history.at(-1));
+    if (formatOver(next.format, next.history, next.totals)) return endSession(next);
     next.reveal = revealFor(next);
   }
   publish(next);
   dealNext();
+}
+
+/**
+ * The round's coordinator left with the old host's tab. A shared world dies
+ * with its host, but a race or a side-by-side round needs none: score it from
+ * the last status this tab saw, each player's result or else their last
+ * progress, instead of throwing away what the others played. Null when there
+ * is nothing to score.
+ */
+function scoreLeftRound(cur) {
+  const s = status;
+  if (!s || s.round !== cur.round || !SELF_REPORTED.includes(cur.mode) || !['countdown', 'playing', 'grace'].includes(s.phase)) return null;
+  const players = s.players.map((p) => ({ id: p.id, key: p.key, slot: p.slot, name: p.name, color: p.color, out: p.out ?? (p.key === cur.coordinator ? 'left' : null) }));
+  const results = new Map();
+  for (const p of s.players) {
+    if (p.result) results.set(p.id, p.result);
+    else if (!p.out && p.key !== cur.coordinator && boardRound === cur.round && progressById.has(p.id)) results.set(p.id, { score: progressById.get(p.id).score, fallback: true });
+  }
+  if (!results.size) return null;
+  const ranked = rankRace(results, players.filter((p) => !p.out || results.has(p.id)).map((p) => p.id));
+  const gone = players.filter((p) => p.out && !results.has(p.id)).map((p) => p.id);
+  const scores = Object.fromEntries([...results].map(([id, r]) => [id, Number.isFinite(r.time) ? r.time : r.score]));
+  return { status: 'played', reason: 'host-left', standings: gone.length ? [...ranked, gone] : ranked, players, results: Object.fromEntries(results), scores };
 }
 
 function applyState() {
@@ -214,7 +272,7 @@ function applyState() {
 function startRound({ under = false } = {}) {
   if (!isHost() || !state) return;
   const players = seated().map((m) => ({ key: m.key, slot: m.slot, name: m.name }));
-  const pick = pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played });
+  const pick = pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played, ...seatsCan() });
   if (!pick) {
     publish({ ...state, phase: 'lobby', notice: `No game in the library fits ${players.length} player${players.length === 1 ? '' : 's'} yet.` });
     return;
@@ -427,9 +485,18 @@ function attachRound(frame) {
     net,
     clock: net.clock ?? Date,
     onIssue: (i) => console.warn(`[session] ${i.problem}`),
+    onProgress: (id, p) => noteProgress(cur.round, id, p),
+    onFullscreen: fullscreen,
   });
   detach = attachFrame(frame, (msg) => bridge.fromGame(msg));
   for (const [from, env] of early.splice(0)) if (env.r === cur.round) bridge.fromNet(from, env);
+}
+
+/** A game asked for fullscreen: the hub's whole page takes it, so the scoreboard and the cards stay over the game. */
+function fullscreen(on) {
+  const page = document.documentElement;
+  if (on && !document.fullscreenElement) page.requestFullscreen?.().catch(() => {});
+  else if (!on && document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
 }
 
 function closeRound() {
@@ -500,6 +567,7 @@ function render() {
     seat: mine()?.slot ?? null,
     links: Object.fromEntries((net?.members() ?? []).filter((m) => m.key !== key).map((m) => [m.key, net.link?.(m.key) ?? 'local'])),
     traffic: bridge ? { ...bridge.stats } : null,
+    progress: boardRound === state?.current?.round ? Object.fromEntries(progressById) : {},
     clock: net?.clock ? { offset: net.clock.offset, rtt: net.clock.rtt, following: net.clock.following } : null,
   };
   player.refresh();
@@ -522,6 +590,7 @@ function render() {
   else app.append(lobbyScreen());
   renderStrip();
   renderResults();
+  renderBoard();
 }
 
 function hostIntro() {
@@ -614,7 +683,7 @@ function wire() {
 function lobbyScreen() {
   const seats = seated();
   const n = seats.length;
-  const fits = eligible(pool, n).length;
+  const fits = eligible(pool, n, seatsCan()).length;
   const cur = state?.current;
   const host = isHost();
   const inRound = state?.phase === 'round' && cur && !cur.players.some((p) => p.key === key);
@@ -778,6 +847,77 @@ function renderStrip() {
   ].filter(Boolean));
 }
 
+/* --- the scoreboard: everyone's progress, live, over the game ----------------- */
+
+const BOARD_KEY = 'ai-hub:board';
+/** Over the game, top right, clear of the corner bar: one row a player, for games that report progress. */
+const board = h('aside', { class: 'session-board', 'aria-label': 'Scores', hidden: true });
+let boardRound = null;
+let progressById = new Map();
+
+function noteProgress(round, id, p) {
+  if (boardRound !== round) {
+    boardRound = round;
+    progressById = new Map();
+  }
+  progressById.set(id, p);
+  // The round ranks a player who never reports by the last progress seen (lib/hub/round.js).
+  if (coordinator && state?.current?.round === round) coordinator.progress(id, p.score);
+  renderBoard();
+}
+
+const boardFolded = () => {
+  try {
+    return localStorage.getItem(BOARD_KEY) === 'folded';
+  } catch {
+    return false;
+  }
+};
+
+function foldBoard() {
+  try {
+    localStorage.setItem(BOARD_KEY, boardFolded() ? 'shown' : 'folded');
+  } catch {
+    /* storage blocked: it just does not stick */
+  }
+  renderBoard();
+  // Most games pause when their window loses focus: give it straight back.
+  player.focusGame();
+}
+
+function renderBoard() {
+  const cur = state?.current;
+  board.hidden = true;
+  if (!cur || boardRound !== cur.round || !player.isOpen() || revealStage() !== 'none') return;
+  const players = status && status.round === cur.round ? status.players : cur.players.map((p, id) => ({ ...p, id, color: SLOT_COLORS[p.slot] }));
+  const rows = liveOrder(players.map((p) => ({ id: p.id, key: p.key, name: p.name, color: p.color, out: p.out, result: p.result ?? null, progress: progressById.get(p.id) ?? null })));
+  board.hidden = !rows.some((r) => r.progress || r.result);
+  if (board.hidden) return;
+  const root = document.getElementById('player');
+  if (board.parentNode !== root) root.append(board);
+  const folded = boardFolded();
+  clear(board);
+  // The button never takes focus from the game (pointerdown's default would).
+  board.append(h('button', { type: 'button', class: 'board__toggle', 'aria-expanded': String(!folded), onpointerdown: (e) => e.preventDefault(), onclick: foldBoard }, folded ? 'Scores ▾' : 'Scores ▴'));
+  if (folded) return;
+  board.append(
+    h(
+      'ol',
+      { class: 'board__rows' },
+      ...rows.map((r, i) =>
+        h(
+          'li',
+          { class: r.key === key ? 'is-me' : r.out ? 'is-out' : '', style: `--seat: ${r.color}` },
+          h('span', { class: 'board__place' }, r.out ? '–' : String(i + 1)),
+          h('span', { class: 'board__name' }, r.name),
+          h('span', { class: 'board__label' }, r.out ? 'left' : r.result ? 'done' : (r.progress?.label ?? '')),
+          h('span', { class: 'board__score' }, r.result ? resultText(r.result) : r.progress ? String(r.progress.score) : '')
+        )
+      )
+    )
+  );
+}
+
 const REASONS = {
   'host-left': 'the host left',
   'host-not-ready': 'the host was not ready',
@@ -900,7 +1040,7 @@ function resultsCard(entry) {
   );
 }
 
-const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op' };
+const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op', parallel: 'Side by side' };
 
 /** Host: skip the rest of the results; the splash starts its countdown now. */
 function nextGameNow() {
@@ -914,7 +1054,7 @@ function splashCard(cur) {
   const game = pool.find((g) => g.slug === cur.slug);
   const info = game ? sessionOf(game) : null;
   // The spin passes the other games once each, starting somewhere new every round.
-  const others = [...new Set(eligible(pool, cur.players.length).filter((g) => g.slug !== cur.slug).map((g) => g.name))];
+  const others = [...new Set(eligible(pool, cur.players.length, seatsCan()).filter((g) => g.slug !== cur.slug).map((g) => g.name))];
   const start = others.length ? cur.round % others.length : 0;
   const reel = [...others.slice(start), ...others.slice(0, start)].filter((n) => n !== cur.name).slice(0, 6);
   const playing = cur.players.some((p) => p.key === key);

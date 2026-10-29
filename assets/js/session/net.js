@@ -4,9 +4,10 @@
  *
  * Presence, round control and WebRTC signalling go over a relay: the
  * session's private Supabase Realtime channel (supabaseRelay below), or a
- * test relay in the browser tests. Game traffic ({k:'g'}) and clock requests
- * ({k:'t'}) go straight between browsers over the mesh (session/mesh.js), so
- * a busy game costs Realtime nothing.
+ * test relay in the browser tests. Game traffic ({k:'g'}), the players'
+ * progress for the scoreboard ({k:'p'}) and clock requests ({k:'t'}) go
+ * straight between browsers over the mesh (session/mesh.js), so a busy game
+ * costs Realtime nothing.
  */
 
 import { createMesh } from './mesh.js';
@@ -123,7 +124,7 @@ export function createRelayNet({ key, relay, iceServers = [], relayOnly = false 
         setTimeout(() => emit(key, copy));
         return;
       }
-      if (env?.k === 'g') mesh.send(to, env, { reliable });
+      if (env?.k === 'g' || env?.k === 'p') mesh.send(to, env, { reliable });
       else relay.send('env', { from: key, to, env });
     },
     broadcast(env) {

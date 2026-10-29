@@ -8,8 +8,9 @@
  *            ask for more time, which holds the countdown, two take it back,
  *            and the countdown runs out by itself;
  *   round 2: everyone presses Ready (a click, Enter, the controller's Cross),
- *            which starts it at once; then the host closes its tab (void: the
- *            round dies with its host, and the next seat takes over);
+ *            which starts it at once; then the host closes its tab and the
+ *            next seat takes over (a shared world would be void; this race or
+ *            side-by-side round is scored from what the next host saw);
  *   round 3: the three who are left; Create + Options hands one tab's corner
  *            bar to the controller and Circle gives it back;
  *   round 4: the host's 🎲 skips it; in round 5 a guest's ✕ (held, then
@@ -183,15 +184,24 @@ try {
   log(`round 2: all four ready (click, Enter, Cross, click), started with ${(left / 1000).toFixed(1)} s still on the clock`);
   await waitFor(pages[1], started, null, 20_000);
   await play([pages[2], pages[3], pages[4]], 2_000);
-  log(`round 2 under way (${(await session(pages[2])).state.current.name}); the host leaves`);
+  const mode2 = (await session(pages[2])).state.current.mode;
+  // A race or side-by-side round outlives its host: let the scoreboard hear from the players first.
+  if (['race', 'parallel'].includes(mode2)) await waitFor(pages[2], () => Object.keys(window.__session?.progress ?? {}).length >= 2, null, 15_000);
+  log(`round 2 under way (${(await session(pages[2])).state.current.name}, ${mode2}); the host leaves`);
   await pages[1].close();
   delete pages[1];
   await waitFor(pages[2], () => (window.__session?.state?.history.length ?? 0) >= 2, null, 20_000);
   state = (await session(pages[2])).state;
   assert.equal(state.host, 'seat2', 'the next seat took over');
-  assert.equal(state.history[1].status, 'void');
   assert.equal(state.history[1].reason, 'host-left');
-  log('round 2 void (host-left); seat 2 hosts now');
+  if (['race', 'parallel'].includes(mode2)) {
+    assert.equal(state.history[1].status, 'played', 'a race or side-by-side round is scored from what the new host saw');
+    assert.equal(state.history[1].rows.find((row) => row.key === 'seat1').place, state.history[1].rows.length, 'the host who left comes last');
+    log(`round 2 scored after the host left: ${state.history[1].rows.map((row) => `${row.name} +${row.points}`).join(', ')}; seat 2 hosts now`);
+  } else {
+    assert.equal(state.history[1].status, 'void');
+    log('round 2 void (host-left); seat 2 hosts now');
+  }
 
   // Round 3: the three who are left; Create + Options hands seat 3's bar to its controller.
   for (const seat of [2, 3, 4]) await onSplash(pages[seat], 3);

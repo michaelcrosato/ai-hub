@@ -12,7 +12,9 @@ const stats = { isFave: () => false, plays: () => 0, lastPlayed: () => 0 };
 const MODE_TAGS = ['versus', 'co-op', 'race'];
 
 const library = (await scan({ quiet: true })).games.map(normalize);
-const sessionGames = library.filter((game) => sessionOf(game)?.supported);
+// Side by side seats friends in a session, but each plays alone: such a game is
+// not a multiplayer game on the wall, only one with a session line in its details.
+const sessionGames = library.filter((game) => sessionOf(game)?.supported && sessionOf(game).mode !== 'parallel');
 
 test('every session game is catalogued for 1–4 players and tagged with how it plays together', () => {
   assert.ok(sessionGames.length > 0);

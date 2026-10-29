@@ -16,7 +16,7 @@
  *
  * A controller reaches the bar too: holding Create + Options for a second
  * hands the bar to it (the D-pad moves, Cross presses, Circle leaves). Games
- * leave Options alone while Create is held (lib/hub/README.md §12).
+ * leave Options alone while Create is held (lib/hub/README.md, Controls).
  */
 
 import { h, clear, icon, ICONS } from '../dom.js';
@@ -522,6 +522,8 @@ export function createPlayer(
     currentBuild: () => session?.build || null,
     /** Where a caller's own line goes in the bar, between the 🎲 and the ←. */
     slot: () => root.querySelector('.player__slot'),
+    /** Hand the keyboard back to the game, after a control of the caller's own over it. */
+    focusGame: () => session?.frame && refocusGame(),
     /** Ask canRoll() again: a session's host can change mid-game. */
     refresh() {
       const roll = root.querySelector('.player__roll');

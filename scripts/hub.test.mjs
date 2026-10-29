@@ -48,19 +48,28 @@ async function loadClient({ search = '?aihub=1', framed = true } = {}) {
   const listeners = [];
   const parent = { postMessage: (msg, origin) => posted.push({ msg: JSON.parse(JSON.stringify(msg)), origin }) };
   const warnings = [];
+  const saved = { getItem: (k) => (k === 'unlocks' ? 'all of them' : null), setItem: () => {} };
+  const realRequest = function () {
+    return 'the real requestFullscreen';
+  };
   const window = {
     location: { search },
     performance: { now: clock.now },
     console: { warn: (text) => warnings.push(text) },
     addEventListener: (type, fn) => type === 'message' && listeners.push(fn),
+    localStorage: saved,
+    sessionStorage: saved,
+    Element: Object.assign(function Element() {}, { prototype: { requestFullscreen: realRequest } }),
+    document: {},
   };
   window.parent = framed ? parent : window;
-  const context = vm.createContext({ window, setTimeout: clock.setTimeout, Promise, JSON, Math, Object, Array, String, Number, Date, isFinite });
+  // Each sandbox gets its own Math, so a client that seeds Math.random seeds only its own page.
+  const context = vm.createContext({ window, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, Promise, JSON, Math: Object.create(Math), Object, Array, String, Number, Date, isFinite });
   vm.runInContext(source, context);
   const hub = window.AIHub;
   const fromHub = (data, origin = 'https://hub.test') => listeners.forEach((fn) => fn({ source: parent, data, origin }));
   const flush = () => new Promise((resolve) => setImmediate(resolve));
-  return { hub, posted, fromHub, clock, warnings, parent, listeners, flush };
+  return { hub, posted, fromHub, clock, warnings, parent, listeners, flush, math: context.Math, window, realRequest };
 }
 
 const WELCOME = { aihub: 1, type: 'welcome', me: 1, host: 0, players: [{ id: 0, name: 'Red Fox', color: '#e8443a' }, { id: 1, name: 'Blue Otter', color: '#3b82f6' }], mode: 'versus', seed: 42, limitMs: 180_000, round: 3 };
@@ -77,7 +86,7 @@ test('the client is inactive without ?aihub=1 in a frame, and connect() answers 
 test('the client says hello until welcomed, then resolves with the round', async () => {
   const { hub, posted, fromHub, clock } = await loadClient();
   const info = hub.connect({ mode: 'versus', seats: [2, 4] });
-  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.2.0', mode: 'versus', seats: [2, 4] });
+  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.3.0', mode: 'versus', seats: [2, 4] });
   assert.equal(posted[0].origin, '*');
   clock.advance(1_000);
   assert.equal(posted.length, 3);
@@ -95,12 +104,16 @@ test('the client says hello until welcomed, then resolves with the round', async
   assert.deepEqual(posted.slice(3).map((p) => [p.msg.type, p.origin]), [['ready', 'https://hub.test']]);
 });
 
-test('the client gives up after ten seconds with no hub, and plays solo', async () => {
-  const { hub, clock } = await loadClient();
-  const info = hub.connect({ mode: 'race' });
+test('the client gives up after ten seconds with no hub, and plays solo with its own storage and Math.random', async () => {
+  const { hub, clock, window, math } = await loadClient({ search: '?aihub=1&aihub-seed=9' });
+  assert.equal(window.localStorage.getItem('unlocks'), null);
+  const info = hub.connect({ mode: 'parallel' });
   clock.advance(10_600);
   assert.equal(await info, null);
   assert.equal(hub.active, false);
+  assert.equal(hub.seeded, false);
+  assert.equal(math.random, Math.random, 'Math.random is the real one again');
+  assert.equal(window.localStorage.getItem('unlocks'), 'all of them', 'and so is the storage');
 });
 
 test('the client ignores messages that are not from its parent', async () => {
@@ -164,6 +177,25 @@ test('the client lets only the host finish, once, and a racer report once', asyn
   assert.deepEqual(host.posted.filter((p) => p.msg.type === 'finish').map((p) => p.msg.standings), [[[0], [1]]]);
 });
 
+test('a result is judged on the numbers the game gave: NaN, Infinity, null and empty text are no time', async () => {
+  const results = [];
+  for (const outcome of [{ time: NaN, score: 120 }, { time: Infinity }, { time: null, score: '' }, { score: '95', time: undefined }, { time: 61_000, score: 3, stats: { Jumps: 9 } }]) {
+    const { hub, posted, fromHub } = await loadClient();
+    hub.connect();
+    fromHub({ ...WELCOME, mode: 'race' });
+    hub.result(outcome);
+    hub.progress({ score: null });
+    results.push(posted.filter((p) => ['result', 'progress'].includes(p.msg.type)).map(({ msg: { aihub, ...m } }) => m));
+  }
+  assert.deepEqual(results, [
+    [{ type: 'result', score: 120 }],
+    [],
+    [],
+    [{ type: 'result', score: 95 }],
+    [{ type: 'result', time: 61_000, score: 3, stats: { Jumps: 9 } }],
+  ]);
+});
+
 test('the client seeds the same generator on every device, one stream per label', async () => {
   const a = await loadClient();
   const b = await loadClient();
@@ -175,6 +207,97 @@ test('the client seeds the same generator on every device, one stream per label'
   assert.deepEqual(take(a.hub.rng('course')), take(b.hub.rng('course')));
   assert.notDeepEqual(take(a.hub.rng('course')), take(a.hub.rng('stars')));
   assert.ok(take(a.hub.rng('x')).every((n) => n >= 0 && n < 1));
+});
+
+test('side by side: with aihub-seed in its address, the client seeds Math.random before the game runs', async () => {
+  const a = await loadClient({ search: '?aihub=1&aihub-seed=4242' });
+  const b = await loadClient({ search: '?aihub-seed=4242&aihub=1' });
+  const take = (c) => Array.from({ length: 6 }, () => c.math.random());
+  assert.equal(a.hub.seeded, true);
+  const first = take(a);
+  assert.deepEqual(first, take(b), 'every copy draws the same numbers');
+  assert.ok(first.every((n) => n >= 0 && n < 1));
+  const other = await loadClient({ search: '?aihub=1&aihub-seed=7' });
+  assert.notDeepEqual(take(other), first);
+  for (const options of [{ search: '?aihub=1' }, { search: '?aihub-seed=4242' }, { search: '?aihub=1&aihub-seed=4242', framed: false }]) {
+    const c = await loadClient(options);
+    assert.equal(c.hub.seeded, false, JSON.stringify(options));
+    assert.equal(c.math.random, Math.random, 'Math.random is left alone outside side by side');
+  }
+});
+
+test('in a session the game gets an empty storage of its own, so every round starts as a first launch', async () => {
+  const { window } = await loadClient();
+  const store = window.localStorage;
+  assert.equal(store.getItem('unlocks'), null, 'nothing saved on the device carries in');
+  store.setItem('best', 120);
+  store.level = '3';
+  assert.equal(store.getItem('best'), '120');
+  assert.equal(store.getItem('level'), '3', 'items set as properties are items too');
+  assert.equal(store.best, '120');
+  assert.equal(store.length, 2);
+  assert.deepEqual(Object.keys(store).sort(), ['best', 'level']);
+  assert.equal(store.key(0), 'best');
+  store.removeItem('best');
+  delete store.level;
+  assert.equal(store.length, 0);
+  assert.notEqual(window.sessionStorage, window.localStorage);
+  const solo = await loadClient({ search: '' });
+  assert.equal(solo.window.localStorage.getItem('unlocks'), 'all of them', 'outside a session the real storage is left alone');
+});
+
+test('in a session a game that asks for fullscreen gets the hub’s whole page, so the hub’s cards stay on top', async () => {
+  const { window, posted } = await loadClient();
+  const canvas = Object.create(window.Element.prototype);
+  assert.equal(await canvas.requestFullscreen(), undefined);
+  await window.document.exitFullscreen();
+  assert.deepEqual(posted.map((p) => p.msg), [{ aihub: 1, type: 'fullscreen', on: true }, { aihub: 1, type: 'fullscreen', on: false }]);
+  const solo = await loadClient({ search: '' });
+  assert.equal(solo.window.Element.prototype.requestFullscreen, solo.realRequest, 'outside a session the game’s own fullscreen is left alone');
+  const lost = await loadClient();
+  lost.hub.connect();
+  lost.clock.advance(10_600);
+  assert.equal(lost.window.Element.prototype.requestFullscreen, lost.realRequest, 'and a page that finds no hub gets it back');
+  assert.equal(lost.window.document.exitFullscreen, undefined);
+});
+
+test('the client keeps every welcome field and passes on events it has never heard of', async () => {
+  const { hub, fromHub, clock, flush } = await loadClient();
+  const info = hub.connect();
+  fromHub({ ...WELCOME, format: 'party', active: false, send: 'not a function', limits: { ratePerS: 5, burst: 5 } });
+  const round = await info;
+  assert.equal(round.format, 'party', 'a field a newer hub adds needs no newer client');
+  assert.equal(hub.format, 'party');
+  assert.equal(hub.active, true, 'the client’s own fields are not the welcome’s to change');
+  assert.equal(typeof hub.send, 'function');
+  let sent = 0;
+  for (let i = 0; i < 20; i++) if (hub.send({ i })) sent++;
+  assert.equal(sent, 5, 'the welcome’s limits replace the built-in ones');
+  const got = [];
+  hub.on('cheer', (detail) => got.push(detail));
+  fromHub({ aihub: 1, type: 'cheer', who: 2, loud: true });
+  clock.advance(0);
+  await flush();
+  assert.deepEqual(JSON.parse(JSON.stringify(got)), [{ who: 2, loud: true }]);
+});
+
+test('progress reaches the hub at most once a second, the latest value last, and stops with the result', async () => {
+  const { hub, posted, fromHub, clock } = await loadClient();
+  hub.connect();
+  fromHub({ ...WELCOME, mode: 'parallel' });
+  const progress = () => posted.filter((p) => p.msg.type === 'progress').map((p) => p.msg);
+  hub.progress({ score: 1, label: 'Floor 1' });
+  for (let i = 2; i <= 9; i++) hub.progress({ score: i, label: `Floor ${i} of a building far too tall to name` });
+  hub.progress({ score: NaN });
+  assert.deepEqual(progress(), [{ aihub: 1, type: 'progress', score: 1, label: 'Floor 1' }]);
+  clock.advance(1_000);
+  assert.deepEqual(progress().at(-1), { aihub: 1, type: 'progress', score: 9, label: 'Floor 9 of a building fa' });
+  assert.equal(progress().length, 2);
+  hub.progress({ score: 10 });
+  hub.result({ score: 10, extra: { kept: true } });
+  clock.advance(5_000);
+  assert.equal(progress().length, 2, 'nothing after the result');
+  assert.deepEqual(posted.at(-1).msg, { aihub: 1, type: 'result', score: 10, extra: { kept: true } }, 'the whole outcome goes to the hub, which checks it');
 });
 
 /* --- the round (lib/hub/round.js) ------------------------------------------- */
@@ -354,6 +477,46 @@ test('a race survives its host leaving and ranks finishers, then scores, then si
   assert.deepEqual(round.record.scores, { 1: 4_200, 2: 9_000 });
 });
 
+test('a racer who finished and then left keeps their place', () => {
+  const { round, clock, allHello, allReady } = setup({ n: 3, mode: 'race' });
+  allHello();
+  allReady();
+  clock.advance(4_000);
+  round.receive('k0', { type: 'result', time: 5_000 });
+  round.leave('k0');
+  round.leave('k2');
+  round.receive('k1', { type: 'result', time: 9_000 });
+  assert.deepEqual(round.record.standings, [[0], [1], [2]]);
+});
+
+test('a player still in a race or side by side who never reports is ranked by their last progress', () => {
+  const { round, clock, allHello, allReady } = setup({ n: 3, mode: 'parallel', limitMs: 30_000 });
+  allHello();
+  allReady();
+  clock.advance(4_000);
+  round.progress(0, 300);
+  round.progress(1, 800);
+  round.progress(2, 50);
+  round.leave('k2');
+  round.receive('k1', { type: 'result', score: 700 });
+  round.progress(1, 9_999);
+  clock.advance(29_000 + 5_000);
+  assert.deepEqual(round.record.standings, [[1], [0], [2]], 'a reported result wins over later progress, and leaving with only progress counts as beaten');
+  assert.deepEqual(round.record.results[0], { score: 300, fallback: true });
+});
+
+test('a race takes no time from null, empty text or true, whatever client sent it', () => {
+  const { round, clock, allHello, allReady } = setup({ n: 2, mode: 'race' });
+  allHello();
+  allReady();
+  clock.advance(4_000);
+  round.receive('k0', { type: 'result', time: null, score: 40 });
+  round.receive('k1', { type: 'result', time: '', score: true });
+  round.receive('k1', { type: 'result', time: '52000' });
+  assert.deepEqual(round.record.results, { 0: { score: 40 }, 1: { time: 52_000 } });
+  assert.deepEqual(round.record.standings, [[1], [0]], 'a finisher beats a score; a null time is no 0 ms finish');
+});
+
 test('a race ends as soon as every racer has reported', () => {
   const { round, clock, allHello, allReady } = setup({ n: 2, mode: 'race' });
   allHello();
@@ -362,6 +525,25 @@ test('a race ends as soon as every racer has reported', () => {
   round.receive('k0', { type: 'result', time: 30_000 });
   round.receive('k1', { type: 'result', time: 25_000 });
   assert.deepEqual(round.record.standings, [[1], [0]]);
+});
+
+test('side by side: each copy reports itself, nothing waits on a host, and the round ranks like a race', () => {
+  const { round, clock, allHello, allReady, to } = setup({ n: 3, mode: 'parallel', limitMs: 30_000 });
+  allHello();
+  allReady();
+  clock.advance(4_000);
+  round.leave('k0');
+  assert.equal(round.record, null, 'the first seat leaving ends nothing: there is no shared world');
+  round.receive('k1', { type: 'result', score: 900, stats: { stars: 12 }, awards: [{ title: 'Star streak' }] });
+  round.receive('k2', { type: 'finish', standings: [[2], [1]] });
+  clock.advance(29_000);
+  assert.equal(to('k2', 'time-up').length, 1);
+  round.receive('k2', { type: 'result', score: 1_400 });
+  assert.equal(round.record.status, 'played', 'the round ends as soon as everyone left in it has reported');
+  assert.deepEqual(round.record.standings, [[2], [1], [0]]);
+  assert.deepEqual(round.record.stats, { 1: { stars: 12 } });
+  assert.deepEqual(round.record.awards, [{ id: 1, title: 'Star streak' }]);
+  assert.match(round.record.issues.map((i) => i.problem).join('|'), /finish is for versus and co-op; parallel games report result/);
 });
 
 test('a fatal error voids the round only when it comes from the host of a shared world', () => {
@@ -405,6 +587,7 @@ function bridgeSetup() {
   const posted = [];
   const net = [];
   const issues = [];
+  const progress = [];
   const bridge = createBridge({
     key: 'b',
     round: 4,
@@ -413,11 +596,57 @@ function bridgeSetup() {
     net: { send: (to, env, opts) => net.push([to, env, opts]) },
     clock,
     onIssue: (i) => issues.push(i.problem),
+    onProgress: (id, p) => progress.push([id, p]),
   });
   const welcome = (extra = {}) =>
     bridge.fromNet('hub', { k: 'h', r: 4, m: { round: 4, type: 'welcome', me: 1, host: 0, players: [], keys: ['a', 'b', 'c'], mode: 'race', seed: 1, limitMs: 9, ...extra } });
-  return { bridge, posted, net, issues, clock, welcome };
+  return { bridge, posted, net, issues, clock, welcome, progress };
 }
+
+test('the bridge hands a game’s fullscreen requests to the hub page, whenever they come', () => {
+  const asked = [];
+  const bridge = createBridge({ key: 'b', round: 1, coordinator: 'hub', post: () => {}, net: { send: () => {} }, clock: fakeClock(), onFullscreen: (on) => asked.push(on) });
+  bridge.fromGame({ aihub: 1, type: 'fullscreen', on: true });
+  bridge.fromGame({ aihub: 1, type: 'fullscreen' });
+  assert.deepEqual(asked, [true, false]);
+});
+
+test('the bridge tells the game the limits it enforces', () => {
+  const { posted, welcome } = bridgeSetup();
+  welcome();
+  assert.deepEqual(posted[0].limits, { maxBytes: LIMITS.maxBytes, ratePerS: LIMITS.ratePerS, burst: LIMITS.burst });
+});
+
+test('progress reaches this hub and every other player over the network, about once a second, never a game', () => {
+  const { bridge, posted, net, issues, clock, welcome, progress } = bridgeSetup();
+  bridge.fromGame({ aihub: 1, type: 'progress', score: 1 });
+  welcome();
+  bridge.fromGame({ aihub: 1, type: 'progress', score: 120, label: '  Lap 2 of 3 and a very long tail  ' });
+  assert.deepEqual(progress, [[1, { score: 120, label: 'Lap 2 of 3 and a very lo' }]]);
+  assert.deepEqual(net.map(([to, env, opts]) => [to, env.k, env.f, opts.reliable]), [['a', 'p', 1, false], ['c', 'p', 1, false]]);
+  bridge.fromGame({ aihub: 1, type: 'progress', score: 130 });
+  clock.advance(1_000);
+  bridge.fromGame({ aihub: 1, type: 'progress', score: 'lots' });
+  bridge.fromGame({ aihub: 1, type: 'progress', score: 140 });
+  assert.deepEqual(progress.map(([, p]) => p.score), [120, 140]);
+  assert.deepEqual(issues, ['progress before welcome', 'progress more than twice a second', 'progress needs a finite score']);
+
+  bridge.fromNet('a', { k: 'p', r: 4, f: 0, d: { score: 77, label: 'Floor 3' } });
+  bridge.fromNet('c', { k: 'p', r: 4, f: 0, d: { score: 99 } });
+  bridge.fromNet('a', { k: 'p', r: 3, f: 0, d: { score: 55 } });
+  assert.deepEqual(progress.slice(2), [[0, { score: 77, label: 'Floor 3' }]], 'a spoofed sender or another round is dropped');
+  assert.ok(!posted.some((m) => m.type === 'progress'), 'games never see progress');
+});
+
+test('progress stops with the end of the round, and from a player who left', () => {
+  const { bridge, welcome, progress } = bridgeSetup();
+  welcome();
+  bridge.fromNet('hub', { k: 'h', r: 4, m: { type: 'leave', id: 2, reason: 'left' } });
+  bridge.fromNet('c', { k: 'p', r: 4, f: 2, d: { score: 5 } });
+  bridge.fromNet('hub', { k: 'h', r: 4, m: { type: 'end', reason: 'finished' } });
+  bridge.fromNet('a', { k: 'p', r: 4, f: 0, d: { score: 6 } });
+  assert.deepEqual(progress, []);
+});
 
 test('the bridge forwards the first hello, and refuses game traffic before the welcome', () => {
   const { bridge, net, issues } = bridgeSetup();
@@ -512,21 +741,21 @@ test('the client reports the splash, and hands the harness whatever the game pro
   assert.equal(hub.splash, true);
 });
 
-test('the spec and both examples carry the client byte for byte', async () => {
+test('the spec and the three examples carry the client byte for byte', async () => {
   const client = await read('lib/hub/session.js');
-  assert.match(client, /^\/\*! aihub-session 1\.2\.0 /);
-  for (const file of ['lib/hub/README.md', 'lib/hub/examples/arena.html', 'lib/hub/examples/race.html']) {
+  assert.match(client, /^\/\*! aihub-session 1\.3\.0 /);
+  for (const file of ['lib/hub/README.md', 'lib/hub/examples/arena.html', 'lib/hub/examples/race.html', 'lib/hub/examples/parallel.html']) {
     assert.ok((await read(file)).includes(client), `${file} must contain lib/hub/session.js unchanged`);
   }
 });
 
-test('both examples declare session support in their heads', async () => {
+test('the examples declare session support in their heads', async () => {
   const { parseHead } = await import('./lib/parse.mjs');
-  for (const [file, mode] of [['lib/hub/examples/arena.html', 'versus'], ['lib/hub/examples/race.html', 'race']]) {
+  for (const [file, mode, seats] of [['lib/hub/examples/arena.html', 'versus', [2, 4]], ['lib/hub/examples/race.html', 'race', [2, 4]], ['lib/hub/examples/parallel.html', 'parallel', [1, 4]]]) {
     const { hub } = parseHead(await read(file));
     assert.equal(hub.session, '1');
     assert.equal(hub.sessionMode, mode);
-    assert.deepEqual(sessionOf(hub).seats, [2, 4]);
+    assert.deepEqual(sessionOf(hub).seats, seats);
   }
 });
 

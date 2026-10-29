@@ -7,7 +7,7 @@
  * a place. First place is a win; in co-op only when the team won.
  *
  * A session ends by its format, and the Party format adds the hub's own
- * awards as bonus points at the end (lib/hub/README.md §15).
+ * awards as bonus points at the end (docs/session-hub.md).
  */
 
 /** Each player's place (1 is best) from standings, best first, ties grouped. */
@@ -53,6 +53,25 @@ export function addRound(totals, entries) {
     };
   }
   return next;
+}
+
+/**
+ * The live scoreboard during a round, in the order the round will rank it
+ * (lib/hub/round.js, rankRace): whoever finished on time, fastest first; then
+ * everyone else by score, from their result or their latest progress; then
+ * those with nothing yet; players who left go last. Rows are
+ * { id, result?, progress?, out? }.
+ */
+export function liveOrder(rows) {
+  const score = (r) => (Number.isFinite(r.result?.score) ? r.result.score : r.progress?.score);
+  const band = (r) => (r.out ? 3 : Number.isFinite(r.result?.time) ? 0 : Number.isFinite(score(r)) ? 1 : 2);
+  return [...rows].sort((a, b) => {
+    const d = band(a) - band(b);
+    if (d) return d;
+    if (band(a) === 0) return a.result.time - b.result.time || a.id - b.id;
+    if (band(a) === 1) return score(b) - score(a) || a.id - b.id;
+    return a.id - b.id;
+  });
 }
 
 /** The table in order: points, then wins, then the better average place. */
