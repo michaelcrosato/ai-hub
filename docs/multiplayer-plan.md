@@ -5,7 +5,7 @@ version is that plan after an audit against the code, a census of all 1,831
 entries in the library, the cc-matrix repository and outside facts, and with
 the first stage built. The protocol itself, the one thing a game builder
 needs, is [`lib/hub/README.md`](../lib/hub/README.md), served at
-<https://crosato-arcade.vercel.app/lib/hub/README.md>. What the hub does
+<https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md>. What the hub does
 around a round is [`session-hub.md`](session-hub.md).
 
 ## The short version
@@ -312,7 +312,7 @@ games or so a night.
 
 ## Part 6. The roadmap
 
-**Now: client 1.3.0, in this change**
+**Now: client 1.3.0, built Oct 29**
 
 - Mode `parallel` (side by side): the client seeds `Math.random` from the
   address, `AIHub.progress()`, the round ranks it like a race, the harness and
@@ -344,7 +344,10 @@ games or so a night.
   `hub-check --retrofit`, `--draws-only` (which knows a WebGPU-only game this
   browser cannot run), `--record` and `--browser-args`.
 - Migration 0008: a round's mode may be any short word (applied from the
-  owner's computer with 0007).
+  owner's computer with 0007: the `/goal` in `docs/party-sessions-handoff.md`).
+- The links a game builder is given are GitHub's (`raw.githubusercontent.com`,
+  the `main` branch), so they outlast any change of host; the site itself
+  stays where it is.
 - Dedicated servers, the part in the games: a shared world must run when its
   host is a copy with no player of its own, and `hub-check` plays one such
   round for every versus and co-op game; the round takes a server seat;
@@ -354,9 +357,16 @@ games or so a night.
   a non-host's player on the next frame (about 17 ms), where it used to wait
   a median of 420 ms for the host.
 
-**Next: the hub alone, no game changes**
+**Next**
 
-- **Again**, first, before the first retrofitted wave is dealt. Side by side
+- **The retrofit pilot**, from the owner's computer, right after migrations
+  0007 and 0008 (both in the handoff's `/goal`): about thirty varied games
+  from wave 1. Its pass rate and cost per game settle the tiers and the cap
+  (row 4 of *Open decisions*); the games that pass are dealt from then on.
+
+Then the hub alone, no game changes:
+
+- **Again**, before wave 1 is dealt. Side by side
   becomes "best attempt in the window": a player whose run ends early starts
   a fresh one (the hub reloads their frame on the same seed) and their best
   counts. 44% of the library's games are shooters and 22% action games,
@@ -383,7 +393,7 @@ games or so a night.
   message when the free Supabase project is asleep after a quiet week,
   instead of a raw error, and perhaps a daily keep-alive; the scoreboard
   marking a player whose peer link is down rather than freezing their row.
-- **The retrofit pilot**, then wave 1 in batches.
+- **Wave 1** in batches of about fifty, once Again is in.
 
 **Later**
 
@@ -437,7 +447,7 @@ games or so a night.
 ## Part 7. cc-matrix
 
 Nothing changes in cc-matrix. It is handed
-<https://crosato-arcade.vercel.app/lib/hub/README.md>, and the protocol's
+<https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md>, and the protocol's
 own one-paragraph ask (in *Start here*) is the line to add to a prompt.
 Version 2's Appendix A is dropped: one source of truth, which the hub checks.
 
@@ -466,7 +476,7 @@ layout: an ai-hub change, made when the first cc-matrix builds come in.
 | # | Decision | Recommendation |
 |---|---|---|
 | 1 | Decisions 3 and 4 | Decided Oct 29: state, not video, and no video anywhere (remote couch pinned); dedicated servers prepared in the games now, built when wanted |
-| 2 | Side by side as "best attempt in the window", with *Again* | Yes: next, before the first retrofitted wave is dealt; no game changes |
+| 2 | Side by side as "best attempt in the window", with *Again* | Yes: after the pilot, before wave 1 is dealt; no game changes |
 | 3 | WebGPU-only games: drop "no fallback" in cc-matrix, or rely on `hub:webgpu`? | Both work; dropping it lets every friend play every new game |
 | 4 | Retrofit tiers and cap | Haiku 5.5, then Sonnet 5.5, $1 a game; confirm after the pilot |
 | 5 | Which builds first | One build of each title, readable and without WebGPU: wave 1, 228 games (`pick --wave 1`) |

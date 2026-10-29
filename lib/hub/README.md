@@ -5,7 +5,7 @@ their own device, playing one round of your game together while the hub deals
 the games, keeps the clock and keeps score. This page is everything a game
 needs. Give its address to the agent building the game:
 
-**https://crosato-arcade.vercel.app/lib/hub/README.md**
+**https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md**
 
 The hub owns everything around a round: the invite, the lobby, the seats and
 names, the network, the clock, the scoreboard and the results. A game plays
@@ -13,11 +13,11 @@ one round and reports how it went. The hub checks every game when it joins
 the library, with the same test you can run yourself (*Test it*), and keeps a
 game that fails it out of sessions.
 
-- Client: https://crosato-arcade.vercel.app/lib/hub/session.js (also in the appendix)
-- Harness: https://crosato-arcade.vercel.app/lib/hub/harness.html
-- Examples, one per mode: [parallel.html](https://crosato-arcade.vercel.app/lib/hub/examples/parallel.html) (side by side),
-  [race.html](https://crosato-arcade.vercel.app/lib/hub/examples/race.html) (race),
-  [arena.html](https://crosato-arcade.vercel.app/lib/hub/examples/arena.html) (versus)
+- Client: https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/session.js (also in the appendix)
+- Harness: https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/harness.html (run from a folder of your own: *Test it*)
+- Examples, one per mode: [parallel.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/parallel.html) (side by side),
+  [race.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/race.html) (race),
+  [arena.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/arena.html) (versus)
 
 ---
 
@@ -39,8 +39,8 @@ take more work and make the best party games: read *Side by side* first, then
 To ask an agent for it, add this to the game's prompt:
 
 > This game must support AI Hub sessions. Follow
-> https://crosato-arcade.vercel.app/lib/hub/README.md (AI Hub Session
-> Protocol v1): pick the mode the game plays best together (side by side,
+> https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md
+> (AI Hub Session Protocol v1): pick the mode the game plays best together (side by side,
 > race, versus or co-op), add the hub:session meta tags, paste session.js in
 > unmodified as the first script in <head>, implement session mode, report
 > progress and a result (in versus or co-op, run the shared world even when
@@ -141,7 +141,7 @@ function frame() {
 function finish() { run.over = true; AIHub.result({ score: run.score }); }
 ```
 
-**Starfall** ([parallel.html](https://crosato-arcade.vercel.app/lib/hub/examples/parallel.html))
+**Starfall** ([parallel.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/parallel.html))
 is the whole pattern in a small game.
 
 ### What side by side allows
@@ -372,7 +372,7 @@ mission, the match clock.
   host's simulation assume a local player, a camera or input; the check runs
   one round hosted this way.
 
-[arena.html](https://crosato-arcade.vercel.app/lib/hub/examples/arena.html)
+[arena.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/arena.html)
 is the plain form of this pattern.
 
 ### Race: a shared course with solid rivals
@@ -408,7 +408,7 @@ solid and in their colours.
 
 A race survives any player leaving, its host included. Ghosts (rivals you
 pass through) are right only where contact makes no sense, as in time trials:
-[race.html](https://crosato-arcade.vercel.app/lib/hub/examples/race.html).
+[race.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/race.html).
 
 ### Interpolating
 
@@ -566,9 +566,9 @@ network and runs the same checks the hub runs when your game joins the
 library. Serve it next to your game from one folder:
 
 ```bash
-curl -sO https://crosato-arcade.vercel.app/lib/hub/harness.html
-curl -sO https://crosato-arcade.vercel.app/lib/hub/bridge.js
-curl -sO https://crosato-arcade.vercel.app/lib/hub/round.js
+curl -fsSO https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/harness.html
+curl -fsSO https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/bridge.js
+curl -fsSO https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/round.js
 python3 -m http.server 8000
 ```
 

@@ -420,7 +420,7 @@ no way for players to message each other; they talk in an app of their own.
 
 What a game must do is the **AI Hub Session Protocol**, specified in
 [`lib/hub/README.md`](lib/hub/README.md) and served at
-<https://crosato-arcade.vercel.app/lib/hub/README.md>. That page is the
+<https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md>. That page is the
 whole interface: it is the one thing handed to whichever agent builds a game.
 A game declares the one mode it plays best together:
 
@@ -483,8 +483,10 @@ alone. Clients only add, so an older one keeps working; upgrade when games
 should use something new.
 
 ```bash
-node scripts/retrofit.mjs pick --wave 1 > wave1.txt     # one build of each title: readable, no WebGPU needed
-node scripts/retrofit.mjs run $(head -30 wave1.txt) --jobs 2 \
+mkdir -p .cache
+node scripts/retrofit.mjs pick --wave 1 > .cache/wave1.txt   # one build of each title: readable, no WebGPU needed; smallest first
+awk 'NR % 7 == 0' .cache/wave1.txt > .cache/pilot.txt        # a pilot of about thirty, small to large
+node scripts/retrofit.mjs run $(cat .cache/pilot.txt) --jobs 2 \
   --agent "claude -p --model claude-haiku-5-5 --max-turns 30 --permission-mode acceptEdits --output-format json" \
   --agent "claude -p --model claude-sonnet-5-5 --max-turns 30 --permission-mode acceptEdits --output-format json"
 ```

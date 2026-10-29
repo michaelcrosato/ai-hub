@@ -2,8 +2,10 @@
 
 ## Work in progress (remove this note when it is done)
 
-The party-session work is not finished. `docs/party-sessions-handoff.md`
-says where it stands and holds the `/goal` that finishes it.
+The party-session work is not finished, and what is left needs the owner's
+computer: the database migrations and the retrofit pilot.
+`docs/party-sessions-handoff.md` says where it stands and holds the `/goal`
+that finishes it.
 
 ## Finish every change on main
 

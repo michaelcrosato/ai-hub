@@ -3,7 +3,7 @@
 What the hub does around a round, and how a round travels between the
 devices. Games never need this page: the protocol a game follows is
 `lib/hub/README.md` (served at
-<https://crosato-arcade.vercel.app/lib/hub/README.md>), and that is the only
+<https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md>), and that is the only
 thing the game factory is given. This page is for whoever changes the hub:
 `lib/hub/` (client, bridge, round, harness) and `assets/js/session/` (the
 session page).
