@@ -71,6 +71,8 @@ const params = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 const auto = params.get('auto') === '1';
 const scenario = params.get('scenario') || 'standard';
+/** ?scenario=server: the shared world runs on one more copy with no player of its own, as a dedicated server would run it. */
+const serverMode = scenario === 'server';
 const playMs = Number(params.get('play')) || 6000;
 /** Like the hub, the harness shows a splash and collects ready itself; ?splash=0 leaves the ready prompt to the game, as older hubs did. */
 const splash = params.get('splash') !== '0';
@@ -162,8 +164,9 @@ async function newRound() {
   const hubEnd = net.endpoint('hub');
   const grid = $('grid');
   grid.replaceChildren();
-  grid.style.gridTemplateColumns = n > 1 ? '1fr 1fr' : '1fr';
-  grid.style.gridTemplateRows = n > 2 ? '1fr 1fr' : '1fr';
+  const copies = n + (serverMode ? 1 : 0);
+  grid.style.gridTemplateColumns = copies > 1 ? '1fr 1fr' : '1fr';
+  grid.style.gridTemplateRows = `repeat(${Math.ceil(copies / (copies > 1 ? 2 : 1))}, 1fr)`;
 
   const state = { round, n, metas, mode, limitMs, seed, players, cells: [], hubEnd, status: null, record: null, hidden: false, splashUntil: splash ? performance.now() + SPLASH_MS : null };
   current = state;
@@ -173,6 +176,7 @@ async function newRound() {
     round,
     players,
     hostKey: 'p0',
+    serverKey: serverMode ? 'server' : null,
     mode,
     seed,
     limitMs,
@@ -191,8 +195,8 @@ async function newRound() {
     state.coordinator.receive(from, env.m);
   });
 
-  for (const p of players) {
-    const color = ['#e8443a', '#3b82f6', '#22c55e', '#f5b700'][p.slot];
+  for (const p of [...players, ...(serverMode ? [{ key: 'server', slot: null, name: 'Server', server: true }] : [])]) {
+    const color = p.server ? '#8a8a8a' : ['#e8443a', '#3b82f6', '#22c55e', '#f5b700'][p.slot];
     const frame = document.createElement('iframe');
     frame.allow = 'fullscreen; autoplay; gamepad; pointer-lock';
     frame.title = p.name;
@@ -270,14 +274,15 @@ function removeCell(cell, tellRound = true) {
 }
 
 function renderWho(state) {
-  $('who').replaceChildren(...state.cells.map((c) => new Option(`${c.name} (${c.key})${c.slot === 0 ? ' — host' : ''}`, c.key)));
+  $('who').replaceChildren(...state.cells.map((c) => new Option(`${c.name} (${c.key})${c.server ? ' — host, no player' : c.slot === 0 && !serverMode ? ' — host' : ''}`, c.key)));
 }
 
 function render(state) {
   const s = state.status;
   if (!s) return;
   for (const cell of state.cells) {
-    const p = s.players.find((q) => q.key === cell.key);
+    const p = s.players.find((q) => q.key === cell.key) ?? (s.server?.key === cell.key ? s.server : null);
+    if (!p) continue;
     const bits = [];
     if (p.out) bits.push(`out: ${p.out}`);
     else if (p.result) bits.push(`result ${JSON.stringify(p.result)}`);
@@ -290,7 +295,7 @@ function render(state) {
     cell.label.querySelector('.cell__state').textContent = bits.join(' · ');
     cell.el.classList.toggle('is-out', !!p.out || cell.gone);
   }
-  const lines = [`Round ${s.round} · ${s.mode || 'mode unknown'} · phase ${s.phase}`, `Host: player ${s.host} · seed ${state.seed}`];
+  const lines = [`Round ${s.round} · ${s.mode || 'mode unknown'} · phase ${s.phase}`, `Host: ${s.server ? 'the server, no player' : `player ${s.host}`} · seed ${state.seed}`];
   if (s.gate && !s.released) lines.push(`Splash: ${state.splashUntil ? `${Math.max(0, Math.ceil((state.splashUntil - performance.now()) / 1000))} s left` : 'held'} (Start now ends it)`);
   if (state.record) {
     const name = (id) => s.players[id]?.name ?? `#${id}`;
@@ -312,7 +317,7 @@ $('hide').onclick = () => {
   if (!current) return;
   current.hidden = !current.hidden;
   $('hide').setAttribute('aria-pressed', String(current.hidden));
-  current.cells[0]?.bridge.visibility(current.hidden);
+  (current.cells.find((c) => c.server) ?? current.cells[0])?.bridge.visibility(current.hidden);
   log(`host tab ${current.hidden ? 'hidden' : 'shown'}`);
 };
 for (const id of ['latency', 'jitter', 'loss']) $(id).onchange = applyNet;
@@ -512,8 +517,10 @@ async function conformance() {
     check('hub:session-players covers 2–4', seats.length === 2 && seats[0] <= 2 && seats[1] >= 4, `hub:session-players=${m?.players}`);
     check('hub:session-minutes is a number', Number(m?.minutes) > 0, `hub:session-minutes=${m?.minutes}`);
 
-    const helloed = await until(() => state.status?.players.every((p) => p.hello), TIMINGS.helloMs + 1000);
-    check('every copy says hello', helloed, state.status?.players.filter((p) => !p.hello).map((p) => p.key).join(', '));
+    // Every copy: the players, and in a server round the server's copy.
+    const copies = () => [...(state.status?.players ?? []), ...(state.status?.server ? [state.status.server] : [])];
+    const helloed = await until(() => copies().every((p) => p.hello), TIMINGS.helloMs + 1000);
+    check('every copy says hello', helloed, copies().filter((p) => !p.hello).map((p) => p.key).join(', '));
     if (!helloed) return;
     const caps = state.coordinator.seats().map((s) => s.caps);
     check('hello names protocol 1 and the mode', caps.every((c) => c.v === 1 && c.mode === state.coordinator.mode), JSON.stringify(caps[0]));
@@ -525,8 +532,8 @@ async function conformance() {
 
     if (splash) {
       // The splash collects ready: every game readies up by itself once loaded, with no prompt and no key.
-      const loaded = await until(() => state.status?.players.every((p) => p.ready), 20_000);
-      check('ready without a key press (the hub’s splash asks the players)', loaded, state.status?.players.filter((p) => !p.ready).map((p) => p.key).join(', '));
+      const loaded = await until(() => copies().every((p) => p.ready), 20_000);
+      check('ready without a key press (the hub’s splash asks the players)', loaded, copies().filter((p) => !p.ready).map((p) => p.key).join(', '));
       releaseRound(state);
     } else {
       await sleep(600);
@@ -536,7 +543,7 @@ async function conformance() {
       }
     }
     const started = await until(() => state.status?.phase !== 'loading', 15_000);
-    check(splash ? 'the round starts when the splash ends' : 'ready on a key press or tap', started && state.status.players.every((p) => p.ready), state.status?.players.filter((p) => !p.ready).map((p) => p.key).join(', ') || state.status?.phase);
+    check(splash ? 'the round starts when the splash ends' : 'ready on a key press or tap', started && copies().every((p) => p.ready), copies().filter((p) => !p.ready).map((p) => p.key).join(', ') || state.status?.phase);
     if (!started || state.record) return;
 
     await until(() => state.status.phase === 'playing' || state.record, TIMINGS.countdownMs + 2000);
@@ -544,7 +551,7 @@ async function conformance() {
     const randomly = async (ms) => {
       const end = performance.now() + ms;
       while (performance.now() < end && !state.record) {
-        for (const cell of state.cells) if (!cell.gone) poke(cell, arrows[Math.floor(Math.random() * arrows.length)]);
+        for (const cell of state.cells) if (!cell.gone && !cell.server) poke(cell, arrows[Math.floor(Math.random() * arrows.length)]);
         await sleep(150);
       }
     };
@@ -581,6 +588,12 @@ async function conformance() {
     if (!state.record) state.coordinator.timeUp();
     const ended = await until(() => state.record, TIMINGS.graceMs + 2000);
     const record = state.record;
+    if (serverMode) {
+      // The world ran on the server: the players heard it, and only the host may finish a shared world.
+      const serverCell = state.cells.find((c) => c.server);
+      check('a copy with no player of its own runs the world (as a server would)', ended && record.status === 'played' && record.hostId === serverCell.bridge.me && serverCell.bridge.stats.sent > 0,
+        record ? `${record.status} (${record.reason}), host ${record.hostId}, server sent ${serverCell.bridge.stats.sent}` : 'no end');
+    }
     if (scenario === 'host-leave' && !SELF_REPORTED.includes(state.coordinator.mode)) {
       check('host leaving voids the round', ended && record.status === 'void' && record.endReason === 'host-left', record ? `${record.status} (${record.reason})` : 'no end');
     } else {

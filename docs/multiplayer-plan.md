@@ -29,7 +29,8 @@ The audit kept version 2's chassis and changed its armour:
   with no player of its own, drawn from the traffic every copy already gets;
   side by side, the live scoreboard is the view. That cuts the hardest,
   costliest per-game ability (snapshot, restore, mirror) out of the roadmap.
-  The dedicated-server rules shrink to two lines of guidance.
+  Dedicated servers: the games are made ready now, with one rule that the
+  check tests; the server itself is built when it is wanted.
 - **Cut**: new names for things the hub already does (a list of modes per
   game, an end-type meta, `authority` and `role`), and every step that needed
   cc-matrix to change. cc-matrix is handed the protocol's address and nothing
@@ -115,12 +116,12 @@ change.
 | 1 | Every mode, one network | **Kept** | Games still speak only through `AIHub.send`. Progress (new) rides the peer links, as game traffic does. |
 | 2 | The hub may change games to standardize them | **Kept, made cheap** | A pasted client is now upgraded by script (`scripts/hub-client.mjs`), verified by hash, never by a model; and 1.3.0 passes on any field or event a newer hub adds, so most future features need no re-paste at all. |
 | 3 | Watching runs on state, not video | **Kept, without the per-game ability** | Video would need the hub to reach into the game's frame: a capture cannot be handed across frames (tested: `DataCloneError`), so it would tie every game to the hub's origin. It misses the HUDs that most canvas games draw in page elements, and the playing machine pays for the encoding (25–43 ms a 720p frame in software, measured here). State costs a shared world or a race nothing new: a copy with no player of its own draws everything from the snapshots and samples every copy already gets. Side by side shares nothing to draw, so there the live scoreboard is the view, and *Again* keeps everyone playing. What is cut is snapshot, restore and mirror as a per-game ability. |
-| 4 | The host is the server, built so a dedicated server can take over later | **Kept for play; the server rules deferred** | The host's copy runs every shared world, unchanged. The four server rules cost every shared-world game work that nothing can test (no harness runs a world without a player of its own), for a headless-browser server the budget won't run. Two of them stay as one line of guidance each: keep the shared world in plain data apart from drawing; gameplay never reads back from the GPU. |
+| 4 | The host is the server, built so a dedicated server can take over later | **Kept: the games are made ready now, the server is built when wanted** | The host's copy runs every shared world today. What multiplies across thousands of games is each game's own part, so that goes in now: a shared world must run when its host is a copy with no player of its own (`AIHub.server`), and `hub-check` plays one such round for every versus and co-op game. Two old rules stay as guidance (the world in plain data apart from drawing; nothing read back from the GPU). Built once, and likely to change before it is needed, so built later: the server program, where it runs, how it joins a session, and the lobby's switch. |
 | 5 | Side by side reaches the library through a tool and a cheap model | **Kept, run by the hub** | cc-matrix is out of scope, so `scripts/retrofit.mjs` runs it: tool step, model, checks, a retry, the next model, a ledger of cost and pass rate. |
 
-Decision 4 is the owner's to take back: the audit's case is above and in the
-evidence at the end. (The audit first leaned to video for watching; the
-platform evidence above turned that around.)
+The owner decided both on Oct 29: no video, and servers prepared in the
+games now but built when they are wanted. (The audit first leaned to video
+for watching; the platform evidence above turned that around.)
 
 ---
 
@@ -344,6 +345,11 @@ games or so a night.
   browser cannot run), `--record` and `--browser-args`.
 - Migration 0008: a round's mode may be any short word (applied from the
   owner's computer with 0007).
+- Dedicated servers, the part in the games: a shared world must run when its
+  host is a copy with no player of its own, and `hub-check` plays one such
+  round for every versus and co-op game; the round takes a server seat;
+  Star Arena does it. Blaze Cup and Grand Theft Motto III predate the rule:
+  they play as before and get it when servers come.
 - The versus example owns its player, as the protocol says: a key press moves
   a non-host's player on the next frame (about 17 ms), where it used to wait
   a median of 420 ms for the host.
@@ -381,6 +387,12 @@ games or so a night.
 
 **Later**
 
+- **Dedicated servers**, when wanted: the server program (a browser with no
+  screen that opens the same game page and joins the session as a seat with
+  no player; it needs no incoming connections, so any machine or container
+  service will do), one database change so it can join without a seat, and
+  the lobby's switch. A small server hosts a few sessions at once for about
+  $5–20 a month.
 - **Watching** shared worlds and races: a seat with no player of its own,
   whose copy draws the world from the snapshots and samples every copy
   already gets. Watchers are member rows without a seat, and once one is
@@ -405,7 +417,6 @@ games or so a night.
 
 - Snapshot, restore and mirror as a game ability; late joins and mid-round
   reconnects (a late player plays from the next round).
-- A dedicated server.
 - `hub:session-modes`, `hub:session-end`, `authority`, `isAuthority`, `role`.
 - A feedback loop into cc-matrix: per-game session data is too thin and too
   confounded to rank models with; build battles compare them directly.
@@ -454,7 +465,7 @@ layout: an ai-hub change, made when the first cc-matrix builds come in.
 
 | # | Decision | Recommendation |
 |---|---|---|
-| 1 | Accept decision 4 as changed (the dedicated-server rules deferred), and decision 3 kept without snapshot, restore and mirror? | Yes |
+| 1 | Decisions 3 and 4 | Decided Oct 29: state, not video, and no video anywhere (remote couch pinned); dedicated servers prepared in the games now, built when wanted |
 | 2 | Side by side as "best attempt in the window", with *Again* | Yes: next, before the first retrofitted wave is dealt; no game changes |
 | 3 | WebGPU-only games: drop "no fallback" in cc-matrix, or rely on `hub:webgpu`? | Both work; dropping it lets every friend play every new game |
 | 4 | Retrofit tiers and cap | Haiku 5.5, then Sonnet 5.5, $1 a game; confirm after the pilot |

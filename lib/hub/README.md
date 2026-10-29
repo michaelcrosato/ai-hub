@@ -29,7 +29,7 @@ A game declares the one way it plays best together:
 |---|---|---|
 | Plays alone at heart, with a score or a finish line | `parallel` | their own copy of the game, started the same for everyone; the hub shows who is ahead |
 | A course everyone runs at once | `race` | their own player on one shared course, the others in it as rivals |
-| One world everyone shares | `versus` or `co-op` | one world, run by the host's copy, every player in it |
+| One world everyone shares | `versus` or `co-op` | one world, run by the host's copy (or a server), every player in it |
 
 **Side by side** (`parallel`) is the minimum, and every game with a score or
 a finish can do it: read *Side by side* and *Rules*. Race, versus and co-op
@@ -43,10 +43,11 @@ To ask an agent for it, add this to the game's prompt:
 > Protocol v1): pick the mode the game plays best together (side by side,
 > race, versus or co-op), add the hub:session meta tags, paste session.js in
 > unmodified as the first script in <head>, implement session mode, report
-> progress and a result, play fully with keyboard and mouse and with a
-> standard gamepad, open settings with Esc or Options, register AIHub.probe,
-> and pass the harness's automatic check. The game must still play normally
-> on its own.
+> progress and a result (in versus or co-op, run the shared world even when
+> the host is a server with no player of its own), play fully with keyboard
+> and mouse and with a standard gamepad, open settings with Esc or Options,
+> register AIHub.probe, and pass the harness's automatic check. The game must
+> still play normally on its own.
 
 ---
 
@@ -294,6 +295,7 @@ copies). Then:
 | `limitMs` | the round's hard limit after the start |
 | `round` | the round number in the session |
 | `splash` | `true` when the hub shows its card and collects ready (every round the hub runs) |
+| `server` | `true` only on a copy that hosts a shared world with no player of its own (a server; `me` is not among `players`) |
 
 - **Ids** are small integers, the same on every copy. Index arrays by them;
   spawn points and starting order follow them.
@@ -363,6 +365,12 @@ mission, the match clock.
   from the GPU.
 - When the match is decided, the host calls `finish()` and sends a last
   reliable event so the others show the result at once.
+- **The host may be a server.** The hub can host a shared world on a copy
+  with no player of its own: there `AIHub.server` is true and `AIHub.me` is
+  not among `AIHub.players`. It runs and sends the world like any host,
+  moves nobody, takes no input, and may skip drawing. So never let the
+  host's simulation assume a local player, a camera or input; the check runs
+  one round hosted this way.
 
 [arena.html](https://crosato-arcade.vercel.app/lib/hub/examples/arena.html)
 is the plain form of this pattern.
@@ -568,7 +576,8 @@ Then open:
 
 - Side by side: `http://localhost:8000/harness.html?game=mygame.html&players=2&auto=1`
 - Race, versus, co-op: `…&players=4&latency=150&jitter=50&loss=5&auto=1`, and
-  again with `&scenario=host-leave`
+  again with `&scenario=host-leave`; versus and co-op once more with
+  `&players=2&scenario=server`
 
 The checklist on the right fills in as it runs; the result is in
 `window.__hubCheck` (`{ done, pass, checks }`), and
@@ -584,7 +593,8 @@ browser to wait on. **A game passes when `window.__hubCheck.pass` is true**:
 - **Race, versus, co-op**: at 2, 3 and 4 players on a bad network, with a
   player leaving and a time-up, and with the host leaving. Checked as above,
   plus game traffic both ways and a world that keeps moving while the menu is
-  open.
+  open. Versus and co-op also play one round hosted by a copy with no player
+  of its own, which must run the world and finish the round.
 
 Click a player's frame to control that player. **New round**, **Time up**,
 **Remove player** and **Hide host tab** walk through the cases by hand;
@@ -621,7 +631,7 @@ own.
 |---|---|
 | `AIHub.active` | `true` in session mode, from the first line |
 | `AIHub.connect({ mode, seats })` | → `Promise<info \| null>`; `null` means play normally |
-| `AIHub.me`, `.host`, `.isHost`, `.players`, `.mode`, `.seed`, `.limitMs`, `.round`, `.splash` | the round, after `connect()` |
+| `AIHub.me`, `.host`, `.isHost`, `.players`, `.mode`, `.seed`, `.limitMs`, `.round`, `.splash`, `.server` | the round, after `connect()` |
 | `AIHub.seeded` | `true` when the hub seeded `Math.random` (side by side) |
 | `AIHub.ready()` | once: as soon as loaded under the card, otherwise from the ready gesture |
 | `AIHub.on(event, fn)` | returns a function that removes the handler |

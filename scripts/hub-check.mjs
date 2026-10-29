@@ -14,6 +14,11 @@
  * confirm, prompt, window.open and socket constructors wrapped, so calling
  * them is caught. Needs Playwright, which is not a dependency (see shots.mjs).
  *
+ * A shared world (versus, co-op) is also played once at 2 players with its
+ * world hosted by one more copy that has no player of its own, as a dedicated
+ * server would host it (README, "Versus and co-op"). It is reported like any
+ * run; --record does not hold it against a game, since no server runs yet.
+ *
  * A side-by-side game (hub:session-mode parallel) is played at 1 and 2
  * players, and once with a player leaving: nothing is shared, so more copies
  * prove nothing more. Its checks expect no game traffic, progress, and
@@ -203,10 +208,13 @@ try {
       runs.push({ game, players: 0, scenario: 'static', pass: client.pass, checks: [client] });
       if (!asJson && !client.pass) console.log(`FAIL  ${game}  ✗ ${client.name} — ${client.detail}`);
     }
-    const counts = countsFor(await modeOf(game));
+    const mode = await modeOf(game);
+    const counts = countsFor(mode);
     // A retrofit is played once, at 2 players with one leaving: nothing is shared, so that says it all.
     const plan = retrofit && !asked ? [] : counts.map((n) => ({ n, scenario: 'standard' }));
     plan.push({ n: retrofit && !asked ? 2 : Math.max(2, Math.min(3, Math.max(...counts))), scenario: 'host-leave' });
+    // A shared world must also run on a copy with no player of its own, as a server would run it.
+    if (!retrofit && ['versus', 'co-op'].includes(mode)) plan.push({ n: 2, scenario: 'server' });
     for (const { n, scenario } of plan) {
       const context = await browser.newContext({ viewport: { width: 1280, height: 860 } });
       await context.addInitScript(watch);
@@ -424,7 +432,8 @@ async function recordChecks() {
       console.log(`--record: ${game} is not in the catalogue, nothing recorded`);
       continue;
     }
-    const mine = runs.filter((r) => r.game === game);
+    // A shared world that cannot yet be hosted by a server still plays: that run is reported, not held against it.
+    const mine = runs.filter((r) => r.game === game && r.scenario !== 'server');
     const failed = [...new Set(mine.flatMap((r) => r.checks.filter((c) => !c.pass).map((c) => c.name)))];
     const entry = { ...(overrides[slug] || {}) };
     if (!failed.length) {

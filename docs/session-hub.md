@@ -131,7 +131,7 @@ to the welcome's origin.
 | From | type | Fields | Rule |
 |---|---|---|---|
 | game | `hello` | `v: 1, client, mode, seats` | every 500 ms until welcomed; after 10 s the game plays alone |
-| hub | `welcome` | `me, host, players, mode, seed, limitMs, round, splash?, limits` | once; a 1.3.0 client keeps any field the hub adds |
+| hub | `welcome` | `me, host, players, mode, seed, limitMs, round, splash?, limits, server?` | once; a 1.3.0 client keeps any field the hub adds |
 | game | `ready` | | once: loaded (`splash`), or within 45 s of the round's start from a gesture |
 | hub | `start` | `in` | milliseconds until play begins |
 | game | `send` | `data, to?, reliable` | after welcome, until end; within `limits` |
@@ -182,6 +182,14 @@ host's state broadcast every second.
   and their mesh links are torn down, even while their data channels are
   healthy. A grace of about 15 seconds before marking them out, with an
   explicit goodbye for a player who really leaves, fixes it.
+- **No server yet.** `createRound({ serverKey })` hosts a shared world on one
+  more copy with no player of its own: it is welcomed with `server: true`
+  and `me` = `host` = the id after the players', must be ready before the
+  start, is never ranked, and voids the round if it goes. The harness and
+  `hub-check` play one such round for every versus and co-op game. The
+  session page never asks for a server yet: the server program, where it
+  runs, how it joins a session (a member with no seat) and the lobby's switch
+  come when servers are wanted.
 - **Four seats.** The database (slot 0–3, place 1–4, points 0–3), the seat
   colours and `SEATS` in app.js hold it at four; the mesh and a host-run world
   would carry six to eight.

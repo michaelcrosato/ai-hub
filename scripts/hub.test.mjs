@@ -601,6 +601,41 @@ test('race ranking groups ties, and standings checks catch every mistake', () =>
   assert.equal(limitFor(undefined), 450_000);
 });
 
+test('a server, a copy with no player of its own, hosts the world, is never ranked, and takes the round with it when it goes', () => {
+  const make = () => {
+    const clock = fakeClock();
+    const sent = [];
+    const players = [0, 1].map((slot) => ({ key: `k${slot}`, slot, name: `P${slot}` }));
+    const round = createRound({ round: 2, players, hostKey: 'k0', serverKey: 's', mode: 'versus', seed: 5, limitMs: 60_000, clock, deliver: (key, msg) => sent.push([key, msg]) });
+    const to = (key, type) => sent.filter(([k, m]) => k === key && m.type === type).map(([, m]) => m);
+    for (const key of ['k0', 'k1', 's']) round.receive(key, { type: 'hello', v: 1, mode: 'versus', seats: [2, 4] });
+    return { round, clock, to };
+  };
+  const { round, clock, to } = make();
+  const [player] = to('k0', 'welcome');
+  const [server] = to('s', 'welcome');
+  assert.deepEqual([player.me, player.host, player.players.map((p) => p.id), player.server], [0, 2, [0, 1], undefined]);
+  assert.deepEqual([server.me, server.host, server.players.map((p) => p.id), server.server, server.keys], [2, 2, [0, 1], true, ['k0', 'k1', 's']]);
+  round.receive('k0', { type: 'ready' });
+  round.receive('k1', { type: 'ready' });
+  assert.equal(round.phase, 'loading', 'the round waits for the server to load too');
+  round.receive('s', { type: 'ready' });
+  assert.equal(round.phase, 'countdown');
+  clock.advance(4_000);
+  round.receive('k0', { type: 'finish', standings: [[0], [1]] });
+  assert.equal(round.record, null, 'a player cannot finish: the server hosts');
+  round.receive('s', { type: 'finish', standings: [[1], [0]] });
+  assert.deepEqual(round.record.standings, [[1], [0]]);
+  assert.equal(round.record.hostId, 2);
+  assert.deepEqual(round.record.players.map((p) => p.id), [0, 1], 'the server is no player');
+
+  const second = make();
+  for (const key of ['k0', 'k1', 's']) second.round.receive(key, { type: 'ready' });
+  second.clock.advance(4_000);
+  second.round.leave('s');
+  assert.deepEqual([second.round.record.status, second.round.record.reason], ['void', 'host-left']);
+});
+
 /* --- the bridge (lib/hub/bridge.js) ----------------------------------------- */
 
 function bridgeSetup() {
