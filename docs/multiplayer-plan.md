@@ -136,7 +136,7 @@ features of the hub that need nothing from a game.
 | 2 Ghosts | Mode `race`; ghosts or solid rivals is a drawing choice the game makes |
 | 3 Together | Modes `versus` and `co-op`: the host's copy runs the world |
 | 4 Natural multiplayer | Whichever of the three a game plays best |
-| 5 Couch and remote couch | *Later*, and only if games built for local multiplayer become common (about two dozen today): remote seats would need video of the host's game and their controllers forwarded. Not called "couch", which is already the name of the hub's TV view |
+| 5 Couch and remote couch | Couch co-op on one screen stays each game's own (up to four controllers), unchanged. Remote couch co-op is **pinned**: friends far away would need the host's screen streamed to them as video |
 
 **One mode per game.** A list of modes per game would mean a code path and a
 conformance run per mode in every game, for a choice the hub never needs to
@@ -400,9 +400,6 @@ games or so a night.
 - More than four players: side by side shares nothing, so up to eight there
   first. Both that and watcher seats are schema and seat-colour changes
   (slot 0–3, place 1–4, points 0–3), not network ones.
-- Remote couch, only if new games with local multiplayer become common: the
-  host's game on video to the remote seats, their controllers forwarded and
-  presented to the host's game as pads 2–4.
 
 **Not doing**
 
@@ -416,6 +413,13 @@ games or so a night.
 - A Discord Activity: Discord's proxy carries no WebRTC, so the one network
   cannot run there. An invite link that unfolds into a card where friends
   already talk gets most of the benefit.
+
+**Pinned** (parked until the owner wants it)
+
+- Remote couch co-op: friends far away playing a game made for one screen, on
+  the host's screen. It needs that screen streamed to them as video, with
+  their controllers sent back, so it waits for a decision to stream video.
+  Couch co-op in one room is the game's own and is unaffected.
 
 ---
 
@@ -437,8 +441,8 @@ next editing it:
   no title screen, so it never starts there. No conflict.
 - **Testing "efficient"**: the agent can still run the harness from the
   protocol's *Test it*; the hub checks every game at import either way.
-- **Up to four players locally, controller first**: welcome, and the future
-  remote couch will use it as it is.
+- **Up to four players locally, controller first**: welcome. Couch co-op in
+  one room is the game's own; remote couch co-op is pinned.
 
 If cc-matrix builds are imported, the hub's importer (`import-matrix-runs.mjs`,
 written for gpt-matrix's layout) needs to learn cc-matrix's `runs/<id>/work/`
