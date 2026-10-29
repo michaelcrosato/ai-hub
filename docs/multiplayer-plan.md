@@ -388,6 +388,12 @@ games or so a night.
   0007, then 0009 and 0010, which make every policy say what a guest may read
   (a guest sees a session only while seated); `supabase/tests/rls.sql` passes
   live (42 checks), and both advisors show nothing from our migrations.
+  The security advisor's three warnings can't be fixed from the SQL editor:
+  "Anonymous Sign-Ins Allowed" on `cron.job` and `cron.job_run_details` is
+  pg_cron's own policy on tables owned by `supabase_admin` (the editor's
+  `postgres` cannot alter them, and guests have no `usage` on schema
+  `cron`), and leaked-password protection is an Auth setting only the Pro
+  plan has.
 - The links a game builder is given are GitHub's (`raw.githubusercontent.com`,
   the `main` branch), so they outlast any change of host; the site itself
   stays where it is.
