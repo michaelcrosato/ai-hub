@@ -260,6 +260,10 @@ Why the four failed:
 What to change before the next batch: an unfit game cost $0.70, because
 Haiku 5.5 exited twice without a word before Sonnet 5.5 said it was unfit,
 so a tier-1 exit that changes nothing should end the game's Haiku tries.
+And none of the 26 reports `stats` or `awards` with its result (the retrofit
+prompt, `lib/hub/retrofit.md`, never asks), so their rounds have no
+highlights: in a live session the side-by-side round stored results with neither,
+while its kart race stored stats. The prompt should ask for up to six stats.
 Games that pause on `blur` (Slick and Skid) pause in the harness, where two
 copies share one page; in a session each player has a window of their own.
 Three passing games (Starflock, Slick and Skid, Gloomkeep) were played in
