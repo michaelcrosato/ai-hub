@@ -1,6 +1,7 @@
 -- RLS tests for supabase/migrations/0001_accounts.sql, 0002_sessions.sql and
 -- the migrations after them (0007 moved the SECURITY DEFINER bodies to the
--- schema `private`; the last checks fail until it is applied).
+-- schema `private`; the last checks fail until it is applied; 0009 decides in
+-- every policy what a guest may read; two of its three checks fail without it).
 --
 -- Run in the Supabase SQL editor (or execute_sql). It makes throwaway users,
 -- acts as each one the way the hub's pages would, checks every rule, and then
@@ -195,6 +196,21 @@ begin
   perform public.end_session(sid);
   select count(*) into n from public.game_sessions where id = sid and status = 'ended';
   if n = 1 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: the host could not end the session'; end if;
+
+  -- ---- what a guest may read (0009) -----------------------------------------
+  perform set_config('request.jwt.claims', json_build_object('sub', other, 'role', 'authenticated', 'is_anonymous', false)::text, true);
+  perform public.leave_session(sid);
+  select count(*) into n from public.game_sessions where id = sid;
+  if n = 1 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a player who left lost the session''s history'; end if;
+  perform set_config('request.jwt.claims', json_build_object('sub', other, 'role', 'authenticated', 'is_anonymous', true)::text, true);
+  select count(*) into n from public.game_sessions where id = sid;
+  if n = 0 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a guest who left can still read the session'; end if;
+  execute 'reset role';
+  insert into public.profiles (user_id, nickname) values (guest, 'Misty Heron');
+  execute 'set local role authenticated';
+  perform set_config('request.jwt.claims', json_build_object('sub', guest, 'role', 'authenticated', 'is_anonymous', true)::text, true);
+  select count(*) into n from public.profiles;
+  if n = 0 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a guest can read a profile'; end if;
 
   perform set_config('request.jwt.claims', json_build_object('sub', extra2, 'role', 'authenticated', 'is_anonymous', false,
     'amr', json_build_array(json_build_object('method', 'oauth', 'timestamp', extract(epoch from now() - interval '1 hour')::bigint)))::text, true);
