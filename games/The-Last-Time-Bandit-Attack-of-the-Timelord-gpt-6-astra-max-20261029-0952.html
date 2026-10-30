@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<!-- SOURCE INFORMATION
+Date: 2026-10-29 10:48 America/Vancouver
+Source: Attack of the Timelord! (1982). Original spiritual successor: The Last Time Bandit!
+Tech: Three.js r180 (0.180.0); WebGPU only, WebGL fallback disabled; TSL cel materials; Rapier 2D 0.19.3 at 60 Hz; Gamepad API; JavaScript ES modules; HTML/CSS.
+Art Direction: Procedural 3D cel shading, ink silhouettes, cosmic comic palette.
+Animation: Procedural transform animation, fixed-step Rapier simulation, interpolated network snapshots, particles.
+Audio: Original procedural Web Audio synth music and sound effects; optional Web Speech synthesized villain voice. Installed voice availability: unknown.
+Online: AI Hub Session Protocol v1, unmodified session.js v1.3.0; 1-4 player host-authoritative shared-world co-op; immediate local movement, interpolated snapshots, team results, server-host support.
+Testing parameters allowed: efficient, lightweight functionality and visual checks; phones, tablets, wide screens, WebKit. No FPS target or optimization pass.
+Environment: Codex CLI (headless); Linux; browser unknown. Test browsers: Chromium with a software Vulkan WebGPU adapter under Xvfb; Linux WebKit for compatibility UI.
+Model: OpenAI, gpt-6-astra, reasoning effort max.
+Usage: estimated API cost unknown; total tokens and token breakdown unknown; estimated session time about 55 minutes.
+TESTING FEEDBACK
+Issues caught and fixed: 5 application issues; 1 critical/game-breaking (missing Three.js module alias prevented startup). Also corrected 2 test-environment issues, excluded from the application count.
+Results: 26 solo functional checks passed; all 5 official AI Hub harness scenarios passed (2, 3, 4 players; host-leave; server host without a player), with 150 ms latency, 50 ms jitter, 5% loss. Phone, tablet, desktop, and ultrawide screenshots inspected; no horizontal overflow or page errors.
+Most helpful: the complete-campaign browser test paired with actual WebGPU screenshot inspection.
+Least helpful: the adapter-only WebGPU probe, which passed even when the original test browser presented blank canvases.
+Limits: this Linux WebKit build does not expose WebGPU, so only compatibility UI/settings were checked there. Real iOS Safari, physical controllers, and a live internet Hub session were not tested.
+ENGINE FEEDBACK
+Most liked: composable Three.js scenes and TSL control over cel-shading bands.
+Stuck or guessed wrong: the TSL bundle required a three/webgpu import-map alias that was initially omitted. The initial headless test GPU also advertised an adapter without presenting pixels.
+Most important custom system: the campaign state machine, ability/collision rules, controller UI, and AI Hub co-op synchronization.
+Hardest part: separating authoritative Rapier collisions from immediate client movement and interpolated rendering.
+Remove or overhaul: implicit renderer backend fallback.
+One change: a public required-WebGPU mode with actionable initialization diagnostics.
+PROMPT FEEDBACK
+Most liked: the specific source, art direction, controller-first UX, and concrete portable deliverable.
+Confusing: Online was a library link; interpreted as full AI Hub co-op session support with invitations owned by the hub.
+Hardest thing: a complete gameplay arc and robust shared-world multiplayer in one portable HTML artifact.
+One additional test: two physical DualSense controllers on separate devices in a live internet AI Hub session, including a mid-boss disconnect. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111724">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="co-op">
+<meta name="hub:session-minutes" content="5">
+<meta name="hub:session-goal" content="Defeat the Clocklord together. Save tomorrow.">
+<meta name="hub:session-howto" content="Stick/WASD move; R2/Space fire; L2/Q slow time; R1/Shift dash; Options/Esc menu">
+<meta name="hub:webgpu" content="required">
+<title>The Last Time Bandit!</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23111724'/%3E%3Cpath d='M32 6 57 51 32 42 7 51Z' fill='%235ee7d2' stroke='%23f6df9d' stroke-width='3'/%3E%3C/svg%3E">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,500;0,600;0,700;0,800;0,900;1,800;1,900&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+:root{--ink:#101723;--paper:#f7edd1;--gold:#ffc75b;--mint:#75eed7;--coral:#fc795f;--muted:#91a5aa;--line:#90b4af36;--font:'Space Grotesk',sans-serif;--display:'Barlow Condensed',Impact,sans-serif}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--ink);color:var(--paper);font-family:var(--font);font-size:16px}button{font:inherit;color:inherit;cursor:pointer;border:0}button:focus{outline:0}button:focus-visible{outline:3px solid var(--mint);outline-offset:4px}button:disabled{cursor:wait;opacity:.5}[hidden]{display:none!important}#sky{position:fixed;inset:0;overflow:hidden;background:radial-gradient(ellipse at 73% 40%,#25464b 0%,#152d38 32%,#111e2b 58%,#101723 100%)}.sky-orbit{position:absolute;width:65vw;height:65vw;border:1px solid #91c1b914;border-radius:50%;left:40%;top:50%;transform:translateY(-50%)}.o2{width:78vw;height:78vw;left:34%}.o3{width:92vw;height:92vw;left:27%}.grain{position:absolute;inset:0;opacity:.13;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 160 160' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' opacity='.6' filter='url(%23n)'/%3E%3C/svg%3E")}#render{position:fixed;inset:0}#render canvas{width:100%;height:100%;display:block}#vignette{position:fixed;inset:0;pointer-events:none;background:linear-gradient(90deg,#101723a8,transparent 52%),linear-gradient(0deg,#101723 0%,transparent 18%,transparent 87%,#10172380 100%)}#flash{position:fixed;inset:0;pointer-events:none;z-index:6;background:#ff64533d;opacity:0;transition:opacity .12s}#masthead{position:fixed;top:4.2%;left:4.6%;right:4.6%;display:flex;align-items:center;justify-content:space-between;z-index:7;pointer-events:none}.brand{display:flex;align-items:center;gap:11px}.brand svg{width:38px;fill:none;stroke:var(--paper);stroke-width:1.8}.brand span{font-size:11px;line-height:1.2;letter-spacing:2.1px}.brand b{font-weight:600}.edition{margin-left:auto;margin-right:34px;text-align:right}.edition span{display:block;font-size:9px;letter-spacing:2px;color:#a5b6b7;margin-bottom:7px}.edition b{font-size:12px;letter-spacing:1.4px;font-weight:500}.edition i{color:var(--gold);padding:0 7px}.icon-button{pointer-events:auto;width:38px;height:38px;background:transparent;border:1px solid var(--line);font-size:23px;border-radius:50%}.icon-button:hover{border-color:var(--gold);color:var(--gold)}#titleScreen{position:absolute;inset:0;pointer-events:none}.title-copy{position:absolute;top:18%;left:8%;width:40%;max-width:680px;pointer-events:auto}.eyebrow{font-size:10px;letter-spacing:2px;font-weight:600;color:var(--mint);display:flex;gap:9px;align-items:center;white-space:nowrap}.live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--mint);box-shadow:0 0 12px #75eed75c;flex-shrink:0}h1{margin:18px 0 22px;line-height:.79;font-family:var(--display);font-weight:900;font-style:italic;letter-spacing:-3px;text-shadow:4px 5px 0 #101723}h1 span{display:block}.the-last{font-size:clamp(26px,3.5vw,58px);letter-spacing:7px;font-weight:700;margin-left:5px;line-height:1.1}.time-word{font-size:clamp(92px,10.4vw,180px)}.bandit-word{font-size:clamp(88px,10vw,170px);color:var(--gold)}h1 .bang{display:inline;color:var(--coral);margin-left:0}.tagline{font-size:clamp(12px,1.05vw,17px);line-height:1.7;color:#c2ceca;margin:0 0 25px}.title-menu{width:min(330px,95%);display:flex;flex-direction:column;gap:6px}.menu-item{position:relative;display:flex;align-items:center;gap:13px;text-align:left;background:#101d26b3;border:1px solid var(--line);padding:13px 17px;min-height:45px;letter-spacing:1.7px;font-family:var(--display);font-size:19px;font-weight:600;transition:background .15s,transform .15s,border-color .15s}.menu-item.selected{border-color:var(--gold);background:#ffc75b15;transform:translateX(4px)}.menu-item.launch{background:var(--gold);color:var(--ink);border-color:var(--gold);font-size:22px;font-weight:800;letter-spacing:1.5px;min-height:55px;box-shadow:4px 4px 0 #0c111b}.launch.selected{background:#ffdc8a}.button-icon{font-size:22px;width:24px;text-align:center}.button-arrow{font-family:var(--font);margin-left:auto;font-size:24px}.small-index{font-family:var(--font);font-size:9px;letter-spacing:1px;margin-left:auto;color:var(--muted)}.title-meta{display:flex;align-items:center;gap:10px;font-size:8px;letter-spacing:1.4px;color:#a1b1b2;margin-top:20px}.meta-cross{color:var(--coral);font-size:12px}.hero-note{position:absolute;top:31%;right:5.5%;text-align:right;transform:rotate(3deg)}.hero-note small{display:block;color:var(--gold);font-size:9px;letter-spacing:2px}.hero-note b{display:block;font-family:var(--display);font-size:22px;letter-spacing:2px;margin:5px 0}.hero-note em{font-size:10px;font-style:normal;color:#a9c0bf}.note-line{position:absolute;width:66px;right:100%;top:18px;border-top:1px solid var(--gold);transform:rotate(-30deg);transform-origin:right}.note-line:before{content:'';width:5px;height:5px;background:var(--gold);position:absolute;left:0;top:-3px;border-radius:50%}.sector-stamp{position:absolute;right:8%;bottom:13%;padding:13px 18px;border-top:1px solid #7daaa34d;border-bottom:1px solid #7daaa34d;transform:rotate(-5deg);text-align:center}.sector-stamp>span{display:block;font-size:9px;letter-spacing:5px;color:var(--mint)}.sector-stamp b{font-family:var(--display);font-size:34px;font-weight:600;letter-spacing:5px;line-height:1.2}.sector-stamp div{font-size:8px;letter-spacing:1px;color:#a5b7b5}.sector-stamp i{font-style:normal;color:var(--coral);padding:0 5px}#titleFooter{position:fixed;z-index:7;left:4.6%;right:4.6%;bottom:4%;display:flex;align-items:center;gap:35px;border-top:1px solid var(--line);padding-top:18px;font-size:9px;letter-spacing:1.5px}.control-hint{display:flex;gap:9px;align-items:center}.control-hint small{font-size:8px;color:#7f989d;margin-left:10px}.key{display:inline-flex;align-items:center;justify-content:center;border:1px solid #94b1b382;border-radius:4px;min-width:24px;height:21px;font-family:var(--font);font-size:10px;color:var(--paper);padding:0 4px}.key.round{border-radius:50%;min-width:21px}.credits-button{background:transparent;padding:4px;font-size:9px;letter-spacing:1.4px;color:#bec9c6}.credits-button span{color:var(--gold);margin-left:8px}.credits-button:hover{color:var(--gold)}.idle-hint{display:flex;gap:8px;align-items:center;margin-left:auto;color:var(--muted);font-size:8px}.idle-hint b{font-size:11px;color:var(--paper);font-weight:500;min-width:15px}.idle-meter{width:46px;height:2px;background:#557e7e50}.idle-meter i{display:block;height:100%;background:var(--gold);width:100%}#loadStatus{position:absolute;bottom:11%;left:8%;font-size:9px;letter-spacing:1.8px;color:var(--gold)}
+body.playing #masthead{display:none}body.playing #vignette{background:linear-gradient(0deg,#101723 0%,transparent 18%,transparent 80%,#101723ab 100%)}#hud{position:fixed;inset:0;pointer-events:none}.hud-top{position:absolute;top:4%;left:4.5%;right:4.5%;display:flex;justify-content:space-between;align-items:flex-start}.micro{font-size:10px;font-weight:500;letter-spacing:2px;color:#a6beba}.score-panel{display:flex;flex-direction:column;min-width:160px}.score-panel>strong{font-family:var(--display);font-size:48px;letter-spacing:3px;line-height:1.12}.score-panel>#combo{font-size:10px;color:var(--gold);letter-spacing:2px}.wave-panel{text-align:center;padding-top:3px}.wave-panel>strong{display:block;font-family:var(--display);font-size:30px;letter-spacing:3px;margin-top:5px}.sector-dots{display:flex;gap:7px;justify-content:center;margin-top:9px}.sector-dots i{width:22px;height:3px;background:#76978b3d}.sector-dots i.done{background:var(--mint)}.sector-dots i.current{background:var(--gold)}.hull-panel{text-align:right;min-width:160px}#hull{display:flex;gap:6px;justify-content:flex-end;margin:14px 0}#hull i{width:17px;height:12px;background:var(--mint);transform:skew(-20deg);box-shadow:0 0 10px #75eed720}#hull i.empty{background:#5366683d;box-shadow:none}#best{font-size:9px;letter-spacing:2px;color:#8aa6a4}.hud-bottom{position:absolute;bottom:4%;left:5%;right:5%;display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--line);padding-top:15px}.ability{display:flex;gap:12px;align-items:center}.ability>.key{width:34px;height:30px;font-weight:700}.ability>div{width:135px}.ability b{display:block;font-size:11px;letter-spacing:1px}.ability b small,#weaponHud small{font-size:8px;color:#7c999c;font-weight:400;margin-left:7px}.meter{height:4px;background:#738d8d30;margin-top:9px;overflow:hidden}.meter i{display:block;height:100%;width:100%;background:var(--mint);transition:width .1s linear}.dash .meter i{background:var(--gold)}.ability strong{font-size:11px;color:var(--mint);font-weight:500;min-width:36px}.dash strong{color:var(--gold)}#weaponHud{display:flex;align-items:center;gap:10px;font-size:10px;letter-spacing:1px}#weaponHud i{position:absolute;left:50%;bottom:45px;transform:translateX(-50%);font-style:normal;font-size:8px;color:var(--gold);white-space:nowrap}.wave-toast{position:absolute;top:35%;left:50%;transform:translate(-50%,-50%);text-align:center;width:80%;text-shadow:3px 3px 0 var(--ink)}.wave-toast>span{font-size:10px;color:var(--gold);letter-spacing:5px}.wave-toast h2{font-family:var(--display);font-weight:800;font-style:italic;font-size:clamp(40px,6vw,85px);letter-spacing:2px;margin:5px 0}.wave-toast p{font-size:13px;color:#dce8dc;line-height:1.6;max-width:560px;margin:auto}#taunt{position:absolute;top:19%;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:12px;background:#101723de;border-left:2px solid var(--coral);padding:11px 18px;max-width:60%;width:max-content}.taunt-icon{font-size:33px;color:var(--coral)}#taunt small{font-size:7px;letter-spacing:2px;color:var(--coral)}#taunt p{font-family:var(--display);font-size:21px;letter-spacing:1px;margin:2px 0 0}#bossHud{position:absolute;top:18%;left:28%;right:28%}#bossHud>div:first-child{display:flex;justify-content:space-between;font-size:9px;letter-spacing:2px;color:var(--coral);margin-bottom:8px}.boss-track{height:7px;background:#41373e;border:1px solid #f2765c5c}.boss-track i{display:block;height:100%;width:100%;background:var(--coral);transition:width .15s}#pickupToast{position:absolute;bottom:18%;left:50%;transform:translateX(-50%);color:var(--gold);font-size:11px;letter-spacing:2px;background:#101723b0;padding:10px 20px;border:1px solid var(--line)}#teamHud{position:absolute;left:4.5%;top:23%;display:flex;flex-direction:column;gap:9px;font-size:10px}#teamHud span{padding:6px 10px;background:#10172390;border-left:2px solid var(--mint)}#attractBadge{position:absolute;bottom:13%;left:50%;transform:translateX(-50%);background:#101723e8;border:1px solid var(--gold);padding:10px 18px;text-align:center;font-size:10px;letter-spacing:2px;white-space:nowrap}#attractBadge .live-dot{margin-right:6px}#attractBadge b{color:var(--gold);margin-left:10px}#attractBadge small{display:block;margin-top:6px;font-size:8px;color:#bec9c3}#slowLabel{position:absolute;left:50%;top:72%;transform:translateX(-50%);color:var(--mint);font-size:10px;letter-spacing:8px;text-shadow:0 0 15px var(--mint)}
+#modalLayer{position:fixed;inset:0;z-index:20;background:#0b141bdb;backdrop-filter:blur(9px);display:flex;align-items:center;justify-content:center;padding:30px}#modal{position:relative;width:min(830px,94vw);max-height:90vh;overflow:auto;scrollbar-width:thin;scrollbar-color:#567778 #11252c;border:1px solid #779f9560;background:linear-gradient(130deg,#1b3039,#131f2b);box-shadow:12px 12px 0 #080e17;padding:36px 42px}#modal:before{content:'';height:3px;width:58px;background:var(--gold);position:absolute;top:0;left:42px}.modal-kicker{color:var(--mint);font-size:10px;letter-spacing:3px}.modal-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0 18px}#modalTitle{font-family:var(--display);font-size:clamp(32px,4vw,53px);font-weight:800;letter-spacing:1.5px;margin:0;line-height:1}.modal-close{background:transparent;border:1px solid var(--line);border-radius:50%;width:35px;height:35px;flex-shrink:0;color:var(--muted)}.modal-intro{font-size:13px;color:#aebfbc;line-height:1.7;margin:0 0 25px;max-width:620px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.setting{display:flex;align-items:center;justify-content:space-between;background:#0d182177;border:1px solid #65888a40;padding:14px 15px;min-height:52px;font-size:12px;gap:15px;text-align:left}.setting span{color:var(--gold);font-size:11px;white-space:nowrap}.setting.selected{border-color:var(--gold);background:#ffc75b0d}.modal-footer{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:24px;border-top:1px solid var(--line);padding-top:18px}.modal-footer .menu-item{font-size:16px;min-height:40px;padding:9px 16px}.modal-footer>span{font-size:9px;color:var(--muted);letter-spacing:1px}.manual-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.manual-card{background:#0d192180;border-top:1px solid var(--line);padding:18px}.manual-card>b{display:block;font-family:var(--display);font-size:24px;font-weight:600;letter-spacing:1px;margin:8px 0 5px}.manual-card p{font-size:11px;color:#aebfbc;line-height:1.7;margin:0}.manual-card>.key{color:var(--gold);border-color:#ffc75b80}.manual-card .hazard-symbol{font-size:27px;color:var(--coral)}.page-label{color:var(--mint)!important;letter-spacing:2px!important;font-size:9px!important}.upgrade-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.upgrade-card{background:#101d25;border:1px solid var(--line);padding:24px 18px;text-align:left;min-height:210px}.upgrade-card.selected{border-color:var(--gold);background:#ffc75b0d;transform:translateY(-4px)}.upgrade-card .upgrade-icon{font-size:35px;color:var(--gold);display:block;margin-bottom:25px}.upgrade-card b{font-family:var(--display);font-size:26px;letter-spacing:1px;display:block;margin-bottom:8px}.upgrade-card p{font-size:11px;line-height:1.6;color:#a7bfbc;margin:0}.upgrade-card small{font-size:8px;color:var(--mint);letter-spacing:2px;display:block;margin-top:18px}.result-score{font-family:var(--display);font-weight:800;font-size:90px;letter-spacing:5px;color:var(--gold);margin:10px 0}.result-stats{display:flex;gap:32px;margin-bottom:20px}.result-stats>div>b{display:block;font-family:var(--display);font-size:32px}.result-stats span{font-size:9px;color:var(--muted);letter-spacing:2px}.result-buttons{display:flex;gap:10px;flex-wrap:wrap}.result-buttons .menu-item{flex:1;min-width:180px}.credit-content{font-size:12px;line-height:1.8;color:#b9ccc7}.credit-content b{color:var(--paper);font-weight:600}.credit-content a{color:var(--mint)}.credit-content p{margin:0 0 14px}.credit-content ul{padding-left:18px}.credits-tabs{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:22px}.credits-tabs button{font-size:11px;padding:8px 12px;background:#0d192177;border:1px solid var(--line)}.credits-tabs button.active,.credits-tabs button.selected{border-color:var(--gold);color:var(--gold)}.online-mark{color:var(--mint);font-family:var(--display);font-size:40px;letter-spacing:2px;margin:22px 0}.pause-actions{display:flex;flex-direction:column;gap:8px}.pause-actions .menu-item{font-size:21px}.small-note{font-size:10px;line-height:1.7;color:#9ab3b1}.warning-text{color:var(--coral)!important}#touchNotice{position:fixed;z-index:19;left:50%;bottom:13%;transform:translateX(-50%);width:max-content;max-width:90%;background:#101723ec;border:1px solid var(--gold);padding:14px 20px;text-align:center;box-shadow:4px 4px #07111b}#touchNotice b{display:block;font-size:12px;color:var(--gold)}#touchNotice span{font-size:10px;display:block;margin-top:6px;color:#b1c2c0}#compatibility{position:fixed;inset:14% 8% 12%;z-index:10;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;background:#101b26e8;border:1px solid var(--line);padding:25px}.compat-symbol{font-size:55px;line-height:1;color:var(--gold);margin-bottom:15px}#compatibility>small{font-size:9px;letter-spacing:3px;color:var(--mint)}#compatibility h2{font-family:var(--display);font-size:clamp(38px,5vw,70px);font-style:italic;line-height:.98;letter-spacing:2px;margin:20px 0}#compatibility p{max-width:480px;color:#a8beba;font-size:13px;line-height:1.7}.compat-actions{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;margin-top:15px}.compat-actions button{padding:12px 18px;border:1px solid var(--line);background:#1f343c;font-size:10px;letter-spacing:1px}.compat-actions button:hover{border-color:var(--gold)}body.slow #render{filter:saturate(.65)}body.high-contrast .micro,body.high-contrast .small-note,body.high-contrast .small-index{color:#e2ece5}body.reduced *{transition:none!important;animation:none!important}
+@media(min-width:1900px){.title-copy{left:12%;top:20%}.title-menu{width:380px}.menu-item{min-height:53px;font-size:23px}.menu-item.launch{min-height:63px}.eyebrow{font-size:13px}.title-meta{font-size:10px}.tagline{margin-bottom:32px}.hero-note{right:12%}#titleFooter{font-size:12px}.hud-bottom{bottom:5%}}
+@media(max-height:780px) and (min-width:801px){.title-copy{top:16%}h1{margin:10px 0 14px}.the-last{font-size:32px}.time-word{font-size:110px}.bandit-word{font-size:105px}.tagline{font-size:12px;margin-bottom:15px}.title-menu{width:300px;gap:5px}.menu-item{padding:9px 15px;min-height:38px;font-size:17px}.menu-item.launch{min-height:47px;font-size:20px}.title-meta{margin-top:13px}#modal{padding:28px 34px}.modal-heading{margin:10px 0 14px}.modal-intro{margin-bottom:16px}.manual-card{padding:14px}.settings-grid{gap:6px}.setting{min-height:43px;padding:11px 13px}}
+@media(max-width:800px){#masthead{top:3%;left:6%;right:6%}.edition{margin-right:16px}.edition span{display:none}.edition b{font-size:9px}.brand svg{width:31px}.brand span{font-size:9px}.title-copy{top:22%;left:8%;width:65%}.eyebrow{font-size:8px;letter-spacing:1.4px}.the-last{font-size:30px;letter-spacing:5px}.time-word{font-size:112px}.bandit-word{font-size:105px}.tagline{font-size:12px}.title-menu{width:280px}.hero-note{top:17%;right:6%}.hero-note small{font-size:7px}.hero-note b{font-size:18px}.hero-note em{display:none}.sector-stamp{right:5%;bottom:20%;padding:10px;transform:rotate(-8deg)}.sector-stamp b{font-size:25px;letter-spacing:3px}.sector-stamp div{font-size:6px}.sector-stamp>span{font-size:7px;letter-spacing:3px}#titleFooter{left:6%;right:6%;bottom:3%;gap:15px}.control-hint small{display:none}.idle-hint{font-size:7px}.idle-meter{display:none}.credits-button{font-size:8px}.hud-top{left:5%;right:5%;top:3%}.score-panel,.hull-panel{min-width:90px}.micro{font-size:8px;letter-spacing:1px}.score-panel>strong{font-size:37px}.wave-panel>strong{font-size:24px;letter-spacing:1px}#hull{gap:4px;margin:10px 0}#hull i{width:12px;height:10px}#best{font-size:7px;letter-spacing:1px}.sector-dots i{width:14px}.hud-bottom{left:5%;right:5%;gap:10px}.ability{gap:6px}.ability>div{width:92px}.ability b{font-size:9px}.ability strong{font-size:9px;min-width:25px}.ability>.key{width:26px;height:26px}.ability b small{display:none}#weaponHud{font-size:8px;gap:5px}#weaponHud small{display:none}#taunt{max-width:80%;top:16%}#taunt p{font-size:18px}#bossHud{left:20%;right:20%;top:15%}#modalLayer{padding:18px}#modal{padding:25px;width:94vw;max-height:92dvh}.modal-footer{margin-top:18px}.upgrade-grid{gap:8px}.upgrade-card{padding:18px 12px}.upgrade-card b{font-size:23px}.upgrade-card p{font-size:10px}.setting{font-size:11px;padding:12px;gap:8px}.setting span{font-size:10px}}
+@media(max-width:500px){.edition{display:none}.title-copy{top:24%;width:85%}.eyebrow{font-size:7px;letter-spacing:1.4px}h1{margin:14px 0 16px}.the-last{font-size:25px;letter-spacing:6px}.time-word{font-size:94px}.bandit-word{font-size:92px}.tagline{font-size:11px;line-height:1.65;margin-bottom:17px}.title-menu{width:255px}.menu-item{padding:10px 14px;min-height:40px;font-size:17px}.menu-item.launch{min-height:48px;font-size:20px}.title-meta{font-size:6px;gap:7px;letter-spacing:1px}.hero-note{top:15%;right:8%}.sector-stamp{display:none}#titleFooter{flex-wrap:wrap;gap:12px;padding-top:12px}.control-hint{font-size:8px;gap:6px}.credits-button{margin-left:auto;font-size:7px}.idle-hint{width:100%;justify-content:center;margin:auto}.brand span{font-size:8px}.score-panel,.hull-panel{min-width:65px}.score-panel>strong{font-size:30px;letter-spacing:1px}.score-panel>#combo{font-size:7px;letter-spacing:1px}.wave-panel>strong{font-size:18px}.wave-panel .micro{font-size:7px}.sector-dots{gap:4px}.sector-dots i{width:10px}#hull{gap:3px}#hull i{width:8px;height:9px}.hull-panel>.micro{font-size:6px}.hud-bottom{flex-wrap:wrap;justify-content:space-between;padding-top:12px}.ability>div{width:85px}.ability strong{display:none}#weaponHud{order:3;justify-content:center;width:100%;font-size:8px;margin-top:3px}#weaponHud i{bottom:75px;font-size:7px}#taunt{width:85%;max-width:85%;padding:9px 12px}#taunt p{font-size:17px}#taunt small{font-size:6px}.taunt-icon{font-size:25px}.wave-toast{top:40%}.wave-toast p{font-size:11px}.wave-toast>span{font-size:8px;letter-spacing:3px}.wave-toast h2{font-size:43px}#attractBadge{bottom:19%;font-size:8px;padding:9px 12px}#attractBadge small{font-size:6px}#touchNotice{bottom:17%;padding:11px 16px}#touchNotice b{font-size:11px}#modal{padding:22px 18px;box-shadow:5px 5px #080e17}#modalTitle{font-size:33px}.modal-intro{font-size:11px}.settings-grid{grid-template-columns:1fr;gap:6px}.setting{min-height:42px;padding:11px 12px}.manual-grid{gap:8px}.manual-card{padding:12px}.manual-card>b{font-size:21px}.manual-card p{font-size:10px}.modal-footer{gap:7px;flex-wrap:wrap}.modal-footer .menu-item{font-size:14px;padding:8px 12px}.modal-footer>span{font-size:8px}.upgrade-grid{grid-template-columns:1fr}.upgrade-card{min-height:100px;padding:14px 16px;position:relative;padding-left:64px}.upgrade-card .upgrade-icon{position:absolute;left:17px;top:20px;font-size:28px}.upgrade-card b{font-size:24px;margin-bottom:3px}.upgrade-card p{font-size:10px}.upgrade-card small{margin-top:9px;font-size:7px}.result-score{font-size:70px}.result-stats{gap:20px}.result-stats span{font-size:7px}.credit-content{font-size:11px}.credits-tabs{gap:5px}.credits-tabs button{font-size:9px;padding:7px 8px}.compat-symbol{font-size:40px}#compatibility{inset:13% 6% 13%;padding:20px}#compatibility h2{font-size:43px}#compatibility p{font-size:11px}.compat-actions{gap:8px}.compat-actions button{font-size:9px}}
+@media(max-height:550px) and (orientation:landscape){#masthead{top:4%}.brand svg{width:25px}.brand span{font-size:7px}.edition span{display:none}.title-copy{top:17%;width:43%;left:7%}.eyebrow{font-size:6px}.the-last{font-size:20px;letter-spacing:4px}.time-word{font-size:70px}.bandit-word{font-size:66px}h1{margin:7px 0 10px}.tagline{font-size:9px;margin-bottom:9px}.title-menu{width:230px;gap:4px}.menu-item{min-height:28px;padding:5px 10px;font-size:14px}.menu-item.launch{min-height:33px;font-size:16px}.button-icon{font-size:16px}.button-arrow{font-size:18px}.title-meta{font-size:6px;margin-top:8px}.small-index{font-size:7px}.hero-note{top:30%;right:7%}.hero-note b{font-size:17px}.sector-stamp{bottom:22%;right:7%}.sector-stamp b{font-size:22px}#titleFooter{bottom:3%;padding-top:9px;flex-wrap:nowrap}.control-hint{font-size:7px}.idle-hint{width:auto;margin-left:auto}#loadStatus{bottom:13%;font-size:7px}.hud-top{top:4%}.score-panel>strong{font-size:30px}.wave-panel>strong{font-size:21px}.hud-bottom{bottom:4%;padding-top:8px;flex-wrap:nowrap}#weaponHud{order:0;width:auto;margin:0}#weaponHud i{bottom:40px}#taunt{top:24%;padding:6px 12px}#taunt p{font-size:16px}#taunt small{font-size:6px}.taunt-icon{font-size:23px}.wave-toast{top:42%}.wave-toast h2{font-size:42px}.wave-toast p{font-size:10px}#attractBadge{bottom:19%;padding:6px 12px}#bossHud{top:24%}#modal{padding:20px 26px;max-height:90vh}.modal-heading{margin:8px 0 10px}#modalTitle{font-size:32px}.modal-intro{font-size:11px;margin-bottom:14px}.settings-grid{grid-template-columns:1fr 1fr}.setting{min-height:36px;padding:8px 12px}.manual-grid{gap:8px}.manual-card{padding:10px}.manual-card>b{font-size:20px}.manual-card p{font-size:10px}.modal-footer{margin-top:12px;padding-top:10px}.upgrade-grid{grid-template-columns:repeat(3,1fr)}.upgrade-card{padding:15px;min-height:160px}.upgrade-card .upgrade-icon{margin-bottom:10px;position:static}.upgrade-card b{font-size:23px}.upgrade-card small{margin-top:10px}.result-score{font-size:57px;margin:6px 0}.result-stats{margin-bottom:12px}.result-stats>div>b{font-size:23px}#touchNotice{bottom:18%}}
+/* Legible sofa-distance information and a compact title on shorter displays. */
+@media(min-width:801px) and (min-height:781px){#modal{width:min(960px,94vw)}.modal-intro{font-size:15px}.setting{font-size:14px;min-height:56px}.setting span{font-size:12px}.manual-card p{font-size:14px}.manual-card>b{font-size:28px}.credit-content{font-size:14px}.upgrade-card p{font-size:14px}.upgrade-card b{font-size:29px}.upgrade-card{min-height:245px}}
+@media(min-width:801px) and (max-height:850px){.title-copy{top:16%}.the-last{font-size:32px}.time-word{font-size:110px}.bandit-word{font-size:105px}h1{margin:10px 0 14px}.tagline{font-size:12px;margin-bottom:15px}.title-menu{gap:5px}.title-meta{margin-top:13px}}
+@media(max-width:500px) and (orientation:portrait){.title-copy{top:21%}.time-word{font-size:90px}.bandit-word{font-size:88px}}
+body.touch-only #titleMenu .launch,body.touch-only #titleMenu [data-action="manual"]{display:none}body.touch-only #titleMenu{margin-top:22px}body.touch-only #titleMenu [data-action="settings"]{border-color:var(--gold)}
+
+@media(max-width:500px){.hero-note{display:none}}
+body.gpu-blocked #touchNotice{bottom:3%}body.boss #taunt{top:25%}
+body.touch-only.playing #masthead{display:flex;top:auto;bottom:19%;left:auto}body.touch-only.playing #masthead .brand,body.touch-only.playing #masthead .edition{display:none}
+body.touch-only #attractBadge{display:none}
+
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "rapier": "/lib/vendor/rapier/0.19.3/rapier2d-compat/rapier.mjs",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head>
+<body>
+<div id="sky" aria-hidden="true"><div class="sky-orbit o1"></div><div class="sky-orbit o2"></div><div class="sky-orbit o3"></div><div class="grain"></div></div>
+<div id="render" aria-label="Three dimensional game arena"></div>
+<div id="vignette" aria-hidden="true"></div>
+<div id="flash" aria-hidden="true"></div>
+<header id="masthead"><div class="brand"><svg viewBox="0 0 36 36" aria-hidden="true"><path d="M18 2 33 10v16L18 34 3 26V10Z M11 11h14l-7 7 7 7H11l7-7Z"/></svg><span>PARADOX<br><b>DIVISION</b></span></div><div class="edition"><span>AN ARCADE REVOLT AGAINST ETERNITY</span><b>VOL. 01 <i> / </i> THE STOLEN HOUR</b></div><button id="globalSettings" class="icon-button" aria-label="Settings">⚙</button></header>
+<main id="titleScreen" class="screen">
+ <div class="title-copy">
+  <div class="eyebrow"><span class="live-dot"></span> TOMORROW IS UNDER NEW MANAGEMENT.</div>
+  <h1><span class="the-last">THE LAST</span><span class="time-word">TIME</span><span class="bandit-word">BANDIT<span class="bang">!</span></span></h1>
+  <p class="tagline">One stolen ship. An eternity of enemies.<br>Give the Clocklord a very bad time.</p>
+  <nav id="titleMenu" class="menu title-menu" aria-label="Main menu">
+   <button class="menu-item launch selected" data-action="start"><span class="button-icon">✦</span><span>LAUNCH MISSION</span><span class="button-arrow">↗</span></button>
+   <button class="menu-item" data-action="manual"><span class="button-icon">⌁</span><span>FLIGHT MANUAL</span><span class="small-index">01—04</span></button>
+   <button class="menu-item" data-action="settings"><span class="button-icon">⊙</span><span>SETTINGS</span><span class="small-index">OPTIONS</span></button>
+  </nav>
+  <div class="title-meta"><span>SOLO ARCADE</span><span class="meta-cross">✚</span><span>1–4 PILOT CO-OP VIA AI HUB</span></div>
+ </div>
+ <div class="hero-note"><span class="note-line"></span><small>PUBLIC ENEMY ∞</small><b>THE CLOCKLORD</b><em>“Your future belongs to me.”</em></div>
+ <div class="sector-stamp"><span>ENTER THE</span><b>ZERO HOUR</b><div>6 SECTORS <i>◆</i> 1 IMPOSSIBLE HEIST</div></div>
+ <div id="loadStatus" role="status">ESTABLISHING TEMPORAL LINK…</div>
+</main>
+<footer id="titleFooter"><div class="control-hint"><span class="key round">✕</span> SELECT <span class="key">↕</span> NAVIGATE <small>ENTER / ARROWS</small></div><button class="credits-button" data-action="about">ABOUT & CREDITS <span>↗</span></button><div class="idle-hint">LIVE DEMO IN <b id="idleCounter">10</b><span class="idle-meter"><i id="idleMeter"></i></span></div></footer>
+<section id="hud" hidden aria-label="Game status">
+ <div class="hud-top"><div class="score-panel"><span class="micro">STOLEN SECONDS</span><strong id="score">000000</strong><span id="combo">×1 MULTIPLIER</span></div><div class="wave-panel"><span id="waveLabel" class="micro">SECTOR 01 / 06</span><strong id="waveName">THE BREACH</strong><div class="sector-dots" id="sectorDots"></div></div><div class="hull-panel"><span class="micro" id="pilotLabel">BANDIT / HULL</span><div id="hull"></div><span id="best">BEST 000000</span></div></div>
+ <div id="bossHud" hidden><div><span>THE CLOCKLORD</span><span id="bossPhase">PHASE I</span></div><div class="boss-track"><i id="bossFill"></i></div></div>
+ <div id="waveToast" class="wave-toast" hidden><span id="toastKicker"></span><h2 id="toastTitle"></h2><p id="toastDesc"></p></div>
+ <div id="taunt" hidden><span class="taunt-icon">♜</span><div><small>INCOMING · THE CLOCKLORD</small><p id="tauntText"></p></div></div>
+ <div id="pickupToast" hidden></div>
+ <div id="teamHud"></div>
+ <div class="hud-bottom"><div class="ability energy"><span class="key">L2</span><div><b>TIME BRAKE <small>Q</small></b><div class="meter"><i id="energyFill"></i></div></div><strong id="energyNumber">100</strong></div><div id="weaponHud"><span class="key">R2</span><span>FIRE <small>SPACE</small></span><i id="upgradeLabels">PULSE CANNON</i></div><div class="ability dash"><span class="key">R1</span><div><b>PHASE DASH <small>SHIFT</small></b><div class="meter"><i id="dashFill"></i></div></div><strong id="dashText">READY</strong></div></div>
+ <div id="attractBadge" hidden><span class="live-dot"></span> AUTOPILOT <b>LIVE DEMO</b><small>ANY INPUT TO RETURN</small></div>
+ <div id="slowLabel" hidden>TIME IS YOURS</div>
+</section>
+<div id="modalLayer" hidden><section id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><div id="modalContent"></div></section></div>
+<div id="touchNotice" hidden><b>Controller or keyboard required</b><span>Connect a controller to join the heist.</span></div>
+<div id="compatibility" hidden><div class="compat-symbol">⌁</div><small>TEMPORAL LINK UNAVAILABLE</small><h2>THIS SHIP RUNS<br>ON WEBGPU.</h2><p id="compatText">A WebGPU-capable browser and secure connection are required.</p><div class="compat-actions"><button data-action="retrygpu">RETRY CONNECTION ↗</button><button data-action="settings">SETTINGS</button><button data-action="about">ABOUT & CREDITS</button></div></div>
+<script type="module">
+const $=id=>document.getElementById(id),clamp=(n,a,b)=>Math.max(a,Math.min(b,n)),lerp=(a,b,t)=>a+(b-a)*t;
+const TAU=Math.PI*2,TITLE='The Last Time Bandit!';
+const DEFAULTS={master:70,music:45,sfx:75,voice:true,invertX:false,invertY:false,shake:true,reduced:false,contrast:false,deadzone:18};
+function readSave(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback}catch{return fallback}}
+function save(key,value){try{localStorage.setItem(key,JSON.stringify(value))}catch{}}
+let prefs={...DEFAULTS,...readSave('time-bandit-settings-v1',{})},record=readSave('time-bandit-record-v1',{best:0,wins:0});
+let THREE,TSL,RAPIER,renderer,scene,camera,physics,events,engineReady=false,gpuError=null;
+let mode='loading',modalPage=null,modalOrigin=null,manualPage=0,creditPage=0,focusIndex=0,lastInputAt=performance.now(),inputType='pad',keyboardSeen=false;
+let simTime=0,visualTime=0,lastFrame=performance.now(),accumulator=0,shake=0,flashTimer=0,run=null,attract=false;
+let hubInfo=null,hubStopped=false,hubStarted=false,hubReadyPending=false,netClock=0,lastSnapshotAt=-Infinity,localSendSeq=0;
+let playerId=0,nextEntityId=1,entities=new Map(),colliderEntities=new Map(),players=new Map();
+let hero,portal,scenery,decoration,starfield,heroShip,bossDecoration,titleShips=[],cosmicBits=[];
+let toastTimer=0,tauntTimer=0,pickupTimer=0,uiClock=0,gamepadWas=null,lastPad=[],navHeldAt=0,navVector='';
+const keys=new Set();let mouseFire=false,mouseSlow=false,input={x:0,y:0,fire:false,slow:false,dash:false},dashPressed=false,usingPad=false;
+const palette={ink:0x0c1622,paper:0xf5e6be,mint:0x72ead0,gold:0xffc257,coral:0xf97960,teal:0x307f81,blue:0x709cce};
+const WAVES=[
+ {name:'THE BREACH',tag:'SECTOR 01 · THE STOLEN HOUR',hint:'Move in the defense lane. Hold R2 / SPACE to fire. Shoot down incoming missiles.',count:12,types:[1],taunt:'A stolen ship? You cannot steal a future.',color:palette.coral},
+ {name:'BAD COMPANY',tag:'SECTOR 02 · ANTIMATTER GARDEN',hint:'Mines follow your ship. Shoot them before they corner you.',count:15,types:[1,2],taunt:'My mines remember where you live.',color:palette.mint},
+ {name:'SIDE EFFECTS',tag:'SECTOR 03 · THE CROOKED MINUTE',hint:'Sidewinders turn across the lane. R1 / SHIFT phases through danger.',count:18,types:[1,3],taunt:'There is no safe side of eternity.',color:palette.gold},
+ {name:'FUTURE SHOCK',tag:'SECTOR 04 · A SECOND TOO SOON',hint:'Oracles lead your movement. Hold L2 / Q to slow their time, not yours.',count:20,types:[2,4],taunt:'I have already watched you lose.',color:palette.blue},
+ {name:'BORROWED TIME',tag:'SECTOR 05 · ALL HANDS AGAINST YOU',hint:'Every weapon. One last fleet. Break their projectiles to refill your time brake.',count:23,types:[1,2,3,4],taunt:'An admirable rebellion. A very brief one.',color:palette.coral},
+ {name:'THE ZERO HOUR',tag:'SECTOR 06 · REPOSSESS TOMORROW',hint:'Break the Clocklord. Watch for the marked lanes. His second phase mixes all four threats.',count:1,types:[1,2,3,4],taunt:'I AM THE LAST SECOND YOU WILL EVER SEE.',color:palette.gold}
+];
+const UPGRADES=[
+ {id:'split',icon:'⋔',name:'FORKED LIGHT',desc:'Two parallel bolts per shot. Twice the trouble for the fleet.',label:'TWIN CANNON'},
+ {id:'rapid',icon:'ϟ',name:'QUICK DRAW',desc:'Fire 30% faster. Keep your finger on the future.',label:'OVERCLOCK'},
+ {id:'battery',icon:'◈',name:'SECOND WIND',desc:'Time recharges 60% faster and the brake consumes 25% less.',label:'TIME CELL'},
+ {id:'pierce',icon:'↟',name:'AFTERIMAGE',desc:'Bolts pierce a second target. Projectiles count, too.',label:'PIERCING'},
+ {id:'dash',icon:'»',name:'SLIPSTREAM',desc:'Phase dash recharges twice as fast and lasts longer.',label:'PHASE COIL'},
+ {id:'hull',icon:'⬡',name:'HARD TO KILL',desc:'Gain two maximum hull and a complete repair.',label:'REINFORCED'}
+];
+const isShared=()=>!!hubInfo;
+const isAuthority=()=>!hubInfo||hubInfo.isHost;
+const localPlayer=()=>players.get(playerId);
+const activeWorld=()=>mode==='play'&&(!modalPage||isShared())&&!hubStopped&&(!hubInfo||hubStarted);
+function applyPrefs(){document.body.classList.toggle('reduced',prefs.reduced);document.body.classList.toggle('high-contrast',prefs.contrast);audio.apply();save('time-bandit-settings-v1',prefs)}
+
+const matCache=new Map();let edgeMat,flatCache=new Map();
+function flat(c,opacity=1){let k=c+':'+opacity;if(!flatCache.has(k))flatCache.set(k,new THREE.MeshBasicMaterial({color:c,transparent:opacity<1,opacity,depthWrite:opacity===1}));return flatCache.get(k)}
+function cel(c){if(matCache.has(c))return matCache.get(c);let m=new THREE.MeshBasicNodeMaterial();const light=TSL.dot(TSL.normalWorld,TSL.vec3(-.4,.7,1).normalize());m.colorNode=TSL.color(c).mul(TSL.float(.38).add(TSL.step(.04,light).mul(.31)).add(TSL.step(.58,light).mul(.31)));matCache.set(c,m);return m}
+function solid(g,c,parent,x=0,y=0,z=0,outline=true){let m=new THREE.Mesh(g,cel(c));m.position.set(x,y,z);if(outline){let e=new THREE.Mesh(g,edgeMat);e.scale.setScalar(1.055);m.add(e)}parent?.add(m);return m}
+function shape(points,depth,c,parent,x=0,y=0,z=0){let s=new THREE.Shape();points.forEach(([a,b],i)=>i?s.lineTo(a,b):s.moveTo(a,b));s.closePath();let g=new THREE.ExtrudeGeometry(s,{depth,bevelEnabled:true,bevelThickness:.055,bevelSize:.04,bevelSegments:1,steps:1});g.translate(0,0,-depth/2);return solid(g,c,parent,x,y,z)}
+function ring(r,t,c,parent,x=0,y=0,z=0){return solid(new THREE.TorusGeometry(r,t,6,72),c,parent,x,y,z,false)}
+function bar(w,h,c,parent,x,y,z=0,rot=0){let m=solid(new THREE.BoxGeometry(w,h,.12),c,parent,x,y,z,false);m.rotation.z=rot;return m}
+function makeShip(c=palette.mint){let g=new THREE.Group();shape([[-1,-.6],[-.6,.45],[-.23,.16],[0,1.04],[.23,.16],[.6,.45],[1,-.6],[.35,-.38],[0,-.65],[-.35,-.38]],.27,c,g);shape([[-.3,-.48],[-.28,.25],[0,.96],[.28,.25],[.3,-.48],[0,-.31]],.33,palette.paper,g,0,0,.17);shape([[-.16,.04],[0,.59],[.16,.04],[0,-.12]],.12,0x183542,g,0,0,.43);bar(.12,.5,palette.gold,g,-.65,-.15,.2,-.22);bar(.12,.5,palette.gold,g,.65,-.15,.2,.22);let flame=new THREE.Group();for(let x of[-.42,.42]){let f=solid(new THREE.ConeGeometry(.15,.7,5),palette.gold,flame,x,-.85,.02,false);f.rotation.z=Math.PI;let q=solid(new THREE.ConeGeometry(.07,.45,5),palette.paper,flame,x,-.78,.09,false);q.rotation.z=Math.PI;}g.add(flame);g.userData.flame=flame;let shield=ring(1.15,.025,palette.mint,g,0,0,0);shield.visible=false;g.userData.shield=shield;return g}
+function makeEnemy(type=0){let g=new THREE.Group(),c=type===1?palette.gold:type===2?palette.blue:palette.coral;shape([[-.8,.15],[-.45,.46],[0,.2],[.45,.46],[.8,.15],[.52,-.4],[.24,-.12],[0,-.5],[-.24,-.12],[-.52,-.4]],.35,c,g);let head=solid(new THREE.IcosahedronGeometry(.38,0),c,g,0,0,.2);head.scale.set(1.2,.75,.8);bar(.17,.065,palette.paper,g,-.18,-.03,.48,.1);bar(.17,.065,palette.paper,g,.18,-.03,.48,-.1);if(type>0){ring(.58,.055,c,g,0,0,-.1);bar(.1,.35,palette.ink,g,0,.2,.5)}return g}
+function makeClocklord(){let g=new THREE.Group();let halo=new THREE.Group();g.add(halo);ring(3.45,.13,palette.gold,halo,0,.3,-.7);ring(3.12,.025,palette.mint,halo,0,.3,-.65);for(let i=0;i<12;i++){let a=i*TAU/12;let mark=bar(i%3===0?.13:.065,i%3===0?.44:.23,palette.gold,halo,Math.sin(a)*3.45,.3+Math.cos(a)*3.45,-.45,-a);}
+ const head=new THREE.Group();g.add(head);shape([[-1.85,1.2],[-1.22,2.1],[0,2.35],[1.22,2.1],[1.85,1.2],[1.6,-.7],[.97,-1.18],[.75,-2.12],[-.75,-2.12],[-.97,-1.18],[-1.6,-.7]],.9,palette.paper,head);
+ shape([[-1.85,1.2],[-1.22,2.1],[-.6,1.66],[-1.2,.72],[-1.6,-.7]],.12,0xb8a780,head,0,0,.48);
+ shape([[-1.42,.9],[-.32,.57],[-.42,-.15],[-1.25,-.27]],.18,palette.ink,head,0,0,.54);shape([[1.42,.9],[.32,.57],[.42,-.15],[1.25,-.27]],.18,palette.ink,head,0,0,.54);
+ shape([[-1.24,.62],[-.48,.4],[-.53,.2],[-1.14,.11]],.07,palette.coral,head,0,0,.68);shape([[1.24,.62],[.48,.4],[.53,.2],[1.14,.11]],.07,palette.coral,head,0,0,.68);
+ shape([[-.27,-.6],[0,-.2],[.27,-.6],[0,-.78]],.15,palette.ink,head,0,0,.58);shape([[-.89,-1.12],[.89,-1.12],[.66,-1.77],[-.66,-1.77]],.13,palette.ink,head,0,0,.55);for(let x of[-.48,0,.48])bar(.16,.35,palette.paper,head,x,-1.45,.7);
+ shape([[-1.2,1.9],[-1.55,3.05],[-.55,2.6],[0,3.7],[.55,2.6],[1.55,3.05],[1.2,1.9]],.38,palette.gold,head,0,0,-.02);let jewel=solid(new THREE.OctahedronGeometry(.25),palette.coral,head,0,2.72,.35);g.userData.halo=halo;g.userData.head=head;g.userData.jewel=jewel;return g}
+function makeBullet(kind){let g=new THREE.Group();if(kind===0){bar(.12,.65,palette.mint,g,0,0,0);bar(.035,.52,palette.paper,g,0,.08,.08);let glow=new THREE.Mesh(new THREE.PlaneGeometry(.35,1),flat(palette.mint,.12));glow.position.z=-.1;g.add(glow)}else if(kind===1){shape([[-.14,.23],[.14,.23],[.13,-.23],[0,-.44],[-.13,-.23]],.1,palette.coral,g);bar(.07,.25,palette.gold,g,0,.37)}else if(kind===2){solid(new THREE.OctahedronGeometry(.27),palette.mint,g);ring(.4,.04,palette.mint,g);for(let i=0;i<4;i++){let a=i*TAU/4;bar(.08,.2,palette.paper,g,Math.cos(a)*.42,Math.sin(a)*.42,0,a)}}else if(kind===3){shape([[-.38,.12],[0,-.22],[.38,.12],[.18,.31],[0,.16],[-.18,.31]],.15,palette.gold,g)}else{solid(new THREE.OctahedronGeometry(.28),palette.blue,g);ring(.38,.035,palette.blue,g);bar(.07,.6,palette.paper,g,0,0,.25)}return g}
+function makePickup(kind){let g=new THREE.Group();let c=kind===1?palette.coral:palette.mint;ring(.37,.06,c,g);solid(new THREE.OctahedronGeometry(.24),c,g);if(kind===1){bar(.34,.1,palette.paper,g,0,0,.3);bar(.1,.34,palette.paper,g,0,0,.3)}else shape([[.07,.25],[-.14,-.03],[.01,-.01],[-.05,-.24],[.17,.06],[.03,.05]],.05,palette.paper,g,0,0,.3);return g}
+function makeModel(e){if(e.kind==='player')return makeShip(e.color||palette.mint);if(e.kind==='enemy')return e.type===3?makeClocklord():makeEnemy(e.type);if(e.kind==='bullet')return makeBullet(e.type);if(e.kind==='pickup')return makePickup(e.type);return new THREE.Group()}
+function buildScene(){scene=new THREE.Scene();camera=new THREE.OrthographicCamera(-20,20,12,-12,.1,150);camera.position.set(0,0,45);camera.lookAt(0,0,0);edgeMat=new THREE.MeshBasicMaterial({color:palette.ink,side:THREE.BackSide});scenery=new THREE.Group();scene.add(scenery);decoration=new THREE.Group();scene.add(decoration);let rng=seeded(71382);
+ starfield=new THREE.Group();scenery.add(starfield);let starGeo=new THREE.SphereGeometry(.027,4,3);for(let i=0;i<420;i++){let m=new THREE.Mesh(starGeo,flat(i%7===0?palette.gold:i%3===0?0x75aaa7:0xa0c2bc));m.position.set((rng()-.5)*100,(rng()-.5)*70,-20-rng()*18);m.scale.setScalar(.5+rng()*1.7);starfield.add(m);if(i%29===0){bar(.2,.02,palette.mint,starfield,m.position.x,m.position.y,m.position.z);bar(.02,.2,palette.mint,starfield,m.position.x,m.position.y,m.position.z)}}
+ let planet=solid(new THREE.IcosahedronGeometry(5.2,2),0x2d585b,scenery,-18,9,-17);planet.rotation.z=.4;let pr=ring(7.3,.06,0x68827c,scenery,-18,9,-16);pr.rotation.x=1.1;pr.rotation.z=-.4;let moon=solid(new THREE.IcosahedronGeometry(1,1),0xb09f7b,scenery,17,10,-20);solid(new THREE.IcosahedronGeometry(.6,0),0x547e7a,scenery,15.5,8.8,-18);
+ for(let i=0;i<32;i++){let side=i%2?1:-1,x=side*(15+rng()*14),y=(rng()-.5)*30,z=-8-rng()*12;let rock=solid(new THREE.IcosahedronGeometry(.6+rng()*1.4,0),i%3===0?0x587d75:0x284651,scenery,x,y,z);rock.scale.set(1.6,.7+rng(),1);rock.rotation.set(rng(),rng(),rng());cosmicBits.push({m:rock,s:.03+rng()*.08});}
+ portal=new THREE.Group();decoration.add(portal);ring(6.1,.1,0x598d82,portal,0,0,-4);ring(6.5,.025,0x537b72,portal,0,0,-4);ring(5.85,.025,0x3c6667,portal,0,0,-4);for(let i=0;i<60;i++){let a=i*TAU/60;bar(i%5===0?.08:.035,i%5===0?.32:.12,i%5===0?0x8a9d7c:0x426c69,portal,Math.sin(a)*6.1,Math.cos(a)*6.1,-3.9,-a)}let hand1=bar(.07,4.4,0x426864,portal,0,2.2,-4.1);hand1.geometry.translate(0,-2.2,0);hand1.position.y=0;portal.userData.hand1=hand1;let hand2=bar(.11,2.8,0x426864,portal,0,0,-4.2);hand2.geometry.translate(0,1.4,0);portal.userData.hand2=hand2;
+ hero=makeClocklord();scene.add(hero);heroShip=makeShip();heroShip.scale.setScalar(1.7);scene.add(heroShip);for(let i=0;i<7;i++){let e=makeEnemy(i%3);e.scale.setScalar(.7);scene.add(e);titleShips.push(e)}
+ let lane=new THREE.Group();scene.add(lane);lane.name='lane';for(let x=-14;x<=14;x+=2){bar(.04,.18,0x4b8a83,lane,x,-9.9,-1);bar(.04,.12,0x325351,lane,x,-5.6,-1)}bar(29,.025,0x325550,lane,0,-10,-1);bar(29,.015,0x263f47,lane,0,-5.5,-1);lane.visible=false;
+ resize();}
+function resize(){if(!renderer)return;let w=innerWidth,h=innerHeight,a=w/h;renderer.setSize(w,h);let height=(mode==='play'||mode==='over'||mode==='ready')?Math.max(24,34/a):24;camera.left=-height*a/2;camera.right=height*a/2;camera.top=height/2;camera.bottom=-height/2;camera.updateProjectionMatrix();}
+const fx=[];function burst(x,y,c,count=14,big=false){if(!scene)return;for(let i=0;i<count;i++){let m=new THREE.Mesh(new THREE.OctahedronGeometry(big?.15:.08),flat(i%3===0?palette.paper:c));m.position.set(x,y,.5);scene.add(m);let a=Math.random()*TAU,spd=(big?5:2)+Math.random()*5;fx.push({m,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,life:.35+Math.random()*.4,max:.75,type:'spark'})}let m=new THREE.Mesh(new THREE.RingGeometry(.8,1,36),flat(c,.7));m.position.set(x,y,.3);m.scale.setScalar(.1);scene.add(m);fx.push({m,vx:0,vy:0,life:.35,max:.35,type:'ring',big})}
+function clearFx(){for(let f of fx){scene.remove(f.m);f.m.geometry.dispose()}fx.length=0}
+function updateVisuals(dt){visualTime+=dt*(prefs.reduced?.2:1);const t=visualTime;let playing=['play','over','ready'].includes(mode);hero.visible=heroShip.visible=!playing;for(let m of titleShips)m.visible=!playing;scene.getObjectByName('lane').visible=playing;let aspect=innerWidth/innerHeight;let cx=aspect<.8?3:aspect<1.3?4.5:7.8;
+ if(!playing){hero.position.set(cx,(aspect<.8?7:1.7)+Math.sin(t*.5)*.25,0);hero.rotation.z=Math.sin(t*.25)*.055;hero.rotation.y=Math.sin(t*.3)*.12;hero.scale.setScalar(aspect<.8?.5:1.12);hero.userData.halo.rotation.z=t*.06;heroShip.position.set(cx-1.6,-5.8+Math.sin(t)*.18,3);heroShip.rotation.set(.18,.1,-.35);heroShip.userData.flame.scale.y=.9+Math.sin(t*25)*.2;for(let i=0;i<titleShips.length;i++){let a=i*.38+t*.1;titleShips[i].position.set(cx+Math.cos(a+1)*6.8,Math.sin(a+1)*6.8-1,-2);titleShips[i].rotation.z=a+.3;}portal.position.set(cx,1,-5);portal.scale.setScalar(1.3)}else{portal.position.set(0,2,-7);portal.scale.setScalar(1);}
+ portal.rotation.z=Math.sin(t*.02)*.1;portal.userData.hand1.rotation.z=-t*.035;portal.userData.hand2.rotation.z=-t*.1;starfield.rotation.z=t*.0008;for(let r of cosmicBits){r.m.rotation.z+=dt*r.s*(prefs.reduced?.1:1);r.m.rotation.x+=dt*r.s*.4}
+ for(let e of entities.values()){if(!e.mesh)continue;if(!isAuthority()&&e.kind!=='player'||!isAuthority()&&e.kind==='player'&&e.id!==playerId){e.mesh.position.x=lerp(e.mesh.position.x,e.x,Math.min(1,dt*15));e.mesh.position.y=lerp(e.mesh.position.y,e.y,Math.min(1,dt*15));}else e.mesh.position.set(e.x,e.y,e.kind==='player'?1:0);
+ if(e.kind==='player'){e.mesh.visible=e.hp>0&&(prefs.reduced||!(e.inv>0)||Math.floor(t*16)%3!==0);e.mesh.rotation.y=lerp(e.mesh.rotation.y,-(e.vx||0)*.025,.2);e.mesh.rotation.z=lerp(e.mesh.rotation.z,-(e.vx||0)*.012,.2);e.mesh.userData.flame.scale.y=.75+Math.sin(t*40)*.15+(e.dashing>0?2:0);e.mesh.userData.shield.visible=e.dashing>0||(prefs.reduced&&e.inv>0)}else if(e.kind==='enemy'){if(e.type===3){e.mesh.userData.halo.rotation.z=t*.15;e.mesh.rotation.z=Math.sin(t)*.03}else e.mesh.rotation.y=Math.sin(t*2+e.id)*.2;}else if(e.kind==='bullet'&&e.type>1)e.mesh.rotation.z+=dt*(e.type===2?2:4);else if(e.kind==='pickup'){e.mesh.rotation.y=t*2;e.mesh.rotation.z=Math.sin(t)*.2}}
+ for(let i=fx.length-1;i>=0;i--){let f=fx[i];f.life-=dt;if(f.life<=0){scene.remove(f.m);f.m.geometry.dispose();fx.splice(i,1);continue}f.m.position.x+=f.vx*dt;f.m.position.y+=f.vy*dt;if(f.type==='ring')f.m.scale.setScalar((1-f.life/f.max)*(f.big?4:2));else{f.m.rotation.z+=dt*8;f.m.scale.setScalar(Math.max(.01,f.life/f.max))}}
+ shake=Math.max(0,shake-dt*4);let amount=prefs.shake&&!prefs.reduced?shake:0;camera.position.x=(Math.random()-.5)*amount;camera.position.y=(Math.random()-.5)*amount;camera.updateMatrixWorld();flashTimer=Math.max(0,flashTimer-dt);$('flash').style.opacity=flashTimer>0&&!prefs.reduced?'1':'0';}
+function seeded(seed){return ()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return ((t^t>>>14)>>>0)/4294967296}}
+
+const audio={ctx:null,master:null,musicGain:null,sfxGain:null,seq:0,next:0,started:false,muted:false,
+ unlock(){if(hubStopped)return;try{if(!this.ctx){this.ctx=new(window.AudioContext||window.webkitAudioContext)();this.master=this.ctx.createGain();this.master.connect(this.ctx.destination);this.musicGain=this.ctx.createGain();this.musicGain.connect(this.master);this.sfxGain=this.ctx.createGain();this.sfxGain.connect(this.master);this.next=this.ctx.currentTime+.1;this.apply()}if(this.ctx.state==='suspended')this.ctx.resume().catch(()=>{});this.started=true}catch{}},
+ apply(){if(!this.ctx)return;let t=this.ctx.currentTime;this.master.gain.setTargetAtTime(this.muted?0:prefs.master/100*.55,t,.05);this.musicGain.gain.setTargetAtTime(prefs.music/100*.26,t,.05);this.sfxGain.gain.setTargetAtTime(prefs.sfx/100*.32,t,.05)},
+ tone(freq,dur,type='sine',gain=.2,at=0,dest=null,slide=null){if(!this.ctx||this.muted||this.ctx.state!=='running')return;let t=at||this.ctx.currentTime,o=this.ctx.createOscillator(),g=this.ctx.createGain();o.type=type;o.frequency.setValueAtTime(freq,t);if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(12,slide),t+dur);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.001,gain),t+.006);g.gain.exponentialRampToValueAtTime(.0001,t+dur);o.connect(g);g.connect(dest||this.sfxGain);o.start(t);o.stop(t+dur+.01)},
+ noise(dur,gain=.3,at=0,dest=null){if(!this.ctx||this.muted||this.ctx.state!=='running')return;let ctx=this.ctx,t=at||ctx.currentTime,n=Math.floor(ctx.sampleRate*dur),b=ctx.createBuffer(1,n,ctx.sampleRate),a=b.getChannelData(0);for(let i=0;i<n;i++)a[i]=(Math.random()*2-1)*(1-i/n);let s=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();s.buffer=b;f.type='highpass';f.frequency.value=800;g.gain.setValueAtTime(gain,t);g.gain.exponentialRampToValueAtTime(.001,t+dur);s.connect(f);f.connect(g);g.connect(dest||this.sfxGain);s.start(t)},
+ sfx(kind){if(attract)return;switch(kind){case'fire':this.tone(1050,.065,'square',.065,0,null,240);break;case'hit':this.tone(200,.06,'triangle',.22,0,null,80);break;case'explode':this.noise(.18,.35);this.tone(120,.18,'sawtooth',.2,0,null,28);break;case'damage':this.noise(.35,.4);this.tone(190,.3,'sawtooth',.3,0,null,35);break;case'dash':this.tone(130,.27,'sawtooth',.16,0,null,1300);break;case'pickup':this.tone(660,.13,'sine',.25);this.tone(990,.2,'sine',.2,(this.ctx?.currentTime||0)+.08);break;case'ui':this.tone(430,.07,'triangle',.14);break;case'confirm':this.tone(440,.11,'triangle',.2);this.tone(880,.13,'triangle',.15,(this.ctx?.currentTime||0)+.08);break;case'win':for(let i=0;i<5;i++)this.tone([261,329,392,523,784][i],.6,'triangle',.25,(this.ctx?.currentTime||0)+i*.12);break}},
+ speak(text){if(!prefs.voice||attract||!this.started||!('speechSynthesis'in window)||this.muted)return;try{speechSynthesis.cancel();let u=new SpeechSynthesisUtterance(text);u.rate=.85;u.pitch=.48;u.volume=prefs.master/100*.65;u.lang='en-US';speechSynthesis.speak(u)}catch{}},
+ tick(){if(!this.ctx||this.ctx.state!=='running'||this.muted)return;let now=this.ctx.currentTime;if(this.next<now-.3)this.next=now+.05;let playing=mode==='play',bpm=playing?112:80,step=60/bpm/4;while(this.next<now+.12){let s=this.seq++,t=this.next,root=[55,55,65.406,49][Math.floor(s/32)%4],notes=[0,7,12,19,12,7,15,12],note=root*4*Math.pow(2,notes[s%8]/12);if(s%4===0)this.tone(root,.32,'triangle',.55,t,this.musicGain);if(s%2===0)this.tone(note,.15,'triangle',playing?.14:.1,t,this.musicGain);if(playing){if(s%4===0)this.tone(130,.18,'sine',.65,t,this.musicGain,35);if(s%8===4)this.noise(.1,.17,t,this.musicGain);this.noise(.025,s%2===0?.055:.025,t,this.musicGain)}this.next+=step;}},
+ quiet(){this.muted=true;this.apply();try{speechSynthesis.cancel()}catch{}}
+};
+
+function newPhysics(){if(physics)physics.free();if(events)events.free();physics=new RAPIER.World({x:0,y:0});physics.timestep=1/60;events=new RAPIER.EventQueue(true);colliderEntities.clear()}
+function addEntity(data,body=true){let e={id:nextEntityId++,...data};e.mesh=makeModel(e);e.mesh.position.set(e.x,e.y,e.kind==='player'?1:0);scene.add(e.mesh);entities.set(e.id,e);
+ if(body&&physics){let dynamic=e.kind==='bullet'||e.kind==='pickup';let d=dynamic?RAPIER.RigidBodyDesc.dynamic():RAPIER.RigidBodyDesc.kinematicPositionBased();d.setTranslation(e.x,e.y);if(dynamic)d.setGravityScale(0).setCanSleep(false).setCcdEnabled(true);e.body=physics.createRigidBody(d);let member,filter,r;
+ if(e.kind==='player'){member=1;filter=8|16;r=.42}else if(e.kind==='enemy'){member=2;filter=4;r=e.type===3?2: .55}else if(e.kind==='bullet'){member=e.type===0?4:8;filter=e.type===0?2|8:1|4;r=e.type===0?.16:e.type===2?.32:.22}else{member=16;filter=1;r=.42}
+ let desc=RAPIER.ColliderDesc.ball(r).setSensor(true).setCollisionGroups(((member<<16)|filter)>>>0).setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS).setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.ALL);e.collider=physics.createCollider(desc,e.body);colliderEntities.set(e.collider.handle,e.id);if(dynamic)e.body.setLinvel({x:e.vx||0,y:e.vy||0},true)}return e}
+function removeEntity(e){if(!e||!entities.has(e.id))return;entities.delete(e.id);if(e.collider)colliderEntities.delete(e.collider.handle);if(e.body&&physics)physics.removeRigidBody(e.body);if(e.mesh){scene.remove(e.mesh);const gs=new Set();e.mesh.traverse(o=>{if(o.geometry)gs.add(o.geometry)});for(let g of gs)g.dispose()}}
+function clearEntities(){for(let e of [...entities.values()])removeEntity(e);players.clear();clearWarnings();clearFx()}
+function createPlayer(id,x,color){let e=addEntity({id,kind:'player',x,y:-8.3,vx:0,vy:0,color,hp:5,maxHp:5,energy:100,dashCd:0,dashing:0,inv:2,fireCd:0,personal:0,kills:0,dead:false,remoteInput:{},lastAt:-Infinity,lastDash:0});players.set(id,e);return e}
+function startRun(auto=false,options={}){if(!engineReady)return;closeModal();attract=auto;clearEntities();newPhysics();nextEntityId=10;simTime=0;accumulator=0;mode=hubInfo&&!hubStarted?'ready':'play';document.body.classList.add('playing');$('titleScreen').hidden=true;$('titleFooter').hidden=true;$('hud').hidden=false;$('compatibility').hidden=true;$('attractBadge').hidden=!auto;
+ run={score:0,wave:options.wave??0,loop:options.loop??0,stage:'intro',stageT:3.5,waveTime:0,age:0,spawned:0,kills:0,intercepts:0,streak:0,streakTime:0,maxCombo:1,upgrades:options.upgrades??[],slow:false,slowSecs:0,dashes:0,retries:0,ended:false,bossPhase:1,attackT:0,warnings:[],rng:seeded(hubInfo?.seed??Date.now()),autoT:0};
+ if(hubInfo){for(let p of hubInfo.players)createPlayer(p.id,(p.id-(hubInfo.players.length-1)/2)*4,parseInt(p.color.slice(1),16));playerId=hubInfo.me}else{playerId=0;createPlayer(0,0,palette.mint)}for(let p of players.values())if(run.upgrades.includes('hull'))p.hp=p.maxHp=7;
+ beginWave(run.wave);resize();updateHUD();lastInputAt=performance.now();audio.unlock();audio.sfx('confirm')}
+function beginWave(w){run.wave=w;run.stage='intro';run.stageT=attract?2:3.8;run.waveTime=0;run.spawned=0;run.attackT=0;run.bossPhase=1;run.autoT=0;for(let e of [...entities.values()])if(e.kind!=='player')removeEntity(e);clearWarnings();for(let p of players.values()){if(p.hp<=0){p.hp=Math.ceil(p.maxHp/2);p.inv=3;p.x=(p.id-1.5)*3;p.y=-8.3}p.hp=Math.min(p.maxHp,p.hp+1);p.energy=Math.min(100,p.energy+25)}let def=WAVES[w];showToast(def.tag,def.name,def.hint,attract?2:3.8);if(w===5)$('bossHud').hidden=false;else $('bossHud').hidden=true;updateHUD();}
+function spawnEnemy(i){let def=WAVES[run.wave],boss=run.wave===5,type=boss?3:i%7===6?1:i%9===8?2:0,hp=boss?110*(1+.55*(players.size-1))*(1+run.loop*.2):(type===1?3:run.wave>=3?2:1)+Math.floor(run.loop/2);let e=addEntity({kind:'enemy',type,x:boss?0:0,y:boss?5:7,hp,maxHp:hp,phase:i*.48,row:i%2,age:0,fireCd:1.8+run.rng()*3,vx:0,vy:0});if(boss)e.mesh.scale.setScalar(.85);else e.mesh.scale.setScalar(.85);run.spawned++;return e}
+function fire(p){if(p.hp<=0||p.fireCd>0)return;p.fireCd=run.upgrades.includes('rapid')?.105:.15;let split=run.upgrades.includes('split');for(let offset of(split?[-.3,.3]:[0])){if([...entities.values()].filter(e=>e.kind==='bullet').length>=68)break;addEntity({kind:'bullet',type:0,owner:p.id,x:p.x+offset,y:p.y+.8,vx:0,vy:34,life:1.2,pierce:run.upgrades.includes('pierce')?2:1})}audio.sfx('fire')}
+function dash(p,dir){if(p.hp<=0||p.dashCd>0)return;p.dashCd=run.upgrades.includes('dash')?1.6:3.2;p.dashing=run.upgrades.includes('dash')?.36:.23;p.inv=Math.max(p.inv,p.dashing+.18);p.dashDir=Math.abs(dir)>.1?Math.sign(dir):p.vx<0?-1:1;run.dashes++;burst(p.x,p.y,palette.mint,7);audio.sfx('dash')}
+function attack(e,type){let alive=[...players.values()].filter(p=>p.hp>0);if(!alive.length)return;let p=alive[Math.floor(run.rng()*alive.length)],x=e.x,y=e.y-.7,vx=0,vy=-4.8;if([...entities.values()].filter(e=>e.kind==='bullet').length>=64)return;
+ if(type===2){vy=-3.4;vx=clamp((p.x-x)*.3,-3,3)}if(type===3){vy=-5.6;vx=(x>0?-1:1)*.5}if(type===4){let tx=clamp(p.x+(p.vx||0)*1.1,-14,14),dy=p.y-y,dx=tx-x,d=Math.hypot(dx,dy);vx=dx/d*7.5;vy=dy/d*7.5;markWarning(tx,.65,false)}addEntity({kind:'bullet',type,owner:-1,target:p.id,x,y,vx,vy,baseVx:vx,baseVy:vy,life:7,turned:false,pierce:1})}
+function pickup(x,y,type=0){addEntity({kind:'pickup',type,x,y,vx:0,vy:-2,life:9})}
+function award(points,owner=playerId){let mult=Math.min(5,1+Math.floor(run.streak/8));let n=Math.round(points*mult);run.score+=n;run.streak++;run.streakTime=4;run.maxCombo=Math.max(run.maxCombo,mult);let p=players.get(owner);if(p)p.personal+=n;hubProgress()}
+function hurtEnemy(e,bullet){e.hp-=bullet.damage||1;audio.sfx('hit');burst(bullet.x,bullet.y,palette.gold,3);if(e.type===3&&e.hp<=e.maxHp*.5&&run.bossPhase===1){run.bossPhase=2;taunt('You have made me late. NOBODY makes me late.',4);shake=.6;burst(e.x,e.y,palette.coral,40,true)}if(e.hp>0)return;run.kills++;let p=players.get(bullet.owner);if(p)p.kills++;award(e.type===3?3000:e.type===1?140:100,bullet.owner);burst(e.x,e.y,e.type===3?palette.gold:palette.coral,e.type===3?55:16,e.type===3);shake=e.type===3?1.2:.16;audio.sfx('explode');if(e.type!==3&&run.kills%4===0)pickup(e.x,e.y,run.kills%12===0?1:0);removeEntity(e)}
+function hitPlayer(p,b){if(p.hp<=0||p.inv>0)return;removeEntity(b);if(attract){burst(p.x,p.y,palette.mint,5);return}p.hp--;p.inv=1.6;run.streak=0;flashTimer=.14;shake=.65;burst(p.x,p.y,palette.coral,18);audio.sfx('damage');if(p.hp<=0){burst(p.x,p.y,palette.gold,30,true);p.dead=true;showPickup(isShared()?'WINGMATE DOWN · CLEAR THE SECTOR TO RESCUE':'HULL LOST');if([...players.values()].every(p=>p.hp<=0))endRun(false)}}
+function collide(a,b){if(!a||!b||!entities.has(a.id)||!entities.has(b.id))return;if(b.kind==='bullet'&&b.type===0)[a,b]=[b,a];if(a.kind==='bullet'&&a.type===0){if(b.kind==='enemy'){hurtEnemy(b,a);a.pierce--;if(a.pierce<=0)removeEntity(a)}else if(b.kind==='bullet'&&b.type>0){run.intercepts++;award(b.type===4?40:15,a.owner);let p=players.get(a.owner);if(p)p.energy=Math.min(100,p.energy+3);burst(b.x,b.y,b.type===2?palette.mint:palette.gold,7);removeEntity(b);a.pierce--;if(a.pierce<=0)removeEntity(a)}return}if(b.kind==='player')[a,b]=[b,a];if(a.kind==='player'){if(b.kind==='bullet'&&b.type>0)hitPlayer(a,b);if(b.kind==='pickup'&&a.hp>0){if(b.type===1){a.hp=Math.min(a.maxHp,a.hp+1);showPickup('+1 HULL · REPAIR CELL')}else{a.energy=Math.min(100,a.energy+32);showPickup('+32 TIME · CHRONON CELL')}award(30,a.id);burst(b.x,b.y,palette.mint,10);audio.sfx('pickup');removeEntity(b)}}}
+function warningMesh(x){let g=new THREE.Group();let a=new THREE.Mesh(new THREE.PlaneGeometry(.7,15),flat(palette.coral,.1));a.position.set(x,-1,-1);g.add(a);let r=ring(.55,.035,palette.coral,g,x,-8,-.5);bar(.07,1.4,palette.coral,g,x,-8,-.5);bar(1.4,.07,palette.coral,g,x,-8,-.5);scene.add(g);return g}
+function markWarning(x,ttl,fire=true,id=null){let w={id:id??nextEntityId++,x,t:ttl,fire,mesh:warningMesh(x)};run.warnings.push(w);return w}
+function removeWarning(w){scene.remove(w.mesh);let gs=new Set();w.mesh.traverse(o=>o.geometry&&gs.add(o.geometry));gs.forEach(g=>g.dispose());run.warnings.splice(run.warnings.indexOf(w),1)}
+function clearWarnings(){if(run?.warnings)for(let w of [...run.warnings])removeWarning(w)}
+function movement(p,c,dt){if(p.hp<=0)return;let speed=10.4;if(p.dashing>0){p.vx=p.dashDir*27;p.vy=0}else{p.vx=c.x*speed;p.vy=c.y*speed*.7}p.x=clamp(p.x+p.vx*dt,-14,14);p.y=clamp(p.y+p.vy*dt,-9.35,-5.95);p.body?.setNextKinematicTranslation({x:p.x,y:p.y})}
+function autoInput(p){let enemies=[...entities.values()].filter(e=>e.kind==='enemy');let target=enemies.sort((a,b)=>Math.abs(a.x-p.x)-Math.abs(b.x-p.x))[0];let dest=target?clamp(target.x+(target.type===3?0:Math.cos(run.waveTime*.66-target.phase)*2),-13,13):Math.sin(simTime)*9;return{x:clamp((dest-p.x)*1.8,-1,1),y:Math.sin(simTime*.4)*.15,fire:true,slow:run.waveTime%13>8,dash:run.waveTime%9<.03}}
+function stepWorld(dt){if(!run||run.ended||hubStopped)return;simTime+=dt;run.age+=dt;if(run.streakTime>0)run.streakTime-=dt;else run.streak=0;let local=localPlayer();let localControl=modalPage?{x:0,y:0,fire:false,slow:false,dash:false}:input;
+ if(!isAuthority()){if(local){local.dashCd=Math.max(0,local.dashCd-dt);local.dashing=Math.max(0,(local.dashing||0)-dt);if(localControl.dash&&local.dashCd===0){dash(local,localControl.x);localSendSeq++}movement(local,localControl,dt);local.fireCd=Math.max(0,local.fireCd-dt);if(localControl.fire&&local.fireCd===0&&local.hp>0){local.fireCd=.15;audio.sfx('fire')}}netTick(dt);return}
+ let anySlow=false;for(let p of players.values()){let c=attract?autoInput(p):p.id===playerId&&!hubInfo?.server?localControl:p.remoteInput||{};c={x:0,y:0,fire:false,slow:false,dash:false,...c};if(p.id!==playerId&&hubInfo&&AIHub.time()-(p.lastAt||0)>600)c={x:0,y:0,fire:false,slow:false,dash:false};p.control=c;
+ p.inv=Math.max(0,p.inv-dt);p.dashCd=Math.max(0,p.dashCd-dt);p.dashing=Math.max(0,p.dashing-dt);p.fireCd=Math.max(0,p.fireCd-dt);
+ if(c.dash)dash(p,c.x);if(p.id===playerId||attract)movement(p,c,dt);else p.body?.setNextKinematicTranslation({x:p.x,y:p.y});if(c.fire&&run.stage!=='clear')fire(p);
+ if(c.slow&&p.energy>1&&p.hp>0){anySlow=true;p.energy=Math.max(0,p.energy-dt*(run.upgrades.includes('battery')?18:24))}else p.energy=Math.min(100,p.energy+dt*(run.upgrades.includes('battery')?12.8:8));}
+ run.slow=anySlow;let ed=dt*(anySlow?.28:1);if(anySlow)run.slowSecs+=dt;
+ if(run.stage==='intro'){run.stageT-=dt;if(run.stageT<=0){run.stage='combat';taunt(WAVES[run.wave].taunt,4)}}else if(run.stage==='clear'){run.stageT-=dt;if(run.stageT<=0)afterWave()}else if(run.stage==='combat'){
+ run.waveTime+=ed;run.autoT+=dt;let def=WAVES[run.wave],count=def.count+(run.wave===5?0:run.loop*3);
+ if(run.spawned<count&&run.waveTime>=run.spawned*(run.wave===5?0:.28))spawnEnemy(run.spawned);
+ if(run.spawned>=count&&![...entities.values()].some(e=>e.kind==='enemy')){run.stage='clear';run.stageT=2.6;award(500);showToast('SECTOR SECURED','TIME WELL STOLEN','+500 clear bonus · Hull repaired · Time replenished',2.4);audio.sfx('pickup');clearWarnings();for(let e of [...entities.values()])if(e.kind==='bullet'&&e.type>0)removeEntity(e)}
+ if(attract&&run.autoT>25){let e=[...entities.values()].find(e=>e.kind==='enemy');if(e)hurtEnemy(e,{x:e.x,y:e.y,owner:0,damage:e.type===3?2:e.hp})}
+ }
+ for(let e of [...entities.values()]){if(!entities.has(e.id))continue;if(e.kind==='enemy'){
+ e.age+=ed;e.fireCd-=ed;
+ if(e.type===3){e.x=Math.sin(run.waveTime*.4)*7.5;e.y=4.9+Math.sin(run.waveTime*.8)*.65;run.attackT+=ed;if(run.attackT>3.5){run.attackT=0;let p=[...players.values()].find(p=>p.hp>0);if(p)for(let dx of[-2.5,0,2.5])markWarning(clamp(p.x+dx,-14,14),1.2,true)}if(e.fireCd<=0){e.fireCd=run.bossPhase===2?.32:.65;attack(e,WAVES[5].types[Math.floor(run.waveTime*2)% (run.bossPhase===2?4:2)])}}
+ else{let t=run.waveTime*(.64+run.loop*.04)-e.phase;e.x=Math.sin(t)*11.7;e.y=4.8+Math.sin(t*1.5+e.row)*2.2+e.row*.55;if(e.fireCd<=0){e.fireCd=Math.max(1.5,4.5-run.wave*.35)+run.rng()*2;attack(e,WAVES[run.wave].types[Math.floor(run.rng()*WAVES[run.wave].types.length)])}}
+ e.body.setNextKinematicTranslation({x:e.x,y:e.y});
+ }else if(e.kind==='bullet'){
+ e.life-=e.type===0?dt:ed;if(e.life<=0||Math.abs(e.x)>17||e.y<-12||e.y>13){removeEntity(e);continue}
+ if(e.type===2){let p=players.get(e.target)||[...players.values()][0];if(p)e.vx=lerp(e.vx,clamp((p.x-e.x)*1.5,-3.6,3.6),ed*1.5)}else if(e.type===3&&!e.turned&&e.y<-6.1){e.turned=true;let p=players.get(e.target)||[...players.values()][0];e.vx=(p&&p.x<e.x?-1:1)*7.4;e.vy=-.1;e.life=4;burst(e.x,e.y,palette.gold,4)}
+ let scale=e.type===0?1:anySlow?.28:1;e.body.setLinvel({x:e.vx*scale,y:e.vy*scale},true)
+ }else if(e.kind==='pickup'){e.life-=dt;if(e.life<0||e.y<-11)removeEntity(e);else if(e.y<-5){let p=[...players.values()].filter(p=>p.hp>0).sort((a,b)=>Math.abs(a.x-e.x)-Math.abs(b.x-e.x))[0];if(p&&Math.abs(p.x-e.x)<3)e.body.setLinvel({x:(p.x-e.x)*3,y:(p.y-e.y)*2.5},true)}}}
+ for(let w of [...run.warnings]){w.t-=ed;w.mesh.visible=Math.floor(w.t*12)%2===0;if(w.t<=0){if(w.fire){for(let k=0;k<3;k++)addEntity({kind:'bullet',type:1,owner:-1,x:w.x,y:8+k*.7,vx:0,vy:-10,life:4,pierce:1})}removeWarning(w)}}
+ physics.step(events);let pairs=[];events.drainCollisionEvents((a,b,started)=>{if(started)pairs.push([colliderEntities.get(a),colliderEntities.get(b)])});for(let e of entities.values())if(e.body&&(e.kind==='bullet'||e.kind==='pickup')){let t=e.body.translation();e.x=t.x;e.y=t.y}for(let[a,b]of pairs)collide(entities.get(a),entities.get(b));netTick(dt);}
+function afterWave(){if(run.wave===5){endRun(true);return}if([1,3].includes(run.wave)){if(attract||hubInfo){let index=run.wave===1?0:3;grantUpgrade(UPGRADES[index].id);beginWave(run.wave+1)}else{run.stage='upgrade';showUpgrades()}}else beginWave(run.wave+1)}
+function grantUpgrade(id){if(!run.upgrades.includes(id))run.upgrades.push(id);if(id==='hull')for(let p of players.values()){p.maxHp=7;p.hp=7}showPickup('SALVAGE INSTALLED · '+UPGRADES.find(u=>u.id===id).name);audio.sfx('confirm')}
+function endRun(won,reason=null){if(!run||run.ended)return;run.ended=true;mode='over';run.won=won;run.reason=reason;run.overAt=performance.now();run.slow=false;document.body.classList.remove('slow');$('slowLabel').hidden=true;clearWarnings();if(!attract&&!hubInfo){record.best=Math.max(record.best,run.score);if(won)record.wins++;save('time-bandit-record-v1',record)}if(won){audio.sfx('win');taunt('Keep your tomorrow, thief. I still own next Tuesday.',5)}if(hubInfo&&hubInfo.isHost&&!hubStopped){let ids=hubInfo.players.filter(p=>players.has(p.id)).map(p=>p.id);AIHub.send({t:'end',won,score:run.score,reason},{reliable:true});AIHub.finish({standings:[ids],scores:Object.fromEntries(ids.map(id=>[id,run.score])),won,stats:Object.fromEntries(ids.map(id=>[id,{'Ships down':players.get(id)?.kills||0,'Team score':run.score,'Sectors':run.wave+(won?1:0)}]))})}if(!attract)showResult(won,reason);updateHUD()}
+function retryCheckpoint(){let old=run,w=old.wave,up=[...old.upgrades],score=Math.floor(old.score*.75);startRun(false,{wave:w,upgrades:up,loop:old.loop});run.score=score;run.retries=old.retries+1;showPickup('CHECKPOINT RESTORED · 25% SCORE TAX')}
+function showTitle(){if(hubInfo)return;attract=false;closeModal();if(engineReady){clearEntities();mode='title';resize()}else mode=gpuError?'unsupported':'loading';run=null;document.body.classList.remove('playing','slow');$('titleScreen').hidden=!!gpuError;$('titleFooter').hidden=!!gpuError;$('hud').hidden=true;$('touchNotice').hidden=!touchOnly();$('compatibility').hidden=!gpuError;lastInputAt=performance.now();focusIndex=0;focusMenu(0);try{speechSynthesis.cancel()}catch{}}
+function showToast(k,title,desc,time=3){$('toastKicker').textContent=k;$('toastTitle').textContent=title;$('toastDesc').textContent=desc;$('waveToast').hidden=false;toastTimer=time}
+function taunt(text,time=4){$('tauntText').textContent='“'+text+'”';$('taunt').hidden=false;tauntTimer=time;audio.speak(text)}
+function showPickup(text){$('pickupToast').textContent=text;$('pickupToast').hidden=false;pickupTimer=2.6}
+function updateHUD(){if(!run)return;document.body.classList.toggle('boss',run.wave===5&&mode==='play');let p=localPlayer()||[...players.values()][0];$('score').textContent=String(run.score).padStart(6,'0');$('combo').textContent='×'+Math.min(5,1+Math.floor(run.streak/8))+' MULTIPLIER';$('waveLabel').textContent=run.loop?'PARADOX LOOP '+run.loop+' · SECTOR '+(run.wave+1):'SECTOR '+String(run.wave+1).padStart(2,'0')+' / 06';$('waveName').textContent=WAVES[run.wave].name;$('sectorDots').innerHTML=WAVES.map((_,i)=>'<i class="'+(i<run.wave?'done':i===run.wave?'current':'')+'"></i>').join('');if(p){$('hull').innerHTML=Array.from({length:p.maxHp||5},(_,i)=>'<i class="'+(i>=p.hp?'empty':'')+'"></i>').join('');$('energyFill').style.width=p.energy+'%';$('energyNumber').textContent=Math.floor(p.energy);$('dashFill').style.width=(1-clamp(p.dashCd/(run.upgrades.includes('dash')?1.6:3.2),0,1))*100+'%';$('dashText').textContent=p.dashCd>0?p.dashCd.toFixed(1)+'s':'READY';$('pilotLabel').textContent=hubInfo?(hubInfo.players.find(n=>n.id===playerId)?.name||'TEAM')+' / HULL':'BANDIT / HULL'}$('best').textContent='BEST '+String(Math.max(record.best,run.score)).padStart(6,'0');$('upgradeLabels').textContent=run.upgrades.length?run.upgrades.map(id=>UPGRADES.find(u=>u.id===id).label).join(' + '):'PULSE CANNON';let boss=[...entities.values()].find(e=>e.kind==='enemy'&&e.type===3);$('bossHud').hidden=!boss;if(boss){$('bossFill').style.width=Math.max(0,boss.hp/boss.maxHp)*100+'%';$('bossPhase').textContent=run.bossPhase===2?'PHASE II · ENRAGED':'PHASE I'}document.body.classList.toggle('slow',!!run.slow);$('slowLabel').hidden=!run.slow;if(hubInfo){$('teamHud').replaceChildren(...hubInfo.players.filter(p=>p.id!==playerId&&players.has(p.id)).map(info=>{let e=players.get(info.id),s=document.createElement('span');s.style.borderColor=info.color;s.textContent=info.name+' · '+(e.hp>0?'◆'.repeat(e.hp):'DOWN');return s}))}}
+
+const ABOUT=["<p><b>The Last Time Bandit!</b> \u2014 an original arcade heist inspired by <b>Attack of the Timelord!</b> (1982), by Ed and Linda Averett. Independently created; not an official sequel. Title drawn with Python\u2019s system-backed random generator from 50 original candidates.</p><p><b>Date:</b> 2026-10-29 10:48 America/Vancouver.<br><b>Tech:</b> Three.js r180 / 0.180.0 \u00b7 WebGPU only \u00b7 TSL \u00b7 Rapier 2D 0.19.3 \u00b7 Gamepad API \u00b7 JavaScript / HTML / CSS.<br><b>Art direction:</b> Procedural 3D cel shading, ink silhouettes, cosmic comic palette.<br><b>Animation:</b> Transform animation, fixed-step physics, interpolated snapshots, particles.<br><b>Audio:</b> Original Web Audio synth music and effects. Optional Web Speech villain voice; installed voice availability unknown.<br><b>Online:</b> AI Hub Session Protocol v1 / client v1.3.0, 1\u20134 pilot shared-world co-op, host-authoritative combat, immediate local movement, team results, server-host support.</p><p><b>Environment:</b> Codex CLI (headless); Linux; browser unknown.<br><b>Model:</b> OpenAI, gpt-6-astra, reasoning effort max.<br><b>Usage:</b> API cost unknown; token count unknown; estimated session time about 55 minutes.</p><p><b>Credits:</b> Game, geometry, writing, music, and sound created for this demo. Three.js: MIT. Rapier: Apache-2.0. Fonts: Barlow Condensed and Space Grotesk, SIL Open Font License. AI Hub client by Michael Crosato.<br><a href='https://odyssey2.info/library/manuals/us_timelord/Attack%20of%20the%20Timelord%20(USA).pdf'>Original game manual</a> \u00b7 <a href='https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub'>AI Hub session library</a></p>", "<p><b>Testing parameters:</b> Efficient, lightweight functionality and visual checks. Phones, tablets, wide screens, and WebKit. No FPS target or optimization pass.</p><p><b>Issues caught:</b> 5 application issues, all fixed. <b>Critical / game-breaking:</b> 1 \u2014 a missing Three.js import-map alias blocked startup. Other fixes covered loading-time diagnostics, shorter-screen layout, focus presentation, and compatibility-screen overlap. Two test-environment issues were diagnosed separately.</p><p><b>Results:</b> 26 solo functional checks passed, including real Rapier collisions, controller controls, axis inversion, both upgrade screens, retry, ten-second attract mode, a complete six-sector AI run, and the Paradox Loop. All 5 official AI Hub scenarios passed: 2 / 3 / 4 players, host departure, and a server host without a local player. Network simulation: 150 ms latency, 50 ms jitter, 5% loss.</p><p><b>Viewports:</b> Chromium WebGPU at 375 \u00d7 667, 768 \u00d7 1024, 1280 \u00d7 800, 1440 \u00d7 900, and 2560 \u00d7 1080. WebKit at 375 \u00d7 667 and 1024 \u00d7 768. Screenshots inspected; no horizontal overflow or JavaScript page errors.</p><p><b>Most helpful test:</b> The complete-campaign browser test paired with actual WebGPU screenshots.<br><b>Least helpful test:</b> The first adapter-only probe: it passed while that test browser presented blank canvases.</p><p><b>Limits:</b> Linux WebKit has no WebGPU here; its compatibility screen and settings were checked. Real iOS Safari, physical DualSense hardware, and a live internet Hub session were not tested. Chromium used the WebGPU backend with a software Vulkan adapter under Xvfb.</p>", "<p><b>What I liked most:</b> Three.js scene composition makes a strong visual identity practical with code-built geometry. TSL gives precise control over cel-shading bands.</p><p><b>Where I got stuck or guessed wrong:</b> The TSL bundle needs a three/webgpu import-map alias; my initial map omitted it. The first headless test configuration exposed an adapter but presented no pixels, which a minimal native WebGPU canvas also reproduced.</p><p><b>Most important custom system:</b> The arcade campaign state machine, ability and collision rules, controller menus, and AI Hub world synchronization.</p><p><b>Hardest part:</b> Separating authoritative Rapier collision events from immediate client movement, network interpolation, and visual effects.</p><p><b>What I would overhaul:</b> Implicit renderer backend fallback.</p><p><b>One engine change:</b> A public required-WebGPU mode with clear, actionable initialization diagnostics.</p>", "<p><b>What I liked most:</b> The prompt supplies a specific source, art direction, controller UX, and a concrete portable deliverable.</p><p><b>What was confusing:</b> Online is specified as a library link. I interpreted it as full AI Hub co-op session integration, with the hub owning invitations and matchmaking.</p><p><b>Hardest thing:</b> Building the full gameplay arc, polish, and shared-world multiplayer in one portable HTML artifact.</p><p><b>One additional test:</b> Two people using real DualSense controllers on separate physical devices over a live internet AI Hub session, including a mid-boss disconnect.</p>"];
+function modalShell(kicker,title,content,footer=''){return '<div class="modal-kicker">'+kicker+'</div><div class="modal-heading"><h2 id="modalTitle">'+title+'</h2><button class="modal-close" data-action="back" aria-label="Close">×</button></div>'+content+(footer?'<div class="modal-footer">'+footer+'</div>':'')}
+function openModal(page,html){if(!modalPage)modalOrigin=mode;modalPage=page;$('modalContent').innerHTML=html;$('modalLayer').hidden=false;$('touchNotice').hidden=true;focusIndex=0;focusMenu(0);audio.sfx('ui')}
+function closeModal(){modalPage=null;$('modalLayer').hidden=true;$('touchNotice').hidden=!touchOnly();if(mode==='title')focusMenu(0)}
+function back(){if(modalPage==='upgrade')return;if(modalPage==='result'){if(!hubInfo)showTitle();return}closeModal();audio.sfx('ui')}
+function showSettings(){let rows=[['master','MASTER VOLUME',prefs.master+'%'],['music','MUSIC',prefs.music+'%'],['sfx','SOUND EFFECTS',prefs.sfx+'%'],['voice','VILLAIN VOICE',prefs.voice?'ON':'OFF'],['invertX','INVERT HORIZONTAL',prefs.invertX?'ON':'OFF'],['invertY','INVERT VERTICAL',prefs.invertY?'ON':'OFF'],['deadzone','STICK DEADZONE',prefs.deadzone+'%'],['shake','SCREEN SHAKE',prefs.shake?'ON':'OFF'],['reduced','REDUCED MOTION',prefs.reduced?'ON':'OFF'],['contrast','HIGH CONTRAST UI',prefs.contrast?'ON':'OFF']];let html='<p class="modal-intro">'+(isShared()?'The shared battle continues. Your ship idles while this menu is open.':mode==='play'?'Take a breath, Bandit. Your timeline is paused.':'Make this timeline your own. Changes save automatically.')+'</p><div class="settings-grid">'+rows.map(([id,label,val])=>'<button class="setting" data-action="setting:'+id+'"><b>'+label+'</b><span>‹ '+val+' ›</span></button>').join('')+'</div>';
+ openModal('settings',modalShell('SHIP CONFIGURATION','YOUR TIME. YOUR RULES.',html,'<button class="menu-item" data-action="back">'+(mode==='play'?'RESUME FLIGHT':'BACK')+' <span class="key round">◯</span></button><button class="menu-item" data-action="fullscreen">FULLSCREEN</button>'+(!hubInfo&&mode==='play'?'<button class="menu-item" data-action="abandon">END RUN</button>':'')+'<span>← → ADJUST · OPTIONS / ESC CLOSE</span>'))}
+function changeSetting(id,dir=1){let old=focusIndex;if(typeof prefs[id]==='boolean')prefs[id]=!prefs[id];else{let increment=id==='deadzone'?4:10,limit=id==='deadzone'?38:100,floor=id==='deadzone'?6:0;prefs[id]=clamp(prefs[id]+dir*increment,floor,limit)}applyPrefs();showSettings();focusMenu(old)}
+const MANUAL=[
+ {k:'FLIGHT MANUAL / 01',title:'STEAL BACK TOMORROW.',intro:'You have taken the Clocklord’s only time machine. He would like it back. Survive six sectors, break his fleet, and put an end to his eternity.',cards:[['L','MOVE','Left stick / D-pad · WASD / arrows. Fly within the defense lane at the bottom. The fleet’s airspace is off limits.'],['R2','FIRE','R2 or Cross · hold Space / left mouse. Infinite ammunition. Your bolts also destroy every enemy projectile.'],['L2','TIME BRAKE','Hold L2 · Q / right mouse. Enemies slow to 28% speed; you stay fast. Release to recharge your time.'],['R1','PHASE DASH','R1 or Square · Shift. Dash in your movement direction and pass through attacks. Recharges in 3.2 seconds.']]},
+ {k:'THREAT INDEX / 02',title:'KNOW YOUR BAD TIMES.',intro:'The first four sectors introduce one threat at a time. Their shapes identify them as clearly as their colors. Every projectile can be shot down.',cards:[['↓','NEEDLE / MISSILE','Coral darts fall straight down. A quick sidestep or a single bolt takes care of them.'],['◇','LATCH / MINE','Mint diamonds gently steer toward your ship. Draw them into your fire; do not let them pile up.'],['⌁','HOOK / SIDEWINDER','Gold hooks descend, then turn sideways across the defense lane. Change altitude or phase through.'],['✧','ORACLE / PREDICTOR','Blue stars aim ahead of your movement. A warning marks the predicted lane. Reverse course or brake time.']]},
+ {k:'FIELD NOTES / 03',title:'MAKE EVERY SECOND COUNT.',intro:'This is one complete arcade chapter. A winning run opens a harder Paradox Loop, with your ship upgrades intact.',cards:[['×5','CHAIN REACTION','Each eight consecutive takedowns raises your multiplier, up to ×5. A hit or four quiet seconds breaks the chain.'],['◈','SALVAGE','Choose an upgrade after sectors 2 and 4. Twin bolts, rapid fire, a time cell, piercing shots, a phase coil, or reinforced hull.'],['＋','RECOVER','Chronon cells restore 32 time. Repair cells restore one hull. Every cleared sector repairs one hull. Nearby cells drift toward you.'],['↺','SECOND CHANCES','Lose all hull and retry the current sector with upgrades intact, at a 25% score tax. Best scores save on this device.']]},
+ {k:'WINGMATE PROTOCOL / 04',title:'A HEIST IS BETTER SHARED.',intro:'Online co-op is built for AI Hub sessions. The hub handles invitations, seats, connections, the shared clock, and results. Launch this game from an AI Hub session to play together.',cards:[['1–4','ONE SHARED BATTLE','All pilots fight the same fleet. Everyone contributes to a team score. Each pilot moves and fires their own ship.'],['∞','SAVE A WINGMATE','A downed pilot returns when the team clears the sector. If everyone loses their hull, the heist ends.'],['◈','SHARED SALVAGE','Co-op automatically installs Forked Light and Afterimage after sectors 2 and 4, so the mission keeps moving.'],['☷','STAY IN CONTROL','Options / Escape opens settings. Co-op never pauses: your ship idles. The hub closes the round when time expires.']]}
+];
+function showManual(page=0){manualPage=(page+4)%4;let d=MANUAL[manualPage];openModal('manual',modalShell(d.k,d.title,'<p class="modal-intro">'+d.intro+'</p><div class="manual-grid">'+d.cards.map(c=>'<article class="manual-card"><span class="key">'+c[0]+'</span><b>'+c[1]+'</b><p>'+c[2]+'</p></article>').join('')+'</div>','<button class="menu-item" data-action="manualprev">← PREVIOUS</button><span class="page-label">'+(manualPage+1)+' / 4 · L1 / R1</span><button class="menu-item" data-action="manualnext">NEXT →</button>'))}
+function showAbout(page=0){creditPage=(page+4)%4;let labels=['SOURCE INFORMATION','TESTING FEEDBACK','ENGINE FEEDBACK','PROMPT FEEDBACK'];let content='<div class="credits-tabs">'+labels.map((s,i)=>'<button class="'+(i===creditPage?'active':'')+'" data-action="credit:'+i+'">'+s+'</button>').join('')+'</div><div class="credit-content">'+ABOUT[creditPage]+'</div>';openModal('about',modalShell('THE ARCHIVE','BEHIND THE HEIST.',content,'<button class="menu-item" data-action="back">BACK <span class="key round">◯</span></button><span>L1 / R1 CHANGE PAGE</span>'))}
+function showUpgrades(){let options=run.wave===1?UPGRADES.slice(0,3):UPGRADES.slice(3);openModal('upgrade',modalShell('SECTOR SALVAGE · '+(run.wave+1)+' / 6','A LITTLE GRAND LARCENY.','<p class="modal-intro">One stolen component. One permanent advantage. Choose your next upgrade.</p><div class="upgrade-grid">'+options.map(u=>'<button class="upgrade-card" data-action="upgrade:'+u.id+'"><span class="upgrade-icon">'+u.icon+'</span><b>'+u.name+'</b><p>'+u.desc+'</p><small>INSTALL COMPONENT ↗</small></button>').join('')+'</div>','<span>← → CHOOSE · CROSS / ENTER INSTALL</span>'));$('modalContent').querySelector('.modal-close').hidden=true;focusMenu(0)}
+function showResult(won,reason=null){let elapsed=Math.floor(run.age),time=Math.floor(elapsed/60)+':'+String(elapsed%60).padStart(2,'0');let rank=run.score>25000?'S':run.score>16000?'A':run.score>9000?'B':'C';let text=reason|| (won?'Tomorrow is back where it belongs. The Clocklord is taking this very personally.':'The Clocklord reclaimed this timeline. Fortunately, you know where to steal another.');let html='<p class="modal-intro">'+text+'</p><div class="result-score">'+String(run.score).padStart(6,'0')+'</div><div class="result-stats"><div><b>'+rank+'</b><span>HEIST RANK</span></div><div><b>'+time+'</b><span>FLIGHT TIME</span></div><div><b>'+run.intercepts+'</b><span>INTERCEPTS</span></div><div><b>×'+run.maxCombo+'</b><span>BEST CHAIN</span></div></div><div class="result-buttons">';
+ if(!hubInfo)html+=won?'<button class="menu-item launch" data-action="endless">PARADOX LOOP ↗</button>':'<button class="menu-item launch" data-action="retry">RETRY SECTOR ↗</button>';if(!hubInfo)html+='<button class="menu-item" data-action="title">BACK TO TITLE</button>';else html+='<p class="small-note">Team result submitted. The hub will open the next round.</p>';html+='</div>';openModal('result',modalShell(won?'HEIST COMPLETE · TOMORROW RESTORED':'TIMELINE LOST · CHECKPOINT SAVED',won?'THE FUTURE IS STOLEN BACK.':'OUT OF BORROWED TIME.',html));if(hubInfo)$('modalContent').querySelector('.modal-close').hidden=true;focusMenu(0)}
+function menuItems(){if(modalPage)return [...$('modalContent').querySelectorAll('button[data-action]:not([hidden]):not(:disabled)')].filter(b=>b.offsetParent!==null);if(mode==='unsupported')return [...$('compatibility').querySelectorAll('button')];if(mode==='title'||mode==='loading')return [...$('titleMenu').querySelectorAll('button:not(:disabled)'),$('titleFooter').querySelector('button')];return []}
+function focusMenu(index){let items=menuItems();if(!items.length)return;focusIndex=(index%items.length+items.length)%items.length;document.querySelectorAll('button.selected').forEach(b=>b.classList.remove('selected'));let el=items[focusIndex];el?.classList.add('selected');if(modalPage)el?.scrollIntoView({block:'nearest',behavior:'instant'})}
+function menuNav(x,y){if(modalPage==='settings'&&x){let el=menuItems()[focusIndex];if(el?.dataset.action.startsWith('setting:')){changeSetting(el.dataset.action.split(':')[1],Math.sign(x));return}}let d=y||x;if(d){focusMenu(focusIndex+Math.sign(d));audio.sfx('ui')}}
+function activate(action,el=null){if(!action)return;if(action.startsWith('setting:'))return changeSetting(action.split(':')[1]);if(action.startsWith('upgrade:')){grantUpgrade(action.split(':')[1]);closeModal();beginWave(run.wave+1);return}if(action.startsWith('credit:'))return showAbout(Number(action.split(':')[1]));switch(action){case'start':if(engineReady&&!touchOnly())startRun();break;case'manual':showManual(0);break;case'manualnext':showManual(manualPage+1);break;case'manualprev':showManual(manualPage-1);break;case'settings':showSettings();break;case'back':back();break;case'about':showAbout();break;case'title':showTitle();break;case'abandon':if(!hubInfo)endRun(false,'You left the mission. The current sector is ready for another attempt.');break;case'retry':if(!hubInfo)retryCheckpoint();break;case'endless':if(!hubInfo){let ups=[...run.upgrades],loop=run.loop+1;startRun(false,{loop,upgrades:ups})}break;case'fullscreen':if(document.fullscreenElement)document.exitFullscreen?.().catch(()=>{});else document.documentElement.requestFullscreen?.().catch(()=>{});break;case'retrygpu':location.reload();break;}}
+function touchOnly(){return matchMedia('(pointer:coarse)').matches&&!keyboardSeen&&!usingPad}
+function activity(){lastInputAt=performance.now();if(hubStopped)return true;if(hubReadyPending){hubReadyPending=false;AIHub.ready();$('waveToast').hidden=true}if(attract){showTitle();return true}return false}
+function getPad(){try{return [...navigator.getGamepads()].find(p=>p&&p.connected)}catch{return null}}
+function readControls(now){let pad=getPad(),bp=i=>!!pad?.buttons[i]?.pressed,pressed=i=>bp(i)&&!lastPad[i];usingPad=!!pad;let ax=pad?.axes[0]||0,ay=pad?.axes[1]||0,dz=prefs.deadzone/100;ax=Math.abs(ax)>dz?Math.sign(ax)*(Math.abs(ax)-dz)/(1-dz):0;ay=Math.abs(ay)>dz?Math.sign(ay)*(Math.abs(ay)-dz)/(1-dz):0;
+ let px=(bp(15)?1:0)-(bp(14)?1:0)||ax,py=(bp(13)?1:0)-(bp(12)?1:0)||ay;if(prefs.invertX)px*=-1;if(prefs.invertY)py*=-1;
+ let padNew=pad&&(pad.buttons.some((b,i)=>b.pressed&&!lastPad[i])||(Math.abs(px)+Math.abs(py)>.2&&Math.abs(gamepadWas?.x||0)+Math.abs(gamepadWas?.y||0)<=.2));let swallowed=false;if(padNew){inputType='pad';swallowed=activity();audio.unlock()}if(pad&&Math.abs(px)+Math.abs(py)>.1)lastInputAt=now;
+ if(!swallowed&&!hubStopped){if(pressed(9)&&!bp(8)){if(modalPage)back();else showSettings()}else if(modalPage||mode==='title'||mode==='unsupported'){
+ let vec=Math.abs(py)>.5?'y'+Math.sign(py):Math.abs(px)>.5?'x'+Math.sign(px):'';if(vec&&(vec!==navVector||now-navHeldAt>190)){menuNav(vec[0]==='x'?Math.sign(px):0,vec[0]==='y'?Math.sign(py):0);navHeldAt=now}navVector=vec;
+ if(pressed(0))activate(menuItems()[focusIndex]?.dataset.action);if(pressed(1))back();if(modalPage==='manual'&&(pressed(4)||pressed(5)))showManual(manualPage+(pressed(5)?1:-1));if(modalPage==='about'&&(pressed(4)||pressed(5)))showAbout(creditPage+(pressed(5)?1:-1));
+ }}
+ let kx=(keys.has('ArrowRight')||keys.has('KeyD')?1:0)-(keys.has('ArrowLeft')||keys.has('KeyA')?1:0),ky=(keys.has('ArrowUp')||keys.has('KeyW')?1:0)-(keys.has('ArrowDown')||keys.has('KeyS')?1:0);
+ input={x:clamp(kx+px,-1,1),y:clamp(ky-py,-1,1),fire:keys.has('Space')||mouseFire||bp(7)||bp(0),slow:keys.has('KeyQ')||mouseSlow||bp(6),dash:dashPressed||pressed(5)||pressed(2)};if(modalPage||hubStopped||swallowed)input={x:0,y:0,fire:false,slow:false,dash:false};dashPressed=false;gamepadWas={x:px,y:py};lastPad=pad?pad.buttons.map(b=>b.pressed):[];
+ document.body.classList.toggle('pointer',inputType==='pointer');document.body.classList.toggle('touch-only',touchOnly());$('touchNotice').hidden=!touchOnly()||!!modalPage||!!hubInfo;if(pressed(0)&&mode==='ready'&&hubReadyPending){hubReadyPending=false;AIHub.ready()}}
+function wireInput(){document.addEventListener('keydown',e=>{if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','Tab','Enter','Escape','Backspace'].includes(e.code))e.preventDefault();keyboardSeen=true;inputType='keyboard';let consumed=activity();audio.unlock();if(consumed||hubStopped)return;keys.add(e.code);if(e.repeat&&!(modalPage||mode==='title'))return;if(e.code==='Escape'){if(modalPage)back();else showSettings();return}if(modalPage||mode==='title'||mode==='unsupported'){if(['ArrowDown','KeyS','Tab'].includes(e.code))menuNav(0,1);if(['ArrowUp','KeyW'].includes(e.code))menuNav(0,-1);if(['ArrowLeft','KeyA'].includes(e.code))menuNav(-1,0);if(['ArrowRight','KeyD'].includes(e.code))menuNav(1,0);if(['Enter','Space'].includes(e.code))activate(menuItems()[focusIndex]?.dataset.action);if(e.code==='Backspace')back();return}if(e.code==='ShiftLeft'||e.code==='ShiftRight')dashPressed=true});
+ document.addEventListener('keyup',e=>keys.delete(e.code));window.addEventListener('blur',()=>{keys.clear();mouseFire=mouseSlow=false;if(mode==='play'&&!attract&&!hubInfo&&!modalPage)showSettings()});document.addEventListener('visibilitychange',()=>{if(document.hidden){keys.clear();mouseFire=mouseSlow=false;if(mode==='play'&&!attract&&!hubInfo&&!modalPage)showSettings()}});
+ document.addEventListener('pointerdown',e=>{let consumed=activity();audio.unlock();if(consumed){e.preventDefault();e.stopPropagation();return}if(e.pointerType==='touch')return;if(!modalPage&&mode==='play'){if(e.button===0)mouseFire=true;if(e.button===2)mouseSlow=true}});document.addEventListener('pointerup',()=>{mouseFire=mouseSlow=false});document.addEventListener('pointermove',e=>{if(e.movementX||e.movementY){inputType='pointer';activity();let button=e.target.closest?.('button[data-action]');if(button){let index=menuItems().indexOf(button);if(index>=0)focusMenu(index)}}});document.addEventListener('contextmenu',e=>e.preventDefault());
+ document.addEventListener('click',e=>{if(hubStopped)return;let b=e.target.closest('button[data-action]');if(b){activity();audio.unlock();activate(b.dataset.action,b)}});$('globalSettings').addEventListener('click',()=>{activity();audio.unlock();if(modalPage==='settings')back();else showSettings()});window.addEventListener('resize',resize);window.addEventListener('gamepaddisconnected',()=>{usingPad=false;keys.clear();if(mode==='play'&&!hubInfo&&!attract)showSettings()})}
+
+const q=n=>Math.round(n*100),uq=n=>n/100;
+function hubProgress(){if(hubInfo&&!hubStopped&&run)AIHub.progress({score:run.score,label:'Sector '+(run.wave+1)+' · Team score'})}
+function packState(){let a=[...entities.values()],r=run;return{t:'s',at:AIHub.time(),r:[r.score,r.wave,['intro','combat','clear','upgrade'].indexOf(r.stage),q(r.waveTime),q(r.age),r.streak,r.kills,r.intercepts,r.maxCombo,r.bossPhase,r.slow?1:0,r.loop],u:r.upgrades.map(id=>UPGRADES.findIndex(u=>u.id===id)),p:[...players.values()].map(p=>[p.id,q(p.x),q(p.y),p.hp,p.maxHp,Math.round(p.energy),q(p.dashCd),q(p.inv),q(p.dashing),q(p.vx||0)]),e:a.filter(e=>e.kind==='enemy').map(e=>[e.id,e.type,q(e.x),q(e.y),e.hp,e.maxHp]),b:a.filter(e=>e.kind==='bullet').slice(-68).map(e=>[e.id,e.type,q(e.x),q(e.y),q(e.vx),q(e.vy),e.owner]),c:a.filter(e=>e.kind==='pickup').map(e=>[e.id,e.type,q(e.x),q(e.y)]),w:r.warnings.map(w=>[w.id,q(w.x),q(w.t)])}}
+function netTick(dt){if(!hubInfo||hubStopped||!run||!hubStarted)return;netClock+=dt;if(netClock<.1)return;netClock%=.1;hubProgress();if(hubInfo.isHost){let data=packState();while(JSON.stringify(data).length>3950&&data.b.length)data.b.shift();AIHub.send(data,{reliable:false})}else{let p=localPlayer();if(p){let c=modalPage||document.hidden?{x:0,y:0,fire:false,slow:false}:input;AIHub.send({t:'p',at:AIHub.time(),x:q(p.x),y:q(p.y),vx:q(p.vx||0),vy:q(p.vy||0),f:c.fire?1:0,s:c.slow?1:0,d:localSendSeq},{to:AIHub.host,reliable:false})}}}
+function receiveState(s){if(!run||run.ended||s.at<=lastSnapshotAt)return;lastSnapshotAt=s.at;let r=s.r,oldWave=run.wave;[run.score,run.wave]=r;run.stage=['intro','combat','clear','upgrade'][r[2]]||'combat';run.waveTime=uq(r[3]);run.age=uq(r[4]);run.streak=r[5];run.kills=r[6];run.intercepts=r[7];run.maxCombo=r[8];run.bossPhase=r[9];run.slow=!!r[10];run.loop=r[11];run.upgrades=s.u.map(i=>UPGRADES[i].id);if(run.wave!==oldWave){showToast(WAVES[run.wave].tag,WAVES[run.wave].name,WAVES[run.wave].hint,3);taunt(WAVES[run.wave].taunt,4)}
+ for(let row of s.p){let p=players.get(row[0]);if(!p)continue;let hp=p.hp;if(p.id!==playerId){p.x=uq(row[1]);p.y=uq(row[2]);p.dashing=uq(row[8]);p.vx=uq(row[9]);}p.hp=row[3];p.maxHp=row[4];p.energy=row[5];p.dashCd=uq(row[6]);p.inv=uq(row[7]);if(hp>p.hp){burst(p.x,p.y,palette.coral,14);if(p.id===playerId){audio.sfx('damage');flashTimer=.12;shake=.4}}if(hp<=0&&p.hp>0){p.x=uq(row[1]);p.y=uq(row[2])}}
+ let seen=new Set(players.keys());function up(row,kind){let[id,type,x,y]=row;seen.add(id);let e=entities.get(id);if(!e){e=addEntity({id,kind,type,x:uq(x),y:uq(y),hp:row[4],maxHp:row[5],owner:row[6]},false);if(kind==='enemy')e.mesh.scale.setScalar(.85)}e.x=uq(x);e.y=uq(y);if(kind==='enemy'){e.hp=row[4];e.maxHp=row[5]}if(kind==='bullet'){e.vx=uq(row[4]);e.vy=uq(row[5])}}s.e.forEach(r=>up(r,'enemy'));s.b.forEach(r=>up(r,'bullet'));s.c.forEach(r=>up(r,'pickup'));for(let e of [...entities.values()])if(!seen.has(e.id)){if(e.kind==='enemy')burst(e.x,e.y,palette.coral,10,e.type===3);removeEntity(e)}
+ let ws=new Set();for(let row of s.w){ws.add(row[0]);let w=run.warnings.find(w=>w.id===row[0]);if(!w)w=markWarning(uq(row[1]),uq(row[2]),false,row[0]);w.t=uq(row[2])}for(let w of [...run.warnings])if(!ws.has(w.id))removeWarning(w);}
+function registerHub(info){hubInfo=info;playerId=info.me;AIHub.on('start',()=>{audio.unlock()});AIHub.on('message',(d,from)=>{if(!d||hubStopped||!run)return;if(d.t==='p'&&info.isHost){let p=players.get(from);if(!p||d.at<=p.lastAt)return;p.lastAt=d.at;p.x=clamp(uq(d.x),-14,14);p.y=clamp(uq(d.y),-9.35,-5.95);p.vx=clamp(uq(d.vx),-30,30);p.vy=clamp(uq(d.vy),-12,12);p.remoteInput={x:p.vx/10.4,y:p.vy/7.28,fire:!!d.f,slow:!!d.s,dash:false};if(d.d>p.lastDash){p.lastDash=d.d;dash(p,p.vx)}}else if(d.t==='s'&&!info.isHost&&from===info.host)receiveState(d);else if(d.t==='end'&&from===info.host&&!info.isHost){run.score=d.score;endRun(!!d.won,d.reason)}});AIHub.on('leave',({id})=>{let p=players.get(id);if(p){removeEntity(p);players.delete(id)}hubInfo.players=hubInfo.players.filter(p=>p.id!==id);if(id===hubInfo.host&&!hubInfo.isHost){hubStopped=true;audio.quiet();if(run&&!run.ended)endRun(false,'The host left. This shared timeline has closed.')}else if(hubInfo.isHost&&players.size===0&&!run?.ended)endRun(false,'All pilots have left the timeline.')});AIHub.on('time-up',()=>{if(info.isHost&&run&&!run.ended)endRun(false,'The shared clock has expired. Your team score is banked.')});AIHub.on('end',d=>{hubStopped=true;audio.quiet();keys.clear();input={x:0,y:0,fire:false,slow:false,dash:false};if(run&&!run.ended)endRun(false,d.reason==='host-left'?'The host left. This shared timeline has closed.':'This AI Hub round is complete.');else if(run)showResult(run.won,run.reason);});}
+
+function unsupported(error){gpuError=String(error?.message||error);document.body.classList.add('gpu-blocked');engineReady=false;mode='unsupported';$('loadStatus').hidden=true;$('titleScreen').hidden=true;$('titleFooter').hidden=true;$('hud').hidden=true;document.body.classList.remove('playing');$('compatibility').hidden=false;$('compatText').textContent=!window.isSecureContext?'Open this file through HTTPS or localhost so your browser can enable WebGPU.':!navigator.gpu?'This browser does not expose WebGPU. Use a WebGPU-capable browser and graphics device to fly this ship.':'WebGPU could not establish a graphics connection. Check your browser’s graphics acceleration and internet connection, then retry.';AIHub.fail('WebGPU required: '+gpuError);focusMenu(0);}
+async function boot(){wireInput();applyPrefs();focusMenu(0);$('titleMenu').querySelector('[data-action="start"]').disabled=true;
+ AIHub.probe(()=>({scene:mode==='ready'?'ready':mode==='play'?'play':mode==='over'?'over':modalPage?'menu':'title',menu:modalPage==='settings',world:simTime,input:{x:input.x,y:input.y,fire:input.fire},backend:renderer?.backend?.isWebGPUBackend?'webgpu':'unavailable'}));
+ let hubPromise=AIHub.active?AIHub.connect({mode:'co-op',seats:[1,4]}):Promise.resolve(null);requestAnimationFrame(frame);
+ try{if(!navigator.gpu)throw Error('WebGPU is unavailable');if(!window.isSecureContext)throw Error('A secure context is required');[THREE,TSL,RAPIER]=await Promise.all([import('three'),import('three/tsl'),import('rapier')]);RAPIER=RAPIER.default||RAPIER;await RAPIER.init();renderer=new THREE.WebGPURenderer({antialias:true,alpha:true});renderer._getFallback=null;renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setClearColor(0x101723,0);await renderer.init();if(!renderer.backend.isWebGPUBackend)throw Error('A native WebGPU backend is required');$('render').appendChild(renderer.domElement);buildScene();newPhysics();await renderer.compileAsync(scene,camera);engineReady=true;mode='title';$('loadStatus').hidden=true;$('titleMenu').querySelector('[data-action="start"]').disabled=false;lastInputAt=performance.now();let info=await hubPromise;if(info){registerHub(info);startRun(false);mode='ready';if(info.splash||info.server)AIHub.ready();else{hubReadyPending=true;showToast('WINGMATES CONNECTED','READY FOR THE HEIST','Press any key, click, or a controller button when you are ready.',999)}}else showTitle();renderer.backend.device.lost.then(info=>{if(info.reason!=='destroyed')unsupported(Error('WebGPU device lost: '+info.message))});
+ }catch(e){unsupported(e)}
+ setInterval(()=>{if(document.hidden&&hubInfo&&!hubStopped)tick(performance.now(),false)},50);
+}
+function tick(now,draw=true){let dt=Math.min(.1,Math.max(0,(now-lastFrame)/1000));lastFrame=now;readControls(now);
+ if(engineReady){if(mode==='ready'&&AIHub.time()>=0&&!hubStopped){hubStarted=true;mode='play';run.stageT=3.8;showToast(WAVES[0].tag,WAVES[0].name,WAVES[0].hint,3.8)}if(activeWorld()){accumulator+=dt;let n=0;while(accumulator>=1/60&&n<6){stepWorld(1/60);accumulator-=1/60;n++}if(n===6)accumulator=0}else accumulator=0;
+ if(mode==='title'&&!hubInfo){let idle=(now-lastInputAt)/1000;$('idleCounter').textContent=Math.max(0,Math.ceil(10-idle));$('idleMeter').style.width=clamp((10-idle)*10,0,100)+'%';if(idle>=10)startRun(true)}if(mode==='over'&&attract&&now-run.overAt>4500)startRun(true);
+ if(!modalPage||hubInfo||attract){toastTimer-=dt;tauntTimer-=dt;pickupTimer-=dt;if(toastTimer<=0)$('waveToast').hidden=true;if(tauntTimer<=0)$('taunt').hidden=true;if(pickupTimer<=0)$('pickupToast').hidden=true}uiClock+=dt;if(uiClock>.1){uiClock=0;updateHUD()}if(draw){updateVisuals(dt);renderer.render(scene,camera)}}audio.tick();}
+function frame(now){try{tick(now)}catch(error){if(!window.__banditRuntimeError){window.__banditRuntimeError=String(error?.stack||error);console.error(error);if(hubInfo)AIHub.fail('Game simulation stopped: '+error.message);else{gpuError=error.message;unsupported(error)}}}requestAnimationFrame(frame)}
+window.addEventListener('wheel',()=>activity(),{passive:true});
+window.BanditDiagnostics={get state(){return{mode,modal:modalPage,attract,ready:engineReady,backend:renderer?.backend?.isWebGPUBackend?'webgpu':null,revision:THREE?.REVISION,rapier:engineReady?RAPIER.version():null,simTime,wave:run?.wave,stage:run?.stage,score:run?.score,upgrades:run?.upgrades,entityCount:entities.size,players:[...players.values()].map(p=>({id:p.id,hp:p.hp,x:p.x,y:p.y,energy:p.energy,dashCd:p.dashCd})),error:gpuError,runtimeError:window.__banditRuntimeError||null,hub:hubInfo?{me:hubInfo.me,host:hubInfo.host,server:hubInfo.server}:null}}};
+if(new URLSearchParams(location.search).has('test'))window.BanditTest={inputInfo:()=>({usingPad,lastPad,input,focusIndex,items:menuItems().map(b=>[b.textContent,b.dataset.action]),pad:getPad(),touch:touchOnly()}),get engine(){return{renderer,scene,camera,THREE}},nocull:()=>scene.traverse(o=>o.frustumCulled=false),renderInfo:()=>({point:new THREE.Vector3(0,0,0).project(camera).toArray(),proj:camera.projectionMatrix.elements,view:camera.matrixWorldInverse.elements,first:scene.children[0].children[0].children[0]?.type,calls:renderer.info.render,canvas:[renderer.domElement.width,renderer.domElement.height],camera:[...camera.position, camera.left,camera.right,camera.top,camera.bottom],objects:scene.children.length,hero:[...hero.position],heroVisible:hero.visible}),start:(auto=false)=>startRun(auto),step:seconds=>{for(let i=0;i<seconds*60;i++)if(activeWorld()){stepWorld(1/60);updateVisuals(1/60);toastTimer-=1/60;tauntTimer-=1/60;pickupTimer-=1/60};$('waveToast').hidden=toastTimer<=0;$('taunt').hidden=tauntTimer<=0;$('pickupToast').hidden=pickupTimer<=0;updateHUD()},wave:w=>beginWave(w),clear:()=>{for(let e of [...entities.values()])if(e.kind==='enemy')hurtEnemy(e,{x:e.x,y:e.y,owner:playerId,damage:9999});run.spawned=WAVES[run.wave].count},spawn:(type,x=0,y=-7)=>addEntity({kind:'bullet',type,owner:-1,target:0,x,y,vx:0,vy:-3,life:5,pierce:1}),pickup:(type,x=0,y=-8)=>pickup(x,y,type),grant:grantUpgrade,hit:()=>{let p=localPlayer();p.inv=0;hitPlayer(p,{})},setInput:c=>{input={x:0,y:0,fire:false,slow:false,dash:false,...c}},end:won=>endRun(won),title:showTitle,settings:showSettings,about:showAbout,get entities(){return[...entities.values()].map(e=>({id:e.id,kind:e.kind,type:e.type,x:e.x,y:e.y,hp:e.hp}))}};
+boot();
+
+</script>
+</body></html>

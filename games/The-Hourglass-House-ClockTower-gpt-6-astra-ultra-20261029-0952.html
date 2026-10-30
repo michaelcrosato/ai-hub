@@ -1,0 +1,3216 @@
+<!doctype html>
+<!-- Source Information
+Date: 2026-10-29 09:52 (America/Vancouver).
+Source: ClockTower.
+Tech: Three.js r180 (0.180.0), native WebGPU with WebGL fallback disabled; Rapier 3D 0.19.3; Gamepad API; Web Audio API; vanilla JavaScript/CSS; esbuild 0.28.2.
+Art direction: original cel-shaded gothic cutaway dioramas, stepped TSL lighting and ink outlines; procedural geometry and canvas clock textures.
+Animation: procedural articulated characters, footsteps, pendulums, gears, candle flames, dust and water.
+Audio: original synthesized ambient music, dynamic pursuit score, heartbeat and sound effects via Web Audio. Voice: none.
+Online: AI Hub session.js 1.3.0; synchronized 1–4 player parallel escape rounds, discovery progress and timed results. Standalone solo.
+Testing: efficient, lightweight functional checks; responsive phone, tablet and desktop checks; WebKit compatibility check. Playwright 1.63; actual Chromium WebGPU; 375×667 to 2560×1080; tablet and WebKit unsupported-GPU/settings checks; official AI Hub solo and two-player host-disconnect checks. Real Safari and physical controller tests: not available.
+Environment: Codex CLI (headless); Linux. Player browser: unknown. Test engines: Chromium and WebKit.
+Model: OpenAI, gpt-6-astra, reasoning effort ultra.
+Usage: API cost unknown; total tokens unknown; session time approximately 30 minutes.
+
+Engine Feedback
+Liked most: Three.js TSL supports a consistent stepped-lighting style across procedural assets.
+Got stuck or guessed wrong: Rapier’s CDN entry changed to rapier.mjs; a controller method name needed correction. A bare WebGPU probe also passed with headless flags that failed to render the full scene.
+Most important custom system: room-and-story state, persistent pursuit, controller focus, checkpoints and the attract replay.
+Hardest part: coordinating asynchronous WebGPU scene compilation, physics, input and AI Hub lifecycle.
+Would overhaul: automatic WebGL fallback; it is explicitly disabled here.
+One change: a public strict-WebGPU constructor option with actionable adapter errors.
+
+Testing Feedback
+Eight product issues were caught and fixed by testing: one critical dependency-loading failure; a reserved controller chord; two geometry clipping defects; small-phone title overlap; portrait scene readability; toast/modal overlap; and stale session-end wording. A separate controller API mismatch was caught during code review.
+Final checks: both endings, correct/incorrect puzzle paths, pursuit/hiding/bird/trap/grab/death/checkpoint behavior, both inversion settings and persistence, natural 76-second attract loop and input exit. Zero final page errors or failed game dependency requests. AI Hub: 24/24 solo and 24/24 two-player host-disconnect checks passed.
+Most helpful: a complete keyboard playthrough with actual WebGPU rendering and screenshots.
+Least helpful: a bare GPU adapter/device probe; it missed a software-renderer configuration problem visible in full-scene screenshots.
+WebKit correctly shows the required-WebGPU screen and working settings. Real iOS Safari and a physical PS5 controller remain untested.
+
+Prompt Feedback
+Liked most: the combination of a clear source inspiration and freedom to build original art, sound and mechanics.
+Confusing: the multiplayer link defines an embedded session protocol rather than a public standalone lobby; this slice uses its supported parallel mode.
+Hardest: delivering a complete survival-horror loop, polished presentation and required engine integration in one shareable HTML file.
+Additional test desired: an extended playthrough on a physical PS5 controller and a hardware WebGPU device. -->
+<html lang="en"><head><meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#102126">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="8"><meta name="hub:session-goal" content="Escape first. Otherwise, uncover the most of the house."><meta name="hub:session-howto" content="Stick / WASD move · Cross / E interact · R2 / Shift run · Options / Esc settings"><meta name="hub:webgpu" content="required">
+<title>The Hourglass House</title>
+<style>@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=DM+Sans:wght@400;500;600;700&display=swap');
+:root{color-scheme:dark;--ink:#0a181d;--paper:#f0e6cd;--gold:#c6a466;--muted:#9da9a6;--line:#c5ac7433;--red:#cf6555}*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#0b171c;color:var(--paper);font-family:'DM Sans',sans-serif}body{font-size:18px}button,a{touch-action:manipulation}button{font:inherit;cursor:pointer}button:disabled{opacity:.3;cursor:default}button:focus-visible,a:focus-visible{outline:2px solid var(--gold);outline-offset:5px}[hidden]{display:none!important}#stage,#stage canvas,#grain,#vignette,#dangerWash,#fade{position:fixed;inset:0;width:100%;height:100%;pointer-events:none}#stage canvas{display:block}#grain{z-index:2;opacity:.055;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' opacity='.5' filter='url(%23n)'/%3E%3C/svg%3E")}#vignette{z-index:1;background:radial-gradient(ellipse at 58% 47%,transparent 30%,#051014bb 100%)}#dangerWash{z-index:2;box-shadow:inset 0 0 180px 30px #9e342c;opacity:0;transition:opacity .2s}#fade{background:#061015;opacity:0;z-index:15;transition:opacity .35s}#masthead{position:absolute;top:32px;left:3.6vw;right:3.6vw;display:flex;align-items:center;justify-content:space-between;z-index:5}#brand{display:flex;align-items:center;gap:12px;color:var(--paper);text-decoration:none;font-size:11px;letter-spacing:2.5px}#brand svg{width:32px;height:42px;fill:none;stroke:var(--gold);stroke-width:1.25}#brand small{display:block;font-size:8px;letter-spacing:2px;color:var(--muted);margin-top:6px}.edition{font-size:10px;letter-spacing:2px;margin-left:auto;margin-right:32px;color:#b7b9ad}.edition span{color:var(--gold);margin:0 12px}.iconButton{width:43px;height:43px;border:1px solid #c5ac7444;border-radius:50%;color:var(--paper);background:#10212599;font-size:24px}.iconButton:hover{background:#a78c4b33}#titleScreen{position:absolute;inset:0;z-index:3;background:linear-gradient(90deg,#08161ded 0%,#0b1b20db 25%,#0c1b2055 49%,transparent 70%)}.titlecopy{position:absolute;left:7.1vw;top:18vh}.eyebrow{font-size:10px;font-weight:600;letter-spacing:2.7px;color:var(--gold);line-height:1.6}.tinyLine{width:26px;height:1px;display:inline-block;background:var(--gold);vertical-align:middle;margin-right:12px}h1,h2,h3,p{margin:0}h1{font-family:'Cormorant Garamond',Georgia,serif;font-weight:400;font-size:clamp(62px,6.4vw,112px);line-height:.86;letter-spacing:-2.5px;margin:22px 0 23px;text-shadow:0 3px 26px #0004}h1 em{color:#d6b67a;font-weight:400}.titlePeriod{color:#d6b67a}.tagline{font-size:13px;line-height:1.8;color:#b8c0b9;letter-spacing:.2px}.titleMenu{margin-top:27px;max-width:325px}.menu{display:flex;flex-direction:column;gap:7px}.menu button{position:relative;border:1px solid transparent;background:transparent;color:#bfc5bd;min-height:43px;text-align:left;padding:11px 18px;display:flex;align-items:center;gap:14px;font-size:14px;letter-spacing:.5px;transition:background .12s,border-color .12s}.menu button:before{content:'◇';font-size:15px;color:#a88e59}.menu button.focused,.menu button:hover,.menu button:focus-visible{border-color:#b79c6177;background:linear-gradient(90deg,#c3a36124,#a6884910);color:var(--paper);outline:none}.menu button.focused:before{content:'◆';font-size:11px}.menu button .buttonRight{margin-left:auto;color:var(--gold);font-size:11px}.menu button.primary{border:1px solid #ba9f6066;background:#a68d4e1d;color:#f5ead0}.titleMeta{margin-top:23px;font-size:8px;letter-spacing:1.4px;color:#9da9a6;display:flex;align-items:center;gap:8px}.goldDot{display:inline-block;background:var(--gold);width:4px;height:4px;border-radius:50%}.playtime{margin-left:10px;color:#c5ac74}.sceneCaption{position:absolute;right:5.8vw;bottom:15vh;text-align:right;display:flex;flex-direction:column;gap:10px;text-shadow:0 2px 10px black}.sceneCaption>span{font-size:9px;letter-spacing:3px;color:var(--gold)}.sceneCaption strong{font-family:'Cormorant Garamond',Georgia,serif;font-weight:400;font-size:44px;letter-spacing:3px}.sceneCaption i{font-style:normal;font-family:'DM Sans';font-size:10px}.sceneCaption small{font-size:8px;letter-spacing:2px;color:#a9b1a7}.titleFooter{position:absolute;bottom:26px;left:3.6vw;right:3.6vw;border-top:1px solid #c5ac7426;padding-top:18px;display:flex;justify-content:space-between;font-size:8px;letter-spacing:2px;color:#adb9b3}.titleFooter span:first-child{color:var(--gold)}#hud{position:absolute;inset:0;z-index:4;pointer-events:none}.roomHead{position:absolute;top:36px;left:4vw;max-width:60%}.roomHead h2{font:500 31px 'Cormorant Garamond',Georgia,serif;margin:5px 0 10px;text-shadow:0 2px 10px #000}.roomHead #objective{font-size:13px;color:#d2d3c0;text-shadow:0 2px 6px black}.survival{position:absolute;right:4vw;top:38px;width:190px}.meterLabel{display:flex;justify-content:space-between;font-size:9px;letter-spacing:2px;margin-bottom:7px}.meter{height:4px;background:#a2aa9f2b;margin-bottom:13px}.meter i{display:block;height:100%;width:100%;background:#a6c5b0;transition:width .2s}.meter.thin{height:2px}.meter.thin i{background:var(--gold)}#threatText{font-size:10px;color:#b1bab1;text-align:right}#inventoryStrip{position:absolute;left:4vw;bottom:104px;font-size:10px;letter-spacing:1.3px;color:var(--gold)}#interactionPrompt{position:absolute;bottom:145px;left:50%;transform:translateX(-50%);padding:12px 20px;background:#0c1b22e8;border:1px solid #c1ab6e77;border-radius:2px;font-size:16px;white-space:nowrap;box-shadow:0 6px 26px #0008}kbd{display:inline-flex;align-items:center;justify-content:center;min-width:25px;height:25px;border:1px solid #aebba588;border-radius:4px;font:600 12px 'DM Sans';color:#efe7cf;margin-right:7px;padding:3px 6px;background:#152629}#controlStrip{position:absolute;left:4vw;right:4vw;bottom:27px;padding-top:15px;border-top:1px solid #c5ac7433;display:flex;gap:25px;justify-content:center;color:#bfc5b9;font-size:11px}#contextTip{position:absolute;left:50%;transform:translateX(-50%);bottom:80px;text-align:center;font-size:12px;color:#d8d7c4;max-width:85%;text-shadow:0 2px 5px black}#worldLabels{position:fixed;inset:0;z-index:3;pointer-events:none}.worldLabel{position:absolute;transform:translate(-50%,-100%);font-size:9px;letter-spacing:1px;color:#cbb77c;text-shadow:0 2px 7px black;display:flex;align-items:center;gap:6px}.worldLabel::before{content:'◇';font-size:16px}#toast{position:absolute;z-index:22;left:50%;top:21%;transform:translate(-50%,10px);max-width:580px;width:max-content;text-align:center;font-size:15px;line-height:1.6;padding:17px 26px;background:#0e2228ef;border:1px solid #be9d6544;color:#eee3c6;opacity:0;pointer-events:none;transition:.25s}#toast.show{opacity:1;transform:translate(-50%,0)}#roomAnnouncement{position:absolute;z-index:6;left:50%;top:32%;transform:translateX(-50%);opacity:0;pointer-events:none;text-align:center;transition:opacity .6s;text-shadow:0 2px 8px #000}#roomAnnouncement span{display:block;font-size:10px;color:var(--gold);letter-spacing:5px;margin-bottom:10px}#roomAnnouncement strong{font:400 46px 'Cormorant Garamond',Georgia;white-space:nowrap}#attractBar{position:absolute;z-index:7;bottom:27px;left:4vw;right:4vw;border:1px solid #bca56855;background:#0b2026e8;padding:15px 22px;display:flex;align-items:center;gap:14px;font-size:9px;letter-spacing:2px}#attractBar b{color:var(--gold);font-weight:500}#attractBar>span:not(.liveDot){color:#a3b5b0}#attractBar small{margin-left:auto;letter-spacing:1.5px;font-size:9px}.liveDot{width:6px;height:6px;background:#bca568;border-radius:100%;box-shadow:0 0 13px #bca568}#modalLayer{position:absolute;inset:0;z-index:20;background:#051319b8;backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;padding:24px}#modal{width:min(640px,90vw);max-height:90vh;overflow:auto;background:linear-gradient(145deg,#192e32fa,#0b1b21fc);padding:38px 44px 25px;border:1px solid #c4ab6655;box-shadow:0 20px 100px #0008}#modal h2{font:400 42px 'Cormorant Garamond',Georgia;margin:8px 0 20px;color:#eee5d1}#modalBody{font-size:15px;line-height:1.8;color:#becbc1}#modalBody p{margin-bottom:15px}#modalBody em{color:#dfc48e;font-family:'Cormorant Garamond',Georgia;font-size:23px}#modalMenu{margin-top:20px}#modalMenu button{min-height:45px;font-size:15px}#modalFooter{border-top:1px solid #c5ac7426;padding-top:17px;margin-top:20px;color:#a1b2a9;font-size:10px;letter-spacing:.6px;line-height:1.6}.fieldGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px 20px;margin-bottom:20px}.fieldGrid>div{font-size:12px;color:#b6c6be}.fieldGrid b{display:block;color:#e4d8bb;font-weight:500;font-size:14px;margin-bottom:3px}.fieldGrid kbd{font-size:10px}.inventory{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}.inventory span{padding:5px 10px;border:1px solid #bea46a44;color:#d4be8e;font-size:12px}.journalMap{display:flex;justify-content:center;flex-wrap:wrap;gap:5px;margin:16px 0}.journalMap span{border:1px solid #728b8155;padding:7px 10px;font-size:11px}.journalMap span.current{border-color:#c8a66c;color:var(--gold)}.notes{border-left:1px solid #bf9e6355;padding-left:18px;margin-top:18px}.notes p{font-size:13px;line-height:1.7}.dialDisplay{font:400 56px 'Cormorant Garamond',Georgia;letter-spacing:5px;color:var(--gold);text-align:center;border-block:1px solid #c5ac7433;padding:12px;margin:10px 0 20px}.dialDisplay.symbols{font-size:26px;letter-spacing:1px}.settingsValue{color:var(--gold);margin-left:auto}.creditsSection{border-bottom:1px solid #c5ac7426;padding-bottom:15px;margin-bottom:15px}.creditsSection h3{font:500 23px 'Cormorant Garamond',Georgia;color:var(--gold);margin-bottom:10px}.creditsSection p{font-size:12px;line-height:1.7}.resultStats{display:flex;justify-content:space-between;gap:16px;margin:25px 0;border-block:1px solid #c5ac7433;padding:18px 0}.resultStats b{display:block;font:400 30px 'Cormorant Garamond';color:var(--gold)}.resultStats span{font-size:9px;letter-spacing:1px}.struggle{height:8px;background:#b6796044;margin:20px 0}.struggle i{height:100%;background:#dec78d;display:block;width:0}.small{font-size:12px!important;color:#9dafaa}#loading,#fatal{position:fixed;inset:0;z-index:25;background:radial-gradient(ellipse at 50% 45%,#243c3d,#09181e 70%);display:flex;align-items:center;justify-content:center;flex-direction:column;text-align:center;padding:30px}#loading h2,#fatal h2{font:400 48px 'Cormorant Garamond',Georgia;margin:15px 0}#loading p,#fatal p{font-size:14px;line-height:1.8;color:#b9c4ba;max-width:540px}.loadingClock{font-size:65px;color:var(--gold);animation:clockturn 5s linear infinite;margin-bottom:30px}#fatal button{background:#b69b5f22;border:1px solid #bfa76b;color:var(--paper);padding:13px 25px;margin:25px}#touchNotice{z-index:26;position:fixed;bottom:90px;left:50%;transform:translateX(-50%);padding:16px 20px;text-align:center;background:#10262cf2;border:1px solid #b69b5f66;width:min(380px,90vw)}#touchNotice span{font-size:14px}#touchNotice small{display:block;color:#9db0a9;margin-top:7px;font-size:11px}body.playing #masthead{display:none}body.reduced *{animation:none!important;transition:none!important}body.bright #stage{filter:brightness(1.2)}@keyframes clockturn{to{transform:rotate(360deg)}}@media(min-width:1900px){.titlecopy{top:20vh}.titleMenu button{font-size:18px;min-height:51px}.tagline{font-size:17px}.eyebrow{font-size:12px}.titleMeta{font-size:10px}.titleFooter{font-size:10px}.roomHead h2{font-size:40px}.roomHead #objective{font-size:18px}.survival{width:250px}.meterLabel{font-size:12px}#controlStrip{font-size:15px}#contextTip{font-size:16px}}@media(max-height:760px) and (min-width:700px){.titlecopy{top:17vh}h1{font-size:68px;margin:15px 0}.tagline{font-size:12px}.titleMenu{margin-top:15px}.titleMenu button{min-height:34px;padding:7px 14px}.titleMeta{margin-top:13px}.sceneCaption{bottom:16vh}}@media(max-width:700px){#masthead{top:19px;left:6vw;right:6vw}.edition{display:none}#brand{font-size:9px;letter-spacing:1.5px}#brand small{font-size:6px}.titlecopy{left:8vw;top:16vh}h1{font-size:69px}.eyebrow{font-size:8px;letter-spacing:2px}.titleMenu{max-width:270px}.sceneCaption{display:none}.titleFooter{left:6vw;right:6vw;font-size:7px;gap:15px}.titleFooter span:nth-child(2){display:none}.titleMeta{font-size:7px;gap:5px}.titleMeta .playtime{margin-left:2px}#titleScreen{background:linear-gradient(90deg,#091a20eb,#091a2099 65%,#091a2033)}#modal{padding:26px 24px;max-height:89vh;width:94vw}#modal h2{font-size:35px}#modalBody{font-size:13px}.fieldGrid{gap:10px}.roomHead{left:5vw;top:25px;max-width:62%}.roomHead h2{font-size:23px}.roomHead #objective{font-size:11px}.survival{right:5vw;top:28px;width:110px}.meterLabel{font-size:7px;letter-spacing:.6px}#threatText{font-size:8px}#controlStrip{font-size:8px;gap:8px;flex-wrap:wrap;bottom:18px}kbd{height:21px;min-width:21px;font-size:10px;margin-right:4px}#contextTip{bottom:88px;font-size:11px;width:85%}#inventoryStrip{bottom:130px;font-size:8px}#interactionPrompt{bottom:180px;font-size:12px;padding:10px 13px;max-width:90%;white-space:normal;text-align:center}#toast{max-width:90%;font-size:12px;top:23%;padding:12px 18px}#attractBar{font-size:7px;padding:12px;gap:7px;flex-wrap:wrap}#attractBar small{font-size:7px}#attractBar>span:not(.liveDot){display:none}#roomAnnouncement strong{font-size:32px}.dialDisplay.symbols{font-size:22px}.worldLabel{font-size:7px}}@media(max-height:650px){#masthead{top:16px}.titlecopy{top:14vh}h1{font-size:55px;margin:13px 0}.tagline{font-size:11px;line-height:1.6}.titleMenu{margin-top:12px;gap:3px}.titleMenu button{min-height:32px;padding:5px 12px;font-size:12px}.titleMeta{margin-top:12px}.titleFooter{bottom:15px;padding-top:12px}.titlecopy>.eyebrow{font-size:7px}.roomHead{top:18px}.survival{top:22px}#modal{max-height:93vh}#touchNotice{bottom:65px}.loadingClock{margin:0}}
+/* Readable from a sofa; the right stick scrolls long journal and credit pages. */
+body:has(#modalLayer:not([hidden])) #toast{opacity:0}
+@media(min-width:1000px) and (min-height:761px){.titleMenu button{font-size:16px;min-height:45px}.roomHead #objective{font-size:16px}#modalBody{font-size:17px}#modalMenu button{font-size:17px}#contextTip{font-size:14px}#controlStrip{font-size:13px}.survival{width:215px}.meterLabel{font-size:10px}#threatText{font-size:12px}}
+@media(max-width:700px) and (min-height:651px) and (max-height:800px){.titlecopy{top:14vh}h1{font-size:56px;margin:15px 0}.tagline{font-size:11px;line-height:1.7}.titleMenu{margin-top:16px;gap:3px}.titleMenu button{min-height:33px;padding:7px 12px;font-size:12px}.titleMeta{margin-top:15px}.titleFooter{bottom:19px}}
+body.touchOnly #titleMenu,body.touchOnly #controlStrip,body.touchOnly #contextTip{visibility:hidden;pointer-events:none}body.touchOnly .titleMeta{display:none}body:has(#modalLayer:not([hidden])) #touchNotice{display:none}body:has(#fatal:not([hidden])) #touchNotice{bottom:25px}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "@dimforge/rapier3d-compat": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head><body>
+<div id="stage" aria-hidden="true"></div><div id="grain" aria-hidden="true"></div><div id="vignette" aria-hidden="true"></div><div id="dangerWash" aria-hidden="true"></div><div id="fade" aria-hidden="true"></div>
+<header id="masthead"><a id="brand" href="#" aria-label="The Hourglass House title"><svg viewBox="0 0 40 48" aria-hidden="true"><path d="M7 3H33M7 45H33M10 5C10 16 13 20 20 24C27 28 30 32 30 43M30 5C30 16 27 20 20 24C13 28 10 32 10 43M12 40L20 31L28 40M12 8H28"/></svg><span>THE HOURGLASS HOUSE<small>AN ORIGINAL SURVIVAL HORROR</small></span></a><div class="edition">CHAPTER 01 <span> / </span> THE LAST VISITOR</div><button id="settingsQuick" class="iconButton" aria-label="Settings">⚙</button></header>
+<main id="titleScreen" class="screen">
+<div class="titlecopy"><div class="eyebrow"><span class="tinyLine"></span> SOME HOUSES NEVER LET GO</div><h1>The<br>Hourglass<br><em>House</em><span class="titlePeriod">.</span></h1><p class="tagline">She came looking for her sister.<br>The house had been expecting her.</p><div id="titleMenu" class="menu titleMenu"></div><div class="titleMeta"><span class="goldDot"></span> A COMPLETE FIVE-ROOM HAUNTING <span class="playtime">8—12 MIN</span></div></div>
+<div class="sceneCaption"><span>BLACKTHORN HOUSE</span><strong>11:57 <i>PM</i></strong><small>THE NIGHT OF OCTOBER 29</small></div>
+<footer class="titleFooter"><span id="inputStatus">CONTROLLER RECOMMENDED</span><span>HEADPHONES ON. LIGHTS LOW.</span><span id="attractCountdown">THE HOUSE IS LISTENING</span></footer>
+</main>
+<div id="hud" hidden><div class="roomHead"><span class="eyebrow" id="chapterLabel">BLACKTHORN HOUSE</span><h2 id="roomName">The Entrance Hall</h2><div id="objective">Find a way through the house.</div></div><div class="survival"><div class="meterLabel"><span>COMPOSURE</span><span id="composureValue">100</span></div><div class="meter"><i id="composureBar"></i></div><div class="meterLabel"><span>BREATH</span><span id="staminaValue">100</span></div><div class="meter thin"><i id="staminaBar"></i></div><div id="threatText">Only the clocks are moving.</div></div><div id="inventoryStrip"></div><div id="interactionPrompt" hidden></div><div id="controlStrip"></div><div id="contextTip"></div></div>
+<div id="worldLabels" aria-hidden="true"></div><div id="toast" role="status" aria-live="polite"></div><div id="roomAnnouncement"><span>BLACKTHORN HOUSE</span><strong></strong></div><div id="attractBar" hidden><span class="liveDot"></span><b>THE HOUSE REMEMBERS</b><span>WATCHING A PLAYED DEMO</span><small>ANY INPUT TO RETURN</small></div>
+<div id="modalLayer" hidden><section id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle"><div id="modalEyebrow" class="eyebrow"></div><h2 id="modalTitle"></h2><div id="modalBody"></div><div id="modalMenu" class="menu"></div><div id="modalFooter"></div></section></div>
+<div id="loading"><div class="loadingClock">◷</div><span class="eyebrow">THE HOURGLASS HOUSE</span><h2>Waking the house…</h2><p id="loadingText">Setting the hands. Lighting the candles.</p></div>
+<div id="touchNotice" hidden><span>Controller or keyboard required</span><small>Connect a controller to enter the house.</small></div>
+<div id="fatal" hidden><span class="eyebrow">THE HOURGLASS HOUSE</span><h2>A different window<br>into the house.</h2><p id="fatalText"></p><button onclick="location.reload()">Try again</button><p class="small">WebGPU is required. WebGL fallback is disabled.</p></div>
+<script type="module">// main.js
+import * as THREE2 from "three/webgpu";
+import RAPIER from "@dimforge/rapier3d-compat";
+
+// world.js
+import * as THREE from "three/webgpu";
+import { color, normalWorld, vec3, float, step } from "three/tsl";
+function createWorld() {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color("#071114");
+  const camera = new THREE.OrthographicCamera(-16, 16, 9, -9, 0.1, 160);
+  let viewportAspect = 1, cameraX = 0, lastViewState = { mode: "title" };
+  camera.position.set(0, 13, 27);
+  camera.lookAt(0, 3.3, 0);
+  const roomRoot = new THREE.Group();
+  scene.add(roomRoot);
+  const ink = new THREE.LineBasicMaterial({ color: 660760, transparent: true, opacity: 0.65 });
+  const palette = { wood: "#493a32", woodDark: "#231f22", gold: "#ba9860", goldLight: "#e3c48b", teal: "#335453", wall: "#254445", cream: "#ded0ad", red: "#793d3b", black: "#122228", blue: "#355b66", green: "#4c6a51" };
+  const materialCache = /* @__PURE__ */ new Map();
+  const cel = (hex) => {
+    if (materialCache.has(hex)) return materialCache.get(hex);
+    const m = new THREE.MeshBasicNodeMaterial();
+    const n = normalWorld.dot(vec3(-0.38, 0.79, 0.49));
+    m.colorNode = color(hex).mul(float(0.43).add(step(-0.25, n).mul(0.25)).add(step(0.35, n).mul(0.32)));
+    materialCache.set(hex, m);
+    return m;
+  };
+  const flat = (hex, opacity = 1) => new THREE.MeshBasicMaterial({ color: hex, transparent: opacity < 1, opacity, depthWrite: opacity === 1 });
+  const mat = {};
+  for (const [k2, c] of Object.entries(palette)) mat[k2] = cel(c);
+  const mesh = (g, m, parent, x = 0, y = 0, z = 0, edge = false) => {
+    const o = new THREE.Mesh(g, typeof m === "string" ? cel(m) : m);
+    o.position.set(x, y, z);
+    parent.add(o);
+    if (edge) {
+      const l = new THREE.LineSegments(new THREE.EdgesGeometry(g, 28), ink);
+      o.add(l);
+    }
+    return o;
+  };
+  const box = (p, x, y, z, w, h, d, m, edge = false) => mesh(new THREE.BoxGeometry(w, h, d), m, p, x, y, z, edge);
+  const cyl = (p, x, y, z, rt, rb, h, m, n = 12) => mesh(new THREE.CylinderGeometry(rt, rb, h, n), m, p, x, y, z);
+  const sphere = (p, x, y, z, r, m, sx = 1, sy = 1, sz = 1) => {
+    const o = mesh(new THREE.IcosahedronGeometry(r, 1), m, p, x, y, z);
+    o.scale.set(sx, sy, sz);
+    return o;
+  };
+  const ring = (p, x, y, z, r, t, m) => mesh(new THREE.TorusGeometry(r, t, 6, 64), m, p, x, y, z);
+  const group = (p, x = 0, y = 0, z = 0) => {
+    const g = new THREE.Group();
+    g.position.set(x, y, z);
+    p.add(g);
+    return g;
+  };
+  const rand = (n) => {
+    const v = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return v - Math.floor(v);
+  };
+  const curves = [];
+  let roomId = "foyer";
+  let candles = [], gears = [], pendulums = [], dust = [], water = [], plants = [], traps = [], clockMechanisms = [];
+  function textureCanvas(w, h, draw) {
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    draw(c.getContext("2d"), w, h);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+  const glowTexture = textureCanvas(128, 128, (c, w, h) => {
+    const g = c.createRadialGradient(64, 64, 0, 64, 64, 64);
+    g.addColorStop(0, "rgba(255,224,153,.65)");
+    g.addColorStop(0.15, "rgba(255,194,93,.2)");
+    g.addColorStop(1, "rgba(255,153,64,0)");
+    c.fillStyle = g;
+    c.fillRect(0, 0, w, h);
+  });
+  const softShadow = textureCanvas(64, 64, (c, w, h) => {
+    const g = c.createRadialGradient(32, 32, 1, 32, 32, 31);
+    g.addColorStop(0, "rgba(3,8,11,.75)");
+    g.addColorStop(0.55, "rgba(3,8,11,.45)");
+    g.addColorStop(1, "rgba(3,8,11,0)");
+    c.fillStyle = g;
+    c.fillRect(0, 0, w, h);
+  });
+  function shadow(p, x, z, w = 2, d = 1.5) {
+    const s2 = mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshBasicMaterial({ map: softShadow, transparent: true, depthWrite: false }), p, x, 0.027, z);
+    s2.rotation.x = -Math.PI / 2;
+    return s2;
+  }
+  function glow(p, x, y, z, size = 2.5, col = "#ffd99a", alpha = 0.7) {
+    const s2 = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture, color: col, transparent: true, opacity: alpha, depthWrite: false }));
+    s2.position.set(x, y, z);
+    s2.scale.setScalar(size);
+    p.add(s2);
+    return s2;
+  }
+  function label(p, text, x, y, z, w = 2, h = 0.4, col = "#dbbd86", bg = null) {
+    const t = textureCanvas(512, 128, (c, W, H) => {
+      if (bg) {
+        c.fillStyle = bg;
+        c.fillRect(0, 0, W, H);
+      }
+      c.fillStyle = col;
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.font = "500 47px Georgia";
+      c.fillText(text, W / 2, H / 2);
+    });
+    return mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: t, transparent: true, depthWrite: false }), p, x, y, z);
+  }
+  function archShape(width, height) {
+    const r = width / 2, s2 = new THREE.Shape();
+    s2.moveTo(-r, 0);
+    s2.lineTo(-r, height - r);
+    s2.absarc(0, height - r, r, Math.PI, 0, true);
+    s2.lineTo(r, 0);
+    s2.closePath();
+    return s2;
+  }
+  function arch(p, x, y, z, w, h, m, depth = 0.12) {
+    return mesh(new THREE.ExtrudeGeometry(archShape(w, h), { depth, bevelEnabled: false, curveSegments: 24 }), m, p, x, y, z);
+  }
+  function rod(p, a, b, r, m) {
+    const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b), v = B.clone().sub(A);
+    const o = cyl(p, ...A.clone().add(B).multiplyScalar(0.5).toArray(), r, r, v.length(), m, 8);
+    o.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), v.normalize());
+    return o;
+  }
+  function candle(p, x, y, z, h = 0.5) {
+    const base = cyl(p, x, y + 0.08, z, 0.18, 0.24, 0.16, mat.gold, 12);
+    cyl(p, x, y + h / 2 + 0.15, z, 0.075, 0.085, h, mat.cream, 8);
+    const f = sphere(p, x, y + h + 0.26, z, 0.13, flat("#ffdc98"), 0.55, 1.7, 0.55);
+    const g = glow(p, x, y + h + 0.27, z, 1.5);
+    candles.push({ f, g, k: rand(x * 31 + z * 23 + y) });
+    return base;
+  }
+  function candelabra(p, x, y, z) {
+    cyl(p, x, y + 0.58, z, 0.045, 0.075, 1.16, mat.gold);
+    cyl(p, x, y + 0.04, z, 0.32, 0.42, 0.08, mat.gold);
+    for (const s2 of [-1, 1]) {
+      rod(p, [x, y + 0.55, z], [x + s2 * 0.45, y + 0.8, z], 0.035, mat.gold);
+      rod(p, [x + s2 * 0.45, y + 0.8, z], [x + s2 * 0.45, y + 1.05, z], 0.035, mat.gold);
+      candle(p, x + s2 * 0.45, y + 1.05, z, 0.32);
+    }
+    candle(p, x, y + 1.16, z, 0.5);
+  }
+  function floor(p, stone = false) {
+    box(p, 0, -0.38, 0.1, 27, 0.68, 10.5, mat.woodDark, true);
+    box(p, 0, -0.08, 5.2, 27, 0.28, 0.2, mat.gold);
+    if (stone) {
+      for (let col = 0; col < 18; col++) for (let row = 0; row < 7; row++) {
+        const dark = (col + row) % 2 === 0;
+        box(p, -13.3 + (col + 0.5) * 26.6 / 18, 1e-3, -4.7 + (row + 0.5) * 9.7 / 7, 26.6 / 18 - 0.025, 0.1, 9.7 / 7 - 0.025, cel(dark ? "#3f5451" : "#293c3e"));
+      }
+    } else {
+      for (let row = 0; row < 19; row++) {
+        const z = -4.48 + row * 0.52;
+        for (let k2 = 0; k2 < 8; k2++) {
+          const start = -15.3 + k2 * 4 + row % 2 * 2;
+          const a = Math.max(-13.3, start), b = Math.min(13.3, start + 4);
+          if (b > a) box(p, (a + b) / 2, 5e-3, z, b - a - 0.025, 0.07, 0.5, cel(["#50463a", "#4b4437", "#423c33", "#514b3d"][Math.floor(rand(k2 + row * 12) * 4)]));
+        }
+      }
+    }
+    for (const x of [-13.1, 13.1]) box(p, x, 0.035, 0, 0.14, 0.07, 9.8, mat.gold);
+  }
+  function wallpaper(p, wallColor = "#29494a") {
+    box(p, 0, 4.5, -4.8, 27, 9, 0.35, cel(wallColor));
+    box(p, 0, 1.03, -4.54, 26.8, 2.1, 0.18, mat.woodDark);
+    box(p, 0, 2.12, -4.35, 26.8, 0.13, 0.35, mat.gold);
+    box(p, 0, 0.12, -4.37, 27, 0.2, 0.28, mat.wood);
+    for (let x = -12.6; x < 13; x += 1.25) {
+      box(p, x, 1.04, -4.4, 0.055, 1.8, 0.07, mat.gold);
+      for (let y = 2.8; y < 8.5; y += 1.2) {
+        const d = mesh(new THREE.PlaneGeometry(0.15, 0.25), cel("#476661"), p, x, y, -4.6);
+        d.rotation.z = Math.PI / 4;
+      }
+    }
+    box(p, 0, 8.6, -4.2, 27, 0.3, 0.85, mat.wood);
+    box(p, 0, 8.4, -4.06, 27, 0.09, 0.75, mat.gold);
+    box(p, 0, 8.9, -4.55, 27, 0.28, 0.55, mat.woodDark);
+    for (const x of [-12.9, -9, -4.35, 4.35, 9, 12.9]) {
+      box(p, x, 4.2, -4.18, 0.24, 8.3, 0.4, mat.wood);
+      box(p, x - 0.15, 4.2, -4, 0.035, 8.2, 0.02, mat.gold);
+      box(p, x + 0.15, 4.2, -4, 0.035, 8.2, 0.02, mat.gold);
+      box(p, x, 2.2, -4.05, 0.54, 0.18, 0.5, mat.gold);
+      box(p, x, 8.16, -4.05, 0.6, 0.2, 0.55, mat.gold);
+    }
+  }
+  function windowPanel(p, x, y, z, w = 2.5, h = 4.3, rose = false) {
+    const g = group(p, x, y, z);
+    arch(g, 0, -0.1, -0.18, w + 0.3, h + 0.3, mat.wood);
+    arch(g, 0, 0, 0, w, h, flat(rose ? "#6e8d86" : "#547b7e"));
+    arch(g, 0, 0.15, 0.015, w - 0.35, h - 0.35, flat("#315059"));
+    const glassMat = flat("#82aaa1", 0.18);
+    for (let i = 0; i < 3; i++) {
+      const pane = box(g, -w / 2 + 0.3 + i * (w - 0.6) / 2, h * 0.43, 0.05, (w - 0.5) / 3, h * 0.68, 0.02, glassMat);
+    }
+    box(g, 0, h * 0.43, 0.12, 0.065, h * 0.85, 0.08, mat.gold);
+    box(g, -w * 0.24, h * 0.38, 0.12, 0.055, h * 0.74, 0.08, mat.gold);
+    box(g, w * 0.24, h * 0.38, 0.12, 0.055, h * 0.74, 0.08, mat.gold);
+    for (const yy of [h * 0.25, h * 0.58]) box(g, 0, yy, 0.12, w - 0.1, 0.07, 0.08, mat.gold);
+    const tracery = ring(g, 0, h - w * 0.5, 0.14, w * 0.34, 0.045, mat.gold);
+    for (const side of [-1, 1]) {
+      const r = ring(g, side * w * 0.17, h - w * 0.5, 0.15, w * 0.18, 0.033, mat.gold);
+    }
+    const moon = mesh(new THREE.CircleGeometry(w * 0.15, 32), flat("#cfdbc0"), g, w * 0.24, h * 0.75, 0.06);
+    for (let i = 0; i < 14; i++) {
+      sphere(g, (rand(i + x) * 0.8 - 0.4) * w, 0.7 + rand(i * 2 + x) * (h - 1.2), 0.08, 0.013, flat("#cee0ca"));
+    }
+    const beam = mesh(new THREE.PlaneGeometry(w * 1.7, 5), flat("#9ccabb", 0.045), p, x + 1, 0.13, z + 4.2);
+    beam.rotation.x = -Math.PI / 2;
+    beam.rotation.z = -0.2;
+    box(g, 0, -0.12, 0.18, w + 0.45, 0.18, 0.5, mat.wood);
+    return g;
+  }
+  function door(p, x, z, labelText) {
+    const g = group(p, x, 0, z);
+    g.rotation.y = x < 0 ? 0.4 : -0.4;
+    box(g, 0, 1.7, 0, 1.8, 3.4, 0.32, mat.woodDark, true);
+    arch(g, 0, 0, 0.18, 1.5, 3.4, cel("#142728"));
+    arch(g, 0, 0.12, 0.2, 1.2, 3.05, cel("#294042"));
+    box(g, 0, 1.5, 0.29, 0.06, 2.7, 0.05, mat.gold);
+    for (let j = 0; j < 2; j++) box(g, 0, 0.7 + j * 1.4, 0.3, 1.05, 0.055, 0.04, mat.gold);
+    sphere(g, 0.47, 1.6, 0.38, 0.065, mat.goldLight);
+    box(g, 0, 3.45, 0.15, 2.15, 0.16, 0.5, mat.gold);
+    label(g, labelText, 0, 3.8, 0.15, 2.3, 0.32);
+    shadow(p, x, z, 2.8, 1.2);
+  }
+  function rug(p, x, z, w, d) {
+    box(p, x, 0.08, z, w, 0.025, d, cel("#632f32"));
+    for (const xx of [x - w / 2 + 0.15, x + w / 2 - 0.15]) box(p, xx, 0.099, z, 0.08, 0.01, d - 0.2, mat.gold);
+    for (const zz of [z - d / 2 + 0.15, z + d / 2 - 0.15]) box(p, x, 0.099, zz, w - 0.2, 0.01, 0.08, mat.gold);
+    for (let i = 0; i < 8; i++) {
+      const t = mesh(new THREE.PlaneGeometry(0.12, d - 0.6), cel("#864c42"), p, x - w / 2 + 0.5 + i * (w - 1) / 7, 0.105, z);
+      t.rotation.x = -Math.PI / 2;
+    }
+    const mid = mesh(new THREE.RingGeometry(0.65, 0.68, 4), mat.gold, p, x, 0.115, z);
+    mid.rotation.x = -Math.PI / 2;
+    mid.rotation.z = Math.PI / 4;
+  }
+  function portrait(p, x, y, z, w = 1.6, h = 2.1, seed = 0) {
+    const tex = textureCanvas(256, 320, (c, W, H) => {
+      c.fillStyle = "#243938";
+      c.fillRect(0, 0, W, H);
+      c.fillStyle = "#63746a";
+      c.beginPath();
+      c.ellipse(W * 0.5, H * 0.58, W * 0.33, H * 0.39, 0, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = "#1c2a2b";
+      c.beginPath();
+      c.moveTo(30, H);
+      c.quadraticCurveTo(38, 215, 128, 210);
+      c.quadraticCurveTo(220, 222, 232, H);
+      c.fill();
+      c.fillStyle = "#aca586";
+      c.beginPath();
+      c.ellipse(127, 128, 44, 62, 0, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = "#252d28";
+      c.beginPath();
+      c.ellipse(126, 83, 48, 34, 0, 0, Math.PI * 2);
+      c.fill();
+      c.fillRect(83, 94, 19, 80);
+      c.fillStyle = "#26372f";
+      c.fillRect(107, 128, 7, 3);
+      c.fillRect(142, 128, 7, 3);
+      c.fillStyle = "#756752";
+      c.fillRect(121, 171, 17, 2);
+      c.fillStyle = "#d1bc8e";
+      c.beginPath();
+      c.moveTo(100, 204);
+      c.lineTo(127, 230);
+      c.lineTo(152, 204);
+      c.lineTo(146, 241);
+      c.lineTo(111, 241);
+      c.fill();
+      for (let i = 0; i < 26; i++) {
+        c.strokeStyle = "rgba(32,39,27,.12)";
+        c.beginPath();
+        const xx = rand(i + seed) * W;
+        c.moveTo(xx, 0);
+        c.lineTo(xx + rand(i * 2) * 40, H);
+        c.stroke();
+      }
+    });
+    box(p, x, y, z, w + 0.23, h + 0.23, 0.15, mat.gold, true);
+    box(p, x, y, z + 0.1, w + 0.06, h + 0.06, 0.1, mat.woodDark);
+    mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex }), p, x, y, z + 0.17);
+    for (const sx of [-1, 1]) for (const sy of [-1, 1]) {
+      const a = box(p, x + sx * w * 0.5, y + sy * h * 0.5, z + 0.2, 0.18, 0.18, 0.06, mat.goldLight);
+      a.rotation.z = Math.PI / 4;
+    }
+    return tex;
+  }
+  function cabinet(p, x = -7, z = -3) {
+    const g = group(p, x, 0, z);
+    shadow(p, x, z, 3.3, 2);
+    box(g, 0, 1.6, 0, 2.25, 3.2, 1.05, mat.wood, true);
+    box(g, 0, 1.7, 0.55, 1.98, 2.85, 0.08, mat.woodDark, true);
+    for (const s2 of [-1, 1]) {
+      box(g, s2 * 0.5, 1.7, 0.61, 0.86, 2.6, 0.05, cel("#3b4a43"), true);
+      box(g, s2 * 0.5, 1.8, 0.65, 0.65, 2.1, 0.035, cel("#32413c"));
+      sphere(g, s2 * 0.13, 1.65, 0.72, 0.055, mat.goldLight);
+    }
+    box(g, 0, 3.27, 0.02, 2.6, 0.17, 1.22, mat.gold);
+    box(g, 0, 3.43, 0, 2.3, 0.15, 1.07, mat.wood);
+    for (const s2 of [-1, 1]) {
+      cyl(g, s2 * 0.88, 0.18, 0.35, 0.1, 0.14, 0.36, mat.wood);
+      sphere(g, s2 * 0.88, 3.63, 0, 0.13, mat.gold);
+    }
+    label(g, "KEEP QUIET", 0, 2.68, 0.69, 1.05, 0.19, "#a99b76");
+    return g;
+  }
+  function gear(p, x, y, z, r = 0.7, teeth = 14) {
+    const g = group(p, x, y, z);
+    ring(g, 0, 0, 0, r * 0.76, r * 0.16, mat.gold);
+    ring(g, 0, 0, 0.02, r * 0.25, r * 0.07, mat.wood);
+    for (let i = 0; i < teeth; i++) {
+      const a = i * Math.PI * 2 / teeth;
+      const t = box(g, Math.cos(a) * r, Math.sin(a) * r, 0, r * 0.26, r * 0.22, 0.18, mat.gold, true);
+      t.rotation.z = a;
+    }
+    for (let i = 0; i < 5; i++) {
+      const a = i * Math.PI * 2 / 5;
+      const t = box(g, Math.cos(a) * r * 0.46, Math.sin(a) * r * 0.46, 0, r * 0.75, 0.065, 0.1, mat.gold);
+      t.rotation.z = a;
+    }
+    const ax = cyl(g, 0, 0, 0.07, r * 0.09, r * 0.09, 0.25, mat.wood);
+    ax.rotation.x = Math.PI / 2;
+    gears.push({ g, s: teeth % 2 === 0 ? 0.09 : -0.08 });
+    return g;
+  }
+  function clockFace(p, x, y, z, r = 1.45) {
+    const t = textureCanvas(1024, 1024, (c, W, H) => {
+      c.fillStyle = "#d0c49a";
+      c.beginPath();
+      c.arc(512, 512, 501, 0, Math.PI * 2);
+      c.fill();
+      c.strokeStyle = "#3b4540";
+      c.lineWidth = 4;
+      c.beginPath();
+      c.arc(512, 512, 465, 0, Math.PI * 2);
+      c.stroke();
+      c.beginPath();
+      c.arc(512, 512, 355, 0, Math.PI * 2);
+      c.stroke();
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.fillStyle = "#273b3a";
+      c.font = "58px Georgia";
+      const roman = ["XII", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI"];
+      for (let i = 0; i < 12; i++) {
+        const a = i * Math.PI / 6 - Math.PI / 2;
+        c.fillText(roman[i], 512 + Math.cos(a) * 415, 512 + Math.sin(a) * 415);
+      }
+      for (let i = 0; i < 60; i++) {
+        const a = i * Math.PI / 30;
+        c.lineWidth = i % 5 ? 2 : 6;
+        c.beginPath();
+        c.moveTo(512 + Math.cos(a) * 477, 512 + Math.sin(a) * 477);
+        c.lineTo(512 + Math.cos(a) * (i % 5 ? 487 : 494), 512 + Math.sin(a) * (i % 5 ? 487 : 494));
+        c.stroke();
+      }
+      c.font = "24px Georgia";
+      c.fillStyle = "#776e53";
+      c.fillText("V E S P E R  &  S O N", 512, 690);
+      c.fillText("MDCCCXCIII", 512, 728);
+      c.strokeStyle = "rgba(76,69,48,.15)";
+      for (let i = 0; i < 14; i++) {
+        c.beginPath();
+        c.moveTo(rand(i) * 1e3, rand(i * 2) * 1e3);
+        c.lineTo(rand(i + 2) * 1e3, rand(i * 3) * 1e3);
+        c.stroke();
+      }
+    });
+    mesh(new THREE.CircleGeometry(r, 96), new THREE.MeshBasicMaterial({ map: t }), p, x, y, z);
+    ring(p, x, y, z + 0.01, r, 0.085, mat.gold);
+    ring(p, x, y, z + 0.025, r * 0.94, 0.018, mat.wood);
+    const hands = group(p, x, y, z + 0.08);
+    const hour = group(hands);
+    box(hour, 0, r * 0.25, 0, 0.07, r * 0.56, 0.03, mat.black);
+    hour.rotation.z = Math.PI / 120;
+    const minute = group(hands);
+    box(minute, 0, r * 0.36, 0.025, 0.045, r * 0.78, 0.025, mat.black);
+    minute.rotation.z = Math.PI / 10;
+    hands.userData = { hour, minute };
+    sphere(hands, 0, 0, 0.05, 0.09, mat.gold);
+    return hands;
+  }
+  function grandfather(p, x = 0, z = -3.7) {
+    const g = group(p, x, 0, z);
+    box(g, 0, 2.8, 0, 2.5, 5.6, 0.75, mat.wood, true);
+    arch(g, 0, 0, 0.42, 2.65, 6.2, mat.wood);
+    arch(g, 0, 0.25, 0.55, 2.15, 5.57, mat.gold);
+    arch(g, 0, 0.38, 0.65, 1.86, 5.2, mat.black);
+    box(g, 0, 1.7, 0.71, 1.55, 2.5, 0.04, cel("#223c3c"));
+    box(g, 0, 0.25, 0.15, 2.85, 0.45, 1.12, mat.wood, true);
+    for (const s2 of [-1, 1]) {
+      cyl(g, s2 * 1.18, 2.6, 0.58, 0.085, 0.12, 4.8, mat.gold);
+      sphere(g, s2 * 1.18, 5.6, 0.58, 0.14, mat.gold);
+    }
+    g.userData.clockHands = clockFace(g, 0, 4.6, 0.8, 1.04);
+    const pend = group(g, 0, 3.18, 0.86);
+    rod(pend, [0, 0, 0], [0, -1.55, 0], 0.04, mat.gold);
+    const disk = cyl(pend, 0, -1.58, 0, 0.34, 0.34, 0.08, mat.goldLight, 32);
+    disk.rotation.x = Math.PI / 2;
+    pendulums.push(pend);
+    for (const y of [1, 2.1]) gear(g, -0.49, y, 0.9, 0.3, 12);
+    shadow(p, x, z, 4, 2.3);
+    return g;
+  }
+  function table(p, x, y, z, w = 3.3, d = 1.3) {
+    box(p, x, y, z, w, 0.18, d, mat.wood, true);
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+      cyl(p, x + sx * (w / 2 - 0.2), y / 2, z + sz * (d / 2 - 0.16), 0.075, 0.11, y, mat.wood);
+    }
+    shadow(p, x, z, w + 1, d + 1);
+  }
+  function paper(p, x, y, z, angle = 0) {
+    const a = box(p, x, y, z, 0.56, 0.012, 0.43, mat.cream);
+    a.rotation.y = angle;
+    for (let i = 0; i < 4; i++) {
+      const l = box(a, 0, 9e-3, -0.12 + i * 0.07, 0.34, 3e-3, 9e-3, mat.wood);
+    }
+  }
+  function book(p, x, y, z, c = "#7e5047", h = 0.65) {
+    const b = box(p, x, y + h / 2, z, 0.19, h, 0.43, cel(c), true);
+    for (const yy of [-h * 0.35, h * 0.35]) box(b, 0, yy, 0.22, 0.18, 0.025, 9e-3, mat.gold);
+    return b;
+  }
+  function leaf(p, x, y, z, s2 = 1, col = "#567762", a = 0) {
+    const o = mesh(new THREE.OctahedronGeometry(0.5), cel(col), p, x, y, z);
+    o.scale.set(0.4 * s2, 0.9 * s2, 0.12 * s2);
+    o.rotation.z = a;
+    return o;
+  }
+  function pot(p, x, z, s2 = 1) {
+    const g = group(p, x, 0, z);
+    cyl(g, 0, 0.36 * s2, 0, 0.46 * s2, 0.3 * s2, 0.72 * s2, cel("#776553"), 10);
+    cyl(g, 0, 0.72 * s2, 0, 0.51 * s2, 0.51 * s2, 0.1 * s2, mat.gold, 10);
+    cyl(g, 0, 0.78 * s2, 0, 0.42 * s2, 0.42 * s2, 0.03, mat.woodDark, 10);
+    for (let i = 0; i < 8; i++) {
+      const a = i * Math.PI / 4;
+      rod(g, [0, 0.8 * s2, 0], [Math.sin(a) * 0.4 * s2, (1.2 + rand(i + x)) * s2, Math.cos(a) * 0.4 * s2], 0.018, mat.green);
+      const l = leaf(g, Math.sin(a) * 0.4 * s2, (1.3 + rand(i + x)) * s2, Math.cos(a) * 0.4 * s2, s2, "#4d7760", a * 0.25 - 0.5);
+      plants.push(l);
+    }
+    return g;
+  }
+  function topplingProp(p, kind) {
+    const g = group(p, 7, 0.02, -2.5);
+    shadow(p, 7, -2.5, 3, 1.8);
+    if (kind === "foyer") {
+      cyl(g, 0, 0.4, 0, 0.12, 0.35, 0.8, mat.gold);
+      candelabra(g, 0, 0.8, 0);
+      for (const side of [-1, 1]) rod(g, [0, 0.5, 0], [side * 0.4, 0.06, 0], 0.035, mat.gold);
+    } else if (kind === "library") {
+      for (const x of [-0.65, 0.65]) for (const z of [-0.32, 0.32]) {
+        const wheel = cyl(g, x, 0.17, z, 0.15, 0.15, 0.09, mat.black);
+        wheel.rotation.x = Math.PI / 2;
+      }
+      for (const y of [0.36, 1.12, 1.88]) {
+        box(g, 0, y, 0, 1.65, 0.13, 0.9, mat.wood, true);
+        if (y < 1.8) for (let i = 0; i < 7; i++) book(g, -0.65 + i * 0.21, y + 0.07, 0.02, ["#726d45", "#704841", "#47656d"][i % 3], 0.51 + rand(i + y) * 0.14);
+      }
+      for (const x of [-0.77, 0.77]) for (const z of [-0.35, 0.35]) rod(g, [x, 0.2, z], [x, 2.05, z], 0.035, mat.gold);
+      rod(g, [-0.8, 2.05, 0], [0.8, 2.05, 0], 0.035, mat.gold);
+    } else if (kind === "conservatory") {
+      for (const x of [-0.4, 0.4]) for (const z of [-0.3, 0.3]) rod(g, [x, 0.05, z], [x, 0.95, z], 0.035, mat.gold);
+      box(g, 0, 1, 0, 1.15, 0.12, 0.95, mat.gold, true);
+      const planter = group(g, 0, 1.08, 0);
+      pot(planter, 0, 0, 0.77);
+    } else if (kind === "workshop") {
+      for (const x of [-0.85, 0.85]) {
+        box(g, x, 1.15, 0, 0.1, 2.3, 0.12, mat.wood);
+        box(g, x, 0.1, 0, 0.48, 0.16, 1.05, mat.wood);
+      }
+      box(g, 0, 1.5, 0, 1.85, 1.32, 0.12, mat.woodDark, true);
+      box(g, 0, 0.7, 0.15, 1.9, 0.12, 0.7, mat.wood, true);
+      for (let i = 0; i < 5; i++) {
+        const x = -0.68 + i * 0.34;
+        rod(g, [x, 1.85, 0.12], [x, 1.05, 0.13], 0.026, mat.gold);
+        ring(g, x, 1.9, 0.13, 0.1, 0.03, mat.gold);
+        if (i % 2) box(g, x, 1.06, 0.14, 0.19, 0.13, 0.06, mat.gold);
+      }
+      for (let i = 0; i < 3; i++) {
+        const b = box(g, -0.4 + i * 0.4, 0.89, 0.12, 0.26, 0.24, 0.3, mat.gold);
+      }
+    } else {
+      for (const x of [-0.6, 0.6]) box(g, x, 1.75, 0, 0.12, 3.5, 0.14, mat.wood);
+      box(g, 0, 3.45, 0, 1.5, 0.18, 0.25, mat.gold);
+      ring(g, 0, 3.12, 0.06, 0.23, 0.06, mat.gold);
+      g.userData.rope = rod(g, [0, 3.12, 0], [0, 1.9, 0], 0.025, mat.cream);
+      const weight = group(g);
+      g.userData.counterweight = weight;
+      cyl(weight, 0, 1.35, 0, 0.52, 0.6, 1.1, mat.black, 12);
+      for (const y of [0.9, 1.7]) cyl(weight, 0, y, 0, 0.6, 0.6, 0.09, mat.gold, 12);
+    }
+    const grip = ring(g, 0.4, 0.9, 0.56, 0.12, 0.033, cel("#b15b45"));
+    traps.push({ g, kind, progress: 0 });
+    return g;
+  }
+  function moonCabinet(p) {
+    const g = group(p, 0, 0, -2.9);
+    shadow(p, 0, -2.9, 4, 2);
+    box(g, 0, 1.45, 0, 2.9, 2.9, 0.88, mat.wood, true);
+    box(g, 0, 1.5, 0.49, 2.58, 2.55, 0.1, cel("#244445"), true);
+    box(g, 0, 0.16, 0, 3.2, 0.28, 1.05, mat.gold);
+    box(g, 0, 2.93, 0, 3.2, 0.19, 1.05, mat.gold);
+    for (const x of [-1.3, 1.3]) rod(g, [x, 0.3, 0.6], [x, 2.75, 0.6], 0.035, mat.gold);
+    for (let i = 0; i < 3; i++) {
+      const x = (i - 1) * 0.79;
+      const t = textureCanvas(256, 256, (c, W, H) => {
+        c.fillStyle = "#c4b181";
+        c.beginPath();
+        c.arc(128, 128, 118, 0, Math.PI * 2);
+        c.fill();
+        c.strokeStyle = "#304947";
+        c.lineWidth = 4;
+        c.beginPath();
+        c.arc(128, 128, 103, 0, Math.PI * 2);
+        c.stroke();
+        c.fillStyle = "#304947";
+        c.strokeStyle = "#304947";
+        c.lineWidth = 8;
+        if (i === 0) {
+          for (const side of [-1, 1]) {
+            c.beginPath();
+            c.ellipse(128 + side * 37, 122, 35, 55, side * 0.4, 0, Math.PI * 2);
+            c.fill();
+          }
+          c.fillRect(121, 82, 14, 102);
+        }
+        if (i === 1) {
+          c.beginPath();
+          c.arc(124, 128, 62, 0, Math.PI * 2);
+          c.fill();
+          c.fillStyle = "#c4b181";
+          c.beginPath();
+          c.arc(150, 105, 58, 0, Math.PI * 2);
+          c.fill();
+        }
+        if (i === 2) {
+          c.beginPath();
+          c.moveTo(128, 192);
+          c.lineTo(128, 65);
+          for (let j = 0; j < 3; j++) {
+            c.moveTo(128, 95 + j * 33);
+            c.lineTo(j % 2 ? 88 : 170, 75 + j * 33);
+          }
+          c.stroke();
+        }
+      });
+      ring(g, x, 1.86, 0.61, 0.37, 0.04, mat.gold);
+      mesh(new THREE.CircleGeometry(0.34, 48), new THREE.MeshBasicMaterial({ map: t }), g, x, 1.86, 0.63);
+      box(g, x, 0.98, 0.62, 0.49, 0.55, 0.06, mat.woodDark, true);
+    }
+    const moon = group(g, 0, 3.32, 0.05);
+    mesh(new THREE.CircleGeometry(0.42, 48), mat.goldLight, moon);
+    mesh(new THREE.CircleGeometry(0.36, 48), cel("#254445"), moon, 0.17, 0.12, 0.02);
+    label(g, "MOTH \xB7 MOON \xB7 THORN", 0, 0.56, 0.65, 2, 0.22);
+    return g;
+  }
+  function buildFoyer(p) {
+    floor(p);
+    wallpaper(p);
+    rug(p, 0, 0.8, 5.3, 7);
+    for (const x of [-6.3, 6.3]) windowPanel(p, x, 3.2, -4.48, 2.65, 4.8);
+    arch(p, 0, 0.18, -4.39, 6.2, 8.05, cel("#142e32"));
+    arch(p, 0, 0.34, -4.2, 5.8, 7.65, cel("#274748"));
+    const clock = grandfather(p, 0, -3.35);
+    const pivot = group(p, -1.4, 0, -3.35);
+    pivot.add(clock);
+    clock.position.set(1.4, 0, 0);
+    const stair = group(p, 0, 0, -3.85);
+    box(stair, 0, 2, -0.02, 2.6, 4, 0.04, flat("#091c20"));
+    for (let i = 0; i < 7; i++) box(stair, 0, 0.14 + i * 0.3, 0.9 - i * 0.16, 1.9, 0.28 + i * 0.6, 0.23, cel(i % 2 ? "#4b635e" : "#63766b"));
+    clockMechanisms.push({ pivot, stair, hands: clock.userData.clockHands.userData, open: 0 });
+    stair.visible = false;
+    gear(p, -2.2, 6.5, -4.02, 0.9, 16);
+    gear(p, 1.9, 5.7, -4.02, 1.13, 18);
+    gear(p, 0.4, 7.42, -4.02, 0.62, 12);
+    for (const side of [-1, 1]) {
+      const g = group(p, side * 8.7, 0, -2.6);
+      for (let i = 0; i < 7; i++) {
+        const st = box(g, side * (i * 0.3 - 1), 0.14 + i * 0.17, -i * 0.25, 1.95, 0.28 + i * 0.34, 0.36, mat.wood, true);
+      }
+      rod(g, [-side * 1.7, 1.15, 0.4], [side * 0.5, 2.4, -1.6], 0.07, mat.gold);
+      for (let i = 0; i < 7; i++) {
+        const xx = -side * 1.7 + side * i * 0.36;
+        rod(g, [xx, 0.2 + i * 0.17, 0.4 - i * 0.33], [xx, 1.15 + i * 0.2, 0.4 - i * 0.33], 0.035, mat.gold);
+      }
+      candelabra(p, side * 3.4, 0, -2.9);
+      portrait(p, side * 10.7, 5.75, -4.35, 1.5, 2.1, side);
+      pot(p, side * 9.2, -3.5, 0.85);
+    }
+    cabinet(p, -7, -2.7);
+    topplingProp(p, "foyer");
+    label(p, "THE HOURS BELONG TO HER", 0, 8.2, -4.01, 6, 0.25);
+    door(p, -11, 0, "LIBRARY");
+    door(p, 11, 0, "WINTER GARDEN");
+  }
+  function shelf(p, x, z, w = 3, h = 5) {
+    const g = group(p, x, 0, z);
+    box(g, 0, h / 2, 0, w, h, 0.6, mat.woodDark, true);
+    for (const sx of [-1, 1]) box(g, sx * w / 2, h / 2, 0.2, 0.16, h, 0.9, mat.wood, true);
+    for (let j = 0; j < 5; j++) {
+      const y = 0.25 + j * (h - 0.4) / 4;
+      box(g, 0, y, 0.2, w + 0.1, 0.12, 0.92, mat.wood, true);
+      if (j < 4) for (let i = 0; i < Math.floor(w / 0.23) - 1; i++) {
+        const b = book(g, -w * 0.43 + i * 0.23, y + 0.07, 0.26, ["#536d5c", "#875a4a", "#526575", "#998158", "#675663"][Math.floor(rand(i + j * 21 + x) * 5)], 0.45 + rand(i * 2 + j + x) * 0.55);
+        b.rotation.z = (rand(i + j * 17) - 0.5) * 0.08;
+      }
+    }
+    box(g, 0, h + 0.12, 0.15, w + 0.38, 0.22, 1.02, mat.gold);
+  }
+  function buildLibrary(p) {
+    floor(p);
+    wallpaper(p, "#34443e");
+    rug(p, 1, 0.5, 9, 5.8);
+    for (const x of [-10, -4.1, 4.1, 10]) shelf(p, x, -4.15, x === -10 || x === 10 ? 3.3 : 3.5, 6.8);
+    windowPanel(p, 0, 3.3, -4.47, 2.5, 4.85);
+    cabinet(p, -7, -2.7);
+    table(p, 0, 1.2, -2.4, 4, 1.7);
+    paper(p, -0.45, 1.31, -2.18, -0.3);
+    paper(p, 0.15, 1.32, -2.4, 0.25);
+    book(p, 1.2, 1.29, -2.5, "#6d3e3e", 0.36);
+    candelabra(p, -1.4, 1.3, -2.65);
+    const inkpot = cyl(p, 0.7, 1.45, -2.3, 0.1, 0.14, 0.27, mat.black, 8);
+    rod(p, [0.7, 1.5, -2.3], [0.85, 2, -2.3], 0.012, mat.cream);
+    leaf(p, 0.9, 1.95, -2.3, 0.27, "#ddd3b7", -0.2);
+    const chair = group(p, 0, 0, -3.5);
+    box(chair, 0, 0.7, 0, 0.9, 0.16, 0.8, mat.wood);
+    box(chair, 0, 1.3, -0.35, 0.95, 1.3, 0.13, mat.red, true);
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) box(chair, sx * 0.35, 0.35, sz * 0.3, 0.08, 0.7, 0.08, mat.wood);
+    const ladder = group(p, 9.3, 0, -3.1);
+    ladder.rotation.z = -0.13;
+    ladder.rotation.x = -0.12;
+    for (const x of [-0.45, 0.45]) box(ladder, x, 2.35, 0, 0.11, 4.7, 0.13, mat.gold);
+    for (let y = 0.3; y < 4.5; y += 0.42) box(ladder, 0, y, 0, 0.95, 0.075, 0.14, mat.wood);
+    for (let i = 0; i < 8; i++) {
+      const b = box(p, 5.8 + Math.sin(i) * 0.2, 0.17 + i * 0.13, -2.6, 0.75, 0.12, 0.6, cel(["#6f3c37", "#6b7254", "#97825b"][i % 3]), true);
+      b.rotation.y = i * 0.32;
+    }
+    topplingProp(p, "library");
+    portrait(p, -7, 6.15, -4.25, 1.5, 1.9, 7);
+    label(p, "A HOUSE REMEMBERS", 0, 8.25, -4.02, 5, 0.26);
+    door(p, -11, 0, "SEALED GARDEN");
+    door(p, 11, 0, "ENTRANCE HALL");
+  }
+  function buildConservatory(p) {
+    floor(p, true);
+    wallpaper(p, "#204743");
+    for (const x of [-10, -6, -2, 2, 6, 10]) windowPanel(p, x, 2.7, -4.45, 3, 5.3);
+    for (let x = -12; x <= 12; x += 4) {
+      rod(p, [x, 8.4, -4.5], [x, 8.9, 0.5], 0.07, mat.gold);
+      rod(p, [x, 8.9, 0.5], [x, 7, 4], 0.07, mat.gold);
+    }
+    for (let x = -12; x < 12; x += 2) {
+      const v = box(p, x, 8.2, -2.5, 0.03, 0.02, 5.8, mat.green);
+    }
+    const fountain = group(p, 3.6, 0, -1);
+    fountain.scale.setScalar(0.75);
+    {
+      const p2 = fountain;
+      const basin = cyl(p2, 0, 0.35, -2.7, 1.4, 1.14, 0.7, cel("#7e8e7b"), 16);
+      cyl(p2, 0, 0.72, -2.7, 1.38, 1.38, 0.12, mat.gold, 32);
+      const waterDisc = cyl(p2, 0, 0.8, -2.7, 1.25, 1.25, 0.025, flat("#87aca1", 0.75), 48);
+      water.push(waterDisc);
+      cyl(p2, 0, 1.12, -2.7, 0.24, 0.5, 0.7, cel("#78917e"));
+      cyl(p2, 0, 1.47, -2.7, 0.72, 0.55, 0.2, mat.gold, 24);
+      cyl(p2, 0, 1.59, -2.7, 0.65, 0.65, 0.02, flat("#aec8ae", 0.8), 24);
+      sphere(p2, 0, 2.1, -2.7, 0.28, mat.goldLight, 0.7, 1.7, 0.7);
+      for (let i = 0; i < 8; i++) {
+        const a = i * Math.PI / 4;
+        const arc = new THREE.QuadraticBezierCurve3(new THREE.Vector3(Math.cos(a) * 0.5, 1.61, -2.7 + Math.sin(a) * 0.5), new THREE.Vector3(Math.cos(a) * 0.9, 1.4, -2.7 + Math.sin(a) * 0.9), new THREE.Vector3(Math.cos(a) * 1.05, 0.83, -2.7 + Math.sin(a) * 1.05));
+        mesh(new THREE.TubeGeometry(arc, 12, 0.013, 4, false), flat("#accabe", 0.48), p2);
+      }
+    }
+    moonCabinet(p);
+    topplingProp(p, "conservatory");
+    cabinet(p, -7, -2.7);
+    for (const x of [-10.2, -4.5, 10.1]) pot(p, x, -3.25, 1 + rand(x) * 0.6);
+    for (let i = 0; i < 45; i++) {
+      const x = -12 + rand(i * 3) * 24, y = 2 + rand(i * 2) * 5;
+      const l = leaf(p, x, y, -4.12, 0.35 + rand(i) * 0.5, ["#496b51", "#6d8b62", "#446b5b"][i % 3], rand(i) * 3);
+      plants.push(l);
+    }
+    for (const s2 of [-1, 1]) {
+      table(p, s2 * 8.8, 0.72, 1.5, 2.1, 0.8);
+      box(p, s2 * 8.8, 1.15, 1.9, 2.1, 0.6, 0.12, mat.green, true);
+    }
+    for (let i = 0; i < 15; i++) {
+      const pet = mesh(new THREE.CircleGeometry(0.04, 5), flat("#b89e78"), p, -8 + rand(i) * 16, 0.13, -3 + rand(i * 3) * 6);
+      pet.rotation.x = -Math.PI / 2;
+    }
+    label(p, "THE WINTER GARDEN", 0, 8.35, -4.01, 5, 0.27);
+    door(p, -11, 0, "ENTRANCE HALL");
+    door(p, 11, 0, "WORKSHOP");
+  }
+  function buildWorkshop(p) {
+    floor(p);
+    wallpaper(p, "#47483a");
+    for (let i = 0; i < 7; i++) {
+      const x = -9.5 + i * 3.2;
+      gear(p, x, 5.3 + Math.sin(i * 1.8) * 1.3, -4.27, 0.7 + rand(i) * 0.65, 12 + i % 3 * 2);
+    }
+    for (const x of [-11.7, 11.7]) {
+      rod(p, [x, 0.2, -4], [x, 7.4, -4], 0.14, mat.gold);
+      rod(p, [x, 7.4, -4], [x > 0 ? 3 : -3, 7.4, -4], 0.14, mat.gold);
+      for (let y = 0.6; y < 7; y += 1.4) ring(p, x, y, -3.85, 0.21, 0.035, mat.woodDark);
+    }
+    table(p, 0, 1.25, -2.7, 5.4, 1.65);
+    box(p, 0, 2.1, -3.65, 5.5, 1.7, 0.14, mat.woodDark, true);
+    for (let i = 0; i < 11; i++) {
+      const x = -2.35 + i * 0.46;
+      const t = box(p, x, 2.2, -3.5, 0.045, 0.65, 0.05, mat.gold);
+      t.rotation.z = (i % 3 - 1) * 0.2;
+      if (i % 2 === 0) ring(p, x, 2.5, -3.46, 0.09, 0.024, mat.gold);
+    }
+    gear(p, -0.65, 1.64, -2.36, 0.36, 12);
+    gear(p, 0.1, 1.64, -2.39, 0.25, 12);
+    candelabra(p, 2, 1.35, -2.95);
+    paper(p, -1.7, 1.36, -2.4);
+    const vise = group(p, 1.05, 1.42, -2.05);
+    box(vise, 0, 0, 0, 0.55, 0.22, 0.6, mat.black, true);
+    box(vise, 0, 0.2, -0.18, 0.55, 0.35, 0.12, mat.gold);
+    box(vise, 0, 0.2, 0.18, 0.55, 0.35, 0.12, mat.gold);
+    rod(vise, [-0.6, 0.05, 0], [0.6, 0.05, 0], 0.045, mat.gold);
+    cabinet(p, -7, -2.7);
+    for (let i = 0; i < 5; i++) {
+      const g = group(p, 9 + i % 2 * 1.5, 0.5 + Math.floor(i / 2) * 1, -3.6);
+      box(g, 0, 0, 0, 1.3, 1, 1.2, mat.wood, true);
+      for (const k2 of [-1, 1]) box(g, k2 * 0.45, 0, 0.61, 0.08, 0.95, 0.03, mat.gold);
+      const b = box(g, 0, 0, 0.63, 0.08, 1.2, 0.04, mat.woodDark);
+      b.rotation.z = 0.8;
+    }
+    topplingProp(p, "workshop");
+    clockFace(p, 0, 6.2, -4.08, 1.35);
+    label(p, "EVERYTHING CAN BE REPAIRED", 0, 8.25, -4.01, 6, 0.27);
+    door(p, -11, 0, "WINTER GARDEN");
+    door(p, 11, 0, "BELFRY");
+  }
+  function buildBelfry(p) {
+    floor(p, true);
+    wallpaper(p, "#253b43");
+    for (const x of [-8, -4, 4, 8]) windowPanel(p, x, 2.5, -4.45, 2.75, 5.5);
+    for (const side of [-1, 1]) {
+      const beam = box(p, side * 6.5, 5, -3.5, 0.4, 9, 0.5, mat.wood, true);
+      beam.rotation.z = side * 0.68;
+    }
+    box(p, 0, 7, -3.2, 21, 0.6, 0.7, mat.wood, true);
+    for (const x of [-11.5, 11.5]) box(p, x, 4.3, -3.5, 0.5, 8.6, 0.6, mat.wood, true);
+    const bellGroup = group(p, 0, 5.5, -3.2);
+    cyl(bellGroup, 0, 0, 0, 0.45, 0.45, 0.7, mat.gold);
+    cyl(bellGroup, 0, -0.8, 0, 0.5, 1.4, 1.3, mat.gold, 32);
+    cyl(bellGroup, 0, -1.5, 0, 1.65, 1.65, 0.18, mat.goldLight, 32);
+    cyl(bellGroup, 0, -1.61, 0, 1.46, 1.46, 0.03, mat.black, 32);
+    rod(bellGroup, [0, -1.5, 0], [0, -2, 0], 0.05, mat.wood);
+    sphere(bellGroup, 0, -2, 0, 0.21, mat.gold);
+    pendulums.push(bellGroup);
+    rod(p, [2.1, 6.6, -3], [2.1, 0.6, -2.8], 0.035, mat.cream);
+    ring(p, 2.1, 0.56, -2.8, 0.18, 0.04, mat.cream);
+    gear(p, -2.1, 5.8, -3.3, 0.76, 16);
+    gear(p, 2.2, 6.1, -3.3, 0.9, 18);
+    cyl(p, 0, 0.45, -2.4, 0.8, 0.95, 0.9, mat.wood, 12);
+    clockFace(p, 0, 1.2, -1.78, 0.59);
+    cabinet(p, -7, -2.7);
+    candelabra(p, 9.1, 0, -3);
+    topplingProp(p, "belfry");
+    portrait(p, 10.3, 3.7, -4.18, 1.5, 2, 20);
+    const moon = mesh(new THREE.CircleGeometry(0.85, 64), flat("#b9c5af"), p, 0, 7.35, -4.4);
+    label(p, "LET THE THIRTEENTH HOUR PASS", 0, 8.22, -4.01, 7, 0.27);
+    door(p, -11, 0, "ENTRANCE HALL");
+    door(p, 11, 0, "THE LAST DOOR");
+  }
+  const builders = { foyer: buildFoyer, library: buildLibrary, conservatory: buildConservatory, workshop: buildWorkshop, belfry: buildBelfry };
+  const roomCache = /* @__PURE__ */ new Map();
+  function makeDust(parent) {
+    for (let i = 0; i < 36; i++) {
+      const d = mesh(new THREE.OctahedronGeometry(0.018 + rand(i) * 0.012), flat(i % 4 === 0 ? "#e2b778" : "#a0b8ac", 0.35 + rand(i) * 0.3), parent, -12 + rand(i * 2) * 24, 1 + rand(i * 3) * 6, -3 + rand(i * 5) * 6);
+      dust.push({ o: d, base: d.position.clone(), k: i });
+    }
+  }
+  function loadRoom2(id) {
+    id = builders[id] ? id : "foyer";
+    roomId = id;
+    for (const c of roomRoot.children) c.visible = false;
+    if (roomCache.has(id)) {
+      const entry = roomCache.get(id);
+      entry.root.visible = true;
+      ({ candles, gears, pendulums, dust, water, plants, traps, clockMechanisms } = entry);
+      return;
+    }
+    candles = [];
+    gears = [];
+    pendulums = [];
+    dust = [];
+    water = [];
+    plants = [];
+    traps = [];
+    clockMechanisms = [];
+    const root = group(roomRoot);
+    builders[id](root);
+    makeDust(root);
+    roomCache.set(id, { root, candles, gears, pendulums, dust, water, plants, traps, clockMechanisms });
+  }
+  function makeCharacter(isHunter = false, isGhost = false) {
+    const root = new THREE.Group();
+    scene.add(root);
+    const body2 = group(root);
+    const scale = isHunter ? 1.2 : 1;
+    root.scale.setScalar(scale);
+    const dress = isGhost ? cel("#789c9b") : isHunter ? cel("#283832") : cel("#30525f");
+    const skin = isGhost ? cel("#9ab8b0") : isHunter ? cel("#aa9a78") : cel("#d9b89b");
+    const boot2 = cel("#172428");
+    const hair = cel(isHunter ? "#24312b" : "#754638");
+    const head = group(body2, 0, isHunter ? 1.96 : 1.64, 0);
+    const skull = sphere(head, 0, 0, 0, isHunter ? 0.26 : 0.28, skin, 0.86, 1.1, 0.87);
+    sphere(head, 0, 0.14, -0.025, 0.28, hair, 1, 1, 0.9);
+    if (!isHunter) {
+      sphere(head, -0.22, -0.02, -0.025, 0.14, hair, 0.75, 1.6, 1);
+      sphere(head, 0.22, -0.02, -0.025, 0.14, hair, 0.75, 1.6, 1);
+      sphere(head, 0, 0.07, 0.18, 0.22, hair, 1, 0.35, 0.38);
+      box(head, 0.04, -0.075, 0.247, 0.06, 0.018, 0.018, cel("#765d50"));
+      for (const s2 of [-1, 1]) sphere(head, s2 * 0.095, 0.025, 0.232, 0.022, cel("#253c3d"));
+      const bow = group(head, 0.25, 0.12, -0.1);
+      for (const s2 of [-1, 1]) {
+        const b = mesh(new THREE.ConeGeometry(0.1, 0.19, 3), cel("#a38057"), bow, s2 * 0.08, 0, 0);
+        b.rotation.z = s2 * Math.PI / 2;
+      }
+    } else {
+      const mask = box(head, 0, -0.01, 0.22, 0.3, 0.39, 0.08, mat.cream, true);
+      for (const s2 of [-1, 1]) box(head, s2 * 0.09, 0.06, 0.272, 0.052, 0.023, 0.015, flat("#d5aa66"));
+      box(head, 0, -0.11, 0.271, 0.11, 0.016, 0.015, mat.black);
+      cyl(head, 0, 0.28, 0, 0.36, 0.36, 0.07, mat.woodDark, 12);
+      cyl(head, 0, 0.4, 0, 0.2, 0.28, 0.25, mat.woodDark, 12);
+    }
+    const torso = cyl(body2, 0, 1.18, 0, isHunter ? 0.31 : 0.23, isHunter ? 0.35 : 0.25, isHunter ? 0.95 : 0.58, isHunter ? dress : cel("#c8c6ad"), 8);
+    const skirt = cyl(body2, 0, 0.77, 0, isHunter ? 0.29 : 0.21, isHunter ? 0.42 : 0.48, isHunter ? 0.8 : 0.67, dress, 10);
+    if (!isHunter) {
+      box(body2, 0, 1.15, 0.215, 0.28, 0.46, 0.07, dress);
+      const collar = mesh(new THREE.ConeGeometry(0.21, 0.15, 4), mat.cream, body2, 0, 1.42, 0.02);
+      collar.rotation.y = Math.PI / 4;
+      box(body2, 0, 1.04, 0, 0.5, 0.07, 0.49, cel("#b99d70"));
+    }
+    const arms = [], legs = [];
+    for (const s2 of [-1, 1]) {
+      const a = group(body2, s2 * (isHunter ? 0.36 : 0.29), isHunter ? 1.58 : 1.37, 0);
+      cyl(a, 0, -0.2, 0, isHunter ? 0.1 : 0.085, isHunter ? 0.085 : 0.07, 0.42, isHunter ? dress : cel("#c9c5af"), 8);
+      const hand = sphere(a, 0, -0.46, 0.025, 0.083, skin, 0.8, 1.15, 0.9);
+      arms.push(a);
+      const l = group(body2, s2 * 0.16, 0.52, 0);
+      cyl(l, 0, -0.2, 0, 0.075, 0.065, 0.43, isHunter ? dress : cel("#b8b5a1"), 8);
+      sphere(l, 0, -0.46, 0.075, 0.12, boot2, 0.8, 0.68, 1.6);
+      legs.push(l);
+    }
+    const lantern = group(arms[1], 0, -0.62, 0.02);
+    if (!isHunter) {
+      ring(lantern, 0, 0.16, 0, 0.09, 0.02, mat.gold);
+      box(lantern, 0, -0.04, 0, 0.23, 0.3, 0.19, mat.gold, true);
+      box(lantern, 0, -0.035, 0.105, 0.145, 0.21, 0.018, flat("#ffda8c"));
+      box(lantern, 0.125, -0.035, 0, 0.012, 0.21, 0.12, flat("#dca35e"));
+      glow(lantern, 0, -0.05, 0.12, 1.3, "#ffbf70", 0.9);
+      const lid = mesh(new THREE.ConeGeometry(0.2, 0.16, 4), mat.gold, lantern, 0, 0.17, 0);
+      lid.rotation.y = Math.PI / 4;
+    } else {
+      for (const s2 of [-1, 1]) {
+        const blade = mesh(new THREE.ConeGeometry(0.115, 1.35, 3), mat.goldLight, lantern, s2 * 0.13, -0.48, 0.07);
+        blade.rotation.z = s2 * 0.19;
+        blade.rotation.x = Math.PI;
+        ring(lantern, s2 * 0.13, 0.18, 0.07, 0.13, 0.035, mat.gold);
+      }
+      sphere(lantern, 0, 0.03, 0.07, 0.06, mat.woodDark);
+    }
+    const blob = shadow(root, 0, 0.06, isHunter ? 1.65 : 1.3, 1.1);
+    const pool = mesh(new THREE.CircleGeometry(isHunter ? 0.6 : 0.77, 48), flat(isGhost ? "#8bd6d1" : "#e6c58a", isHunter ? 0 : 0.045), root, 0, 0.022, 0);
+    pool.rotation.x = -Math.PI / 2;
+    if (isGhost) root.traverse((o) => {
+      if (o.isMesh) {
+        o.material = o.material.clone();
+        o.material.transparent = true;
+        o.material.opacity = 0.34;
+        o.material.depthWrite = false;
+      }
+    });
+    root.userData = { body: body2, head, arms, legs, lantern, moving: false, crouch: false, heading: 0, hidden: false, hunter: isHunter };
+    return root;
+  }
+  const player = makeCharacter();
+  const hunter = makeCharacter(true);
+  const ghost = makeCharacter(false, true);
+  hunter.visible = false;
+  ghost.visible = false;
+  function setPlayer(x, z, heading = 0, moving = false, crouch = false, hidden = false) {
+    player.position.set(x, 0, z);
+    Object.assign(player.userData, { heading, moving, crouch, hidden });
+    player.visible = !hidden;
+  }
+  function setHunter(x, z, heading = 0, moving = false, visible = true) {
+    hunter.position.set(x, 0, z);
+    Object.assign(hunter.userData, { heading, moving });
+    hunter.visible = visible;
+  }
+  function setGhost(x, z, visible = true) {
+    ghost.position.set(x, 0.07, z);
+    ghost.visible = visible;
+    ghost.userData.moving = true;
+  }
+  function animateCharacter(c, dt, t, reduced = false) {
+    const d = c.userData;
+    if (!c.visible) return;
+    let diff = d.heading - d.body.rotation.y;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+    d.body.rotation.y += diff * Math.min(1, dt * 12);
+    const phase = t * (d.hunter ? 5.5 : 9);
+    const walk = d.moving ? 1 : 0;
+    d.body.position.y = (d.crouch ? -0.35 : 0) + Math.abs(Math.sin(phase)) * walk * 0.045;
+    d.body.rotation.x = d.crouch ? 0.2 : 0;
+    d.head.rotation.z = reduced ? 0 : Math.sin(t * 1.3) * 0.015;
+    for (let i = 0; i < 2; i++) {
+      d.legs[i].rotation.x = Math.sin(phase + i * Math.PI) * 0.45 * walk;
+      d.arms[i].rotation.x = Math.sin(phase + i * Math.PI + Math.PI) * 0.32 * walk;
+    }
+    d.arms[1].rotation.x -= 0.15;
+    d.lantern.rotation.z = (reduced ? 0 : Math.sin(t * 4) * 0.05) + Math.sin(phase) * 0.08 * walk;
+  }
+  function update(dt, time, state = {}) {
+    lastViewState = state;
+    updateView(dt, state);
+    const locomotionTime = time;
+    if (state.reducedMotion) time = 0;
+    for (const t of traps) {
+      const used = !!state.trapRooms?.includes(roomId);
+      t.progress += ((used ? 1 : 0) - t.progress) * Math.min(1, dt * (state.reducedMotion ? 30 : 8));
+      if (t.kind === "belfry") {
+        t.g.userData.counterweight.position.y = -t.progress * 0.75;
+        t.g.userData.rope.scale.y = 1 + t.progress * 0.75 / 1.22;
+        t.g.userData.rope.position.y = 2.51 - t.progress * 0.375;
+      } else {
+        t.g.rotation.z = t.progress * 1.48;
+        t.g.position.y = 0.02 + t.progress * 0.38;
+      }
+    }
+    for (const c of clockMechanisms) {
+      c.open += ((state.clockSolved ? 1 : 0) - c.open) * Math.min(1, dt * 3);
+      c.pivot.rotation.y = -c.open * 1.5;
+      c.stair.visible = c.open > 0.05;
+      c.hands.hour.rotation.z = Math.PI / 120 + c.open * Math.PI / 30;
+      c.hands.minute.rotation.z = Math.PI / 10 + c.open * Math.PI * 0.4;
+    }
+    for (const { f, g, k: k2 } of candles) {
+      const s2 = 1 + Math.sin(time * 8 + k2 * 20) * 0.1 + Math.sin(time * 14 + k2 * 80) * 0.05;
+      f.scale.y = 1.7 * s2;
+      g.material.opacity = 0.63 + Math.sin(time * 7 + k2 * 42) * 0.11;
+    }
+    for (const { g, s: s2 } of gears) g.rotation.z = time * s2;
+    for (const p of pendulums) p.rotation.z = Math.sin(time * (roomId === "belfry" ? 0.8 : 1.4)) * (roomId === "belfry" ? 0.025 : 0.14);
+    for (const { o, base, k: k2 } of dust) {
+      o.position.x = base.x + Math.sin(time * 0.16 + k2) * 0.5;
+      o.position.y = base.y + Math.sin(time * 0.22 + k2) * 0.35;
+      o.rotation.y = time * 0.2 + k2;
+    }
+    for (let i = 0; i < plants.length; i++) plants[i].rotation.x = Math.sin(time * 0.7 + i) * 0.025;
+    for (const w of water) w.material.opacity = 0.7 + Math.sin(time * 2) * 0.07;
+    animateCharacter(player, dt, locomotionTime, state.reducedMotion);
+    animateCharacter(hunter, dt, locomotionTime, state.reducedMotion);
+    animateCharacter(ghost, dt, locomotionTime, state.reducedMotion);
+  }
+  function updateView(dt, state) {
+    const close = viewportAspect < 1.1 && ["play", "attract"].includes(state.mode);
+    const span = close ? Math.max(4.5, 9 * viewportAspect) : Math.max(15.4, 9 * viewportAspect);
+    const targetX = close ? THREE.MathUtils.clamp(player.position.x, -13.3 + span, 13.3 - span) : 0;
+    cameraX = state.reducedMotion ? targetX : THREE.MathUtils.lerp(cameraX, targetX, Math.min(1, dt * 5));
+    camera.position.x = cameraX;
+    camera.lookAt(cameraX, 3.3, 0);
+    if (camera.right !== span || camera.top !== span / viewportAspect) {
+      camera.left = -span;
+      camera.right = span;
+      camera.top = span / viewportAspect;
+      camera.bottom = -span / viewportAspect;
+      camera.updateProjectionMatrix();
+    }
+  }
+  function resize(w, h) {
+    viewportAspect = w / h;
+    updateView(1, lastViewState);
+  }
+  const markers = { main: new THREE.Vector3(0, 2.1, -2.5), hide: new THREE.Vector3(-7, 3.7, -2.5), left: new THREE.Vector3(-11, 4, 0), right: new THREE.Vector3(11, 4, 0) };
+  loadRoom2("foyer");
+  setPlayer(0, 1.1, 0, false);
+  resize(window.innerWidth, window.innerHeight);
+  return { scene, camera, player, hunter, ghost, loadRoom: loadRoom2, update, resize, setPlayer, setHunter, setGhost, markers };
+}
+
+// input.js
+var InputController = class {
+  constructor(onActivity = () => {
+  }) {
+    this.onActivity = onActivity;
+    this.keys = /* @__PURE__ */ new Set();
+    this.events = /* @__PURE__ */ new Set();
+    this.padButtons = [];
+    this.padAxes = { x: 0, y: 0 };
+    this._axes = { x: 0, y: 0 };
+    this._held = { run: false, crouch: false, focus: false };
+    this._gamepadConnected = false;
+    this._mode = matchMedia("(pointer: coarse)").matches ? "touch" : "keyboard";
+    this.invertX = false;
+    this.invertY = false;
+    this.nav = { up: 0, down: 0, left: 0, right: 0 };
+    this._lastAxisActivity = 0;
+    this._lastPointerActivity = 0;
+    this._listeners = [];
+    const bind = (target, name, fn, options) => {
+      target.addEventListener(name, fn, options);
+      this._listeners.push(() => target.removeEventListener(name, fn, options));
+    };
+    const editable = (el) => el instanceof Element && !!el.closest('input,textarea,select,[contenteditable="true"]');
+    const keyboardActions = {
+      Enter: ["confirm", "interact"],
+      Space: ["confirm", "interact"],
+      KeyE: ["confirm", "interact"],
+      Escape: ["pause", "back"],
+      Backspace: ["back"],
+      KeyQ: ["distract"],
+      KeyJ: ["journal"],
+      Tab: ["journal"],
+      KeyP: ["pause"]
+    };
+    const gameKeys = /* @__PURE__ */ new Set([
+      ...Object.keys(keyboardActions),
+      "KeyW",
+      "KeyA",
+      "KeyS",
+      "KeyD",
+      "ArrowUp",
+      "ArrowDown",
+      "ArrowLeft",
+      "ArrowRight",
+      "KeyC",
+      "KeyF",
+      "ShiftLeft",
+      "ShiftRight",
+      "ControlLeft",
+      "ControlRight"
+    ]);
+    bind(window, "keydown", (e) => {
+      this._mode = "keyboard";
+      if (!e.repeat) this.onActivity("keyboard");
+      if (editable(e.target)) return;
+      if (gameKeys.has(e.code)) e.preventDefault();
+      this.keys.add(e.code);
+      if (!e.repeat) for (const action of keyboardActions[e.code] || []) this.events.add(action);
+    });
+    bind(window, "keyup", (e) => this.keys.delete(e.code));
+    bind(window, "pointerdown", (e) => {
+      this._mode = e.pointerType === "touch" ? "touch" : "keyboard";
+      this.onActivity(this._mode);
+    }, { passive: true });
+    bind(window, "pointermove", (e) => {
+      const now = performance.now();
+      if (e.pointerType === "mouse" && now - this._lastPointerActivity > 250 && Math.abs(e.movementX) + Math.abs(e.movementY) > 2) {
+        this._lastPointerActivity = now;
+        this.onActivity("pointer");
+      }
+    }, { passive: true });
+    bind(window, "blur", () => this.clear());
+    bind(document, "visibilitychange", () => {
+      if (document.hidden) this.clear();
+    });
+    bind(window, "gamepadconnected", () => {
+      this._gamepadConnected = true;
+      this._mode = "gamepad";
+      this.onActivity("gamepad");
+    });
+    bind(window, "gamepaddisconnected", () => {
+      this.padButtons = [];
+      this.padAxes = { x: 0, y: 0 };
+    });
+  }
+  get axes() {
+    return this._axes;
+  }
+  get held() {
+    return this._held;
+  }
+  get gamepadConnected() {
+    return this._gamepadConnected;
+  }
+  get mode() {
+    return this._mode;
+  }
+  setInversion(horizontal, vertical) {
+    this.invertX = !!horizontal;
+    this.invertY = !!vertical;
+  }
+  consume(action) {
+    if (!this.events.has(action)) return false;
+    this.events.delete(action);
+    if (action === "confirm" || action === "interact") {
+      this.events.delete("confirm");
+      this.events.delete("interact");
+    }
+    if (action === "back" || action === "pause") {
+      this.events.delete("back");
+      this.events.delete("pause");
+    }
+    return true;
+  }
+  clear() {
+    this.keys.clear();
+    this.events.clear();
+    this._axes.x = this._axes.y = 0;
+    this._held.run = this._held.crouch = this._held.focus = false;
+    for (const k2 in this.nav) this.nav[k2] = 0;
+  }
+  update(dt = 1 / 60) {
+    const elapsed = Math.min(Math.max(dt, 0), 0.1);
+    const pads = navigator.getGamepads ? Array.from(navigator.getGamepads() || []) : [];
+    const pad = pads.find((p) => p?.connected && p.mapping === "standard") || pads.find((p) => p?.connected);
+    this._gamepadConnected = !!pad;
+    let x = 0, y = 0, menuX = 0, menuY = 0;
+    const buttons = pad ? pad.buttons.map((b) => !!b.pressed || b.value > 0.55) : [];
+    const buttonActions = {
+      0: ["confirm", "interact"],
+      1: ["back"],
+      2: ["distract"],
+      3: ["journal"],
+      9: ["pause"]
+    };
+    if (pad) {
+      x = Number.isFinite(pad.axes[0]) ? pad.axes[0] : 0;
+      y = Number.isFinite(pad.axes[1]) ? pad.axes[1] : 0;
+      const magnitude = Math.hypot(x, y);
+      if (magnitude < 0.2) x = y = 0;
+      else {
+        const scaled = Math.min(1, (magnitude - 0.2) / 0.8) / magnitude;
+        x *= scaled;
+        y *= scaled;
+      }
+      if (buttons[14] || buttons[15]) x = (buttons[15] ? 1 : 0) - (buttons[14] ? 1 : 0);
+      if (buttons[12] || buttons[13]) y = (buttons[13] ? 1 : 0) - (buttons[12] ? 1 : 0);
+      menuX = x;
+      menuY = y;
+      if (this.invertX) x *= -1;
+      if (this.invertY) y *= -1;
+      let active = false;
+      buttons.forEach((down, index) => {
+        if (down && !this.padButtons[index]) {
+          active = true;
+          if (!(index === 9 && buttons[8])) for (const action of buttonActions[index] || []) this.events.add(action);
+        }
+      });
+      const now = performance.now();
+      if (Math.hypot(x, y) > 0.3 && (now - this._lastAxisActivity > 200 || Math.hypot(x - this.padAxes.x, y - this.padAxes.y) > 0.3)) {
+        this._lastAxisActivity = now;
+        active = true;
+      }
+      if (active) {
+        this._mode = "gamepad";
+        this.onActivity("gamepad");
+      }
+    }
+    this.padButtons = buttons;
+    this.padAxes.x = x;
+    this.padAxes.y = y;
+    const key = (...codes) => codes.some((code) => this.keys.has(code));
+    const kx = (key("KeyD", "ArrowRight") ? 1 : 0) - (key("KeyA", "ArrowLeft") ? 1 : 0);
+    const ky = (key("KeyS", "ArrowDown") ? 1 : 0) - (key("KeyW", "ArrowUp") ? 1 : 0);
+    if (kx || ky) {
+      x = kx;
+      y = ky;
+      menuX = kx;
+      menuY = ky;
+    }
+    const length = Math.hypot(x, y);
+    if (length > 1) {
+      x /= length;
+      y /= length;
+    }
+    this._axes.x = x;
+    this._axes.y = y;
+    this._held.run = key("ShiftLeft", "ShiftRight") || !!buttons[5] || !!buttons[7];
+    this._held.crouch = key("KeyC", "ControlLeft", "ControlRight") || !!buttons[1];
+    this._held.focus = key("KeyF") || !!buttons[4] || !!buttons[6];
+    const directions = { left: menuX < -0.45, right: menuX > 0.45, up: menuY < -0.45, down: menuY > 0.45 };
+    for (const name in directions) {
+      if (!directions[name]) {
+        this.nav[name] = 0;
+        continue;
+      }
+      if (this.nav[name] === 0) {
+        this.events.add(name);
+        this.nav[name] = 0.38;
+      } else {
+        this.nav[name] -= elapsed;
+        if (this.nav[name] <= 0) {
+          this.events.add(name);
+          this.nav[name] = 0.14;
+        }
+      }
+    }
+  }
+  dispose() {
+    this._listeners.forEach((remove) => remove());
+    this.clear();
+  }
+};
+
+// audio.js
+var AudioEngine = class {
+  constructor() {
+    this.context = null;
+    this.volume = 0.62;
+    this.muted = false;
+    this.step = 0;
+    this.nextMusic = 0;
+    this.nextFoot = 0;
+    this.nextHeart = 0;
+    this.danger = 0;
+    this.room = "foyer";
+    this.playing = false;
+  }
+  async unlock() {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return false;
+    if (!this.context) {
+      const ctx = this.context = new AudioContext();
+      this.master = ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : this.volume;
+      this.filter = ctx.createBiquadFilter();
+      this.filter.type = "lowpass";
+      this.filter.frequency.value = 7500;
+      this.compressor = ctx.createDynamicsCompressor();
+      this.compressor.threshold.value = -17;
+      this.compressor.knee.value = 20;
+      this.compressor.ratio.value = 4;
+      this.compressor.attack.value = 6e-3;
+      this.compressor.release.value = 0.25;
+      this.music = ctx.createGain();
+      this.music.gain.value = 0.46;
+      this.effects = ctx.createGain();
+      this.effects.gain.value = 0.64;
+      this.music.connect(this.filter);
+      this.effects.connect(this.filter);
+      this.filter.connect(this.master);
+      this.master.connect(this.compressor);
+      this.compressor.connect(ctx.destination);
+      this.reverb = ctx.createConvolver();
+      const impulse = ctx.createBuffer(2, Math.floor(ctx.sampleRate * 2.2), ctx.sampleRate);
+      for (let channel = 0; channel < 2; channel++) {
+        const data2 = impulse.getChannelData(channel);
+        for (let i = 0; i < data2.length; i++) data2[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / data2.length, 2.9) * 0.5;
+      }
+      this.reverb.buffer = impulse;
+      this.reverbGain = ctx.createGain();
+      this.reverbGain.gain.value = 0.21;
+      this.reverb.connect(this.reverbGain);
+      this.reverbGain.connect(this.filter);
+      this.noise = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+      const data = this.noise.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+      this.droneGain = ctx.createGain();
+      this.droneGain.gain.value = 0.035;
+      this.droneGain.connect(this.music);
+      this.drones = [36.708, 55, 73.416].map((frequency, index) => {
+        const osc = ctx.createOscillator();
+        osc.type = index === 1 ? "triangle" : "sine";
+        osc.frequency.value = frequency;
+        osc.detune.value = [-4, 3, 1][index];
+        const gain = ctx.createGain();
+        gain.gain.value = index === 2 ? 0.35 : 0.65;
+        osc.connect(gain);
+        gain.connect(this.droneGain);
+        osc.start();
+        return osc;
+      });
+      this.nextMusic = ctx.currentTime + 0.08;
+    }
+    try {
+      if (this.context.state !== "running") await this.context.resume();
+    } catch (_) {
+      return false;
+    }
+    return this.context.state === "running";
+  }
+  setVolume(value) {
+    this.volume = Math.max(0, Math.min(1, Number(value) || 0));
+    if (this.master) this.master.gain.setTargetAtTime(this.muted ? 0 : this.volume, this.context.currentTime, 0.04);
+  }
+  setMuted(muted) {
+    this.muted = !!muted;
+    if (this.master) this.master.gain.setTargetAtTime(this.muted ? 0 : this.volume, this.context.currentTime, 0.04);
+  }
+  _tone(frequency, duration = 0.3, gain = 0.1, type = "sine", when, destination, endFrequency, attack = 8e-3) {
+    const ctx = this.context;
+    if (!ctx) return;
+    const time = when ?? ctx.currentTime;
+    const oscillator = ctx.createOscillator();
+    const envelope = ctx.createGain();
+    oscillator.type = type;
+    oscillator.frequency.setValueAtTime(Math.max(1, frequency), time);
+    if (endFrequency) oscillator.frequency.exponentialRampToValueAtTime(Math.max(1, endFrequency), time + duration);
+    envelope.gain.setValueAtTime(1e-4, time);
+    envelope.gain.exponentialRampToValueAtTime(Math.max(2e-4, gain), time + attack);
+    envelope.gain.exponentialRampToValueAtTime(1e-4, time + duration);
+    oscillator.connect(envelope);
+    envelope.connect(destination || this.effects);
+    oscillator.start(time);
+    oscillator.stop(time + duration + 0.03);
+  }
+  _noise(duration, gain, frequency, when, highpass = false) {
+    const ctx = this.context;
+    if (!ctx) return;
+    const time = when ?? ctx.currentTime;
+    const source = ctx.createBufferSource();
+    source.buffer = this.noise;
+    const filter = ctx.createBiquadFilter();
+    filter.type = highpass ? "highpass" : "lowpass";
+    filter.frequency.value = frequency;
+    const envelope = ctx.createGain();
+    envelope.gain.setValueAtTime(1e-4, time);
+    envelope.gain.exponentialRampToValueAtTime(Math.max(gain, 2e-4), time + 6e-3);
+    envelope.gain.exponentialRampToValueAtTime(1e-4, time + duration);
+    source.connect(filter);
+    filter.connect(envelope);
+    envelope.connect(this.effects);
+    source.start(time, Math.random() * 0.5);
+    source.stop(time + duration + 0.02);
+  }
+  _bell(frequency, gain = 0.12, time, duration = 2.5, music = false) {
+    const destination = music ? this.music : this.effects;
+    for (const [multiple, strength, length] of [[1, 1, 1], [2.756, 0.2, 0.58], [4.07, 0.085, 0.3]]) {
+      this._tone(frequency * multiple, duration * length, gain * strength, "sine", time, destination);
+      this._tone(frequency * multiple * 1.003, duration * length, gain * strength * 0.32, "sine", time, this.reverb);
+    }
+  }
+  play(name) {
+    const ctx = this.context;
+    if (!ctx || ctx.state !== "running") return;
+    const t = ctx.currentTime + 5e-3;
+    switch (name) {
+      case "select":
+      case "move":
+      case "hover":
+        this._tone(293.66, 0.09, 0.06, "sine", t);
+        break;
+      case "confirm":
+      case "interact":
+      case "save":
+        this._bell(587.33, 0.075, t, 0.7);
+        this._bell(880, 0.035, t + 0.09, 0.6);
+        break;
+      case "back":
+        this._tone(220, 0.14, 0.07, "triangle", t, null, 164.81);
+        break;
+      case "step":
+      case "footstep":
+        this._noise(0.09, 0.14, this.room === "conservatory" ? 2e3 : 650, t);
+        this._tone(75 + Math.random() * 18, 0.09, 0.12, "sine", t, null, 36);
+        break;
+      case "run":
+        this._noise(0.12, 0.2, 850, t);
+        this._tone(92, 0.13, 0.19, "sine", t, null, 38);
+        break;
+      case "door":
+        this._noise(0.5, 0.16, 450, t);
+        this._tone(145, 0.55, 0.085, "sawtooth", t, null, 70);
+        this._tone(48, 0.24, 0.22, "sine", t + 0.34, null, 25);
+        break;
+      case "locked":
+      case "error":
+        this._tone(83, 0.16, 0.12, "triangle", t);
+        this._noise(0.1, 0.1, 500, t + 0.12);
+        break;
+      case "item":
+      case "pickup":
+        [293.66, 440, 587.33].forEach((f, i) => this._bell(f, 0.1 - i * 0.015, t + i * 0.15, 1.8));
+        break;
+      case "hide":
+        this._noise(0.3, 0.16, 350, t);
+        this._tone(60, 0.3, 0.16, "sine", t, null, 32);
+        break;
+      case "unhide":
+        this._noise(0.25, 0.12, 600, t);
+        this._tone(70, 0.18, 0.08, "triangle", t, null, 100);
+        break;
+      case "hit":
+      case "impact":
+      case "caught":
+        this._noise(0.5, 0.46, 1700, t);
+        this._tone(150, 0.5, 0.34, "sawtooth", t, null, 32);
+        this._bell(155.56, 0.13, t, 1.8);
+        break;
+      case "death":
+        this._noise(0.8, 0.32, 1e3, t);
+        [146.83, 155.56, 220].forEach((f) => this._tone(f, 2.6, 0.12, "triangle", t, this.reverb, f * 0.4));
+        break;
+      case "ending":
+      case "win":
+        [293.66, 349.23, 440, 587.33, 698.46].forEach((f, i) => this._bell(f, 0.15, t + i * 0.38, 4));
+        break;
+      case "bell":
+        this._bell(146.83, 0.3, t, 5);
+        this._bell(73.416, 0.2, t, 6);
+        break;
+      case "clock":
+      case "tick":
+        this._noise(0.035, 0.08, 1900, t, true);
+        this._tone(1020, 0.028, 0.04, "sine", t);
+        break;
+      case "distract":
+      case "throw":
+      case "glass":
+      case "lure":
+        this._noise(0.08, 0.08, 3500, t, true);
+        [1567.98, 2093, 2637.02, 3135.96].forEach((f, i) => this._bell(f, 0.06, t + 0.22 + i * 0.035, 0.5));
+        this._noise(0.4, 0.13, 2900, t + 0.22, true);
+        break;
+      case "panic":
+      case "danger":
+        [146.83, 155.56, 293.66].forEach((f) => this._tone(f, 1.5, 0.13, "sawtooth", t, this.reverb, f * 0.93, 0.12));
+        break;
+      case "breathe":
+        this._noise(0.8, 0.08, 950, t);
+        break;
+    }
+  }
+  update(dt, state = {}) {
+    const ctx = this.context;
+    if (!ctx || ctx.state !== "running") return;
+    const now = ctx.currentTime;
+    this.danger += (Math.max(0, Math.min(1, Number(state.danger) || 0)) - this.danger) * Math.min(1, dt * 4);
+    this.room = state.room || this.room;
+    this.playing = !!state.playing;
+    this.filter.frequency.setTargetAtTime(state.hidden ? 1300 : 7200, now, 0.35);
+    this.droneGain.gain.setTargetAtTime(0.033 + this.danger * 0.045, now, 0.3);
+    if (this.nextMusic < now - 0.5) this.nextMusic = now + 0.03;
+    while (this.nextMusic < now + 0.12) {
+      const t = this.nextMusic;
+      const phrase = [74, null, 69, 77, null, 76, 69, null, 74, null, 72, 69, 65, null, 68, null];
+      const roomTranspose = this.room === "conservatory" ? 12 : this.room === "belfry" ? -12 : 0;
+      const note2 = phrase[this.step % 16];
+      if (note2 !== null && this.danger < 0.85) {
+        const frequency = 440 * 2 ** ((note2 + roomTranspose - 69) / 12);
+        this._bell(frequency, (0.045 + (this.step % 4 === 0 ? 0.025 : 0)) * (1 - this.danger * 0.5), t, 2.8, true);
+      }
+      if (this.step % 2 === 0) {
+        this._tone(this.step % 4 === 0 ? 146.83 : 138.59, 0.17, 8e-3 + this.danger * 0.12, "triangle", t, this.music);
+        this._tone(110, 0.18, this.danger * 0.035 + 2e-4, "sine", t + 0.1, this.music);
+      }
+      this._tone(this.step % 2 ? 880 : 1100, 0.022, 0.012, "sine", t, this.music);
+      this.step++;
+      this.nextMusic += 0.5 - this.danger * 0.22;
+    }
+    if (this.playing && state.moving && !state.hidden && now >= this.nextFoot) {
+      this.play(state.running ? "run" : "step");
+      this.nextFoot = now + (state.running ? 0.28 : 0.47);
+    }
+    if (this.playing && this.danger > 0.25 && now >= this.nextHeart) {
+      this._tone(55, 0.16, this.danger * 0.22, "sine", now, this.effects, 30);
+      this._tone(46, 0.16, this.danger * 0.15, "sine", now + 0.17, this.effects, 28);
+      this.nextHeart = now + 1.1 - this.danger * 0.58;
+    }
+  }
+  dispose() {
+    if (this.context) {
+      this.drones?.forEach((osc) => {
+        try {
+          osc.stop();
+        } catch (_) {
+        }
+      });
+      this.context.close().catch(() => {
+      });
+      this.context = null;
+    }
+  }
+};
+
+// online.js
+var OnlineSession = class {
+  /**
+   * Hooks:
+   * onConnect(info) -> build a fresh run without title / attract / saved progress.
+   * onStart(info) -> may create/resume audio; gameplay still waits for canPlay.
+   * onTimeUp() -> stop the run and show its result (adapter reports last score).
+   * onEnd(event) -> stop audio and input, leave final state visible.
+   * onStatus(text), probe() -> {scene,menu,world,input}.
+   */
+  constructor(hooks = {}) {
+    this.hub = globalThis.AIHub;
+    this.hooks = hooks;
+    this.active = !!this.hub?.active;
+    this.connected = false;
+    this.ended = false;
+    this.reported = false;
+    this.waitingForGesture = false;
+    this.info = null;
+    this.latest = { score: 0, label: "Entered the house" };
+    this.unsubscribers = [];
+    this.hub?.probe(() => {
+      const own = this.hooks.probe?.() || {};
+      const scene = this.ended || this.reported ? "over" : this.active && (!this.connected || !this.canPlay) ? "ready" : own.scene || "title";
+      return {
+        scene,
+        menu: !!own.menu,
+        world: Number(own.world) || 0,
+        input: own.input || { x: 0, y: 0, fire: false }
+      };
+    });
+  }
+  get time() {
+    return this.active ? this.hub.time() : 0;
+  }
+  get canPlay() {
+    return !this.active || this.connected && !this.ended && !this.reported && this.hub.time() >= 0;
+  }
+  get countdown() {
+    return this.active && this.connected && this.time < 0 && Number.isFinite(this.time) ? Math.ceil(-this.time / 1e3) : null;
+  }
+  get players() {
+    return this.info?.players || [];
+  }
+  /** Call once after assets, physics and renderer are ready. Returns null solo. */
+  async connect() {
+    if (!this.active || !this.hub) return null;
+    this.hooks.onStatus?.("Joining AI Hub\u2026");
+    const on = (name, handler) => this.unsubscribers.push(this.hub.on(name, handler));
+    on("start", (event) => {
+      this.hooks.onStatus?.("The house opens in three\u2026");
+      this.hooks.onStart?.(event);
+    });
+    on("time-up", () => {
+      if (this.ended || this.reported) return;
+      this.finish({ escaped: false, score: this.latest.score });
+      this.hooks.onTimeUp?.();
+    });
+    on("end", (event) => {
+      this.ended = true;
+      this.waitingForGesture = false;
+      this.hooks.onStatus?.("Round complete");
+      this.hooks.onEnd?.(event);
+    });
+    on("leave", () => {
+      this.hooks.onStatus?.("A rival left. Your escape continues.");
+    });
+    this.info = await this.hub.connect({ mode: "parallel", seats: [1, 4] });
+    if (!this.info) {
+      this.active = false;
+      this.hooks.onStatus?.("Solo play");
+      return null;
+    }
+    this.connected = true;
+    await this.hooks.onConnect?.(this.info);
+    if (this.info.splash) {
+      this.hub.ready();
+      this.hooks.onStatus?.("Ready for AI Hub");
+    } else {
+      this.waitingForGesture = true;
+      this.hooks.onStatus?.("Press any key, click or controller button when ready");
+    }
+    return this.info;
+  }
+  /** Feed genuine keyboard, pointer or controller presses here. */
+  inputGesture() {
+    if (!this.active || !this.waitingForGesture || this.ended) return;
+    this.waitingForGesture = false;
+    this.hub.ready();
+    this.hooks.onStatus?.("Ready for AI Hub");
+  }
+  /** Feed progress each frame or when objectives change. No peer messages. */
+  update(snapshot = {}) {
+    if (Number.isFinite(snapshot.score)) this.latest.score = Math.max(0, snapshot.score);
+    if (snapshot.label != null) this.latest.label = String(snapshot.label).slice(0, 24);
+    if (this.active && this.connected && !this.ended && !this.reported && this.time >= 0) {
+      this.hub.progress(this.latest);
+    }
+  }
+  /** A successful escape ranks by synchronized finish time; unfinished by score. */
+  finish({ escaped = false, score: score2 = this.latest.score, stats = {}, awards = [] } = {}) {
+    if (!this.active || !this.connected || this.reported || this.ended) return;
+    this.reported = true;
+    const result = { stats, awards };
+    if (escaped && Number.isFinite(this.time)) result.time = Math.max(0, Math.round(this.time));
+    else result.score = Number.isFinite(score2) ? score2 : this.latest.score;
+    this.hub.result(result);
+    this.hooks.onStatus?.(escaped ? "Escaped \xB7 waiting for rivals" : "Round finished \xB7 waiting for rivals");
+  }
+  fail(message) {
+    if (!this.active) return;
+    this.hub?.fail(String(message));
+  }
+};
+
+// main.js
+var $ = (s2) => document.getElementById(s2);
+var clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+var SAVE = "hourglass-save-v1";
+var PREF = "hourglass-prefs-v1";
+var ROOMS = {
+  foyer: { name: "The Entrance Hall", subtitle: "A minute that will not end", main: "Examine the great clock", left: "library", right: "conservatory", hide: "Hide in the hall cabinet", trap: "Pull the candle stand" },
+  library: { name: "The Mourning Library", subtitle: "Someone has crossed out the names", main: "Read the keeper\u2019s ledger", left: null, right: "foyer", hide: "Hide in the wardrobe", trap: "Topple the book trolley" },
+  conservatory: { name: "The Glass Garden", subtitle: "Nothing here has seen the sun", main: "Examine the moon cabinet", left: "foyer", right: "workshop", hide: "Hide in the garden cupboard", trap: "Overturn the plant stand" },
+  workshop: { name: "The Keeper\u2019s Workshop", subtitle: "Even the dolls know to be quiet", main: "Search the workbench", left: "conservatory", right: "belfry", hide: "Hide in the linen press", trap: "Pull the tool rack" },
+  belfry: { name: "The Thirteenth Bell", subtitle: "There is room for one more name", main: "Approach the bell", left: "foyer", right: null, hide: "Hide in the bell keeper\u2019s cabinet", trap: "Release the counterweight" }
+};
+var prefs = { volume: 0.65, invertX: false, invertY: false, brightness: false, reduced: false, difficulty: "Dread" };
+try {
+  prefs = { ...prefs, ...JSON.parse(localStorage.getItem(PREF) || "{}") };
+} catch {
+}
+var audio = new AudioEngine();
+var ready = false;
+var world;
+var renderer;
+var physics;
+var body;
+var collider;
+var kcc;
+var hunterBody;
+var hunterCollider;
+var hunterKcc;
+var mode = "title";
+var modalKind = null;
+var menuItems = [];
+var menuIndex = 0;
+var modalReturn = null;
+var modalClose = null;
+var lastActivity = performance.now();
+var ignoreUntil = 0;
+var toastTimer = 0;
+var announceTimer = 0;
+var simTime = 0;
+var frameTime = performance.now();
+var transitioning = false;
+var playing = false;
+var nearby = null;
+var attractTime = 0;
+var attractStage = -1;
+var struggleHits = 0;
+var struggleTime = 0;
+var frameCount = 0;
+var s;
+var fixedItems = [];
+var projectiles = [];
+var gamepadMode = false;
+var sessionStatus = "";
+var actionHeld = false;
+var input = new InputController(() => {
+  lastActivity = performance.now();
+  audio.unlock();
+  online?.inputGesture();
+  if (mode === "attract") {
+    showTitle();
+    ignoreUntil = performance.now() + 400;
+    input.clear();
+  }
+});
+var online = new OnlineSession({ onConnect: () => startRun(false, false), onStart: () => audio.unlock(), onTimeUp: () => finishSession(false), onEnd: () => {
+  audio.setMuted(true);
+  finishSession(true);
+}, onStatus: (t) => {
+  sessionStatus = t;
+}, probe: () => ({ scene: mode === "play" ? "play" : mode === "ending" || mode === "dead" ? "over" : "title", menu: !!modalKind, world: simTime, input: { x: input.axes.x, y: input.axes.y, fire: actionHeld } }) });
+for (const ev of ["keydown", "keyup"]) window.addEventListener(ev, (e) => {
+  if (["KeyE", "Enter", "Space"].includes(e.code)) actionHeld = ev === "keydown";
+});
+function fresh() {
+  return { room: "foyer", x: -4, z: 1.7, heading: 1.4, stamina: 100, panic: 0, hidden: false, hideSeen: false, hiddenTime: 0, flags: {}, notes: [], birds: 3, trapRooms: [], elapsed: 0, escapes: 0, deaths: 0, chapter: 0, hunter: { room: "library", x: 10, z: 0, heading: -1.57, phase: "dormant", timer: 16, lost: 0, stun: 0, notice: 0 }, struggleCooldown: 0, ending: null };
+}
+s = fresh();
+var notes = { ledger: "\u201CFirst came the moth, for it loved the moon. Last came the thorn, for it loved nothing.\u201D The keeper\u2019s hand shakes on the final word.", garden: "An inscription beneath the moon cabinet: \u201CGive the house its heart. Set its hands a quarter before midnight. Then the bell will remember.\u201D", workshop: "Iris\u2019s locket is warm. Inside: \u201CIf he takes my voice, bring this to the bell. Please do not leave me here.\u201D", clock: "The clock opens at 11:45. Behind its face, a narrow stair leads to the bell. Somewhere above, Iris is still waiting.", intro: "October 29. Iris wrote that she had found work at Blackthorn House. Three weeks later, her letters stopped." };
+function savePrefs() {
+  try {
+    localStorage.setItem(PREF, JSON.stringify(prefs));
+  } catch {
+  }
+  applyPrefs();
+}
+function applyPrefs() {
+  input.setInversion(prefs.invertX, prefs.invertY);
+  audio.setVolume(prefs.volume);
+  document.body.classList.toggle("bright", prefs.brightness);
+  document.body.classList.toggle("reduced", prefs.reduced);
+}
+function saveGame() {
+  if (mode !== "play" || online.active) return;
+  try {
+    localStorage.setItem(SAVE, JSON.stringify({ room: s.room, flags: s.flags, notes: s.notes, birds: Math.max(2, s.birds), elapsed: s.elapsed, escapes: s.escapes, deaths: s.deaths, trapRooms: s.trapRooms }));
+  } catch {
+  }
+}
+function hasSave() {
+  try {
+    return !!JSON.parse(localStorage.getItem(SAVE) || "null");
+  } catch {
+    return false;
+  }
+}
+function notify(msg, duration = 4) {
+  $("toast").textContent = msg;
+  $("toast").classList.add("show");
+  toastTimer = duration;
+}
+function k(name) {
+  const map = gamepadMode ? { interact: "\u2715", run: "R2", crouch: "\u25CB", distract: "\u25A1", journal: "\u25B3", focus: "L1", pause: "OPTIONS", move: "L" } : { interact: "E", run: "SHIFT", crouch: "C", distract: "Q", journal: "J", focus: "F", pause: "ESC", move: "WASD" };
+  return `<kbd>${map[name]}</kbd>`;
+}
+function menu(container, items, index = 0) {
+  menuItems = items;
+  menuIndex = Math.min(index, items.length - 1);
+  container.innerHTML = "";
+  items.forEach((it, i) => {
+    const b = document.createElement("button");
+    b.innerHTML = `${it.label}${it.right ? `<span class="buttonRight">${it.right}</span>` : ""}`;
+    b.disabled = !!it.disabled;
+    b.className = it.primary ? "primary" : "";
+    b.addEventListener("pointerenter", () => {
+      if (!it.disabled) {
+        menuIndex = i;
+        highlight();
+      }
+    });
+    b.addEventListener("click", () => {
+      if (!it.disabled) {
+        menuIndex = i;
+        audio.play("select");
+        it.action?.();
+      }
+    });
+    container.appendChild(b);
+  });
+  highlight();
+  input.clear();
+}
+function highlight() {
+  const box = modalKind ? $("modalMenu") : $("titleMenu");
+  [...box.children].forEach((b, i) => b.classList.toggle("focused", i === menuIndex));
+}
+function navigateMenu() {
+  if (!menuItems.length) return;
+  let d = input.consume("down") ? 1 : input.consume("up") ? -1 : 0;
+  if (d) {
+    let count = 0;
+    do {
+      menuIndex = (menuIndex + d + menuItems.length) % menuItems.length;
+      count++;
+    } while (menuItems[menuIndex].disabled && count < menuItems.length);
+    highlight();
+    audio.play("tick");
+    const box = modalKind ? $("modalMenu") : $("titleMenu");
+    box.children[menuIndex]?.scrollIntoView({ block: "nearest" });
+  }
+  const left = input.consume("left"), right = input.consume("right");
+  if (left || right) menuItems[menuIndex]?.adjust?.(right ? 1 : -1);
+  if (input.consume("confirm") && !menuItems[menuIndex]?.disabled) {
+    audio.play("select");
+    menuItems[menuIndex]?.action?.();
+  }
+}
+function dialog(kind, title, body2, items, { eyebrow = "BLACKTHORN HOUSE", footer = "", close = null, index = 0 } = {}) {
+  modalReturn = modalReturn || mode;
+  modalKind = kind;
+  modalClose = close;
+  $("modalEyebrow").textContent = eyebrow;
+  $("modalTitle").textContent = title;
+  $("modalBody").innerHTML = body2;
+  $("modalFooter").innerHTML = footer || `${k("interact")} Select <span style="float:right">${gamepadMode ? "\u25CB Back \xB7 Right stick to scroll" : "ESC Back \xB7 PgUp/PgDn to scroll"}</span>`;
+  $("modalLayer").hidden = false;
+  menu($("modalMenu"), items, index);
+}
+function closeModal() {
+  const cb = modalClose;
+  modalKind = null;
+  modalClose = null;
+  modalReturn = null;
+  $("modalLayer").hidden = true;
+  menuItems = [];
+  input.clear();
+  cb?.();
+  if (mode === "title") titleMenu();
+}
+function titleMenu() {
+  menu($("titleMenu"), [{ label: "Enter the house", right: "\u2192", primary: true, action: () => startRun(false, true) }, { label: "Continue the night", right: hasSave() ? "SAVED" : "\u2014", disabled: !hasSave(), action: () => startRun(true, false) }, { label: "How to survive", action: () => showGuide() }, { label: "Settings", action: () => showSettings() }, { label: "About & credits", action: () => showAbout() }]);
+}
+function showTitle() {
+  mode = "title";
+  playing = false;
+  modalKind = null;
+  $("modalLayer").hidden = true;
+  $("titleScreen").hidden = false;
+  $("hud").hidden = true;
+  $("masthead").hidden = false;
+  $("attractBar").hidden = true;
+  $("worldLabels").innerHTML = "";
+  document.body.classList.remove("playing");
+  $("dangerWash").style.opacity = 0;
+  s = fresh();
+  if (world) {
+    loadRoom("foyer", false);
+    world.setPlayer(4.2, 1.3, -0.4, false, false, false);
+    world.setHunter(-9, -1, 1, false, false);
+  }
+  lastActivity = performance.now();
+  titleMenu();
+}
+function startRun(resume = false, intro = true) {
+  s = fresh();
+  if (online.active) {
+    prefs.difficulty = "Dread";
+  }
+  if (resume) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SAVE));
+      if (saved) {
+        Object.assign(s, saved);
+        s.flags = saved.flags || {};
+        s.notes = saved.notes || [];
+        s.hunter = fresh().hunter;
+        s.hunter.phase = s.flags.key ? "search" : "dormant";
+        s.hunter.room = "library";
+        s.hunter.timer = 22;
+      }
+    } catch {
+    }
+  }
+  mode = "play";
+  playing = true;
+  modalKind = null;
+  $("modalLayer").hidden = true;
+  $("titleScreen").hidden = true;
+  $("hud").hidden = false;
+  $("attractBar").hidden = true;
+  document.body.classList.add("playing");
+  loadRoom(s.room, false);
+  s.x = -4;
+  s.z = 1.5;
+  placeBody();
+  input.clear();
+  updateHud();
+  if (intro && !online.active) dialog("intro", "The last visitor", `<p><em>\u201CIris said the clocks here were beautiful.\u201D</em></p><p>You have come to Blackthorn House to bring your sister home. The front door closes before you can knock.</p><p>Somewhere upstairs, a pair of shears opens. Then closes.</p>`, [{ label: "Step inside", primary: true, action: () => {
+    closeModal();
+    announce();
+    notify("Find Iris. Start with the ledger in the library to your left.", 6);
+  } }], { eyebrow: "OCTOBER 29 \xB7 11:57 PM", footer: "You cannot fight the keeper. Run, hide, and use the house against him." });
+  else announce();
+}
+function showGuide() {
+  dialog("guide", "How to survive", `<div class="fieldGrid"><div><b>${k("move")} Move</b>Left stick or WASD / arrows.</div><div><b>${k("interact")} Investigate</b>Doors, clues, puzzles, hiding places.</div><div><b>${k("run")} Run</b>Fast and loud. Watch your breath.</div><div><b>${k("crouch")} Crouch</b>Hold to move quietly, out of sight.</div><div><b>${k("distract")} Wind-up bird</b>Throw a noise lure. Three per night.</div><div><b>${k("focus")} Steady yourself</b>Hold still to recover composure.</div><div><b>${k("journal")} Journal</b>Your map, clues, and belongings.</div><div><b>${k("pause")} Pause</b>Settings, guide, and checkpoints.</div></div><p>The keeper follows noise and sight. Break away, then hide in an alcove. Hiding while he is close can give you away. Pull marked furniture down to delay him.</p><p>If grabbed, press ${gamepadMode ? "\u2715" : "E"} repeatedly to break free. That strength takes time to return. Your progress saves when you find an important object.</p>`, [{ label: "I understand", primary: true, action: closeModal }], { eyebrow: "YOU ARE NOT A FIGHTER" });
+}
+function showSettings(index = 0, back = null) {
+  const parent = back || (() => {
+    closeModal();
+    if (mode === "play") showPause();
+  });
+  const toggle = (key, i) => {
+    prefs[key] = !prefs[key];
+    savePrefs();
+    showSettings(i, parent);
+  };
+  const vol = (d) => {
+    prefs.volume = clamp(Math.round((prefs.volume + d * 0.1) * 100) / 100, 0, 1);
+    savePrefs();
+    showSettings(0, parent);
+  };
+  dialog("settings", "Make yourself comfortable", `<p class="small">Use left / right to adjust. Changes are saved on this device.</p>`, [{ label: "Volume", right: Math.round(prefs.volume * 100) + "%", action: () => vol(prefs.volume >= 1 ? -1 : 1), adjust: vol }, { label: "Invert horizontal axis", right: prefs.invertX ? "ON" : "OFF", action: () => toggle("invertX", 1), adjust: () => toggle("invertX", 1) }, { label: "Invert vertical axis", right: prefs.invertY ? "ON" : "OFF", action: () => toggle("invertY", 2), adjust: () => toggle("invertY", 2) }, { label: "Brighter shadows", right: prefs.brightness ? "ON" : "OFF", action: () => toggle("brightness", 3) }, { label: "Reduce motion", right: prefs.reduced ? "ON" : "OFF", action: () => toggle("reduced", 4) }, { label: "Pursuit intensity", disabled: online.active, right: online.active ? "SESSION: DREAD" : prefs.difficulty.toUpperCase(), action: () => {
+    prefs.difficulty = prefs.difficulty === "Dread" ? "Story" : "Dread";
+    savePrefs();
+    showSettings(5, parent);
+  } }, { label: "Back", action: parent }], { eyebrow: "SETTINGS", index, close: null });
+  modalClose = null;
+  settingsBack = parent;
+}
+var settingsBack = null;
+function showPause() {
+  if (mode !== "play" || online.ended) return;
+  dialog("pause", "A borrowed moment", `<p>${online.active ? "Your escape is paused. The shared AI Hub clock keeps running." : "The house can wait a moment."}</p>`, [{ label: "Return to the house", primary: true, action: closeModal }, { label: "Journal & map", action: showJournal }, { label: "How to survive", action: showGuide }, { label: "Settings", action: () => showSettings() }, ...online.active ? [] : [{ label: "Restart from checkpoint", disabled: !hasSave(), action: () => startRun(true, false) }, { label: "Return to title", action: () => {
+    saveGame();
+    showTitle();
+  } }]], { eyebrow: "PAUSED" });
+}
+function showAbout() {
+  dialog("about", "Behind the clockface", `<div class="creditsSection"><h3>An original haunting</h3><p>The Hourglass House is an original spiritual successor inspired by ClockTower\u2019s vulnerable heroine, deliberate exploration, persistent pursuer, and branching escape. All characters, writing, geometry, animation, and sound are original. No source game assets are used.</p></div><div class="creditsSection"><h3>Source information</h3><p id="sourceCredits">Date: 2026-10-29 09:52 (America/Vancouver).<br>Source: ClockTower.<br>Tech: Three.js r180 (0.180.0), native WebGPU with WebGL fallback disabled; Rapier 3D 0.19.3; Gamepad API; Web Audio API; vanilla JavaScript/CSS; esbuild 0.28.2.<br>Art direction: original cel-shaded gothic cutaway dioramas, stepped TSL lighting and ink outlines; procedural geometry and canvas clock textures.<br>Animation: procedural articulated characters, footsteps, pendulums, gears, candle flames, dust and water.<br>Audio: original synthesized ambient music, dynamic pursuit score, heartbeat and sound effects via Web Audio. Voice: none.<br>Online: AI Hub session.js 1.3.0; synchronized 1–4 player parallel escape rounds, discovery progress and timed results. Standalone solo.<br>Testing: efficient, lightweight functional checks; responsive phone, tablet and desktop checks; WebKit compatibility check. Playwright 1.63; actual Chromium WebGPU; 375×667 to 2560×1080; tablet and WebKit unsupported-GPU/settings checks; official AI Hub solo and two-player host-disconnect checks. Real Safari and physical controller tests: not available.<br>Environment: Codex CLI (headless); Linux. Player browser: unknown. Test engines: Chromium and WebKit.<br>Model: OpenAI, gpt-6-astra, reasoning effort ultra.<br>Usage: API cost unknown; total tokens unknown; session time approximately 30 minutes.</p></div><div class="creditsSection"><h3>Engine feedback</h3><p>Liked most: Three.js TSL supports a consistent stepped-lighting style across procedural assets.<br>Got stuck or guessed wrong: Rapier’s CDN entry changed to rapier.mjs; a controller method name needed correction. A bare WebGPU probe also passed with headless flags that failed to render the full scene.<br>Most important custom system: room-and-story state, persistent pursuit, controller focus, checkpoints and the attract replay.<br>Hardest part: coordinating asynchronous WebGPU scene compilation, physics, input and AI Hub lifecycle.<br>Would overhaul: automatic WebGL fallback; it is explicitly disabled here.<br>One change: a public strict-WebGPU constructor option with actionable adapter errors.</p></div><div class="creditsSection"><h3>Testing feedback</h3><p>Eight product issues were caught and fixed by testing: one critical dependency-loading failure; a reserved controller chord; two geometry clipping defects; small-phone title overlap; portrait scene readability; toast/modal overlap; and stale session-end wording. A separate controller API mismatch was caught during code review.<br>Final checks: both endings, correct/incorrect puzzle paths, pursuit/hiding/bird/trap/grab/death/checkpoint behavior, both inversion settings and persistence, natural 76-second attract loop and input exit. Zero final page errors or failed game dependency requests. AI Hub: 24/24 solo and 24/24 two-player host-disconnect checks passed.<br>Most helpful: a complete keyboard playthrough with actual WebGPU rendering and screenshots.<br>Least helpful: a bare GPU adapter/device probe; it missed a software-renderer configuration problem visible in full-scene screenshots.<br>WebKit correctly shows the required-WebGPU screen and working settings. Real iOS Safari and a physical PS5 controller remain untested.</p></div><div class="creditsSection"><h3>Prompt feedback</h3><p>Liked most: the combination of a clear source inspiration and freedom to build original art, sound and mechanics.<br>Confusing: the multiplayer link defines an embedded session protocol rather than a public standalone lobby; this slice uses its supported parallel mode.<br>Hardest: delivering a complete survival-horror loop, polished presentation and required engine integration in one shareable HTML file.<br>Additional test desired: an extended playthrough on a physical PS5 controller and a hardware WebGPU device.</p></div><div class="creditsSection"><h3>Online play</h3><p>Launch this game inside <a href="https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub" target="_blank" rel="noopener">AI Hub</a> for a synchronized 1\u20134 player escape challenge. Everyone explores their own house. Successful escapes rank by finish time; unfinished attempts rank by discoveries. Standalone play is solo.</p></div>`, [{ label: "Back to the house", primary: true, action: closeModal }], { eyebrow: "ABOUT & CREDITS", footer: "THREE.JS \xB7 RAPIER \xB7 AI HUB \xB7 ORIGINAL PROCEDURAL ART & SOUND" });
+}
+function objective() {
+  if (!s.flags.key) return "Search the library for news of Iris.";
+  if (!s.flags.gear) return "Open the moon cabinet in the glass garden.";
+  if (!s.flags.fuse) return "Find the power fuse in the keeper\u2019s workshop.";
+  if (!s.flags.clock) return "Restore the great clock in the entrance hall.";
+  return s.flags.locket ? "Bring Iris\u2019s locket to the thirteenth bell." : "Reach the belfry. There may still be time for Iris.";
+}
+function showJournal() {
+  const bag = [s.flags.key ? "Brass winding key" : null, s.flags.gear ? "Moon gear" : null, s.flags.fuse ? "Ceramic fuse" : null, s.flags.locket ? "Iris\u2019s locket" : null, `${s.birds} wind-up birds`].filter(Boolean);
+  dialog("journal", "What the house remembers", `<p><em>${objective()}</em></p><div class="journalMap">${["library", "foyer", "conservatory", "workshop", "belfry"].map((r) => `<span class="${r === s.room ? "current" : ""}">${ROOMS[r].name.replace("The ", "")}</span>`).join("")}</div><p class="small">Library \u2194 Hall \u2194 Garden \u2194 Workshop. The great clock opens a stair from the Hall to the Belfry.</p><div class="inventory">${bag.map((t) => `<span>${t}</span>`).join("")}</div><div class="notes"><p>${notes.intro}</p>${s.notes.map((id) => `<p>${notes[id]}</p>`).join("")}</div>`, [{ label: "Close the journal", primary: true, action: closeModal }], { eyebrow: "NORA\u2019S JOURNAL" });
+}
+function note(id) {
+  if (!s.notes.includes(id)) s.notes.push(id);
+}
+function collect(flag, id, msg) {
+  s.flags[flag] = true;
+  if (id) note(id);
+  audio.play("item");
+  saveGame();
+  notify(msg);
+  online.update({ score: score(), label: msg });
+  updateHud();
+}
+function score() {
+  return Object.values(s.flags).filter(Boolean).length * 100 + s.notes.length * 10 + (s.ending ? 1e3 : 0);
+}
+function announce() {
+  const el = $("roomAnnouncement");
+  el.querySelector("strong").textContent = ROOMS[s.room].name;
+  el.style.opacity = 1;
+  announceTimer = 2.5;
+}
+function loadRoom(id, announceIt = true) {
+  s.room = id;
+  world.loadRoom(id);
+  buildPhysics();
+  placeBody();
+  world.setGhost(2.6, -2, id === "belfry" && !!s.flags.clock);
+  if (world.ghost) world.ghost.userData.moving = false;
+  world.setHunter(s.hunter.x, s.hunter.z, s.hunter.heading, false, s.hunter.room === id && s.hunter.phase !== "dormant");
+  if (announceIt) announce();
+  updateHud();
+  buildLabels();
+}
+function placeBody() {
+  body?.setTranslation({ x: s.x, y: 0.9, z: s.z }, true);
+  body?.setNextKinematicTranslation({ x: s.x, y: 0.9, z: s.z });
+}
+function buildPhysics() {
+  physics?.free();
+  physics = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  fixedItems = [];
+  const box = (x, y, z, w, h, d) => physics.createCollider(RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2).setTranslation(x, y, z));
+  box(0, -0.18, 0, 27, 0.3, 11);
+  box(-12.5, 2, 0, 0.6, 5, 11);
+  box(12.5, 2, 0, 0.6, 5, 11);
+  box(0, 2, -4.4, 26, 5, 0.6);
+  box(0, 2, 4.5, 26, 5, 0.6);
+  box(0, 0.8, -2.9, s.room === "workshop" ? 5.4 : s.room === "library" ? 4 : 2.9, 1.6, 1.4);
+  box(-7, 1, -2.7, 2.3, 2, 1.1);
+  box(7, 1, -2.7, 1.4, 2, 0.85);
+  body = physics.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(s.x, 0.9, s.z));
+  collider = physics.createCollider(RAPIER.ColliderDesc.capsule(0.52, 0.3), body);
+  kcc = physics.createCharacterController(0.025);
+  kcc.setSlideEnabled(true);
+  hunterBody = physics.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(40, 1, 0));
+  hunterCollider = physics.createCollider(RAPIER.ColliderDesc.capsule(0.7, 0.38), hunterBody);
+  hunterKcc = physics.createCharacterController(0.03);
+  for (const p of projectiles) world.scene.remove(p.mesh);
+  projectiles = [];
+}
+function enterRoom(id, side) {
+  if (transitioning) return;
+  if (id === "belfry" && !s.flags.clock) {
+    audio.play("locked");
+    notify("The belfry is sealed. The great clock controls its lock.");
+    return;
+  }
+  transitioning = true;
+  audio.play("door");
+  $("fade").style.opacity = 1;
+  setTimeout(() => {
+    s.hidden = false;
+    s.x = side === "left" ? 9.6 : -9.6;
+    s.z = 0.6;
+    loadRoom(id);
+    $("fade").style.opacity = 0;
+    transitioning = false;
+    const h = s.hunter;
+    if (h.phase === "chase") {
+      h.timer = 4.7;
+      h.phase = "following";
+    }
+    saveGame();
+  }, 320);
+}
+function getInteractions() {
+  return [{ id: "main", x: 0, z: -2.5, label: s.room === "foyer" && s.flags.clock ? "Climb the hidden stair" : ROOMS[s.room].main }, { id: "hide", x: -7, z: -2.5, label: s.hidden ? "Leave your hiding place" : ROOMS[s.room].hide }, { id: "trap", x: 7, z: -2.5, label: s.trapRooms.includes(s.room) ? "The fallen furniture" : ROOMS[s.room].trap }, { id: "left", x: -11, z: 0, label: ROOMS[s.room].left ? `Enter ${ROOMS[ROOMS[s.room].left].name.toLowerCase()}` : "The sealed garden door" }, { id: "right", x: 11, z: 0, label: ROOMS[s.room].right ? `Enter ${ROOMS[ROOMS[s.room].right].name.toLowerCase()}` : s.room === "belfry" ? "The way out" : "A boarded window" }];
+}
+function buildLabels() {
+  $("worldLabels").innerHTML = getInteractions().map((o) => `<span class="worldLabel" data-id="${o.id}">${o.id === "main" ? "INVESTIGATE" : o.id === "hide" ? "HIDE" : o.id === "trap" ? "DISTRACTION" : o.id === "left" ? ROOMS[s.room].left ? ROOMS[ROOMS[s.room].left].name.replace("The ", "").toUpperCase() : "SEALED" : ROOMS[s.room].right ? ROOMS[ROOMS[s.room].right].name.replace("The ", "").toUpperCase() : s.room === "belfry" ? "EXIT" : "SEALED"}</span>`).join("");
+}
+function updateLabels() {
+  if (mode !== "play" && mode !== "attract") return;
+  for (const el of $("worldLabels").children) {
+    const o = getInteractions().find((x) => x.id === el.dataset.id);
+    const v = new THREE2.Vector3(o.x, 2.8, o.z);
+    v.project(world.camera);
+    el.style.left = (v.x * 0.5 + 0.5) * innerWidth + "px";
+    el.style.top = (-v.y * 0.5 + 0.5) * innerHeight + "px";
+    el.style.opacity = input.held.focus || Math.hypot(s.x - o.x, s.z - o.z) < 3.4 ? ".95" : ".28";
+  }
+}
+function interact() {
+  if (s.hidden) {
+    s.hidden = false;
+    s.x = -6.8;
+    s.z = -1.7;
+    placeBody();
+    audio.play("unhide");
+    return;
+  }
+  if (!nearby) {
+    notify("Look for the small gold diamonds. Move closer to investigate.", 2);
+    return;
+  }
+  const id = nearby.id;
+  if (id === "left" || id === "right") {
+    const dest = ROOMS[s.room][id];
+    if (dest) enterRoom(dest, id);
+    else if (s.room === "belfry" && id === "right") endingChoice();
+    else {
+      audio.play("locked");
+      notify("It will not open. Someone has nailed it shut from the outside.");
+    }
+    return;
+  }
+  if (id === "hide") {
+    s.hidden = true;
+    s.hiddenTime = 0;
+    const h = s.hunter;
+    s.hideSeen = h.room === s.room && h.phase === "chase" && Math.hypot(h.x - s.x, h.z - s.z) < 4.6;
+    s.x = -7;
+    s.z = -2.5;
+    placeBody();
+    audio.play("hide");
+    notify(s.hideSeen ? "He saw you disappear. Hold your breath." : "The dark closes around you. Hold steady.");
+    return;
+  }
+  if (id === "trap") {
+    if (s.trapRooms.includes(s.room)) {
+      notify("It will not hold together a second time.");
+      return;
+    }
+    s.trapRooms.push(s.room);
+    audio.play("hit");
+    const h = s.hunter;
+    if (h.room === s.room) {
+      h.stun = 9;
+      h.phase = "stunned";
+      s.panic = Math.max(0, s.panic - 25);
+      s.escapes++;
+      notify("The keeper is pinned. Now, run!", 4);
+    } else notify("The crash travels through the house.", 3);
+    return;
+  }
+  if (id === "main") mainInteraction();
+}
+function mainInteraction() {
+  switch (s.room) {
+    case "library":
+      if (!s.flags.key) {
+        collect("key", "ledger", "A brass winding key. And Iris\u2019s name.");
+        s.hunter = { room: "library", x: 10.8, z: 1, heading: -Math.PI / 2, phase: "search", timer: 12, lost: 0, stun: 0, notice: 0 };
+        dialog("note", "The keeper\u2019s ledger", `<p><em>\u201CFirst came the moth, for it loved the moon. Last came the thorn, for it loved nothing.\u201D</em></p><p>Iris\u2019s name is the last entry. Beneath it, in a different hand: <em>\u201CDo not let her hear the thirteenth bell.\u201D</em></p><p>A small brass key slips out of the binding. Then you hear the shears.</p>`, [{ label: "Take the key. Stay quiet.", primary: true, action: () => {
+          closeModal();
+          notify("The keeper has heard you. Crouch or hide in the wardrobe to the left.", 6);
+        } }], { eyebrow: "FOUND \xB7 BRASS WINDING KEY", footer: "The verse has been copied to your journal." });
+      } else dialog("note", "The crossed-out names", `<p>${notes.ledger}</p><p>The key is already in your pocket. Iris\u2019s name is still there.</p>`, [{ label: "Close the ledger", action: closeModal }]);
+      break;
+    case "conservatory":
+      if (s.flags.gear) notify("An empty place where the moon used to be. You have the gear.");
+      else showGardenPuzzle();
+      break;
+    case "workshop":
+      if (!s.flags.fuse) {
+        collect("fuse", null, "Found the ceramic fuse.");
+        dialog("note", "A little borrowed power", `<p>The fuse is intact. A woman\u2019s photograph lies beneath it, face down.</p><p>From the lower drawer comes a familiar tune. Your sister used to hum it when she was afraid.</p>`, [{ label: "Open the lower drawer", primary: true, action: takeLocket }, { label: "Leave with the fuse", action: closeModal }], { eyebrow: "FOUND \xB7 CERAMIC FUSE" });
+      } else if (!s.flags.locket) takeLocket();
+      else dialog("note", "The empty drawer", `<p>The tune has stopped. You carry the locket now.</p><p>${notes.workshop}</p>`, [{ label: "Step away", action: closeModal }]);
+      break;
+    case "foyer":
+      if (s.flags.clock) {
+        enterRoom("belfry", "right");
+        break;
+      }
+      if (!s.flags.key || !s.flags.gear || !s.flags.fuse) {
+        const missing = [!s.flags.key ? "a winding key" : null, !s.flags.gear ? "a moon-shaped gear" : null, !s.flags.fuse ? "a ceramic fuse" : null].filter(Boolean);
+        dialog("note", "Three things are missing", `<p>The great clock has stopped at 11:57. The pendulum is still moving.</p><p>The mechanism needs ${missing.join(", ")}.</p><p class="small">Look in the library, the glass garden, and the keeper\u2019s workshop. The hands must remember the right time.</p>`, [{ label: "Leave the clock", action: closeModal }], { eyebrow: "THE HEART OF THE HOUSE" });
+      } else showClockPuzzle();
+      break;
+    case "belfry":
+      endingChoice();
+      break;
+  }
+}
+function takeLocket() {
+  collect("locket", "workshop", "Iris\u2019s locket. Still warm.");
+  dialog("note", "She knew you would come", `<p><em>\u201CIf he takes my voice, bring this to the bell. Please do not leave me here.\u201D</em></p><p>Inside the locket, Iris is laughing. You cannot remember the last time you heard that sound.</p>`, [{ label: "I will bring you home.", primary: true, action: closeModal }], { eyebrow: "FOUND \xB7 IRIS\u2019S LOCKET" });
+}
+var gardenDials = [0, 0, 0];
+var clockHour = 12;
+var clockMinute = 0;
+var symbols = ["Sun", "Moth", "Thorn", "Moon"];
+function showGardenPuzzle(index = 0) {
+  const adjust = (i, d = 1) => {
+    gardenDials[i] = (gardenDials[i] + d + 4) % 4;
+    audio.play("tick");
+    showGardenPuzzle(i);
+  };
+  dialog("garden", "The moon cabinet", `<p>Three brass discs. Four engraved symbols. A tiny inscription: <em>\u201CThe keeper\u2019s verse knows the order.\u201D</em></p><div class="dialDisplay symbols">${gardenDials.map((v) => symbols[v]).join(" \xB7 ")}</div><p class="small">${s.notes.includes("ledger") ? "Your journal: \u201CFirst came the moth, for it loved the moon. Last came the thorn.\u201D" : "A verse in the library might explain these symbols."}</p>`, [{ label: "First disc", right: symbols[gardenDials[0]], action: () => adjust(0), adjust: (d) => adjust(0, d) }, { label: "Second disc", right: symbols[gardenDials[1]], action: () => adjust(1), adjust: (d) => adjust(1, d) }, { label: "Third disc", right: symbols[gardenDials[2]], action: () => adjust(2), adjust: (d) => adjust(2, d) }, { label: "Turn the latch", primary: true, action: () => {
+    if (gardenDials.join(",") === "1,3,2") {
+      closeModal();
+      collect("gear", "garden", "The moon gear turns in your hand.");
+      dialog("note", "A quarter before midnight", `<p><em>\u201CGive the house its heart. Set its hands a quarter before midnight. Then the bell will remember.\u201D</em></p><p>Behind the glass, a moon-shaped gear gleams in the dark.</p>`, [{ label: "Take the moon gear", primary: true, action: closeModal }], { eyebrow: "FOUND \xB7 MOON GEAR" });
+    } else {
+      audio.play("locked");
+      notify("The latch resists. The order is wrong.");
+      s.panic = clamp(s.panic + 6, 0, 90);
+    }
+  } }, { label: "Step away", action: closeModal }], { eyebrow: "A MECHANICAL SECRET", index, footer: "Left / right changes a symbol. Select turns the focused disc." });
+}
+function showClockPuzzle(index = 0) {
+  const hour = (d) => {
+    clockHour = (clockHour - 1 + d + 12) % 12 + 1;
+    showClockPuzzle(0);
+  }, minute = (d) => {
+    clockMinute = (clockMinute + d * 5 + 60) % 60;
+    showClockPuzzle(1);
+  };
+  dialog("clock", "The hour that was stolen", `<p>The key fits. The fuse glows. The moon gear settles into place.</p><div class="dialDisplay">${String(clockHour).padStart(2, "0")}:${String(clockMinute).padStart(2, "0")}</div><p class="small">The garden\u2019s inscription: \u201CSet its hands a quarter before midnight.\u201D</p>`, [{ label: "Hour hand", right: String(clockHour), action: () => hour(1), adjust: hour }, { label: "Minute hand", right: String(clockMinute).padStart(2, "0"), action: () => minute(1), adjust: minute }, { label: "Wind the clock", primary: true, action: () => {
+    if (clockHour === 11 && clockMinute === 45) {
+      closeModal();
+      collect("clock", "clock", "The face opens. A stair waits behind it.");
+      audio.play("bell");
+      s.hunter.stun = 12;
+      notify("The bell has remembered. Go through the clock.", 6);
+    } else {
+      audio.play("locked");
+      notify("The pendulum refuses to turn. Not that hour.");
+      s.panic = clamp(s.panic + 8, 0, 90);
+    }
+  } }, { label: "Step away", action: closeModal }], { eyebrow: "RESTORE THE GREAT CLOCK", index });
+}
+function endingChoice() {
+  if (!s.flags.clock) {
+    notify("The bell has no voice. Restore the clock downstairs.");
+    return;
+  }
+  dialog("choice", "One last thing to leave behind", `<p>Iris stands beneath the bell. You can see the far wall through her.</p><p><em>\u201CHe only keeps the part of us that remembers.\u201D</em></p><p>The keeper\u2019s steps climb the stair. Beyond the open window, the first bird begins to sing.</p>`, [...s.flags.locket ? [{ label: "Give Iris the locket", right: "BRING HER HOME", primary: true, action: () => finishEnding("together") }] : [{ label: "I will come back for you.", disabled: true, right: "HER LOCKET IS MISSING" }], { label: "Escape through the window", right: "LEAVE ALONE", action: () => finishEnding("alone") }, { label: "There is something I have forgotten.", action: closeModal }], { eyebrow: "THE THIRTEENTH BELL" });
+}
+function finishEnding(kind) {
+  closeModal();
+  s.ending = kind;
+  mode = "ending";
+  audio.play("ending");
+  $("hud").hidden = true;
+  $("worldLabels").innerHTML = "";
+  online.finish({ escaped: true, score: score(), stats: { clues: s.notes.length, escapes: s.escapes, ending: kind } });
+  const together = kind === "together";
+  dialog("ending", together ? "Two shadows in the morning" : "The one who came home", `<p><em>${together ? "\u201CI knew you would remember.\u201D" : "\u201CI will come back,\u201D you tell the empty window."}</em></p><p>${together ? "You place the locket in her hand. The bell cracks without a sound. For one terrible moment, every clock in the house is quiet. Then Iris takes your hand. It is warm." : "The garden gate opens before you touch it. Behind you, a clock begins to strike thirteen. You count every note. You do not turn around."}</p><p>${together ? "At the road, you look back. Blackthorn House has no windows. You keep walking." : "Years later, when the clocks stop, you will still hear her humming."}</p><div class="resultStats"><div><b>${Math.floor(s.elapsed / 60)}:${String(Math.floor(s.elapsed % 60)).padStart(2, "0")}</b><span>TIME IN THE HOUSE</span></div><div><b>${s.notes.length} / 4</b><span>CLUES REMEMBERED</span></div><div><b>${together ? "I" : "II"}</b><span>ENDING FOUND</span></div></div>`, online.active ? [{ label: "Waiting for the other visitors", disabled: true }] : [{ label: "Return to title", primary: true, action: showTitle }, { label: "Walk through the house again", action: () => startRun(false, true) }], { eyebrow: together ? "ENDING I \xB7 THE REMEMBERED" : "ENDING II \xB7 THE SURVIVOR", footer: online.active ? "Your finish time has been sent to AI Hub." : "THE END OF CHAPTER ONE \xB7 THANK YOU FOR PLAYING" });
+}
+function finishSession(ended) {
+  if (mode === "ending") {
+    if (ended) {
+      $("modalFooter").textContent = "Round complete. Return to the AI Hub lobby for another round.";
+      for (const b of $("modalMenu").children) if (b.disabled) b.textContent = "Round complete";
+    }
+    return;
+  }
+  mode = "ending";
+  closeModal();
+  dialog("sessionEnd", ended ? "The round has ended" : "The eighth minute", `<p>The house closes its doors for tonight.</p><div class="resultStats"><div><b>${score()}</b><span>DISCOVERY SCORE</span></div><div><b>${s.notes.length}</b><span>CLUES FOUND</span></div></div><p>${ended ? "Return to the AI Hub lobby to play another round." : "Your result is recorded. Waiting for the other visitors."}</p>`, [], { eyebrow: "AI HUB \xB7 PARALLEL ESCAPE", footer: "Round controls are managed by AI Hub." });
+}
+function beginStruggle() {
+  if (s.struggleCooldown > 0) {
+    die();
+    return;
+  }
+  s.struggleCooldown = 45;
+  struggleHits = 0;
+  struggleTime = prefs.difficulty === "Story" ? 6 : 4.8;
+  audio.play("panic");
+  dialog("struggle", "Not yet.", `<p>The cold metal catches your sleeve.</p><p><em>Pull away. Do not let him keep you.</em></p><div class="struggle"><i id="struggleMeter"></i></div><p id="struggleLabel">Press ${gamepadMode ? "\u2715" : "E"} repeatedly \xB7 0 / 7</p>`, [], { eyebrow: "BREAK FREE", footer: "Seven presses. One chance." });
+}
+function die() {
+  closeModal();
+  mode = "dead";
+  s.deaths++;
+  audio.play("death");
+  $("hud").hidden = true;
+  online.finish({ escaped: false, score: score(), stats: { clues: s.notes.length } });
+  dialog("death", "The house keeps its visitor", `<p>Somewhere, a name is added to the ledger.</p><p class="small">Break away before hiding. The keeper remembers where he last saw you. Wind-up birds and falling furniture can buy the seconds you need.</p>`, online.active ? [{ label: "Waiting for the other visitors", disabled: true }] : [{ label: "Wake at the last checkpoint", primary: true, action: () => startRun(hasSave(), false) }, { label: "Return to title", action: showTitle }], { eyebrow: "THE CLOCK HAS STOPPED", footer: online.active ? "Your discovery score has been sent to AI Hub." : "Your discoveries are safe at the last checkpoint." });
+}
+function throwBird() {
+  if (s.hidden) {
+    notify("You cannot wind a bird in here.");
+    return;
+  }
+  if (s.birds <= 0) {
+    notify("No wind-up birds left. Use the furniture, or find somewhere to hide.");
+    return;
+  }
+  s.birds--;
+  audio.play("distract");
+  const b = physics.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(s.x, 1.4, s.z).setLinvel(Math.sin(s.heading) * 7, 4, Math.cos(s.heading) * 7));
+  physics.createCollider(RAPIER.ColliderDesc.ball(0.18).setRestitution(0.6), b);
+  const mesh = new THREE2.Mesh(new THREE2.IcosahedronGeometry(0.22, 0), new THREE2.MeshBasicNodeMaterial({ color: 14924133 }));
+  world.scene.add(mesh);
+  projectiles.push({ body: b, mesh, life: 7 });
+  const h = s.hunter;
+  if (h.room === s.room) {
+    h.phase = "lured";
+    h.target = { x: clamp(s.x + Math.sin(s.heading) * 7, -11, 11), z: clamp(s.z + Math.cos(s.heading) * 7, -3, 3) };
+    h.timer = 7;
+    s.panic = Math.max(0, s.panic - 12);
+  }
+  notify("The little bird sings somewhere else. Move quietly.", 3);
+}
+function stepPlayer(dt) {
+  let x = input.axes.x, z = input.axes.y;
+  const len = Math.hypot(x, z);
+  if (len > 1) {
+    x /= len;
+    z /= len;
+  }
+  const running = input.held.run && s.stamina > 2 && !input.held.crouch && len > 0.1;
+  const crouch = input.held.crouch;
+  const moving = len > 0.08 && !s.hidden;
+  let speed = running ? 6.1 : crouch ? 1.8 : 3.25;
+  if (s.panic > 85) speed *= 0.82;
+  if (input.held.focus) speed *= 0.55;
+  s.stamina = clamp(s.stamina + (running && !s.hidden ? -22 : input.held.focus ? 23 : 15) * dt, 0, 100);
+  if (moving) {
+    s.heading = Math.atan2(x, z);
+    kcc.computeColliderMovement(collider, { x: x * speed * dt, y: -0.1, z: z * speed * dt }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS);
+    const mv = kcc.computedMovement(), p2 = body.translation();
+    body.setNextKinematicTranslation({ x: p2.x + mv.x, y: 0.9, z: p2.z + mv.z });
+  } else body.setNextKinematicTranslation({ x: s.x, y: 0.9, z: s.z });
+  physics.timestep = dt;
+  physics.step();
+  const p = body.translation();
+  s.x = p.x;
+  s.z = p.z;
+  world.setPlayer(s.x, s.z, s.heading, moving, crouch, s.hidden);
+  s.moving = moving;
+  s.running = running;
+  let nearest = null, dist = 2.45;
+  for (const o of getInteractions()) {
+    const d = Math.hypot(s.x - o.x, s.z - o.z);
+    if (d < dist) {
+      dist = d;
+      nearest = o;
+    }
+  }
+  nearby = s.hidden ? getInteractions().find((o) => o.id === "hide") : nearest;
+  if (input.consume("interact")) interact();
+  if (input.consume("distract")) throwBird();
+  if (input.consume("journal")) showJournal();
+  if (input.consume("pause")) showPause();
+}
+function stepHunter(dt) {
+  const h = s.hunter;
+  s.struggleCooldown = Math.max(0, s.struggleCooldown - dt);
+  if (!s.flags.key) {
+    world.setHunter(h.x, h.z, h.heading, false, false);
+    return;
+  }
+  if (h.stun > 0) {
+    h.stun -= dt;
+    h.phase = "stunned";
+    if (h.stun <= 0) {
+      h.phase = "search";
+      h.timer = 9;
+    }
+    world.setHunter(h.x, h.z, h.heading, false, h.room === s.room);
+    return;
+  }
+  if (h.room !== s.room) {
+    h.timer -= dt;
+    if (h.timer <= 0) {
+      h.room = s.room;
+      h.x = s.x > 0 ? -10.8 : 10.8;
+      h.z = 0.5;
+      h.phase = "search";
+      h.timer = 18;
+      notify("Metal against wood. He has found this room.", 3);
+      audio.play("door");
+    }
+    world.setHunter(h.x, h.z, h.heading, false, false);
+    s.panic = Math.max(0, s.panic - dt * (input.held.focus ? 13 : 4));
+    return;
+  }
+  let distance = Math.hypot(h.x - s.x, h.z - s.z);
+  const vision = input.held.crouch ? 4.6 : s.running ? 12 : 8.7;
+  if (s.hidden) {
+    s.hiddenTime += dt;
+    if (s.hideSeen && s.hiddenTime > 2.2) {
+      s.hidden = false;
+      s.hideSeen = false;
+      notify("The cabinet door opens.", 2);
+      beginStruggle();
+      return;
+    }
+    h.lost += dt;
+    s.panic = clamp(s.panic - dt * (input.held.focus ? 12 : 5), 0, 100);
+    if (h.lost > 8) {
+      h.room = s.room === "library" ? "foyer" : "library";
+      h.timer = 19;
+      h.phase = "search";
+      h.lost = 0;
+      s.escapes++;
+      notify("The footsteps pass. For now.", 3);
+      audio.play("tick");
+      return;
+    }
+  } else if (h.phase !== "lured" && distance < vision) {
+    h.phase = "chase";
+    h.lost = 0;
+    h.timer = 16;
+    s.panic = clamp(s.panic + dt * (distance < 4 ? 13 : 4) * (prefs.difficulty === "Story" ? 0.55 : 1), 0, 100);
+  } else if (h.phase === "chase") {
+    h.lost += dt;
+    if (h.lost > 4.5) {
+      h.phase = "search";
+      h.timer = 12;
+    }
+  } else s.panic = Math.max(0, s.panic - dt * (input.held.focus ? 9 : 2));
+  let tx, tz, speed;
+  if (h.phase === "chase" && !s.hidden) {
+    tx = s.x;
+    tz = s.z;
+    speed = prefs.difficulty === "Story" ? 2.35 : 2.95;
+    if (distance < 1.05) {
+      beginStruggle();
+      return;
+    }
+  } else if (h.phase === "lured") {
+    tx = h.target.x;
+    tz = h.target.z;
+    speed = 2.7;
+    h.timer -= dt;
+    if (h.timer <= 0) {
+      h.phase = "search";
+      h.timer = 12;
+    }
+  } else {
+    h.timer -= dt;
+    tx = Math.sin(s.elapsed * 0.16) * 8;
+    tz = 0.4;
+    speed = 1.15;
+    if (h.timer < 0 && !s.hidden) {
+      h.room = s.room === "library" ? "foyer" : "library";
+      h.timer = 18;
+      return;
+    }
+  }
+  const dx = tx - h.x, dz = tz - h.z, l = Math.hypot(dx, dz);
+  if (l > 0.12) {
+    h.x += dx / l * speed * dt;
+    h.z += dz / l * speed * dt;
+    h.heading = Math.atan2(dx, dz);
+  }
+  hunterBody.setTranslation({ x: h.x, y: 1, z: h.z }, true);
+  hunterBody.setNextKinematicTranslation({ x: h.x, y: 1, z: h.z });
+  world.setHunter(h.x, h.z, h.heading, l > 0.12, true);
+}
+function updateHud() {
+  if (!world) return;
+  $("roomName").textContent = ROOMS[s.room].name;
+  $("objective").textContent = objective();
+  $("composureValue").textContent = Math.round(100 - s.panic);
+  $("composureBar").style.width = 100 - s.panic + "%";
+  $("composureBar").style.background = s.panic > 65 ? "#cf6555" : "#a6c5b0";
+  $("staminaValue").textContent = Math.round(s.stamina);
+  $("staminaBar").style.width = s.stamina + "%";
+  const h = s.hunter;
+  $("threatText").textContent = s.hidden ? "Hidden \xB7 keep still" : h.stun > 0 ? "He cannot move. Run." : h.room === s.room && h.phase === "chase" ? "HE SEES YOU" : s.flags.key ? "Listen for the shears." : "Only the clocks are moving.";
+  $("inventoryStrip").textContent = [s.flags.key ? "WINDING KEY" : null, s.flags.gear ? "MOON GEAR" : null, s.flags.fuse ? "FUSE" : null, s.flags.locket ? "IRIS\u2019S LOCKET" : null].filter(Boolean).join("   \xB7   ");
+  $("controlStrip").innerHTML = `<span>${k("move")} Move</span><span>${k("run")} Run</span><span>${k("crouch")} Crouch</span><span>${k("distract")} Bird \xD7${s.birds}</span><span>${k("focus")} Breathe</span><span>${k("journal")} Journal</span><span>${k("pause")} Pause</span>`;
+  $("interactionPrompt").hidden = !nearby || !!modalKind;
+  if (nearby) $("interactionPrompt").innerHTML = k("interact") + nearby.label;
+  let tip = s.hidden ? "Stay still. Hold " + (gamepadMode ? "L1" : "F") + " to steady your breathing." : h.phase === "chase" && h.room === s.room ? "Break away. Find a hiding place before he gets close." : !s.flags.key ? "The library is through the door to your left." : !s.flags.gear ? "The verse in your journal opens the moon cabinet." : !s.flags.fuse ? "The keeper\u2019s workshop lies beyond the glass garden." : !s.flags.clock ? "Return to the great clock. A quarter before midnight." : "The clock has opened. Find Iris above the house.";
+  if (online.active && !online.canPlay) tip = online.countdown ? `The house opens in ${online.countdown}\u2026` : sessionStatus;
+  $("contextTip").textContent = tip;
+  const danger = h.room === s.room && h.phase === "chase" ? clamp((12 - Math.hypot(h.x - s.x, h.z - s.z)) / 12, 0, 1) : s.panic / 200;
+  $("dangerWash").style.opacity = prefs.reduced ? danger * 0.2 : danger * 0.45;
+}
+var attractScenes = [{ t: 0, room: "foyer", text: "The house is beautiful. That is the first lie." }, { t: 10, room: "library", text: "Every visitor leaves a name in the ledger." }, { t: 23, room: "conservatory", text: "A moth. A moon. A thorn. The order matters." }, { t: 36, room: "workshop", text: "A familiar song, inside a forgotten drawer." }, { t: 49, room: "foyer", text: "Set the hands to the hour the house remembers." }, { t: 61, room: "belfry", text: "There is still time to bring her home." }];
+function startAttract() {
+  mode = "attract";
+  modalKind = null;
+  $("modalLayer").hidden = true;
+  $("titleScreen").hidden = true;
+  $("hud").hidden = false;
+  $("attractBar").hidden = false;
+  document.body.classList.add("playing");
+  s = fresh();
+  s.flags.key = true;
+  attractTime = 0;
+  attractStage = -1;
+  input.clear();
+}
+function stepAttract(dt) {
+  attractTime += dt;
+  if (attractTime >= 76) {
+    attractTime = 0;
+    attractStage = -1;
+  }
+  s.elapsed = attractTime;
+  let idx = attractScenes.findLastIndex((o) => attractTime >= o.t);
+  const st = attractScenes[idx];
+  if (idx !== attractStage) {
+    attractStage = idx;
+    loadRoom(st.room);
+    s.x = -9;
+    s.z = 1.2;
+    notify(st.text, 6);
+  }
+  const t = attractTime - st.t;
+  let x = -9 + Math.min(t * 1.6, 16), z = 0.8, hidden = false;
+  if (idx === 1) {
+    x = 5 - Math.min(t * 2, 12);
+    z = t > 5 ? -2.2 : 0.8;
+    hidden = t > 6;
+    s.hunter.room = st.room;
+    s.hunter.phase = "search";
+    world.setHunter(10 - Math.max(0, t - 4) * 1.4, 1, -Math.PI / 2, true, t > 4);
+  } else if (idx === 3) {
+    x = -9 + Math.min(t * 2, 16);
+    world.setHunter(-9 + Math.min(t * 1.4, 11), 0.6, Math.PI / 2, t < 8, t > 3);
+    if (t > 8) s.trapRooms = ["workshop"];
+  } else world.setHunter(0, 0, 0, false, false);
+  if (idx === 2) {
+    x = -9 + Math.min(t * 2, 9);
+    if (t > 6) s.flags.gear = true;
+  }
+  if (idx === 4) {
+    x = -9 + Math.min(t * 1.6, 9);
+    if (t > 6) {
+      z = -1.5;
+      s.flags.clock = true;
+    }
+  }
+  if (idx === 5) {
+    x = -9 + Math.min(t * 1.6, 9);
+  }
+  s.x = x;
+  s.z = z;
+  s.hidden = hidden;
+  s.heading = Math.PI / 2;
+  world.setPlayer(x, z, s.heading, t < 9, false, hidden);
+  $("roomName").textContent = ROOMS[st.room].name;
+  $("objective").textContent = st.text;
+  $("contextTip").textContent = idx === 1 ? "Hide. Let the footsteps pass." : idx === 3 ? "Use the house to buy yourself another second." : "Explore. Remember. Survive.";
+  $("controlStrip").innerHTML = "";
+  $("interactionPrompt").hidden = true;
+  $("inventoryStrip").textContent = "";
+  $("threatText").textContent = hidden ? "Hidden" : "Attract demonstration";
+  $("dangerWash").style.opacity = 0;
+  updateLabels();
+}
+function animate(now) {
+  const dt = Math.min((now - frameTime) / 1e3, 0.05);
+  frameTime = now;
+  frameCount++;
+  input.update(dt);
+  gamepadMode = input.gamepadConnected;
+  actionHeld = input.keys.has("KeyE") || input.keys.has("Enter") || input.keys.has("Space");
+  const gp = navigator.getGamepads?.();
+  if (gp) {
+    for (const p of gp) if (p) {
+      actionHeld = actionHeld || !!p.buttons[0]?.pressed;
+      if (modalKind && Math.abs(p.axes[3] || 0) > 0.2) $("modal").scrollTop += (p.axes[3] || 0) * 650 * dt;
+    }
+  }
+  if (toastTimer > 0) {
+    toastTimer -= dt;
+    if (toastTimer <= 0) $("toast").classList.remove("show");
+  }
+  if (announceTimer > 0) {
+    announceTimer -= dt;
+    if (announceTimer <= 0) $("roomAnnouncement").style.opacity = 0;
+  }
+  if (performance.now() > ignoreUntil) {
+    if (modalKind === "struggle") {
+      struggleTime -= dt;
+      if (input.consume("interact")) {
+        struggleHits++;
+        audio.play("hit");
+        $("struggleMeter").style.width = struggleHits / 7 * 100 + "%";
+        $("struggleLabel").textContent = `Press ${gamepadMode ? "\u2715" : "E"} repeatedly \xB7 ${struggleHits} / 7`;
+      }
+      if (struggleHits >= 7) {
+        closeModal();
+        s.hunter.stun = 7;
+        s.hunter.phase = "stunned";
+        s.panic = 35;
+        s.escapes++;
+        notify("Your sleeve tears. Run!", 3);
+      } else if (struggleTime <= 0) die();
+    } else if (modalKind) {
+      if (input.consume("back")) {
+        if (modalKind === "settings") settingsBack?.();
+        else if (!["ending", "death", "sessionEnd"].includes(modalKind)) closeModal();
+      } else navigateMenu();
+    } else if (mode === "title") {
+      navigateMenu();
+      const idle = (performance.now() - lastActivity) / 1e3;
+      $("attractCountdown").textContent = idle > 5 ? "THE HOUSE REMEMBERS IN " + Math.ceil(10 - idle) : "THE HOUSE IS LISTENING";
+      if (idle >= 10 && !online.active) startAttract();
+    } else if (mode === "play" && online.canPlay && !transitioning) {
+      simTime += dt;
+      s.elapsed += dt;
+      stepPlayer(dt);
+      if (!modalKind) stepHunter(dt);
+      for (const p of [...projectiles]) {
+        p.life -= dt;
+        p.mesh.position.copy(p.body.translation());
+        p.mesh.rotation.x += dt * 5;
+        if (p.life <= 0) {
+          world.scene.remove(p.mesh);
+          physics.removeRigidBody(p.body);
+          projectiles.splice(projectiles.indexOf(p), 1);
+        }
+      }
+      online.update({ score: score(), label: s.flags.clock ? "The belfry opens" : s.flags.gear ? "Restoring the clock" : s.flags.key ? "Following Iris" : "Searching the house" });
+    } else if (mode === "attract") stepAttract(dt);
+  }
+  if (mode === "title") {
+    world.setPlayer(4.2, 1.3, -0.4, false, false, false);
+    world.setHunter(0, 0, 0, false, false);
+  }
+  const h = s.hunter, danger = mode === "play" && h.room === s.room && h.phase === "chase" ? clamp(1 - Math.hypot(h.x - s.x, h.z - s.z) / 14, 0, 1) : 0;
+  audio.update(dt, { danger, moving: mode === "play" && !modalKind && s.moving, running: s.running, hidden: s.hidden, room: s.room, playing: mode === "play" && !modalKind && online.canPlay });
+  world.update(dt, now / 1e3, { ...s, danger, mode, reducedMotion: prefs.reduced, clockSolved: !!s.flags.clock });
+  if (frameCount % 5 === 0) {
+    if (mode === "play") {
+      updateHud();
+      updateLabels();
+    }
+    const touch = matchMedia("(pointer:coarse)").matches && !input.gamepadConnected && input.mode !== "keyboard";
+    $("touchNotice").hidden = !touch || !!modalKind;
+    document.body.classList.toggle("touchOnly", touch);
+    $("inputStatus").textContent = gamepadMode ? "CONTROLLER CONNECTED" : "CONTROLLER RECOMMENDED";
+  }
+  renderer.render(world.scene, world.camera);
+}
+function fatal(message) {
+  $("loading").hidden = true;
+  $("fatal").hidden = false;
+  $("fatalText").textContent = message;
+  online.fail(message);
+  $("settingsQuick").style.zIndex = "30";
+  $("settingsQuick").style.position = "fixed";
+  $("settingsQuick").style.right = "25px";
+  $("settingsQuick").style.top = "25px";
+  $("masthead").style.zIndex = "30";
+  $("modalLayer").style.zIndex = "40";
+  $("touchNotice").hidden = !matchMedia("(pointer:coarse)").matches;
+}
+$("settingsQuick").addEventListener("click", () => {
+  if (mode === "attract") showTitle();
+  showSettings(0, closeModal);
+});
+$("brand").addEventListener("click", (e) => {
+  e.preventDefault();
+  if (!online.active) showTitle();
+});
+window.addEventListener("keydown", (e) => {
+  if (modalKind && ["PageDown", "PageUp"].includes(e.code)) {
+    e.preventDefault();
+    $("modal").scrollTop += (e.code === "PageDown" ? 1 : -1) * $("modal").clientHeight * 0.65;
+  }
+});
+window.addEventListener("blur", () => {
+  if (mode === "play" && !modalKind && !online.active) showPause();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) audio.setMuted(true);
+  else if (!online.ended) audio.setMuted(false);
+});
+async function boot() {
+  try {
+    applyPrefs();
+    document.body.classList.toggle("touchOnly", matchMedia("(pointer:coarse)").matches);
+    if (!navigator.gpu) throw new Error("This browser does not expose WebGPU. Open the game in a WebGPU-enabled browser on a secure origin (HTTPS or localhost).");
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error("No WebGPU adapter is available. Enable hardware acceleration and use a WebGPU-capable browser.");
+    $("loadingText").textContent = "Opening the doors of Blackthorn House\u2026";
+    await RAPIER.init();
+    renderer = new THREE2.WebGPURenderer({ antialias: true, alpha: false });
+    renderer._getFallback = null;
+    await renderer.init();
+    if (!renderer.backend.isWebGPUBackend) throw new Error("A native WebGPU backend is required.");
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.backend.device.lost.then((info) => {
+      if (ready) {
+        ready = false;
+        renderer.setAnimationLoop(null);
+        fatal("The WebGPU device was lost. Your last checkpoint is saved. Reload to reopen the house.");
+      }
+    });
+    renderer.toneMapping = THREE2.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.3;
+    $("stage").appendChild(renderer.domElement);
+    world = createWorld();
+    world.resize(innerWidth, innerHeight);
+    showTitle();
+    await renderer.compileAsync(world.scene, world.camera);
+    await renderer.renderAsync(world.scene, world.camera);
+    $("loading").hidden = true;
+    ready = true;
+    lastActivity = performance.now();
+    frameTime = performance.now();
+    window.addEventListener("resize", () => {
+      renderer.setSize(innerWidth, innerHeight);
+      world.resize(innerWidth, innerHeight);
+    });
+    await online.connect();
+    renderer.setAnimationLoop(animate);
+    if (new URLSearchParams(location.search).has("test")) window.__hourglass = { ready: true, getState: () => JSON.parse(JSON.stringify({ mode, modal: modalKind, s, simTime, backend: renderer.backend.isWebGPUBackend, version: THREE2.REVISION, physicsVersion: RAPIER.version(), menuIndex, attractTime })), act: (name) => {
+      if (name === "start") startRun(false, false);
+      if (name === "interact") interact();
+      if (name === "main") mainInteraction();
+      if (name === "journal") showJournal();
+      if (name === "close") closeModal();
+      if (name === "attract") startAttract();
+      if (name === "title") showTitle();
+      if (name === "struggle") beginStruggle();
+      if (name === "die") die();
+      if (name === "pause") showPause();
+      if (name === "ending") endingChoice();
+      if (name === "bird") throwBird();
+    }, teleport: (room, x = 0, z = -1.5) => {
+      s.x = x;
+      s.z = z;
+      loadRoom(room, false);
+      placeBody();
+    }, setFlag: (name, value = true) => {
+      s.flags[name] = value;
+    }, setHunter: (props) => Object.assign(s.hunter, props), setState: (props) => Object.assign(s, props), input, online };
+  } catch (e) {
+    console.error(e);
+    fatal(e.message || String(e));
+  }
+}
+boot();
+</script>
+</body></html>

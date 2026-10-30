@@ -1,0 +1,727 @@
+<!--
+SOURCE INFORMATION
+Date: 2026-10-29 10:57 (America/Vancouver)
+Game: Star Hootodier
+Source: Star Parodier. An original spiritual successor; no original game assets or characters are included.
+Title selection: 50 candidates, selected with Python secrets.randbelow(50). The draw is recorded in title-draw.json.
+Tech: Three.js r180 (0.180.0), WebGPU only with its fallback disabled; Three.js Shading Language; @dimforge/rapier3d-compat 0.19.3 WASM physics; Gamepad API; Web Audio API; HTML/CSS and JavaScript ES modules. AI Hub client 1.3.0, Session Protocol v1. Google Fonts: Barlow Condensed and DM Sans; font service build versions unknown.
+Art Direction: Original procedural cel-shaded 3D characters and scenery, quantized TSL lighting, dark silhouette outlines, cream/teal/pink arcade UI.
+Animation: Fixed-step 60 Hz gameplay; procedural banking, bobbing, spinning, hit flashes, particles, scrolling scenery, and interpolated remote entities.
+Audio: Original synthesized arpeggiated arcade music and synthesized shot, impact, pickup, bomb, and interface effects through Web Audio. Voice: none.
+Online: 1-4-player shared-world co-op through AI Hub. Host-authoritative combat; local movement and shot prediction; compact snapshots; shared score; individual hulls and upgrades; automatic reinforcement; dedicated-server support; leave/end handling. Invites and rooms are supplied by AI Hub, not by the standalone file. No chat or voice.
+Testing parameters allowed: Efficient, lightweight functional and visual checks. No FPS targets or optimization work. Keyboard, emulated standard gamepad, mobile/tablet/ultrawide layouts, WebGPU and WebKit compatibility checks.
+Environment: Codex CLI (headless); Linux; user browser unknown. Validation used automated Chromium and WebKit. Real iOS Safari and physical DualSense hardware were not available.
+Model: OpenAI, gpt-6-astra, reasoning effort high.
+Usage: API cost unknown; token count and breakdown unknown. Estimated implementation/test session time: approximately 25 minutes.
+
+TESTING FEEDBACK
+Issues caught: 5 application issues, all fixed: diagnostic access before physics initialization; oversized hitbox marker; native Enter double activation after mouse focus; short controller menu presses missed under rendering load; unsupported-browser message obscuring navigation. Three test-environment/setup problems were also resolved (graphics-adapter flags, virtual-pad adapter shape, and an expired local server).
+Critical/game-breaking: 1 major input blocker (Enter activation), fixed. No known remaining game-breaking issues from the tests performed.
+Most helpful test: Accelerated complete-campaign simulation through all three boss defeats, together with the AI Hub conformance harness.
+Least helpful test: The first screenshot pass with the default Vulkan adapter, which produced corrupted output and had to be repeated with software Vulkan.
+Validation: 12 simulation assertions passed, including all weapon upgrades, wingmen, bombs, damage/repair, complete campaign, 120-second Caravan, game over, and checkpoint upgrade retention. 10 final interaction checks passed, including attract entry/exit, controller axis inversion, solo pause, scoring, and unsupported-browser credits. AI Hub 4-player standard, 2-player dedicated-server, and 3-player host-leave scenarios passed with simulated 70 ms latency, 20 ms jitter, and 4% message loss. Layouts checked at 375x667, 768x1024, 1440x900, and 2560x1080; no horizontal overflow or JavaScript errors in the six Chromium/WebKit layout cases. Screenshots were visually inspected. WebKit on this machine has no WebGPU, so its compatibility UI was tested rather than gameplay. WebKit is not real iOS Safari.
+
+ENGINE FEEDBACK
+What I liked most: Three.js TSL made a consistent quantized cel-shading style straightforward, and Rapier sensor events kept collision rules explicit.
+Where I got stuck or guessed wrong: Headless GPU adapter selection initially produced corrupted images; a mesh-scale reset enlarged the hitbox marker. Visual checks exposed both.
+Most important system built myself: The complete arcade game layer: encounter pacing, weapons, pickups, boss phases, controller menus, attract pilot, save/settings, and co-op state replication.
+Hardest engine task: Keeping local, host-authoritative, and rendered state separate while preserving responsive movement and correct physics contacts.
+One thing to remove or overhaul: Implicit WebGL fallback in the WebGPU renderer; this project explicitly disables it.
+One change I would make: A public, strict WebGPU-only initialization option with a concise capability/error report, avoiding reliance on the pinned renderer's internal fallback field.
+
+PROMPT FEEDBACK
+What I liked most: A clear arcade reference combined with controller-first UX, a concrete technology stack, and explicit attract-mode requirements.
+What was confusing: The multiplayer link specifies a hosting protocol, but not whether standalone room creation is expected. This build uses AI Hub for invites and session hosting.
+Hardest part: Delivering the full campaign and co-op lifecycle as one portable HTML file while verifying WebGPU-only behavior across different browser engines.
+One additional test I would run: A real four-person session on separate devices, including a physical PS5 DualSense and a WebGPU-capable Safari device, with real network latency and a host disconnect.
+
+REFERENCES & CREDITS
+Star Parodier gameplay reference: https://strategywiki.org/wiki/Star_Parodier
+AI Hub: https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub
+Three.js: https://threejs.org/ (MIT)
+Rapier: https://rapier.rs/ (Apache-2.0)
+Font families: Barlow Condensed and DM Sans, Google Fonts (SIL Open Font License).
+All game models, writing, music, effects, and gameplay implementation created for this demo.
+
+-->
+<!doctype html><html lang="en"><head><meta charset="utf-8"><script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#082e38">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="co-op"><meta name="hub:session-minutes" content="6"><meta name="hub:session-goal" content="Save breakfast together. Beat all three bosses."><meta name="hub:session-howto" content="Stick/WASD move; Cross/Space fire; Square/X bomb; R1/E weapon; L2/Shift focus"><meta name="hub:webgpu" content="required">
+<title>Star Hootodier · Breakfast needs a hero.</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=DM+Sans:wght@400;500;600;700&display=swap');
+:root{--ink:#0b3039;--cream:#fff4d8;--yellow:#ffcf51;--pink:#ff7191;--mint:#8be4c9;--line:rgba(255,244,216,.22)}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}body{background:var(--ink);color:var(--cream);font-family:'DM Sans',sans-serif}button{font:inherit;color:inherit;cursor:pointer}button:disabled{opacity:.45;cursor:wait}button:focus-visible{outline:3px solid white;outline-offset:5px}#world{position:absolute;inset:0;width:100%;height:100%;display:block}#veil{position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(5,35,43,.95) 0%,rgba(5,35,43,.88) 29%,rgba(5,35,43,.25) 61%,rgba(5,35,43,.05));transition:opacity .4s}body.playing #veil{opacity:0}.grain{position:absolute;inset:0;pointer-events:none;opacity:.055;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.83' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Cpath fill='%23fff' filter='url(%23n)' opacity='.8' d='M0 0h180v180H0z'/%3E%3C/svg%3E")}.topbar{position:absolute;top:30px;left:3.8vw;right:3.8vw;display:flex;align-items:center;justify-content:space-between;gap:14px;z-index:3;font-size:12px;letter-spacing:2px;font-weight:700}.brand{display:flex;align-items:center;gap:11px}.brand i{display:grid;place-items:center;width:31px;height:31px;border:1px solid var(--cream);border-radius:50%;font-style:normal;font-size:18px}.status{font-size:10px;letter-spacing:1.7px;color:var(--mint)}.status:before{content:'●';margin-right:8px}.iconbtn{background:transparent;border:1px solid var(--line);border-radius:50%;width:39px;height:39px;font-size:22px;display:grid;place-items:center}.righttop{display:flex;align-items:center;gap:25px}#title{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;padding:95px 5.4vw 80px;pointer-events:none}#title>*{pointer-events:auto}.eyebrow{font-size:11px;letter-spacing:3.7px;font-weight:700;color:var(--mint);margin-bottom:20px;display:flex;align-items:center;gap:12px}.eyebrow:before{content:'';height:2px;width:32px;background:var(--mint)}h1{font-family:'Barlow Condensed',Impact,sans-serif;font-weight:900;font-size:clamp(72px,9vw,150px);line-height:.79;letter-spacing:-2px;margin:0 0 24px;transform:rotate(-3deg);text-shadow:5px 6px 0 #083039}h1 span{display:block;color:var(--yellow)}h1 .subline{font-size:.76em;color:var(--cream);margin-top:10px}#title .tagline{font-size:16px;line-height:1.6;max-width:340px;color:#c8dbd4;margin:0 0 25px}#mainmenu{display:flex;flex-direction:column;gap:9px;width:310px}.menuitem{background:rgba(10,47,55,.68);border:1px solid var(--line);text-align:left;padding:13px 17px;border-radius:6px;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between;transition:.15s}.menuitem small{font-size:10px;font-weight:500;letter-spacing:1px;color:#adcac4}.menuitem.primary,.menuitem.focused{background:var(--yellow);color:var(--ink);border-color:var(--yellow);box-shadow:0 4px 0 #b77726;transform:translateX(5px)}.menuitem.focused small,.menuitem.primary small{color:#3d5351}.menuitem:not(.focused):hover{border-color:var(--cream)}.title-links{display:flex;gap:25px;margin:23px 0 0}.textbtn{border:0;border-bottom:1px solid var(--line);padding:3px 0;background:none;color:#bbd2cc;font-size:12px}.textbtn.focused{color:var(--yellow);border-color:var(--yellow)}.bottom{position:absolute;bottom:27px;left:3.8vw;right:3.8vw;display:flex;justify-content:space-between;align-items:center;gap:15px;font-size:10px;letter-spacing:1.4px;z-index:3;color:#bad0c8}.key{display:inline-grid;place-items:center;border:1px solid #88a7a2;border-radius:5px;min-width:21px;height:21px;font:11px 'DM Sans';padding:0 5px;color:var(--cream);margin:0 4px 0 10px}.missionbadge{position:absolute;right:6%;bottom:16%;width:225px;padding:18px 0;border-top:1px solid var(--line);z-index:2;transform:rotate(-3deg)}.missionbadge .num{font-family:'Barlow Condensed';font-size:42px;font-weight:800;color:var(--yellow);float:left;margin-right:15px;line-height:1}.missionbadge b{font-size:12px;letter-spacing:1px}.missionbadge p{font-size:11px;line-height:1.7;color:#b8d9d1;margin:6px 0}.orbit-label{position:absolute;right:9%;top:20%;font-size:11px;letter-spacing:2px;color:var(--cream);transform:rotate(5deg)}.orbit-label:after{content:'';display:block;width:75px;height:40px;border-right:1px solid var(--cream);transform:skew(-30deg)}#hud{position:absolute;inset:0;pointer-events:none;display:none;z-index:2}.hudtop{position:absolute;top:24px;left:25px;right:25px;display:flex;justify-content:space-between;align-items:flex-start}.scoreblock{background:#092c39d9;border:1px solid var(--line);border-radius:8px;padding:12px 18px;min-width:160px}.tiny{font-size:10px;font-weight:700;letter-spacing:2px;color:var(--mint)}#score{font-family:'Barlow Condensed';font-size:38px;line-height:1.1;letter-spacing:2px;font-weight:700}.stageblock{text-align:center;padding-top:8px;text-shadow:0 2px 4px #052d36}.stageblock b{display:block;font-family:'Barlow Condensed';font-size:24px;letter-spacing:1px}.stageblock small{font-size:10px;letter-spacing:2px}#health{font-size:23px;letter-spacing:3px;color:var(--pink)}.hudbottom{position:absolute;bottom:25px;left:25px;right:25px;display:flex;justify-content:space-between;align-items:flex-end}.weaponbox{background:#082d38db;border:1px solid var(--line);padding:13px 17px;border-radius:7px;font-size:13px;line-height:1.7}.weaponbox b{font-size:17px}.meter{height:5px;width:170px;background:#496062;border-radius:10px;overflow:hidden;margin-top:6px}.meter i{display:block;height:100%;background:var(--mint);transition:width .15s}#toast{position:absolute;top:22%;left:50%;transform:translateX(-50%);text-align:center;max-width:580px;width:90%;pointer-events:none;opacity:0;transition:opacity .25s;z-index:5;text-shadow:0 3px 0 #0b3039}#toast b{font:800 38px/.95 'Barlow Condensed';letter-spacing:1px;color:var(--yellow);display:block}#toast span{display:block;font-size:13px;margin-top:9px;color:white}#bossbar{position:absolute;top:110px;left:30%;right:30%;display:none;text-align:center}#bossbar b{font-size:11px;letter-spacing:2px}.bar{height:8px;background:#153e49;border:1px solid #ffd9a4;border-radius:9px;margin-top:7px;overflow:hidden}.bar i{display:block;height:100%;background:var(--pink);width:100%}#attract{position:absolute;bottom:90px;left:50%;transform:translateX(-50%);padding:10px 22px;border:1px solid #ffe3a0;background:#0a323bd9;border-radius:30px;font-size:12px;letter-spacing:2px;white-space:nowrap;display:none;z-index:6}.modal-backdrop{position:absolute;inset:0;background:#04222bd9;backdrop-filter:blur(14px);z-index:10;display:none;align-items:center;justify-content:center;padding:24px}.panel{width:min(660px,100%);max-height:90dvh;overflow:auto;background:#0b343f;border:1px solid #47716e;border-radius:16px;padding:32px 38px;box-shadow:0 24px 90px #001a25}.panel.wide{width:min(900px,100%)}h2{font:800 45px/1 'Barlow Condensed';margin:8px 0 15px;letter-spacing:.4px}.lead{color:#bfd6d0;font-size:14px;line-height:1.7}.actions{display:flex;flex-direction:column;gap:9px;margin-top:20px}.actions button{width:100%}.pilotcards{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:24px 0}.pilot{border:1px solid #4b7776;border-radius:12px;background:#164650;padding:20px 13px;text-align:center}.pilot.focused{border:3px solid var(--yellow);padding:18px 11px;background:#245b5c}.pilot .face{font-size:50px;height:75px;display:block}.pilot h3{font:700 25px 'Barlow Condensed';margin:10px 0 6px}.pilot p{font-size:12px;line-height:1.6;color:#c2d8d1;margin:0}.ribbon{font-size:10px;letter-spacing:2px;color:var(--yellow);font-weight:700}.controlgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px 24px;margin:25px 0}.controlgrid div{font-size:12px;line-height:1.8;border-bottom:1px solid var(--line);padding-bottom:8px}.controlgrid b{display:block;color:var(--yellow);font-size:15px}.abouttext{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.7;color:#c3d7d2;max-height:45vh;overflow:auto;padding-right:10px}#loading{position:absolute;bottom:75px;left:5.4vw;font-size:11px;color:var(--mint);z-index:7}#touchNotice{display:none;color:var(--yellow);font-size:13px;margin-bottom:16px}#error{display:none;background:#0a303be8;border:1px solid #ffbd74;color:var(--cream);padding:17px 20px;border-radius:8px;position:absolute;right:5%;top:35%;width:min(360px,42%);z-index:4;font-size:13px;line-height:1.6}#error b{display:block;font:700 26px 'Barlow Condensed';color:var(--yellow);margin-bottom:8px}body.playing .topbar,body.playing #title,body.playing .bottom,body.playing .missionbadge,body.playing .orbit-label{display:none}body.playing #hud{display:block}.results{display:flex;gap:30px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:22px 0;margin:22px 0}.results b{display:block;font:700 38px 'Barlow Condensed';color:var(--yellow)}.results small{font-size:10px;letter-spacing:1px}
+@media(min-width:1900px){#title{padding-left:9vw}#mainmenu{width:360px}.menuitem{padding:17px 20px;font-size:18px}#title .tagline{font-size:20px;max-width:420px}.eyebrow{font-size:14px}.bottom,.topbar{left:6vw;right:6vw}}
+@media(max-width:750px){.topbar{top:18px;left:22px;right:22px}.status{display:none}.topbar{font-size:10px}.righttop{gap:5px}#title{padding:85px 27px 70px;justify-content:center}h1{font-size:90px}.eyebrow{font-size:9px;letter-spacing:2px;margin-bottom:18px}#title .tagline{font-size:13px;max-width:280px;margin-bottom:19px}#mainmenu{width:280px}.menuitem{font-size:13px;padding:12px 15px}.missionbadge,.orbit-label{display:none}#veil{background:linear-gradient(90deg,#05232bee,#05232b99 75%,#05232b66)}.bottom{left:22px;right:22px;font-size:8px;letter-spacing:.7px}.bottom .build{display:none}.panel{padding:22px}.panel h2{font-size:36px}.pilotcards{gap:8px}.pilot{padding:14px 8px}.pilot.focused{padding:12px 6px}.pilot .face{font-size:36px;height:52px}.pilot h3{font-size:20px}.pilot p{font-size:11px}.hudtop{top:15px;left:12px;right:12px;gap:8px}.scoreblock{min-width:95px;padding:9px}#score{font-size:25px}#health{font-size:17px;letter-spacing:0}.stageblock b{font-size:18px}.stageblock small,.tiny{font-size:8px}.hudbottom{left:12px;right:12px;bottom:14px;gap:8px}.weaponbox{padding:8px 10px;font-size:10px}.weaponbox b{font-size:13px}.meter{width:115px}#bossbar{left:18%;right:18%;top:91px}#toast b{font-size:30px}#toast span{font-size:11px}#error{top:auto;bottom:80px;right:24px;left:24px;width:auto;font-size:11px}#loading{left:27px;bottom:63px}.controlgrid{gap:10px}.controlgrid div{font-size:11px}.results{gap:22px}.results b{font-size:31px}#attract{bottom:100px;font-size:9px;padding:9px 13px}.title-links{margin-top:17px}#touchNotice{font-size:12px}}
+@media(max-height:650px){#title{padding-top:65px;padding-bottom:50px}h1{font-size:70px;margin-bottom:15px}.eyebrow{margin-bottom:12px}#title .tagline{margin-bottom:12px;font-size:12px}.menuitem{padding:8px 14px}#mainmenu{gap:6px}.title-links{margin-top:12px}.topbar{top:12px}.bottom{bottom:12px}.missionbadge{bottom:12%}#loading{bottom:43px}.panel{max-height:94dvh;padding:22px}}
+body.unsupported #mainmenu{display:none}body.unsupported #error{position:static;width:min(380px,100%);margin:4px 0 0;padding:14px 18px;font-size:12px}body.unsupported #title .title-links{margin-top:15px}@media(max-width:750px){body.unsupported h1{font-size:72px;margin-bottom:18px}body.unsupported #title{padding-top:72px;padding-bottom:55px}body.unsupported #error{font-size:11px;line-height:1.5}body.unsupported #error b{font-size:23px}}
+body.playing #toast{left:25px;top:145px;transform:none;width:245px;text-align:left}body.playing #toast b{font-size:27px}body.playing #toast span{font-size:12px;line-height:1.5}@media(max-width:750px){body.playing #toast{left:13px;top:125px;width:215px}body.playing #toast b{font-size:23px}body.playing #toast span{font-size:11px}}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head><body><canvas id="world" aria-label="Star Hootodier game world"></canvas><div id="veil"></div><div class="grain"></div>
+<header class="topbar"><div class="brand"><i>✦</i> THE BREAKFAST BRIGADE</div><div class="righttop"><span class="status" id="engineStatus">WARMING UP THE GALAXY</span><button class="iconbtn" id="gear" aria-label="Settings">⚙</button></div></header>
+<main id="title"><div class="eyebrow">A VERY UN-SERIOUS SPACE ADVENTURE</div><h1><span>STAR</span><span class="subline">HOOTODIER</span></h1><p class="tagline">Small wings. Big trouble.<br>Breakfast needs a hero.</p><div id="touchNotice">Controller or keyboard required</div><nav id="mainmenu"><button class="menuitem primary" data-act="campaign">Start adventure <span>↗</span></button><button class="menuitem" data-act="caravan">Caravan rush <small>2 MIN SCORE ATTACK</small></button><button class="menuitem" data-act="online">Fly with friends <small>1–4 PILOTS</small></button></nav><div class="title-links"><button class="textbtn" data-act="how">Flight school</button><button class="textbtn" data-act="about">About & credits</button></div></main>
+<div class="orbit-label">CAPTAIN HOOT<br>LICENSED TO WING IT.</div><div class="missionbadge"><span class="num">01</span><b>THE TOASTAL FRONTIER</b><p>A beautiful morning.<br>An unreasonable number of waffles.</p></div>
+<footer class="bottom"><div><span class="key">↑↓</span> SELECT <span class="key">✕ / ↵</span> CONFIRM <span class="key">Esc</span> SETTINGS</div><span class="build">ORIGINAL ARCADE ADVENTURE &nbsp; / &nbsp; VOL. 01</span><span id="bestlabel">BEST &nbsp; 000000</span></footer><div id="loading">Preparing your launch…</div><div id="error" role="status"></div>
+<div id="hud"><div class="hudtop"><div class="scoreblock"><div class="tiny">BRIGADE SCORE</div><div id="score">000000</div><div id="chain" class="tiny">CHAIN ×1</div></div><div class="stageblock"><small id="sector">SECTOR 01 / 03</small><b id="stageName">TOASTAL FRONTIER</b><small id="clock">00:00</small></div><div class="scoreblock" style="text-align:right"><div class="tiny">HULL / RESERVES</div><div id="health">♥ ♥ ♥ ♥</div><div class="tiny" id="lives">2 LIVES</div></div></div><div id="bossbar"><b id="bossname">THE TOASTMASTER</b><div class="bar"><i id="bosshp"></i></div></div><div class="hudbottom"><div class="weaponbox"><div class="tiny">R1 / E · CYCLE WEAPON</div><b id="weapon">CONFETTI · LV 1</b><div id="wingmen">WINGMEN 0 / 2</div></div><div class="weaponbox" style="text-align:right"><b id="bombs">✦ ✦ ✦</b> <span>SUPER HOOT</span><div class="tiny">□ / X BOMB &nbsp; L2 / SHIFT FOCUS</div><div class="meter"><i id="charge" style="width:0%"></i></div></div></div></div><div id="toast"><b></b><span></span></div><div id="attract">AUTO PILOT · PRESS ANY BUTTON TO PLAY</div>
+<div id="modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="paneltitle"><section class="panel" id="panel"></section></div>
+<template id="feedback">SOURCE INFORMATION
+Date: 2026-10-29 10:57 (America/Vancouver)
+Game: Star Hootodier
+Source: Star Parodier. An original spiritual successor; no original game assets or characters are included.
+Title selection: 50 candidates, selected with Python secrets.randbelow(50). The draw is recorded in title-draw.json.
+Tech: Three.js r180 (0.180.0), WebGPU only with its fallback disabled; Three.js Shading Language; @dimforge/rapier3d-compat 0.19.3 WASM physics; Gamepad API; Web Audio API; HTML/CSS and JavaScript ES modules. AI Hub client 1.3.0, Session Protocol v1. Google Fonts: Barlow Condensed and DM Sans; font service build versions unknown.
+Art Direction: Original procedural cel-shaded 3D characters and scenery, quantized TSL lighting, dark silhouette outlines, cream/teal/pink arcade UI.
+Animation: Fixed-step 60 Hz gameplay; procedural banking, bobbing, spinning, hit flashes, particles, scrolling scenery, and interpolated remote entities.
+Audio: Original synthesized arpeggiated arcade music and synthesized shot, impact, pickup, bomb, and interface effects through Web Audio. Voice: none.
+Online: 1-4-player shared-world co-op through AI Hub. Host-authoritative combat; local movement and shot prediction; compact snapshots; shared score; individual hulls and upgrades; automatic reinforcement; dedicated-server support; leave/end handling. Invites and rooms are supplied by AI Hub, not by the standalone file. No chat or voice.
+Testing parameters allowed: Efficient, lightweight functional and visual checks. No FPS targets or optimization work. Keyboard, emulated standard gamepad, mobile/tablet/ultrawide layouts, WebGPU and WebKit compatibility checks.
+Environment: Codex CLI (headless); Linux; user browser unknown. Validation used automated Chromium and WebKit. Real iOS Safari and physical DualSense hardware were not available.
+Model: OpenAI, gpt-6-astra, reasoning effort high.
+Usage: API cost unknown; token count and breakdown unknown. Estimated implementation/test session time: approximately 25 minutes.
+
+TESTING FEEDBACK
+Issues caught: 5 application issues, all fixed: diagnostic access before physics initialization; oversized hitbox marker; native Enter double activation after mouse focus; short controller menu presses missed under rendering load; unsupported-browser message obscuring navigation. Three test-environment/setup problems were also resolved (graphics-adapter flags, virtual-pad adapter shape, and an expired local server).
+Critical/game-breaking: 1 major input blocker (Enter activation), fixed. No known remaining game-breaking issues from the tests performed.
+Most helpful test: Accelerated complete-campaign simulation through all three boss defeats, together with the AI Hub conformance harness.
+Least helpful test: The first screenshot pass with the default Vulkan adapter, which produced corrupted output and had to be repeated with software Vulkan.
+Validation: 12 simulation assertions passed, including all weapon upgrades, wingmen, bombs, damage/repair, complete campaign, 120-second Caravan, game over, and checkpoint upgrade retention. 10 final interaction checks passed, including attract entry/exit, controller axis inversion, solo pause, scoring, and unsupported-browser credits. AI Hub 4-player standard, 2-player dedicated-server, and 3-player host-leave scenarios passed with simulated 70 ms latency, 20 ms jitter, and 4% message loss. Layouts checked at 375x667, 768x1024, 1440x900, and 2560x1080; no horizontal overflow or JavaScript errors in the six Chromium/WebKit layout cases. Screenshots were visually inspected. WebKit on this machine has no WebGPU, so its compatibility UI was tested rather than gameplay. WebKit is not real iOS Safari.
+
+ENGINE FEEDBACK
+What I liked most: Three.js TSL made a consistent quantized cel-shading style straightforward, and Rapier sensor events kept collision rules explicit.
+Where I got stuck or guessed wrong: Headless GPU adapter selection initially produced corrupted images; a mesh-scale reset enlarged the hitbox marker. Visual checks exposed both.
+Most important system built myself: The complete arcade game layer: encounter pacing, weapons, pickups, boss phases, controller menus, attract pilot, save/settings, and co-op state replication.
+Hardest engine task: Keeping local, host-authoritative, and rendered state separate while preserving responsive movement and correct physics contacts.
+One thing to remove or overhaul: Implicit WebGL fallback in the WebGPU renderer; this project explicitly disables it.
+One change I would make: A public, strict WebGPU-only initialization option with a concise capability/error report, avoiding reliance on the pinned renderer's internal fallback field.
+
+PROMPT FEEDBACK
+What I liked most: A clear arcade reference combined with controller-first UX, a concrete technology stack, and explicit attract-mode requirements.
+What was confusing: The multiplayer link specifies a hosting protocol, but not whether standalone room creation is expected. This build uses AI Hub for invites and session hosting.
+Hardest part: Delivering the full campaign and co-op lifecycle as one portable HTML file while verifying WebGPU-only behavior across different browser engines.
+One additional test I would run: A real four-person session on separate devices, including a physical PS5 DualSense and a WebGPU-capable Safari device, with real network latency and a host disconnect.
+
+REFERENCES &amp; CREDITS
+Star Parodier gameplay reference: https://strategywiki.org/wiki/Star_Parodier
+AI Hub: https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub
+Three.js: https://threejs.org/ (MIT)
+Rapier: https://rapier.rs/ (Apache-2.0)
+Font families: Barlow Condensed and DM Sans, Google Fonts (SIL Open Font License).
+All game models, writing, music, effects, and gameplay implementation created for this demo.
+</template>
+<script type="module">
+const $=s=>document.querySelector(s), H=window.AIHub;
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v)), rand=(a,b)=>a+Math.random()*(b-a);
+let settings={music:65,sfx:75,invertX:false,invertY:false,shake:true,autoFire:false,difficulty:1};let best=0;
+try{Object.assign(settings,JSON.parse(localStorage.getItem('hoot-settings')||'{}'));best=+localStorage.getItem('hoot-best')||0}catch{}
+$('#bestlabel').textContent='BEST  '+String(best).padStart(6,'0');
+let ready=false,failed=false,screen='title',modal='',menuIndex=0,menuButtons=[],mode='campaign',pilot=0,attract=false,lastInput=performance.now(),lastTime=0,acc=0,visualTime=0,toastUntil=0,ended=false,net=null,netSend=0,lastSnapshot=-1,activePlayers=[],localId=0,remoteInputs=new Map(),remoteTimes=new Map(),nextVfx=-1;
+let T,tsl,R,renderer,scene,camera,world,queue,entityLayer,titleShip,decor=[],entities=new Map(),colliders=new Map(),nextId=1;
+let state={time:0,stage:0,stageTime:0,wave:0,nextWave:3,nextDrop:6,boss:false,bossDone:false,score:0,chain:0,chainTimer:0,kills:0,graze:0,shots:0,bombs:0,clearWait:0,over:false};
+const players=new Map(), keys=new Set();let rawInput={x:0,y:0,fire:false,bomb:false,cycle:false,focus:false},padPrev=[],navLatch=0;
+const stages=[{name:'TOASTAL FRONTIER',boss:'THE TOASTMASTER',subtitle:'He takes everything personally. Especially bread.',color:0x458d8e,ground:0x76bdab,accent:0xffd668,duration:62},{name:'MILKY WAY EXPRESS',boss:'COUNT KETTLE',subtitle:'A storm is brewing. Literally.',color:0x456380,ground:0x839ca9,accent:0xf8b1c2,duration:66},{name:'THE LAST BREAKFAST',boss:'ADMIRAL ALARM',subtitle:'Five more minutes? Not on his watch.',color:0x5c5885,ground:0x9b8fa8,accent:0xffa27f,duration:70}];
+const pilots=[{name:'CAPTAIN HOOT',desc:'Balanced speed. Wide confetti. A natural wingman.',icon:'◉',color:0xffcf51,speed:8.6,health:4},{name:'TEA-RAMISU',desc:'Fast porcelain. Extra homing shots. Steep learning curve.',icon:'♨',color:0x8be4c9,speed:10.3,health:3},{name:'TOAST SCOUT',desc:'Sturdy chassis. Strong laser. Comfortably well done.',icon:'▣',color:0xff92a9,speed:7.3,health:5}];
+const weapons=['CONFETTI','SUNBEAM','HOMING JAM'],weaponColors=[0xffce53,0x8ef8e7,0xff7da3];
+let audioCtx,master,musicGain,sfxGain,musicStep=0,musicAt=0;
+function audioStart(){try{if(!audioCtx){audioCtx=new AudioContext();master=audioCtx.createGain();master.connect(audioCtx.destination);musicGain=audioCtx.createGain();musicGain.connect(master);sfxGain=audioCtx.createGain();sfxGain.connect(master)}audioCtx.resume();audioVolumes()}catch{}}
+function audioVolumes(){if(audioCtx){musicGain.gain.value=settings.music/100*.14;sfxGain.gain.value=settings.sfx/100*.20;master.gain.value=ended?0:1}}
+function tone(freq,duration=.1,type='square',gain=.3,channel=sfxGain,at=0,endFreq){if(!audioCtx||!channel)return;let t=at||audioCtx.currentTime;let o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type=type;o.frequency.setValueAtTime(freq,t);if(endFreq)o.frequency.exponentialRampToValueAtTime(endFreq,t+duration);g.gain.setValueAtTime(.001,t);g.gain.exponentialRampToValueAtTime(Math.max(.002,gain),t+.008);g.gain.exponentialRampToValueAtTime(.001,t+duration);o.connect(g);g.connect(channel);o.start(t);o.stop(t+duration+.03)}
+function sfx(k){if(attract||ended)return;if(k==='shot')tone(720,.05,'triangle',.13,sfxGain,0,350);if(k==='pop')tone(170,.12,'square',.22,sfxGain,0,55);if(k==='pick'){tone(740,.12,'sine',.5);tone(1110,.15,'triangle',.3,sfxGain,audioCtx?.currentTime+.08)}if(k==='hit')tone(100,.32,'sawtooth',.45,sfxGain,0,33);if(k==='bomb'){tone(70,.8,'sawtooth',.6,sfxGain,0,400);tone(1100,.8,'sine',.5,sfxGain,0,90)}if(k==='ui')tone(540,.06,'sine',.2)}
+function musicTick(){if(!audioCtx||attract||ended||audioCtx.state!=='running')return;if(musicAt<audioCtx.currentTime)musicAt=audioCtx.currentTime+.05;const melody=[0,4,7,12,7,4,2,7,5,9,12,16,14,12,9,5,0,4,7,11,7,4,2,-1,0,7,12,7,4,2,4,7];while(musicAt<audioCtx.currentTime+.15){let step=musicStep++%32;let root=state.stage===1?220:state.stage===2?196:261.63;tone(root*Math.pow(2,melody[step]/12),.17,'triangle',.45,musicGain,musicAt);if(step%2===0)tone(root/4*Math.pow(2,[0,0,5,7][Math.floor(step/8)]/12),.22,'square',.2,musicGain,musicAt);if(step%4===0)tone(100,.08,'sine',.7,musicGain,musicAt,35);musicAt+=state.boss?.12:.15}}
+function save(){try{localStorage.setItem('hoot-settings',JSON.stringify(settings))}catch{}audioVolumes()}
+function notice(title,sub='',duration=3){$('#toast b').textContent=title;$('#toast span').textContent=sub;toastUntil=performance.now()+duration*1000;$('#toast').style.opacity=1}
+function refreshMenu(){menuButtons=[...document.querySelectorAll(modal?'#panel button:not(:disabled)':'#title button:not(:disabled)')].filter(b=>b.offsetParent!==null);menuIndex=clamp(menuIndex,0,Math.max(0,menuButtons.length-1));menuButtons.forEach((b,i)=>b.classList.toggle('focused',i===menuIndex));}
+function focusMenu(delta){menuIndex=(menuIndex+delta+menuButtons.length)%menuButtons.length;refreshMenu();menuButtons[menuIndex]?.scrollIntoView({block:'nearest'});sfx('ui')}
+function openModal(kind){if(attract){stopAttract();return}modal=kind;menuIndex=0;$('#modal').style.display='flex';$('#panel').classList.toggle('wide',kind==='pilots');let html='';if(kind==='pilots'){html=`<div class="ribbon">${mode==='campaign'?'ADVENTURE / THREE SECTORS':'CARAVAN / TWO MINUTES'}</div><h2 id="paneltitle">Choose your breakfast hero.</h2><p class="lead">Three ships. Three flavors of trouble. Every pilot can use every weapon.</p><div class="pilotcards">${pilots.map((p,i)=>`<button class="pilot" data-pilot="${i}"><span class="face" style="color:#${p.color.toString(16)}">${p.icon}</span><h3>${p.name}</h3><p>${p.desc}</p></button>`).join('')}</div><p class="lead">Hold <b>✕ / Space</b> to fire. Collect colored capsules to level up.<br>Your tiny glowing center is your hitbox. The wings are just for show.</p><div class="actions"><button class="menuitem" data-act="back">Back <small>○ / ESC</small></button></div>`}
+if(kind==='settings'){html=`<div class="ribbon">${screen==='play'?(net?'ONLINE WORLD CONTINUES':'FLIGHT PAUSED'):'FLIGHT PREFERENCES'}</div><h2 id="paneltitle">Make yourself at home.</h2><div class="actions">${[['music','Music',settings.music+'%'],['sfx','Sound effects',settings.sfx+'%'],['invertX','Invert horizontal axis',settings.invertX?'ON':'OFF'],['invertY','Invert vertical axis',settings.invertY?'ON':'OFF'],['autoFire','Auto fire',settings.autoFire?'ON':'OFF'],['shake','Screen shake',settings.shake?'ON':'OFF'],...(!net&&screen==='title'?[['difficulty','Flight difficulty',['PICNIC','ARCADE','SPICY'][settings.difficulty]]]:[])].map(([k,l,v])=>`<button class="menuitem" data-setting="${k}">${l}<small>${v}</small></button>`).join('')}<button class="menuitem" data-act="back">${screen==='play'?'Resume flight':'Back'} <small>○ / ESC</small></button>${screen==='play'&&!net?'<button class="menuitem" data-act="quit">Return to title</button>':''}</div>`}
+if(kind==='how'){html=`<div class="ribbon">FLIGHT SCHOOL / NO TUITION FEES</div><h2 id="paneltitle">A crash course. Ideally not.</h2><div class="controlgrid"><div><b>Move</b>Left stick / D-pad · WASD / arrows</div><div><b>Fire</b>Hold ✕ or R2 · Space / Z</div><div><b>Focus & magnet</b>Hold L2 · Shift<br>Slow down; see your tiny hitbox.</div><div><b>Super Hoot</b>□ · X / B<br>Clear bullets; damage everything.</div><div><b>Cycle weapon</b>R1 · E / C<br>Confetti → Sunbeam → Homing Jam</div><div><b>Pause & settings</b>Options · Esc<br>○ to go back. Sticks select menus.</div></div><p class="lead">Colored capsules level up that weapon (max 3). Stars feed your score chain. Near-miss bullets to charge a bonus bomb. Satellite capsules add two wingmen; hearts repair your hull. Losing a hull costs a reserve, but keeps your upgrades.</p><p class="lead">The campaign visits three sectors with a boss in each. Caravan is a two-minute score sprint. Your best score saves on this device.</p><div class="actions"><button class="menuitem" data-act="back">Ready for takeoff <span>↵</span></button></div>`}
+if(kind==='online'){html=`<div class="ribbon">AI HUB / 1–4 PLAYER CO-OP</div><h2 id="paneltitle">The more, the messier.</h2><p class="lead">Launch this game in an <b>AI Hub session</b> and invite your friends through the hub. Everyone joins the same breakfast galaxy, sharing the score and the mission.</p><p class="lead">The hub handles invites, seats, and the synchronized launch. This standalone file is ready for its game library. Each pilot has their own hull, weapons, and bombs. Repairs and reinforcements keep the whole brigade flying.</p><div class="actions"><button class="menuitem" data-act="back">Back to hangar <span>○</span></button></div>`}
+if(kind==='about'){html=`<div class="ribbon">HANDCRAFTED NONSENSE / ORIGINAL ASSETS</div><h2 id="paneltitle">Behind the breakfast.</h2><p class="lead">An original affectionate riff on the cheerful vertical arcade shooter. No original game art, music, or characters are used.</p><div class="abouttext" tabindex="0"></div><div class="actions"><button class="menuitem" data-act="back">Back <span>○</span></button></div>`}
+$('#panel').innerHTML=html;if(kind==='about')$('.abouttext').textContent=$('#feedback').content.textContent;refreshMenu()}
+function closeModal(){modal='';$('#modal').style.display='none';menuIndex=0;lastInput=performance.now();refreshMenu()}
+function act(a){audioStart();lastInput=performance.now();sfx('ui');if(a==='campaign'||a==='caravan'){if(!ready){notice('HOLD THAT HOOT',failed?'WebGPU is required to fly. See the compatibility message.':'The flight deck is still warming up.');return}mode=a;openModal('pilots')}if(['how','about','online','settings'].includes(a))openModal(a);if(a==='back')closeModal();if(a==='quit'){closeModal();toTitle()}if(a==='again'){closeModal();startRun(mode,pilot,false)}if(a==='continue'){closeModal();continueRun()} }
+document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(attract){stopAttract();return}if(b.dataset.act)act(b.dataset.act);if(b.dataset.pilot!==undefined){pilot=+b.dataset.pilot;closeModal();startRun(mode,pilot,false)}if(b.dataset.setting){let k=b.dataset.setting;if(k==='music'||k==='sfx')settings[k]=(settings[k]+25)>100?0:Math.min(100,settings[k]+25);else if(k==='difficulty')settings[k]=(settings[k]+1)%3;else settings[k]=!settings[k];save();let i=menuIndex;openModal('settings');menuIndex=i;refreshMenu()}});
+$('#gear').onclick=()=>openModal('settings');
+function inputEvent(){lastInput=performance.now();if(attract){stopAttract();return true}return false}
+window.addEventListener('keydown',e=>{if(ended)return;if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','Enter','Tab'].includes(e.code))e.preventDefault();if(inputEvent())return;audioStart();keys.add(e.code);if(e.repeat)return;if(e.code==='Escape'){if(modal==='results'&&!net){closeModal();toTitle();return}if(modal)closeModal();else openModal('settings');return}if(modal||screen==='title'||screen==='over'){if(e.code==='ArrowDown'||e.code==='KeyS')focusMenu(1);if(e.code==='ArrowUp'||e.code==='KeyW')focusMenu(-1);if(modal==='pilots'&&(e.code==='ArrowRight'||e.code==='KeyD'))focusMenu(1);if(modal==='pilots'&&(e.code==='ArrowLeft'||e.code==='KeyA'))focusMenu(-1);if(e.code==='Enter'||e.code==='Space')menuButtons[menuIndex]?.click();if(e.code==='PageDown'&&modal==='about')$('.abouttext').scrollTop+=200;return}if(e.code==='KeyX'||e.code==='KeyB')triggerAction('bomb');if(e.code==='KeyE'||e.code==='KeyC')triggerAction('cycle')});
+window.addEventListener('keyup',e=>keys.delete(e.code));window.addEventListener('pointermove',()=>inputEvent());window.addEventListener('wheel',()=>inputEvent(),{passive:true});window.addEventListener('pointerdown',()=>{inputEvent();audioStart()});window.addEventListener('blur',()=>{keys.clear();if(screen==='play'&&!net&&!attract&&!modal)openModal('settings')});
+function readInput(){if(ended){rawInput={x:0,y:0,fire:false,focus:false,bomb:false,cycle:false};return}let gp;try{gp=Array.from(navigator.getGamepads?.()||[]).find(p=>p?.connected)}catch{}let b=gp?gp.buttons.map(v=>v.pressed):[],ax=gp?.axes[0]||0,ay=gp?.axes[1]||0;const edge=i=>b[i]&&!padPrev[i];if(Math.abs(ax)<.18)ax=0;if(Math.abs(ay)<.18)ay=0;let any=ax||ay||b.some(Boolean);if(any){if(attract){padPrev=b;stopAttract();return}lastInput=performance.now();$('#touchNotice').style.display='none';if(b.some(Boolean))audioStart()}if(edge(9)&&!b[8]){if(modal)closeModal();else openModal('settings')}else if(modal||screen==='title'||screen==='over'){let dir=b[13]||ay>.5?1:b[12]||ay<-.5?-1:modal==='pilots'&&(b[15]||ax>.5)?1:modal==='pilots'&&(b[14]||ax<-.5)?-1:0;if(dir&&performance.now()>navLatch){focusMenu(dir);navLatch=performance.now()+210}if(!dir)navLatch=0;if(edge(0))menuButtons[menuIndex]?.click();if(edge(1)&&modal){let result=modal==='results';closeModal();if(result&&!net)toTitle()}if(modal==='about'&&Math.abs(gp?.axes[3]||0)>.15)$('.abouttext').scrollTop+=gp.axes[3]*12}else{if(edge(2))triggerAction('bomb');if(edge(5))triggerAction('cycle')}
+padPrev=b;let x=(keys.has('ArrowRight')||keys.has('KeyD')?1:0)-(keys.has('ArrowLeft')||keys.has('KeyA')?1:0)+(b[15]?1:0)-(b[14]?1:0)+ax*(settings.invertX?-1:1);let y=(keys.has('ArrowUp')||keys.has('KeyW')?1:0)-(keys.has('ArrowDown')||keys.has('KeyS')?1:0)+(b[12]?1:0)-(b[13]?1:0)-ay*(settings.invertY?-1:1);let len=Math.hypot(x,y);if(len>1){x/=len;y/=len}rawInput={x,y,fire:!!(keys.has('Space')||keys.has('KeyZ')||b[0]||b[7]),focus:!!(keys.has('ShiftLeft')||keys.has('ShiftRight')||b[6]),bomb:!!(keys.has('KeyX')||keys.has('KeyB')||b[2]),cycle:!!(keys.has('KeyE')||keys.has('KeyC')||b[5])};if(modal)rawInput={x:0,y:0,fire:false,focus:false,bomb:false,cycle:false};}
+function triggerAction(action){if(screen!=='play'||modal)return;const p=players.get(localId);if(!p)return;if(net&&!H.isHost){H.send({t:'action',a:action,at:H.time()});if(action==='cycle')p.weapon=(p.weapon+1)%3}else if(action==='bomb')bomb(p);else cycle(p)}
+function cycle(p){p.weapon=(p.weapon+1)%3;if(p.idSeat===localId)notice(weapons[p.weapon],`Level ${p.levels[p.weapon]} · each weapon keeps its upgrades`,1.5)}
+// Three.js TSL uses quantized world-space lighting for hard, illustrated color bands.
+const mats=new Map(),geos={};function mat(c){if(mats.has(c))return mats.get(c);let m=new T.MeshBasicNodeMaterial();let n=tsl.normalWorld.dot(tsl.vec3(-.35,.5,.8).normalize()).max(0);let light=n.mul(3).floor().div(3).mul(.48).add(.52);m.colorNode=tsl.color(c).mul(light);mats.set(c,m);return m}
+function mesh(g,c,parent,x=0,y=0,z=0,sx=1,sy=sx,sz=sx,outline=true){let m=new T.Mesh(g,mat(c));m.position.set(x,y,z);m.scale.set(sx,sy,sz);parent.add(m);if(outline){let line=new T.Mesh(g,geos.outline);line.scale.setScalar(1.045);m.add(line)}return m}
+function orb(parent,c,x,y,z,sx,sy=sx,sz=sx,outline=true){return mesh(geos.sphere,c,parent,x,y,z,sx,sy,sz,outline)}
+function box(parent,c,x,y,z,sx,sy,sz,outline=true){return mesh(geos.box,c,parent,x,y,z,sx,sy,sz,outline)}
+function ring(parent,c,x,y,z,scale=1){let o=mesh(geos.torus,c,parent,x,y,z,scale,scale,scale);return o}
+function face(g,x,y,z,scale=1,angry=false){for(let side of [-1,1]){orb(g,0xfff5d9,x+side*.25*scale,y,z,.20*scale,.23*scale,.09*scale);orb(g,0x102b3a,x+side*.25*scale,y-.02*scale,z+.09*scale,.085*scale,.11*scale,.03*scale,false);orb(g,0xffffff,x+side*.25*scale-.025*scale,y+.025*scale,z+.12*scale,.025*scale,.025*scale,.015*scale,false);if(angry){let q=box(g,0x102b3a,x+side*.25*scale,y+.2*scale,z+.09*scale,.23*scale,.045*scale,.035*scale,false);q.rotation.z=side*.3}}}
+function shipModel(kind=0,color){let g=new T.Group();let c=color||pilots[kind].color;if(kind===0){orb(g,c,0,0,0,.65,.9,.4);orb(g,0xfff0c9,0,-.12,.35,.48,.56,.15);for(let s of [-1,1]){let w=orb(g,0xff7c89,s*.78,-.15,-.03,.52,.29,.13);w.rotation.z=s*.3;let ear=mesh(geos.cone,c,g,s*.43,.68,.1,.21,.5,.22);ear.rotation.z=-s*.35;orb(g,0xfff7df,s*.24,.26,.37,.28,.32,.12);orb(g,0x163b4a,s*.24,.28,.49,.12,.17,.06);orb(g,0xffffff,s*.21,.34,.54,.045,.05,.02,false)}let beak=mesh(geos.cone,0xff8e45,g,0,.04,.55,.13,.23,.14);beak.rotation.z=Math.PI;box(g,0x74e0c5,0,-.44,.51,.8,.14,.1);for(let s of [-1,1]){orb(g,0xceeedd,s*.43,-.66,-.12,.18,.36,.2);orb(g,0xffbf4d,s*.43,-.94,-.13,.11,.3,.13,false)}}else if(kind===1){orb(g,c,0,0,0,.65,.65,.42);orb(g,0xfdf4de,0,.03,.36,.47,.45,.13);ring(g,c,-.69,0,0,.47);let sp=mesh(geos.cone,c,g,.7,.28,0,.28,.8,.27);sp.rotation.z=-.8;orb(g,0xffce56,0,.65,.12,.43,.12,.25);orb(g,0xff8d9c,0,.78,.1,.12);face(g,0,.05,.52,.8);box(g,0xffce56,0,-.65,0,1.3,.15,.3)}else{box(g,c,0,0,0,1.3,1.15,.7);box(g,0xfff5db,0,.1,.38,1.0,.75,.08);face(g,0,.22,.45,.95);box(g,0xb27243,0,.72,0,.9,.35,.2);box(g,0xfad681,0,.78,.12,.7,.32,.1);for(let s of [-1,1])orb(g,0x8be4c9,s*.77,-.1,0,.28,.14,.22)}let hit=orb(g,0xfaffff,0,0,.7,.08,.08,.03,false);hit.name='hit';return g}
+function enemyModel(type,stage=0){let g=new T.Group(),c=stages[stage].accent;if(type==='waffle'){box(g,c,0,0,0,1,1,.3);for(let i=-1;i<=1;i++)for(let j=-1;j<=1;j++)box(g,0xb77840,i*.27,j*.27,.17,.15,.15,.03,false);face(g,0,.05,.24,.8);for(let s of [-1,1])orb(g,0xfff3d7,s*.68,0,0,.38,.14,.09)}else if(type==='berry'){orb(g,0xff7998,0,0,0,.62,.67,.35);for(let s of [-1,0,1]){let leaf=orb(g,0x90d6a1,s*.19,.63,.03,.16,.3,.07);leaf.rotation.z=s*.65}face(g,0,.02,.35,.85)}else if(type==='cup'){box(g,0xf7e6d2,0,0,0,1.1,1.0,.4);ring(g,0xff9bb3,.65,.05,0,.4);orb(g,0x704b54,0,.42,.2,.47,.13,.16);face(g,0,-.08,.24,.8)}else{ring(g,c,0,0,0,.9);orb(g,0xff9caf,0,0,-.05,.37,.37,.15);face(g,0,0,.25,.75)}return g}
+function bossModel(stage){let g=new T.Group();if(stage===0){box(g,0xff8589,0,0,0,3.8,2.5,1.0);box(g,0xffc36e,0,-.05,.55,3.3,1.9,.13);box(g,0x203d4a,0,.95,.61,2.7,.25,.1);for(let s of [-1,1]){box(g,0xac6a3e,s*.75,1.5,0,1.15,1.0,.35);box(g,0xffdc88,s*.75,1.5,.22,.9,.78,.1);orb(g,0x8be4c9,s*2.1,-.05,0,.5,.7,.35);orb(g,0xfff0d6,s*1.65,-1.3,0,.45,.3,.3)}face(g,0,.12,.75,2.3,true);box(g,0x3a3e48,0,-.64,.72,.65,.18,.05)}else if(stage===1){orb(g,0x8be4c9,0,0,0,2.2,1.8,.9);ring(g,0xffd05d,-2.0,.05,0,1.1);let sp=mesh(geos.cone,0xffd05d,g,2,1,0,.7,2,.6);sp.rotation.z=-.8;orb(g,0xff85a5,0,1.8,.1,1.4,.35,.5);orb(g,0xffd05d,0,2.15,.1,.35);face(g,0,.2,.91,2.5,true)}else{orb(g,0xffcc67,0,0,0,2,2,.75);orb(g,0xfff2d5,0,0,.72,1.65,1.65,.12);ring(g,0xff839f,0,0,.83,1.63);for(let i=0;i<12;i++){let a=i*Math.PI/6;orb(g,0x2c4b60,Math.sin(a)*1.35,Math.cos(a)*1.35,.9,.08,.08,.03,false)}for(let s of [-1,1])orb(g,0xff839f,s*1.6,1.8,.1,.9,.5,.5);face(g,0,.2,.95,1.8,true);let hand=box(g,0x203c4a,0,-.3,1.04,.14,.8,.05);hand.rotation.z=.7}return g}
+function createVisual(e){let g;if(e.kind==='player')g=shipModel(e.pilot,e.color);else if(e.kind==='enemy')g=enemyModel(e.type,e.stage);else if(e.kind==='boss')g=bossModel(e.stage);else if(e.kind==='pickup'){g=new T.Group();if(e.type==='star'){mesh(geos.star,0xffe291,g,0,0,0,.35,.35,.2)}else{orb(g,e.type==='heart'?0xff7da3:e.type==='wing'?0xb8a3ff:weaponColors[+e.type||0],0,0,0,.39,.39,.19);ring(g,0xfff6de,0,0,.12,.38);box(g,0xffffff,0,0,.22,.1,.30,.04,false);if(e.type==='heart')box(g,0xffffff,0,0,.22,.3,.1,.04,false)}}else if(e.kind==='shot'){g=new T.Group();orb(g,weaponColors[e.weapon]||0xffd867,0,0,0,e.weapon===1?.12:.13,e.weapon===1?.75:.32,.08,false);orb(g,0xfff9df,0,0,.07,.055,e.weapon===1?.65:.23,.025,false)}else if(e.kind==='bullet'){g=new T.Group();orb(g,0x23394c,0,0,0,.24,.24,.12,false);orb(g,e.type==='blue'?0x93ffec:0xff729b,0,0,.07,.19,.19,.10,false);orb(g,0xfff6da,-.04,.05,.16,.075,.075,.025,false)}else{g=new T.Group();mesh(geos.star,e.color||0xffd56b,g,0,0,0,.15,.15,.06,false)}g.position.set(e.x,e.y,e.z||0);entityLayer.add(g);e.mesh=g;return g}
+function makeEntity(kind,x,y,props={}){let e={id:net&&!H.isHost&&['shot','particle'].includes(kind)?nextVfx--:nextId++,kind,x,y,z:0,age:0,...props};entities.set(e.id,e);createVisual(e);if(world&&(!net||H.isHost)){let dyn=kind==='shot'||kind==='bullet'||kind==='particle';let rb=dyn?R.RigidBodyDesc.dynamic():R.RigidBodyDesc.kinematicPositionBased();rb.setTranslation(x,y,e.z);if(dyn){rb.setLinvel(e.vx||0,e.vy||0,0);rb.setGravityScale(0);rb.setCcdEnabled(true)}e.body=world.createRigidBody(rb);if(kind!=='particle'){let rad=kind==='player'?.19:kind==='enemy'?.52:kind==='boss'?1.65:kind==='pickup'?.45:kind==='shot'?.17:.18;let cd=R.ColliderDesc.ball(rad).setSensor(true).setActiveEvents(R.ActiveEvents.COLLISION_EVENTS).setActiveCollisionTypes(R.ActiveCollisionTypes.ALL);e.collider=world.createCollider(cd,e.body);colliders.set(e.collider.handle,e.id)}}return e}
+function removeEntity(e){if(!e||!entities.has(e.id))return;entityLayer.remove(e.mesh);if(e.collider)colliders.delete(e.collider.handle);if(e.body)world.removeRigidBody(e.body);entities.delete(e.id)}
+function clearEntities(){for(const e of [...entities.values()])removeEntity(e);players.clear()}
+function burst(x,y,color=0xffd468,n=12){for(let i=0;i<n;i++){let a=rand(0,Math.PI*2),v=rand(1,5);makeEntity('particle',x,y,{vx:Math.cos(a)*v,vy:Math.sin(a)*v,color,life:rand(.3,.75)})}}
+function makeDecor(){const group=new T.Group();scene.add(group);for(let i=0;i<45;i++){let x=rand(-30,30),y=rand(-22,23),g=new T.Group();g.position.set(x,y,-3-rand(0,2));if(i<13){let size=rand(.7,2.3);orb(g,0x33736f,0,0,-.2,size*1.6,size*.85,.55);orb(g,0x9dd3aa,0,.08,0,size*1.45,size*.75,.3);orb(g,0xf5d798,.25,.1,.2,size*.8,size*.5,.12);for(let j=0;j<3;j++){let tx=rand(-size,size),ty=rand(-.3,.4);box(g,0x715c50,tx,ty,.4,.08,.08,.6);orb(g,j%2?0x5db88c:0x86cf91,tx,ty,.88,.35,.35,.4)}}else if(i<26){for(let j=0;j<3;j++)orb(g,0xb8dfcd,j*.6,Math.sin(j)*.25,0,rand(.4,.8),.4,.18,false)}else{ring(g,0x70aca0,0,0,0,rand(.2,.7));g.scale.z=.12}group.add(g);decor.push({g,speed:rand(.3,1),baseY:y})}let stars=new T.Group();scene.add(stars);for(let i=0;i<90;i++)mesh(geos.star,i%3?0xa5cebb:0xffe0a1,stars,rand(-32,32),rand(-23,23),-5,rand(.03,.1),.09,.02,false);}
+async function init(){try{if(!navigator.gpu)throw new Error('This browser does not expose WebGPU. Open this file in a WebGPU-capable browser over HTTPS or localhost.');const adapter=await navigator.gpu.requestAdapter();if(!adapter)throw new Error('No WebGPU adapter is available. Enable GPU acceleration and use a WebGPU-capable browser.');[T,tsl,R]=await Promise.all([import('three/webgpu'),import('three/tsl'),import('/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs')]);R=R.default||R;await R.init();renderer=new T.WebGPURenderer({canvas:$('#world'),antialias:true,alpha:false});renderer._getFallback=null;await renderer.init();if(!renderer.backend.isWebGPUBackend)throw new Error('A WebGPU renderer is required.');renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setClearColor(0x458d8e);scene=new T.Scene();camera=new T.OrthographicCamera(-20,20,14,-14,.1,100);camera.position.set(0,0,40);camera.lookAt(0,0,0);world=new R.World({x:0,y:0,z:0});queue=new R.EventQueue(true);geos.sphere=new T.SphereGeometry(1,16,10);geos.box=new T.BoxGeometry(1,1,1);geos.cone=new T.ConeGeometry(1,1,12);geos.torus=new T.TorusGeometry(1,.19,8,32);let star=new T.Shape();for(let i=0;i<10;i++){let a=i*Math.PI/5+Math.PI/2,r=i%2?.45:1;i?star.lineTo(Math.cos(a)*r,Math.sin(a)*r):star.moveTo(Math.cos(a)*r,Math.sin(a)*r)}star.closePath();geos.star=new T.ExtrudeGeometry(star,{depth:.25,bevelEnabled:false});geos.outline=new T.MeshBasicMaterial({color:0x193b45,side:T.BackSide});entityLayer=new T.Group();scene.add(entityLayer);makeDecor();titleShip=shipModel(0);titleShip.scale.setScalar(5.1);titleShip.position.set(6.8,1,2);titleShip.rotation.z=-.18;scene.add(titleShip);for(let i=0;i<5;i++){let e=enemyModel(i%2?'berry':'waffle');e.position.set(4+Math.cos(i*1.5)*7,1+Math.sin(i*1.5)*7,0);e.scale.setScalar(.7+Math.random()*.45);scene.add(e);decor.push({g:e,speed:.4,baseY:e.position.y,titleOnly:true})}resize();window.addEventListener('resize',resize);await renderer.compileAsync(scene,camera);ready=true;$('#loading').style.display='none';$('#engineStatus').textContent='WEBGPU · FLIGHT DECK READY';if(H.active)await setupHub();else refreshMenu()}catch(e){failed=true;document.body.classList.add('unsupported');$('#title').insertBefore($('#error'),$('#mainmenu'));$('#loading').style.display='none';$('#engineStatus').textContent='WEBGPU REQUIRED';$('#error').style.display='block';$('#error').innerHTML='<b>The flight deck needs WebGPU.</b>';$('#error').append(document.createTextNode(e.message+' No WebGL fallback is used. Settings and credits remain available.'));refreshMenu();H.fail(e.message);console.warn('Flight deck:',e.message)} }
+function resize(){if(!renderer)return;renderer.setSize(innerWidth,innerHeight);let aspect=innerWidth/innerHeight;let h=screen==='title'?14:14.5;if(aspect<.9)h=14.5/aspect;camera.left=-h*aspect;camera.right=h*aspect;camera.top=h;camera.bottom=-h;camera.updateProjectionMatrix()}
+function newPlayer(id,kind=0,color){let p=makeEntity('player',(id-(activePlayers.length-1)/2)*2.2,-8,{pilot:kind,color,health:pilots[kind].health,maxHealth:pilots[kind].health,lives:2,bombs:3,levels:[1,1,1],weapon:kind===1?2:kind===2?1:0,wing:0,inv:2,fireAt:0,charge:0,respawn:0,dead:false,input:{x:0,y:0,fire:false,focus:false},actionStamp:-1});p.idSeat=id;players.set(id,p);return p}
+function startRun(m='campaign',kind=0,demo=false){if(!ready)return;clearEntities();nextId=1;mode=m;pilot=kind;attract=demo;screen='play';ended=false;lastSnapshot=-1;state={time:0,stage:0,stageTime:0,wave:0,nextWave:2,nextDrop:5,boss:false,bossDone:false,score:0,chain:0,chainTimer:0,kills:0,graze:0,shots:0,bombs:0,clearWait:0,over:false};activePlayers=net?H.players.map(p=>p.id):[0];localId=net?H.me:0;for(let id of activePlayers)newPlayer(id,net?id%3:kind,net?parseInt(H.players.find(p=>p.id===id).color.slice(1),16):undefined);titleShip.visible=false;decor.filter(d=>d.titleOnly).forEach(d=>d.g.visible=false);document.body.classList.add('playing');$('#attract').style.display=demo?'block':'none';closeModal();resize();setStage(0);notice('BREAKFAST NEEDS A HERO',demo?'AUTO PILOT · Any input returns to the hangar':'Hold ✕ / Space to fire · L2 / Shift to focus',4);audioVolumes()}
+function setStage(n){state.stage=n;state.stageTime=0;state.nextWave=2;state.nextDrop=5;state.boss=false;state.bossDone=false;state.wave=0;renderer.setClearColor(stages[n].color);notice(stages[n].name,['The Toastmaster has declared breakfast a no-fly zone. Rude.','The tea is airborne. Please keep your biscuit inside the vehicle.','Admiral Alarm stole the snooze button. This is personal.'][n],4);if(n>0)for(let p of players.values()){p.health=p.maxHealth;p.bombs=Math.min(5,p.bombs+1);p.inv=3}}
+function toTitle(){if(net)return;clearEntities();screen='title';attract=false;state.over=false;document.body.classList.remove('playing');titleShip.visible=true;decor.filter(d=>d.titleOnly).forEach(d=>d.g.visible=true);renderer.setClearColor(stages[0].color);$('#attract').style.display='none';$('#bossbar').style.display='none';$('#toast').style.opacity=0;lastInput=performance.now();menuIndex=0;refreshMenu();resize()}
+function stopAttract(){attract=false;keys.clear();toTitle();lastInput=performance.now()}
+function spawnWave(){let s=state.stage,w=state.wave++;let count=5+(w%3);for(let i=0;i<count;i++){let type=['waffle','berry','cup','donut'][(w+s)%4];makeEntity('enemy',-7+i*14/(count-1),14+i*.55,{type,stage:s,hp:2+s+(w%4===3?2:0),baseX:-7+i*14/(count-1),phase:i*.7,pattern:w%4,vy:-1.4-s*.2,shotAt:1.5+i*.25,value:100})}if(w%4===2){for(let side of [-1,1])makeEntity('enemy',side*9,10,{type:'cup',stage:s,hp:10+s*3,baseX:side*9,phase:0,pattern:4,shotAt:1,value:350})}}
+function spawnBoss(){state.boss=true;let hp=(350+state.stage*180)*(1+(players.size-1)*.7);makeEntity('boss',0,15,{stage:state.stage,hp,maxHp:hp,shotAt:1.8,phase:0,value:8000});notice(stages[state.stage].boss,stages[state.stage].subtitle,3);sfx('hit')}
+function pickup(x,y,type='star'){if(type==='star'&&[...entities.values()].filter(e=>e.kind==='pickup'&&e.type==='star').length>35)return;return makeEntity('pickup',x,y,{type,vy:-1.6,life:16})}
+function shoot(p){const l=p.levels[p.weapon],w=p.weapon,damage=(w===1?(p.pilot===2?2.0:1.65):1);let arr=w===0?Array.from({length:3+(l-1)*2},(_,i)=>(i-(2+(l-1)*2)/2)*.14):w===1?Array.from({length:l},(_,i)=>(i-(l-1)/2)*.04):Array.from({length:l+1+(p.pilot===1?1:0)},(_,i)=>(i-l/2)*.24);for(let a of arr)makeEntity('shot',p.x+Math.sin(a)*.7,p.y+.75,{vx:Math.sin(a)*18,vy:Math.cos(a)*22,weapon:w,damage,owner:p.idSeat,life:1.65,homing:w===2});for(let side of [-1,1].slice(0,p.wing))makeEntity('shot',p.x+side*.95,p.y+.2,{vx:0,vy:22,weapon:0,damage:.7,owner:p.idSeat,life:1.5});state.shots++;if(p.idSeat===localId)sfx('shot')}
+function enemyFire(e){if([...entities.values()].filter(e=>e.kind==='bullet').length>64)return;let live=[...players.values()].filter(p=>!p.dead),target=live[Math.floor(e.age)%Math.max(1,live.length)];if(!target)return;const aim=Math.atan2(target.y-e.y,target.x-e.x),spd=attract?3.2:settings.difficulty===0?3.1:(4.1+state.stage*.35)*(settings.difficulty===2?1.25:1);if(e.kind==='boss'){let phase=e.hp/e.maxHp<.34?2:e.hp/e.maxHp<.67?1:0;e.phase=phase;let count=phase===2?14:phase===1?11:8;for(let i=0;i<count;i++){let a=phase===1?aim+(i-(count-1)/2)*.16:i*Math.PI*2/count+e.age*.4;makeEntity('bullet',e.x+Math.cos(a)*1.5,e.y+Math.sin(a)*1.3,{vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,type:phase===1?'blue':'pink',life:9})}if(phase===2){for(let i=-1;i<=1;i++)makeEntity('bullet',e.x,e.y-1.3,{vx:Math.cos(aim+i*.14)*(spd+1),vy:Math.sin(aim+i*.14)*(spd+1),life:8})}}else{let count=e.type==='cup'?3:1;for(let i=0;i<count;i++){let a=aim+(i-(count-1)/2)*.22;makeEntity('bullet',e.x,e.y-.3,{vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,life:9})}}}
+function bomb(p){if(!p||p.dead||p.bombs<=0)return;p.bombs--;state.bombs++;p.inv=2.5;for(let e of [...entities.values()])if(e.kind==='bullet'){if(e.id%3===0)pickup(e.x,e.y);removeEntity(e)}else if(e.kind==='enemy'||e.kind==='boss')damageEnemy(e,e.kind==='boss'?45:99);burst(p.x,p.y,0xaaffdf,35);notice('SUPER HOOT!', 'All complaints have been converted into confetti.',1.8);sfx('bomb');shake=.6}
+let shake=0;
+function damageEnemy(e,n){if(!entities.has(e.id))return;e.hp-=n;e.flash=.08;if(e.hp<=0){let x=e.x,y=e.y,kind=e.kind;state.chain=clamp(state.chain+1,0,40);state.chainTimer=4;state.score+=e.value*(1+Math.floor(state.chain/8));state.kills++;burst(x,y,stages[state.stage].accent,kind==='boss'?40:7);sfx('pop');removeEntity(e);for(let i=0;i<(kind==='boss'?15:2);i++)pickup(x+rand(-.5,.5),y+rand(-.5,.5));if(kind==='enemy'&&state.kills%8===0)pickup(x,y,String(Math.floor(state.kills/8)%3));if(kind==='boss'){state.boss=false;state.bossDone=true;state.clearWait=4;notice('BOSS DEFEATED. BREAKFAST SAVED.',state.stage===2?'The snooze button is free. The galaxy can sleep in.':'Please enjoy these complimentary upgrades.',3);for(let i=0;i<3;i++)pickup(-2+i*2,3,String(i));pickup(0,1,'heart');for(let b of [...entities.values()])if(b.kind==='bullet')removeEntity(b)}}}
+function hitPlayer(p){if(p.inv>0||p.dead||attract)return;p.health--;p.inv=2;state.chain=0;shake=.35;sfx('hit');burst(p.x,p.y,0xff7da3,12);if(p.health<=0){if(p.lives>0){p.lives--;p.health=p.maxHealth;p.inv=4;p.x=clamp(p.x,-8,8);p.y=-8;p.bombs=Math.max(2,p.bombs);notice('BACK FOR SECONDS', 'Your upgrades are safe. Keep flying.',2)}else{p.dead=true;p.respawn=net?8:0;p.mesh.visible=false;if(!net)finishRun(false)}}}
+function collect(p,e){if(!entities.has(e.id)||p.dead)return;if(e.type==='star'){state.score+=50*(1+Math.floor(state.chain/8));p.charge+=1.4}else if(e.type==='heart'){p.health=Math.min(p.maxHealth,p.health+2);notice('FRESHLY PATCHED', 'Hull repaired. Crumbs removed.',1.5);sfx('pick')}else if(e.type==='wing'){p.wing=Math.min(2,p.wing+1);state.score+=500;notice('WINGMAN ON THE MENU',p.wing===2?'Full formation. Extra firepower.':'A little friend with a very large work ethic.',2);sfx('pick')}else{let w=+e.type;p.levels[w]=Math.min(3,p.levels[w]+1);p.weapon=w;state.score+=250;notice(weapons[w]+' · LEVEL '+p.levels[w], 'Cycle with R1 / E. Upgrades stay with each weapon.',1.5);sfx('pick')}removeEntity(e)}
+function collision(a,b){if(!a||!b)return;if(a.kind==='shot'&&(b.kind==='enemy'||b.kind==='boss')){damageEnemy(b,a.damage);removeEntity(a)}if(a.kind==='player'&&b.kind==='bullet'){hitPlayer(a);removeEntity(b)}if(a.kind==='player'&&(b.kind==='enemy'||b.kind==='boss'))hitPlayer(a);if(a.kind==='player'&&b.kind==='pickup')collect(a,b)}
+function aiInput(p){let target=[...entities.values()].find(e=>e.kind==='boss')||[...entities.values()].filter(e=>e.kind==='enemy').sort((a,b)=>a.y-b.y)[0];let drop=[...entities.values()].find(e=>e.kind==='pickup'&&e.type!=='star'&&e.y<7);let tx=drop?drop.x:target?target.x:Math.sin(state.time)*6,ty=drop?drop.y:-7+Math.sin(state.time*.7)*2;return{x:clamp((tx-p.x)*2,-1,1),y:clamp((ty-p.y)*2,-1,1),fire:true,focus:false}}
+function movePlayer(p,input,dt){if(p.dead)return;let speed=pilots[p.pilot].speed*(input.focus?.43:1);p.x=clamp(p.x+input.x*speed*dt,-10,10);p.y=clamp(p.y+input.y*speed*dt,-11,10.5);p.input=input;}
+function step(dt){if(screen!=='play'||ended||state.over)return;if(net&&H.time()<0)return;state.time+=dt;if(net&&H.isHost)state.time=Math.max(state.time,H.time()/1000);if(net&&!H.isHost){let p=players.get(localId);if(p){movePlayer(p,rawInput,dt);p.fireAt=(p.fireAt||0)-dt;if(!p.dead&&(rawInput.fire||settings.autoFire)&&p.fireAt<=0){shoot(p);p.fireAt=p.weapon===1?.115:.16}}for(let [id,rp] of players)if(id!==localId&&!rp.dead){rp.fireAt=(rp.fireAt||0)-dt;if(rp.remoteFire&&rp.fireAt<=0){shoot(rp);rp.fireAt=rp.weapon===1?.115:.16}}for(let e of [...entities.values()])if(e.kind==='shot'||e.kind==='particle'){e.x+=(e.vx||0)*dt;e.y+=(e.vy||0)*dt;e.age+=dt;if(e.age>e.life)removeEntity(e)}return}state.stageTime+=dt;if(state.chainTimer>0)state.chainTimer-=dt;else state.chain=0;
+for(let [id,p]of players){p.inv=Math.max(0,p.inv-dt);if(p.dead){if(net){p.respawn-=dt;if(p.respawn<=0){p.dead=false;p.health=p.maxHealth;p.inv=4;p.x=0;p.y=-8;p.bombs=2}}continue}let input=attract?aiInput(p):id===localId?rawInput:remoteInputs.get(id)||{x:0,y:0,fire:false,focus:false};if(!net||id===localId)movePlayer(p,input,dt);p.input=input;p.fireAt-=dt;if((input.fire||settings.autoFire||attract)&&p.fireAt<=0){shoot(p);p.fireAt=p.weapon===1?.115:.16}if(p.charge>=100){p.charge-=100;p.bombs=Math.min(5,p.bombs+1);if(id===localId)notice('ANOTHER HELPING!', 'Near misses earned a Super Hoot.',2)}if(attract){p.health=p.maxHealth;p.inv=2;if(Math.floor(state.time)%13===12&&p.bombs>0&&p.inv<2.01&&state.time-(p.lastBomb||0)>9){bomb(p);p.lastBomb=state.time}if(Math.floor(state.time)%16===0&&state.time-(p.lastCycle||0)>10){cycle(p);p.lastCycle=state.time}p.bombs=3}}
+if(mode==='caravan'&&state.time>=120){finishRun(true);return}if(!state.boss&&!state.bossDone){if(state.stageTime>=state.nextWave){spawnWave();state.nextWave+=mode==='caravan'?3.6:settings.difficulty===2?3.8:4.6}if(state.stageTime>=(mode==='caravan'?42:stages[state.stage].duration))spawnBoss()}
+if(state.stageTime>=state.nextDrop){let k=Math.floor(state.nextDrop/7);pickup(Math.sin(k*1.8)*7,12,k%5===0?'heart':k%3===0?'wing':String(k%3));state.nextDrop+=7}
+if(state.bossDone){state.clearWait-=dt;if(state.clearWait<=0){if(mode==='caravan'){if(state.stage<2)setStage(state.stage+1);else{state.bossDone=false;state.stageTime=0}}else if(state.stage<2){for(let e of [...entities.values()])if(e.kind!=='player'&&e.kind!=='pickup')removeEntity(e);setStage(state.stage+1)}else{finishRun(true);return}}}
+for(let e of [...entities.values()]){e.age+=dt;if(e.flash)e.flash-=dt;if(e.kind==='enemy'){if(e.pattern===4){e.y=10-e.age*.45;e.x=e.baseX+Math.sin(e.age)*.8}else{e.y-=dt*(1.7+state.stage*.25);e.x=e.baseX+Math.sin(e.age*(e.pattern===2?2:1)+e.phase)*(e.pattern===1?2.4:1.1)}e.shotAt-=dt;if(e.shotAt<=0&&e.y<11){enemyFire(e);e.shotAt=e.type==='cup'?1.5:2.9}if(e.y<-14)removeEntity(e)}else if(e.kind==='boss'){e.y+=(7-e.y)*Math.min(1,dt*1.4);e.x=Math.sin(e.age*.65)*(e.stage===2?5:4);e.shotAt-=dt;if(e.shotAt<=0&&e.age>1.5){enemyFire(e);e.shotAt=e.phase===2?.65:1.1}if(attract)e.hp-=dt*3.8}else if(e.kind==='pickup'){let nearest=[...players.values()].filter(p=>!p.dead).sort((a,b)=>Math.hypot(a.x-e.x,a.y-e.y)-Math.hypot(b.x-e.x,b.y-e.y))[0];let d=nearest?Math.hypot(nearest.x-e.x,nearest.y-e.y):99;if(d<(nearest?.input?.focus?5:2.2)||attract&&d<6){e.x+=(nearest.x-e.x)*dt*5;e.y+=(nearest.y-e.y)*dt*5}else e.y-=dt*1.45;if(e.age>e.life||e.y<-14)removeEntity(e)}else if(e.kind==='shot'&&e.homing){let target=[...entities.values()].filter(q=>(q.kind==='enemy'||q.kind==='boss')&&q.y>e.y-.5).sort((a,b)=>Math.hypot(a.x-e.x,a.y-e.y)-Math.hypot(b.x-e.x,b.y-e.y))[0];if(target){let dx=target.x-e.x,dy=target.y-e.y,d=Math.hypot(dx,dy);e.vx+=(dx/d*19-e.vx)*dt*6;e.vy+=(dy/d*19-e.vy)*dt*6;e.body?.setLinvel({x:e.vx,y:e.vy,z:0},true)}}
+if(e.kind==='bullet'){for(let p of players.values())if(!p.dead&&!e.grazed&&Math.hypot(p.x-e.x,p.y-e.y)<.9&&Math.hypot(p.x-e.x,p.y-e.y)>.4){e.grazed=true;p.charge+=4;state.score+=20;state.graze++}}if(['shot','bullet','particle'].includes(e.kind)&&(e.age>e.life||Math.abs(e.x)>18||Math.abs(e.y)>18))removeEntity(e);if(e.body&&entities.has(e.id)&&!['shot','bullet','particle'].includes(e.kind))e.body.setNextKinematicTranslation({x:e.x,y:e.y,z:0});}
+world.timestep=dt;world.step(queue);for(let e of entities.values())if(e.body&&['shot','bullet','particle'].includes(e.kind)){let pos=e.body.translation();e.x=pos.x;e.y=pos.y}queue.drainCollisionEvents((a,b,start)=>{if(!start)return;let ea=entities.get(colliders.get(a)),eb=entities.get(colliders.get(b));collision(ea,eb);collision(eb,ea)});for(let e of [...entities.values()])if(e.kind==='boss'&&e.hp<=0)damageEnemy(e,1);
+}
+function finishRun(won){if(state.over)return;state.over=true;screen='over';if(attract){setTimeout(()=>{if(attract)startRun('campaign',(pilot+1)%3,true)},4000);return}if(net){if(H.isHost){let ids=H.players.map(p=>p.id);H.send({t:'done',won,score:state.score},{reliable:true});H.finish({standings:[ids],scores:Object.fromEntries(ids.map(id=>[id,state.score])),won})}showResults(won);return}if(state.score>best){best=state.score;try{localStorage.setItem('hoot-best',String(best))}catch{}$('#bestlabel').textContent='BEST  '+String(best).padStart(6,'0')}showResults(won)}
+function showResults(won){screen='over';modal='results';$('#modal').style.display='flex';$('#panel').classList.remove('wide');$('#panel').innerHTML=`<div class="ribbon">${won?'MISSION COMPLETE':'FLIGHT LOG CLOSED'}</div><h2 id="paneltitle">${won?'You saved our bacon.':'A little over-toasted.'}</h2><p class="lead">${won?'The galaxy can finally enjoy a peaceful breakfast. Captain Hoot has requested a nap and seventeen pancakes.':'The brigade is down, but breakfast is not over. Your sector checkpoint and upgrades are ready for another helping.'}</p><div class="results"><div><b>${state.score.toLocaleString()}</b><small>POINTS</small></div><div><b>${state.kills}</b><small>FOES FOLDED</small></div><div><b>${state.graze}</b><small>NEAR MISSES</small></div></div><p class="lead">${won?'RANK '+(state.score>65000?'S · BREAKFAST LEGEND':state.score>35000?'A · CERTIFIED HOOT':'B · SUNNY SIDE UP'):'Sector '+(state.stage+1)+' · '+stages[state.stage].name}${net?' · Shared brigade score':''}</p>${net?'<p class="lead">Waiting for the hub’s next round.</p>':`<div class="actions">${!won?'<button class="menuitem" data-act="continue">Continue from sector checkpoint</button>':''}<button class="menuitem" data-act="again">Fly again <span>↗</span></button><button class="menuitem" data-act="quit">Return to title <span>○</span></button></div>`}`;menuIndex=0;refreshMenu()}
+function continueRun(){let stage=state.stage,score=state.score,p=players.get(localId),levels=p?.levels.slice()||[1,1,1];startRun(mode,pilot);state.score=score;setStage(stage);players.get(localId).levels=levels;notice('ANOTHER HELPING', 'Sector restarted. Score and upgrades retained.',2)}
+// Compact host snapshots; clients predict their own movement and ease remote objects.
+function snapshot(){let list=[];for(let e of entities.values()){if(e.kind==='particle'||e.kind==='shot')continue;list.push([e.id,e.kind==='player'?0:e.kind==='enemy'?1:e.kind==='boss'?2:e.kind==='pickup'?3:4,Math.round(e.x*10),Math.round(e.y*10),e.kind==='player'?e.idSeat:e.kind==='enemy'?['waffle','berry','cup','donut'].indexOf(e.type):e.kind==='pickup'?['star','0','1','2','heart','wing'].indexOf(e.type):e.type==='blue'?1:0,Math.round((e.hp||0)*10)/10,e.kind==='player'?[e.pilot,e.health,e.lives,e.bombs,e.levels,e.weapon,e.wing,+e.inv.toFixed(1),Math.round(e.charge),e.dead?1:0,e.input?.fire||settings.autoFire?1:0]:e.kind==='boss'?[e.maxHp,e.stage]:e.kind==='enemy'?e.stage:0]);}return{t:'s',at:H.time(),s:[+state.time.toFixed(2),state.stage,+state.stageTime.toFixed(2),state.score,state.chain,state.kills,state.graze,state.boss?1:0],e:list}}
+function applySnapshot(data){if(data.at<=lastSnapshot)return;lastSnapshot=data.at;let s=data.s;Object.assign(state,{time:s[0],stage:s[1],stageTime:s[2],score:s[3],chain:s[4],kills:s[5],graze:s[6],boss:!!s[7]});renderer.setClearColor(stages[state.stage].color);let seen=new Set();for(let a of data.e){let [id,k,x,y,type,hp,extra]=a;x/=10;y/=10;if(k===1)type=['waffle','berry','cup','donut'][type];if(k===3)type=['star','0','1','2','heart','wing'][type];if(k===4)type=type===1?'blue':'pink';seen.add(id);let e=entities.get(id);if(e&&e.kind!==['player','enemy','boss','pickup','bullet'][k]){removeEntity(e);e=null}if(!e){e={id,kind:['player','enemy','boss','pickup','bullet'][k],x,y,age:0,hp,type,stage:k===1?extra:k===2?extra[1]:state.stage};if(k===0){e.idSeat=type;e.pilot=extra[0];e.color=parseInt((H.players.find(p=>p.id===type)?.color||'#ffcf51').slice(1),16)}entities.set(id,e);createVisual(e)}e.tx=x;e.ty=y;e.hp=hp;if(k===0){if(e.dead&&!extra[9]||extra[7]>3&&(e.inv||0)<=3&&Math.hypot(e.x-x,e.y-y)>2){e.x=x;e.y=y}Object.assign(e,{health:extra[1],maxHealth:pilots[extra[0]].health,lives:extra[2],bombs:extra[3],levels:extra[4],weapon:extra[5],wing:extra[6],inv:extra[7],charge:extra[8],dead:!!extra[9],remoteFire:!!extra[10]});players.set(type,e);}else if(k===2)e.maxHp=extra[0]}
+for(let e of [...entities.values()])if(!seen.has(e.id)&&e.kind!=='shot'&&e.kind!=='particle'){if(e.kind==='enemy'||e.kind==='boss')burst(e.x,e.y,stages[state.stage].accent,5);removeEntity(e)}}
+let netParts=new Map();async function setupHub(){const info=await H.connect({mode:'co-op',seats:[1,4]});if(!info)return;net=info;H.on('message',(d,from)=>{if(!d||ended)return;if(d.t==='s'&&!H.isHost&&from===H.host)applySnapshot(d);if(d.t==='part'&&!H.isHost&&from===H.host){if(d.at>lastSnapshot){let v=netParts.get(d.at)||[];v[d.n]=d;netParts.set(d.at,v);if(v[0]&&v[1]){applySnapshot({t:'s',at:d.at,s:v[0].s,e:[...v[0].e,...v[1].e]});netParts.clear()}if(netParts.size>4)netParts.delete(netParts.keys().next().value)}}if(d.t==='me'&&H.isHost&&players.has(from)){if(d.at<=(remoteTimes.get(from)||-1))return;remoteTimes.set(from,d.at);let p=players.get(from);p.x=clamp(d.x,-10,10);p.y=clamp(d.y,-11,10.5);remoteInputs.set(from,{x:d.ix||0,y:d.iy||0,fire:!!d.fire,focus:!!d.focus})}if(d.t==='action'&&H.isHost){let p=players.get(from);if(p&&d.at>p.actionStamp){p.actionStamp=d.at;d.a==='bomb'?bomb(p):cycle(p)}}if(d.t==='done'&&from===H.host){state.score=d.score;state.over=true;showResults(d.won)}});H.on('leave',({id})=>{let p=players.get(id);if(p)removeEntity(p);players.delete(id);remoteInputs.delete(id);activePlayers=activePlayers.filter(x=>x!==id);if(id===H.host){ended=true;state.over=true;showResults(false)}});H.on('time-up',()=>{if(H.isHost)finishRun(false)});H.on('end',()=>{ended=true;state.over=true;if(screen!=='over')showResults(false);keys.clear();audioVolumes()});startRun('campaign',H.me%3,false);H.ready()}
+function netTick(dt){if(!net||ended||state.over)return;netSend+=dt;if(netSend<.14)return;netSend=0;if(H.isHost){let snap=snapshot();let text=JSON.stringify(snap);if(text.length<3900)H.send(snap,{reliable:false});else{let mid=Math.ceil(snap.e.length/2);H.send({t:'part',at:snap.at,n:0,s:snap.s,e:snap.e.slice(0,mid)},{reliable:false});H.send({t:'part',at:snap.at,n:1,e:snap.e.slice(mid)},{reliable:false})}}else{let p=players.get(localId);if(p)H.send({t:'me',at:H.time(),x:+p.x.toFixed(3),y:+p.y.toFixed(3),ix:rawInput.x,iy:rawInput.y,fire:rawInput.fire||settings.autoFire,focus:rawInput.focus},{to:H.host,reliable:false})}H.progress({score:state.score,label:'Sector '+(state.stage+1)+' / 3'})}
+function updateHud(){const p=players.get(localId)||players.values().next().value;$('#score').textContent=String(Math.floor(state.score)).padStart(6,'0');$('#chain').textContent='CHAIN ×'+(1+Math.floor(state.chain/8))+'  ·  '+state.chain;$('#sector').textContent=mode==='caravan'?'CARAVAN / SCORE ATTACK':'SECTOR 0'+(state.stage+1)+' / 03';$('#stageName').textContent=stages[state.stage].name;let seconds=mode==='caravan'?Math.max(0,120-state.time):state.time;$('#clock').textContent=net&&H.time()<0?'LAUNCH IN '+Math.ceil(-H.time()/1000):`${Math.floor(seconds/60).toString().padStart(2,'0')}:${Math.floor(seconds%60).toString().padStart(2,'0')}`;if(p){$('#health').textContent=p.dead?'REJOINING…':'♥'.repeat(Math.max(0,p.health))+'♡'.repeat(Math.max(0,p.maxHealth-p.health));$('#lives').textContent=net?players.size+' PILOTS · CO-OP':p.lives+' RESERVES';$('#weapon').textContent=weapons[p.weapon]+' · LV '+p.levels[p.weapon];$('#wingmen').textContent='WINGMEN '+p.wing+' / 2';$('#bombs').textContent='✦'.repeat(p.bombs)||'—';$('#charge').style.width=p.charge+'%'}let boss=[...entities.values()].find(e=>e.kind==='boss');$('#bossbar').style.display=boss?'block':'none';if(boss){$('#bossname').textContent=stages[state.stage].boss+' · PHASE '+(boss.hp/boss.maxHp<.34?3:boss.hp/boss.maxHp<.67?2:1);$('#bosshp').style.width=clamp(boss.hp/boss.maxHp*100,0,100)+'%'}}
+let hudTick=0;function frame(now){requestAnimationFrame(frame);let dt=Math.min(.1,(now-lastTime)/1000||.016);lastTime=now;visualTime+=dt;readInput();if(!ready)return;if(!net&&screen==='title'&&!modal&&now-lastInput>10000)startRun('campaign',0,true);if(screen==='play'&&(!modal||net||attract)){acc+=dt;let steps=0;while(acc>=1/60&&steps++<6){step(1/60);acc-=1/60}}else acc=0;netTick(dt);musicTick();if(now>toastUntil)$('#toast').style.opacity=0;
+if(screen==='title'){titleShip.position.y=.7+Math.sin(visualTime*1.3)*.4;titleShip.rotation.z=-.16+Math.sin(visualTime*.8)*.06;titleShip.rotation.y=Math.sin(visualTime*.6)*.13}
+for(let d of decor){if(d.titleOnly){if(screen==='title')d.g.rotation.z=Math.sin(visualTime*.5+d.baseY)*.15;continue}if(screen==='play'&&(!modal||net||attract)){d.g.position.y-=dt*d.speed*1.3;if(d.g.position.y<-23)d.g.position.y=23}}
+for(let e of entities.values()){if(net&&!H.isHost&&e.tx!==undefined&&(e.kind!=='player'||e.idSeat!==localId)){e.x+=(e.tx-e.x)*Math.min(1,dt*15);e.y+=(e.ty-e.y)*Math.min(1,dt*15);e.age+=dt}e.mesh.position.set(e.x,e.y,e.z||0);if(e.kind==='player'){e.mesh.visible=!e.dead&&(e.inv<=0||Math.sin(visualTime*28)>-.4);e.mesh.rotation.z=-(e.input?.x||0)*.15;e.mesh.rotation.y=(e.input?.x||0)*.18;let hit=e.mesh.getObjectByName('hit');if(hit){let f=e.input?.focus?1.7:1;hit.scale.set(.08*f,.08*f,.03)};if(!e.wings){e.wings=[];for(let s of [-1,1]){let wing=shipModel(e.pilot);wing.scale.setScalar(.32);e.mesh.add(wing);e.wings.push(wing)}}e.wings.forEach((w,i)=>{w.visible=i<e.wing;w.position.set((i?1:-1)*(1.25+Math.sin(visualTime*3)*.12),-.55+Math.sin(visualTime*3+i)*.15,0)})}else if(e.kind==='pickup')e.mesh.rotation.y=visualTime*2;else if(e.kind==='enemy')e.mesh.rotation.z=Math.sin(e.age*3)*.13;else if(e.kind==='particle'){e.mesh.rotation.z+=dt*9;let v=Math.max(.01,1-e.age/e.life);e.mesh.scale.setScalar(v)}if(e.flash>0)e.mesh.scale.setScalar(1.12);else if(e.kind==='enemy'||e.kind==='boss')e.mesh.scale.setScalar(1)}
+shake=Math.max(0,shake-dt);camera.position.x=settings.shake&&shake>0?Math.sin(now*.13)*shake*.4:0;camera.position.y=settings.shake&&shake>0?Math.cos(now*.17)*shake*.3:0;hudTick+=dt;if(screen!=='title'&&hudTick>.08){updateHud();hudTick=0}renderer.render(scene,camera)}
+H.probe(()=>({scene:ended||screen==='over'?'over':net&&H.time()<0?'ready':screen==='play'?'play':modal?'menu':'title',menu:!!modal,world:state.time,input:rawInput}));
+// Read-only diagnostic surface for efficient verification of the delivered simulation.
+window.Hootodier={inspect:()=>({ready,failed,screen,modal,attract,mode,state:{...state},players:[...players.values()].map(p=>({id:p.idSeat,x:p.x,y:p.y,health:p.health,lives:p.lives,bombs:p.bombs,weapon:p.weapon,levels:p.levels,wing:p.wing,charge:p.charge})),entities:entities.size,nonFiniteEntities:[...entities.values()].filter(e=>!Number.isFinite(e.x)||!Number.isFinite(e.y)).length,webgpu:!!renderer?.backend?.isWebGPUBackend,physics:ready?R.version():null,settings:{...settings}})};
+setInterval(()=>{if(!document.hidden||!net||!ready||ended||screen!=='play')return;const now=performance.now(),dt=Math.min(.1,(now-lastTime)/1000);lastTime=now;rawInput={x:0,y:0,fire:false,focus:false,bomb:false,cycle:false};for(let i=0;i<Math.floor(dt*60);i++)step(1/60);netTick(dt)},50);
+setInterval(readInput,16);
+if(matchMedia('(pointer: coarse)').matches)$('#touchNotice').style.display='block';refreshMenu();requestAnimationFrame(frame);init();
+
+</script></body></html>
