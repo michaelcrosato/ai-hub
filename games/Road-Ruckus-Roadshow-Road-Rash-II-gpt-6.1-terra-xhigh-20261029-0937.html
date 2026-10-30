@@ -1,0 +1,630 @@
+<!doctype html>
+<!--
+Source Information
+Date: 2026-10-29 09:37
+Source: Road Rash II
+Tech: Three.js r180 WebGPURenderer (WebGPU required), Rapier 0.19.3, Web Audio, Gamepad API, BroadcastChannel, AI Hub Session Protocol v1.
+Art Direction: original cel-shaded roadside comic-book Americana.
+Animation: procedural rigid-part animation and camera easing.
+Audio: synthesized procedural music, engine, impacts and gibberish vocal effects.
+Online: AI Hub parallel sessions; standalone same-origin BroadcastChannel rivals. No external game server.
+Testing: lightweight automated browser and syntax checks; browser and hardware coverage limited.
+Environment: Codex CLI (headless); Linux; browser: Google Chrome headless.
+Model: OpenAI, gpt-6.1-terra, reasoning effort xhigh.
+Usage: unknown.
+Testing Feedback: 1 issue caught; 1 critical in the test environment: headless Chrome lost its WebGPU device and could not present the 3D scene. The browser smoke test was most helpful; syntax checking alone was least helpful. Collision, combat, settings, finish and a mock AI Hub exchange passed.
+Engine Feedback: Most liked: straightforward Three.js scene construction. Got stuck on headless WebGPU presentation. Built the procedural road, race, AI, combat and audio here. Hardest: validating the renderer headlessly. Overhaul automatic renderer fallback when WebGPU is mandatory; add an explicit WebGPU-only initialization option.
+Prompt Feedback: Most liked: controller-first arcade direction. Confusing: standalone multiplayer scope. Hardest: combining a complete race with networking. Desired test: a real multi-device, physical-controller playtest.
+-->
+<html lang="en"><head><meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="3"><meta name="hub:session-goal" content="Finish the road race in the shortest time"><meta name="hub:session-howto" content="Steer left stick, R2 gas, L2 brake, Square/Circle strike, R1 boost"><meta name="hub:webgpu" content="required">
+<title>Road Ruckus Roadshow</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;800;900&family=Space+Mono:wght@400;700&display=swap');
+:root{--ink:#162d34;--cream:#fff4d9;--orange:#ff643b;--yellow:#ffe16a;--teal:#1c7772}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#76c4c4;color:var(--cream);font-family:'Barlow Condensed',Impact,sans-serif}canvas{position:absolute;inset:0;width:100%;height:100%}button{font:inherit;color:inherit;cursor:pointer}#shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(15,41,45,.89),rgba(15,41,45,.4) 43%,transparent 76%),linear-gradient(0deg,rgba(10,38,42,.55),transparent 45%);pointer-events:none}#screen{position:absolute;inset:0;pointer-events:none}.panel{position:absolute;left:6.5vw;top:7vh;width:min(600px,48vw);pointer-events:auto}.eyebrow{font:700 clamp(12px,1vw,17px) 'Space Mono',monospace;letter-spacing:.22em;text-transform:uppercase;color:var(--yellow)}h1{font-size:clamp(62px,8.2vw,128px);line-height:.73;letter-spacing:-.045em;text-transform:uppercase;margin:20px 0 20px;font-weight:900;transform:rotate(-3deg);text-shadow:5px 6px 0 #d94a2f,9px 10px 0 #173b3e}h1 span{color:var(--yellow)}.tag{font-size:clamp(20px,2vw,30px);line-height:1.05;max-width:440px;margin:26px 0;color:#fff2d7}.menu{display:flex;flex-direction:column;gap:8px;width:min(400px,100%)}.choice{position:relative;border:2px solid transparent;background:rgba(17,49,51,.75);padding:11px 18px;text-align:left;text-transform:uppercase;font-weight:800;font-size:clamp(20px,1.8vw,27px);letter-spacing:.04em;transition:transform .12s,background .12s}.choice:hover,.choice:focus,.choice.selected{outline:none;background:var(--yellow);color:var(--ink);transform:translateX(8px);border-color:#fff5d9}.choice small{float:right;font:700 12px 'Space Mono';padding-top:7px}.foot{font:700 12px 'Space Mono',monospace;letter-spacing:.08em;color:#e2eddf;margin-top:25px;line-height:1.7}.badge{position:absolute;right:5vw;top:7vh;color:var(--ink);background:var(--yellow);padding:10px 16px;font:700 13px 'Space Mono';transform:rotate(3deg);box-shadow:4px 4px 0 var(--ink)}.overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(8,30,34,.86);pointer-events:auto}.card{width:min(780px,90vw);max-height:88vh;overflow:auto;background:var(--cream);color:var(--ink);border:5px solid var(--ink);box-shadow:12px 12px 0 var(--orange);padding:clamp(22px,3vw,42px)}.card h2{font-size:clamp(42px,5vw,68px);line-height:.9;text-transform:uppercase;margin:0 0 15px}.card p{font-size:clamp(19px,1.5vw,25px);line-height:1.2;margin:10px 0}.card .choice{background:#d7e2cf;color:var(--ink);border-color:var(--ink);margin:4px 0}.card .choice.selected,.card .choice:hover,.card .choice:focus{background:var(--yellow)}.card .menu{width:100%}.card .foot{color:#385451}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.label{font:700 12px 'Space Mono';letter-spacing:.15em;text-transform:uppercase;color:#b8462a}.about{font:14px/1.45 'Space Mono',monospace;max-height:48vh;overflow:auto;white-space:pre-line}.hud{position:absolute;inset:0;pointer-events:none;text-shadow:2px 3px 0 #17383a}.hudtop{display:flex;justify-content:space-between;align-items:flex-start;padding:3vh 4vw}.hudbox{background:rgba(18,51,52,.82);border-left:5px solid var(--yellow);padding:8px 16px;min-width:145px}.hudlabel{font:700 11px 'Space Mono';letter-spacing:.16em;color:var(--yellow);text-transform:uppercase}.hudbig{font-size:clamp(35px,4.5vw,68px);font-weight:900;line-height:.9}.hudright{text-align:right}.hudbottom{position:absolute;bottom:4vh;left:4vw;right:4vw;display:flex;align-items:end;justify-content:space-between}.meters{width:min(300px,28vw)}.meterline{display:flex;align-items:center;gap:8px;font:700 11px 'Space Mono';margin-top:8px}.meter{height:12px;flex:1;background:#264c4a;border:2px solid #ffefd4}.fill{height:100%;background:var(--orange);width:100%}.fill.boost{background:var(--yellow)}.speed{font-size:clamp(50px,6vw,90px);font-weight:900;line-height:.75}.speed small{font:700 12px 'Space Mono';color:var(--yellow)}.progress{position:absolute;left:28%;right:28%;top:4vh;height:9px;border:2px solid #fdf1d4;background:#244b4c}.progress>div{height:100%;background:var(--yellow)}.callout{position:absolute;left:50%;top:19%;transform:translateX(-50%) rotate(-2deg);font-size:clamp(26px,4vw,52px);font-weight:900;text-align:center;color:var(--yellow);text-transform:uppercase;white-space:nowrap;text-shadow:3px 4px 0 #17383a}.hint{position:absolute;left:50%;bottom:5vh;transform:translateX(-50%);font:700 12px 'Space Mono';text-align:center;white-space:nowrap}.attract{position:absolute;top:11vh;left:50%;transform:translateX(-50%);font:700 15px 'Space Mono';background:var(--yellow);color:var(--ink);padding:8px 15px;animation:blink 1s infinite alternate}@keyframes blink{to{opacity:.5}}#error{display:none}.touch #screen>.panel,.touch #screen>.badge{display:none}.touchNotice{display:none}.touch .touchNotice{display:block;position:absolute;left:5vw;bottom:5vh;color:white;background:#173b3e;padding:20px;font-size:25px;pointer-events:auto}.touch .touchNotice button{background:var(--yellow);color:var(--ink);border:0;padding:10px;font-weight:900}.hide{display:none!important}@media(max-width:700px){.panel{width:75vw}.badge{display:none}.columns{grid-template-columns:1fr}.hudbox{min-width:90px}.hint{display:none}}
+</style></head><body><div id="shade"></div><div id="screen"></div><div class="touchNotice">Controller or keyboard required<br><button id="touchSettings">SETTINGS</button></div><div id="error" class="overlay"><div class="card"><h2>Road closed</h2><p id="errorText"></p></div></div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<script type="module">
+import * as THREE from '/lib/vendor/three/0.180.0/build/three.webgpu.js';
+import { mergeGeometries } from '/lib/vendor/three/0.180.0/examples/jsm/utils/BufferGeometryUtils.js';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+const $=s=>document.querySelector(s), screen=$('#screen'), shade=$('#shade');
+const CFG={length:2600,road:13,segment:20,cruise:41};
+const settings={invertX:false,invertY:false,volume:0.65};
+try{Object.assign(settings,JSON.parse(localStorage.getItem('rrr-settings')||'{}'))}catch{}
+let scene,camera,renderer,world,events,playerBody,playerCollider,playerBike,clock=0,last=performance.now(),state='title',menuIndex=0,menuItems=[],settingsReturn='title',idle=0,game=null,objects=[],racers=[],remote=new Map(),channel=null,networkTimer=0,sessionStopped=false,callTime=0,callText='',lastPad=[],padDir=0,keys={},axis={x:0,y:0,fire:false},audio=null,volumeGain=null,musicTick=0,musicStep=0,engineOsc=null,engineGain=null,muted=false;
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v)), mix=(a,b,t)=>a+(b-a)*t;
+function curve(z){return Math.sin(z/155)*13+Math.sin(z/63)*3.2}
+function heading(z){return Math.atan2(curve(z+1)-curve(z-1),2)}
+function say(t,seconds=2){callText=t;callTime=seconds}
+function saveSettings(){try{localStorage.setItem('rrr-settings',JSON.stringify(settings))}catch{}}
+function sound(){if(audio){audio.resume();return} try{audio=new AudioContext();volumeGain=audio.createGain();volumeGain.gain.value=settings.volume*.25;volumeGain.connect(audio.destination);engineOsc=audio.createOscillator();engineGain=audio.createGain();engineOsc.type='sawtooth';engineOsc.frequency.value=65;engineGain.gain.value=0;engineOsc.connect(engineGain).connect(volumeGain);engineOsc.start()}catch{}}
+function tone(freq,dur,type='square',gain=.12,slide=1){if(!audio||muted)return;let o=audio.createOscillator(),g=audio.createGain(),t=audio.currentTime;o.type=type;o.frequency.setValueAtTime(freq,t);o.frequency.exponentialRampToValueAtTime(Math.max(20,freq*slide),t+dur);g.gain.setValueAtTime(gain,t);g.gain.exponentialRampToValueAtTime(.001,t+dur);o.connect(g).connect(volumeGain);o.start(t);o.stop(t+dur)}
+function voice(){[0,.07,.14].forEach((t,i)=>setTimeout(()=>tone([280,370,230][i],.09,'sawtooth',.08,1.35),t*1000))}
+function updateAudio(dt){if(!audio)return;volumeGain.gain.setTargetAtTime(muted?0:settings.volume*.25,audio.currentTime,.05);engineGain.gain.setTargetAtTime(state==='play'||state==='attract'?.055:0,audio.currentTime,.12);if(game)engineOsc.frequency.setTargetAtTime(45+game.speed*2,audio.currentTime,.1);if(state==='play'||state==='attract'){musicTick-=dt;if(musicTick<=0){musicTick=.18;let bass=[82,82,98,110,82,82,123,110][musicStep%8];tone(bass,.14,'sawtooth',.045);if(musicStep%2===0)tone([330,392,440,392,294,349,392,440][Math.floor(musicStep/2)%8],.1,'square',.022);if(musicStep%4===0)tone(75,.08,'sine',.13,.4);musicStep++}}}
+function mat(c){return new THREE.MeshToonMaterial({color:c})}
+const mats={road:mat(0x38434a),edge:mat(0xf1dfb3),dirt:mat(0xc57c52),grass:mat(0xa4be75),dark:mat(0x1c3336),white:mat(0xfff2d7),yellow:mat(0xffd557),red:mat(0xe95336),cyan:mat(0x68c9c2),orange:mat(0xff8b45),skin:mat(0xe8ab80),tire:mat(0x192e31),chrome:mat(0x9ab7aa),blue:mat(0x3e8a9b),purple:mat(0x995f91),green:mat(0x6b9b59)};
+const geometries={box:new THREE.BoxGeometry(1,1,1),wheel:new THREE.CylinderGeometry(.43,.43,.26,10),sphere:new THREE.SphereGeometry(1,10,7),cone:new THREE.ConeGeometry(1,1,6),cyl:new THREE.CylinderGeometry(1,1,1,8)};
+function part(parent,geo,material,x,y,z,sx,sy,sz,rx=0,ry=0,rz=0){let m=new THREE.Mesh(geometries[geo],material);m.position.set(x,y,z);m.scale.set(sx,sy,sz);m.rotation.set(rx,ry,rz);parent.add(m);return m}
+function bike(color=0xe95336){let g=new THREE.Group(),body=mat(color);let lean=new THREE.Group();g.add(lean);for(let z of [-.85,.85]){let w=part(lean,'wheel',mats.tire,0,.48,z,1,1,1,0,0,Math.PI/2);part(lean,'cyl',mats.chrome,0,.48,z,.2,.29,.2,0,0,Math.PI/2);w.userData.wheel=true}part(lean,'box',body,0,.83,0,.5,.35,1.35);part(lean,'box',mats.dark,0,1.09,-.32,.55,.15,.7);part(lean,'box',mats.chrome,0,.82,.65,.1,.6,.1,.4,0,0);part(lean,'box',mats.chrome,0,1.13,.75,.9,.07,.07);part(lean,'box',mats.red,0,.94,-.96,.36,.18,.09);part(lean,'box',mats.yellow,0,1,.99,.34,.22,.1);let torso=part(lean,'box',body,0,1.55,-.05,.62,.75,.4,.35,0,0);part(lean,'sphere',mats.skin,0,2.02,.16,.28,.31,.28);part(lean,'sphere',mats.white,0,2.18,.16,.31,.22,.31);part(lean,'box',mats.dark,0,2.04,.4,.4,.13,.1);for(let s of [-1,1]){part(lean,'box',mats.dark,s*.27,1.25,-.32,.22,.65,.22,-.6,0,s*.15);part(lean,'box',body,s*.35,1.5,.38,.18,.18,.75,-.2,0,s*.08)}g.userData={lean,torso};return g}
+function terrain(){scene=new THREE.Scene();scene.background=new THREE.Color(0x8dcfca);scene.fog=new THREE.Fog(0x8dcfca,120,420);camera=new THREE.PerspectiveCamera(52,innerWidth/innerHeight,.1,600);scene.add(new THREE.HemisphereLight(0xfff0cd,0x769b7a,2.3));let sun=new THREE.DirectionalLight(0xffe6bd,2.6);sun.position.set(-50,100,-40);scene.add(sun);let ground=part(scene,'box',mats.grass,0,-.32,1300,1300,.4,4000);ground.receiveShadow=true;
+// Distant silhouettes give the road a horizon without obscuring play.
+for(let i=0;i<22;i++){let m=part(scene,'cone',i%2?mats.blue:mats.green,(i-11)*90,22,3000,85,95,55);m.rotation.y=.4}
+}
+function makeRoad(){let group=new THREE.Group();scene.add(group);for(let z=0;z<CFG.length+250;z+=CFG.segment){let x1=curve(z),x2=curve(z+CFG.segment),mid=(x1+x2)/2,ang=Math.atan2(x2-x1,CFG.segment),len=Math.hypot(CFG.segment,x2-x1);part(group,'box',mats.dirt,mid,-.08,z+10,CFG.road+10,.15,len,0,ang,0);part(group,'box',mats.road,mid,.01,z+10,CFG.road,.12,len,0,ang,0);for(let s of [-1,1])part(group,'box',mats.edge,mid+s*6.15,.09,z+10,.16,.04,len,0,ang,0);for(let j=0;j<2;j++)part(group,'box',mats.yellow,mix(x1,x2,(j+.5)/2),.1,z+j*10+5,.14,.05,4,0,ang,0);
+if(z%40===0){for(let s of [-1,1]){let x=curve(z)+s*(15+(z%3)*1.5);part(group,'box',mats.white,x,1,z,.18,2,.18);part(group,'box',s>0?mats.red:mats.cyan,x,2.05,z,.55,.4,.12);}}
+if(z%60===0){for(let s of [-1,1]){let x=curve(z)+s*(25+(z%7));part(group,'cyl',mats.dirt,x,2,z,.7,4,.7);part(group,'cone',mats.green,x,5,z,3.8,7,3.8)}}
+if(z%160===0){let x=curve(z)+22;part(group,'box',mats.dark,x,2,z,.45,4,.45);part(group,'box',mats.cream||mats.white,x,4,z,9,3,.35);part(group,'box',mats.orange,x,4,z+.2,8,.45,.1)}}
+// Finish gantry
+let fx=curve(CFG.length);for(let s of [-1,1])part(group,'box',mats.dark,fx+s*7,3,CFG.length,.45,6,.45);part(group,'box',mats.yellow,fx,6,CFG.length,14,1.1,.4);for(let i=0;i<12;i++)part(group,'box',i%2?mats.dark:mats.white,fx-6.5+i*1.1,6,CFG.length+.25,1.1,.8,.1);
+// Combine static roadside pieces by material to avoid thousands of separate draws.
+group.updateMatrixWorld(true);let batches=new Map();for(const child of [...group.children]){child.updateMatrix();let list=batches.get(child.material)||[];let geo=child.geometry.clone();geo.applyMatrix4(child.matrix);list.push(geo);batches.set(child.material,list);group.remove(child)}for(const [material,list] of batches){let merged=mergeGeometries(list);if(merged)group.add(new THREE.Mesh(merged,material));for(const geo of list)geo.dispose()}
+}
+function makeObstacle(z,lane,type){let x=curve(z)+lane,g=new THREE.Group();g.position.set(x,0,z);scene.add(g);if(type==='traffic'){part(g,'box',mats.blue,0,.75,0,2.15,1.05,3.8);part(g,'box',mats.white,0,1.42,-.1,1.8,.55,2);for(let s of [-1,1])for(let d of [-1,1])part(g,'wheel',mats.tire,s*1.1,.45,d*1.2,1,1,1,0,0,Math.PI/2);part(g,'box',mats.red,0,.9,-1.94,1.5,.2,.1)}else if(type==='boost'){part(g,'cyl',mats.yellow,0,.25,0,1.3,.3,1.3);part(g,'box',mats.orange,0,.5,0,.6,.3,1.4,0,.7,0)}else if(type==='repair'){part(g,'box',mats.white,0,.65,0,1.2,1.2,1.2);part(g,'box',mats.red,0,.7,-.62,.7,.2,.05);part(g,'box',mats.red,0,.7,-.63,.2,.7,.05)}else{part(g,'cone',mats.orange,0,.65,0,.7,1.3,.7);part(g,'cyl',mats.white,0,.65,0,.48,.15,.48)}
+let rb=world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x,.7,z));let cd=RAPIER.ColliderDesc.cuboid(type==='traffic'?1.2:.8,1,type==='traffic'?2:.8).setSensor(true).setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);let c=world.createCollider(cd,rb);objects.push({g,rb,c,type,z,used:false});}
+function clearRun(){for(let o of objects){scene.remove(o.g);world.removeRigidBody(o.rb)}objects=[];for(let r of racers)scene.remove(r.mesh);racers=[];for(let r of remote.values())scene.remove(r.mesh);remote.clear();if(playerBike)scene.remove(playerBike);if(playerBody)world.removeRigidBody(playerBody);playerBody=null;playerCollider=null}
+function startRun(attract=false){clearRun();game={z:0,x:0,speed:0,health:100,boost:100,damage:0,knockouts:0,crashes:0,elapsed:0,hitCooldown:0,attackCooldown:0,attackSide:0,attackAnim:0,crashTimer:0,place:1,finished:false};playerBike=bike(0xf36a3f);scene.add(playerBike);playerBody=world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0,.8,0));playerCollider=world.createCollider(RAPIER.ColliderDesc.cuboid(.55,.8,1).setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.ALL).setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),playerBody);
+for(let i=0;i<7;i++){let z=18+i*13,x=(i%3-1)*3;let mesh=bike([0x3795a2,0xe9b740,0x976b9f,0x70a05a,0xe66853,0x6789b3,0xe78d40][i]);scene.add(mesh);racers.push({z,x,speed:29+i*.8,mesh,hp:2,down:0,name:['MABEL','CHOPS','VINNY','RITA','GAS CAN','LUNK','OFFICER DOOM'][i],police:i===6,attack:0})}
+for(let z=100;z<CFG.length;z+=85){let n=Math.floor(z/85);makeObstacle(z,[-3.5,0,3.5][n%3],n%7===0?'repair':n%5===0?'boost':n%3===0?'traffic':'cone')}
+state=attract?'attract':'play';idle=0;menuItems=[];screen.innerHTML='';shade.style.display='none';renderHUD();say(attract?'THE ROADSHOW NEVER SLEEPS':'LET’S RIDE!',2);}
+function endRun(reason='finish'){if(!game||game.finished)return;game.finished=true;state='over';if(AIHub.active){let res=reason==='finish'?{time:Math.max(0,AIHub.time()),stats:{Knockouts:game.knockouts,Crashes:game.crashes}}:{score:Math.round(game.z),stats:{Knockouts:game.knockouts}};AIHub.result(res)}if(channel)channel.postMessage({t:'leave',id:clientId});tone(180,.5,'sawtooth',.1,1.7);showOver(reason)}
+function crash(){if(game.crashTimer>0)return;game.crashes++;game.speed*=.27;game.health=Math.max(0,game.health-18);game.crashTimer=1.5;game.boost=Math.max(0,game.boost-15);tone(90,.35,'sawtooth',.2,.3);say('WIPEOUT! GET BACK ON!',1.5);if(game.health<=0){game.health=45;game.z=Math.max(0,game.z-35);say('TOW TRUCK TAX! −35 M',2)}}
+function attack(side){if(!game||game.attackCooldown>0||game.crashTimer>0)return;game.attackCooldown=.48;game.attackAnim=.32;game.attackSide=side;tone(160,.12,'sawtooth',.08,1.8);let target=racers.filter(r=>r.down<=0&&Math.abs(r.z-game.z)<3.3&&Math.sign(r.x-game.x)===side&&Math.abs(r.x-game.x)<3.4).sort((a,b)=>Math.abs(a.z-game.z)-Math.abs(b.z-game.z))[0];if(target){target.hp--;target.speed-=5;game.boost=clamp(game.boost+12,0,100);voice();if(target.hp<=0){target.down=3;target.hp=2;game.knockouts++;say(target.name+' ATE DIRT!',1.4)}else say('NICE HIT!',.8)}}
+function collect(o){if(o.used)return;o.used=true;o.g.visible=false;if(o.type==='boost'){game.boost=clamp(game.boost+35,0,100);say('NITRO TOPPED UP!',1);tone(440,.16,'square',.08,1.7)}else if(o.type==='repair'){game.health=clamp(game.health+30,0,100);say('BIKE PATCHED UP!',1);tone(330,.2,'sine',.1,1.5)}else crash()}
+function menu(html,actions){screen.innerHTML=html;menuItems=[...screen.querySelectorAll('.choice')];menuIndex=0;menuItems.forEach((b,i)=>{b.addEventListener('click',()=>{sound();idle=0;actions[i]?.()});b.addEventListener('mouseenter',()=>select(i))});select(0)}
+function select(i){if(!menuItems.length)return;menuIndex=(i+menuItems.length)%menuItems.length;menuItems.forEach((b,j)=>b.classList.toggle('selected',j===menuIndex));}
+function title(){state='title';game=null;idle=0;shade.style.display='';menu(`<div class="panel"><div class="eyebrow">A two-wheeled bad idea • 01</div><h1>Road<br><span>Ruckus</span><br>Roadshow</h1><p class="tag">Seven rivals. One highway. Absolutely no manners.</p><div class="menu"><button class="choice">Start race <small>✕ / ENTER</small></button><button class="choice">How to ride</button><button class="choice">Settings</button><button class="choice">About / credits</button></div><div class="foot">DUALSENSE OR KEYBOARD &nbsp;•&nbsp; WEBGPU REQUIRED<br>OPTIONS / ESC OPENS SETTINGS</div></div><div class="badge">THE DUSTY COAST RUN<br>2.6 KM OF TROUBLE</div>`,[()=>startRun(),howto,openSettings,about])}
+function howto(){state='menu';menu(`<div class="overlay"><div class="card"><div class="label">FIELD GUIDE / 01</div><h2>Ride fast.<br>Fight dirty.</h2><div class="columns"><div><p><b>LEFT STICK</b> steer<br><b>R2 / CROSS</b> gas<br><b>L2</b> brake</p><p><b>SQUARE / CIRCLE</b> hit left / right<br><b>R1</b> spend boost</p></div><div><p><b>ARROWS / WASD</b> steer & gas<br><b>Q / E</b> hit left / right<br><b>SHIFT</b> boost</p><p>Pass the pack, dodge traffic and finish. Hit rivals twice to knock them down. Pick up yellow nitro and white repair crates.</p></div></div><p>Off-road slows you down. Wrecks cost bike health; a tow gets you rolling again. There’s always another road.</p><div class="menu"><button class="choice">Back to garage <small>○ / ESC</small></button></div></div></div>`,[title])}
+function openSettings(){if(state==='settings')return;settingsReturn=state;state='settings';settingsMenu()}
+function settingsMenu(){let ret=settingsReturn;menu(`<div class="overlay"><div class="card"><div class="label">YOUR RIDE / SETTINGS</div><h2>Make it yours.</h2><p>Changes apply immediately and stay on this device.</p><div class="menu"><button class="choice">Invert horizontal <small>${settings.invertX?'ON':'OFF'}</small></button><button class="choice">Invert vertical <small>${settings.invertY?'ON':'OFF'}</small></button><button class="choice">Sound level <small>${Math.round(settings.volume*100)}%</small></button><button class="choice">${ret==='play'?'Resume ride':'Back'}</button></div><div class="foot">↑ ↓ / D-PAD TO CHOOSE &nbsp; • &nbsp; ✕ / ENTER TO CHANGE<br>OPTIONS / ESC OR ○ TO CLOSE</div></div></div>`,[()=>{settings.invertX=!settings.invertX;saveSettings();settingsMenu();select(0)},()=>{settings.invertY=!settings.invertY;saveSettings();settingsMenu();select(1)},()=>{settings.volume=settings.volume>=1?0:Math.round((settings.volume+.25)*100)/100;saveSettings();settingsMenu();select(2)},closeSettings])}
+function closeSettings(){state=settingsReturn;if(state==='play'||state==='attract'){screen.innerHTML='';renderHUD()}else if(state==='menu')howto();else if(state==='over')showOver('finish');else title()}
+function about(){state='menu';menu(`<div class="overlay"><div class="card"><div class="label">THE FINE PRINT / 02</div><h2>About the roadshow</h2><div class="about">SOURCE INFORMATION
+2026-10-29 09:37 • Source: Road Rash II
+Tech: Three.js r180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio, BroadcastChannel and AI Hub Session Protocol v1.
+Art: original cel-shaded comic-book highway. Animation: procedural rigid-part motion and camera easing. Audio: code-generated music, effects and gibberish voices.
+Online: AI Hub side-by-side sessions; same-origin browser tabs see each other as riders outside the hub. No remote game server.
+Testing: lightweight syntax and headless browser checks; physical controller, multi-device and production GPU tests unknown.
+Environment: Codex CLI (headless); Linux; browser: Chrome headless. Model: OpenAI gpt-6.1-terra, xhigh. Usage: unknown.
+
+TESTING FEEDBACK
+Issues caught: 1; critical: 1. Headless Chrome lost its WebGPU device, so the 3D presentation could not be verified there. Most helpful: browser smoke test. Least helpful: syntax checking alone.
+
+ENGINE FEEDBACK
+Most liked: Three.js scene construction. Got stuck: headless WebGPU presentation. Built here: procedural road, race, AI, combat and audio. Hardest: validating the renderer headlessly. Overhaul: automatic renderer fallback when WebGPU is mandatory. Change: add an explicit WebGPU-only initialization option.
+
+PROMPT FEEDBACK
+Most liked: controller-first arcade direction. Confusing: standalone multiplayer scope. Hardest: combining a complete race with networking. Desired test: real multi-device, physical-controller playtest.</div><div class="menu"><button class="choice">Back <small>○ / ESC</small></button></div></div></div>`,[title])}
+function showOver(reason){shade.style.display='';let text=reason==='finish'?`YOU FINISHED ${ordinal(game.place)}!`:'TIME CALLED!';let message=game.place===1?'The highway has a new problem. It’s you.':'You made it to the end. The pack will be talking about this one.';let buttons=AIHub.active?[]:[()=>startRun(),title];menu(`<div class="overlay"><div class="card"><div class="label">THE DUSTY COAST / RESULTS</div><h2>${text}</h2><p>${message}</p><div class="columns"><p><b>${formatTime(game.elapsed)}</b><br>RACE TIME</p><p><b>${game.knockouts}</b> KNOCKOUTS<br><b>${game.crashes}</b> WIPEOUTS</p></div><div class="menu">${AIHub.active?'Waiting for the hub…':'<button class="choice">Race again</button><button class="choice">Back to garage</button>'}</div></div></div>`,buttons)}
+function ordinal(n){return n+(n===1?'ST':n===2?'ND':n===3?'RD':'TH')}
+function formatTime(s){return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}.${Math.floor(s*10)%10}`}
+function renderHUD(){screen.innerHTML=`<div class="hud"><div class="hudtop"><div class="hudbox"><div class="hudlabel">POSITION</div><div class="hudbig" id="place">8TH</div></div><div class="hudbox hudright"><div class="hudlabel">DISTANCE LEFT</div><div class="hudbig" id="distance">2.6 <span style="font-size:.3em">KM</span></div></div></div><div class="progress"><div id="progress"></div></div><div class="callout" id="callout"></div><div class="hudbottom"><div class="meters"><div class="meterline">BIKE <div class="meter"><div class="fill" id="health"></div></div></div><div class="meterline">NITRO<div class="meter"><div class="fill boost" id="boost"></div></div></div></div><div class="speed"><span id="speed">0</span> <small>KM/H</small></div></div><div class="hint">□ / Q HIT LEFT &nbsp; • &nbsp; ○ / E HIT RIGHT &nbsp; • &nbsp; R1 / SHIFT BOOST</div>${state==='attract'?'<div class="attract">ATTRACT MODE • PRESS ANY BUTTON</div>':''}</div>`}
+function updateHUD(){if(!$('#place'))return;$('#place').textContent=ordinal(game.place);$('#distance').innerHTML=(Math.max(0,CFG.length-game.z)/1000).toFixed(2)+' <span style="font-size:.3em">KM</span>';$('#speed').textContent=Math.round(game.speed*3.6);$('#health').style.width=game.health+'%';$('#boost').style.width=game.boost+'%';$('#progress').style.width=clamp(game.z/CFG.length*100,0,100)+'%';$('#callout').textContent=callTime>0?callText:''}
+function control(){let p=[...navigator.getGamepads?.()||[]].find(Boolean),b=p?.buttons||[],a=p?.axes||[];let down=i=>!!b[i]?.pressed,edge=i=>down(i)&&!lastPad[i];let steer=(keys.ArrowRight||keys.KeyD?1:0)-(keys.ArrowLeft||keys.KeyA?1:0)+(Math.abs(a[0]||0)>.18?a[0]:0);steer=clamp(steer,-1,1)*(settings.invertX?-1:1);let vert=(Math.abs(a[1]||0)>.18?a[1]:0)*(settings.invertY?-1:1);axis={x:steer,y:vert,fire:!!(keys.KeyQ||keys.KeyE||down(1)||down(2))};let anyEdge=b.some((x,i)=>x.pressed&&!lastPad[i]);if(state==='attract'&&(anyEdge||Math.abs(a[0]||0)>.25||Math.abs(a[1]||0)>.25)){title();lastPad=b.map(x=>x.pressed);return {}}if(edge(9)&&!down(8)){if(state==='settings')closeSettings();else openSettings()}
+if(['title','menu','settings','over'].includes(state)){let dir=(down(13)||vert>.6?1:0)-(down(12)||vert<-.6?1:0);if(dir&&dir!==padDir){select(menuIndex+dir);idle=0;tone(330,.04,'square',.04)}padDir=dir;if(edge(0)){menuItems[menuIndex]?.click()}if(edge(1)){if(state==='settings')closeSettings();else if(state==='menu')title()} }
+let out={steer,gas:Math.max(down(7)?b[7].value:0,down(0)?1:0,keys.ArrowUp||keys.KeyW?1:0,vert<-.3?-vert:0),brake:Math.max(down(6)?b[6].value:0,keys.ArrowDown||keys.KeyS?1:0,vert>.3?vert:0),boost:down(5)||!!keys.ShiftLeft||!!keys.ShiftRight,left:edge(2),right:edge(1)};lastPad=b.map(x=>x.pressed);return out}
+window.addEventListener('keydown',e=>{if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Shift'].includes(e.key))e.preventDefault();let first=!keys[e.code];keys[e.code]=true;idle=0;if(!first)return;sound();if(state==='attract'){title();return}if(e.code==='Escape'){if(state==='settings')closeSettings();else if(state==='menu')title();else openSettings();return}if(['title','menu','settings','over'].includes(state)){if(e.code==='ArrowDown'||e.code==='KeyS')select(menuIndex+1);else if(e.code==='ArrowUp'||e.code==='KeyW')select(menuIndex-1);else if(e.code==='Enter'||e.code==='Space')menuItems[menuIndex]?.click()}else if(state==='play'){if(e.code==='KeyQ')attack(-1);if(e.code==='KeyE')attack(1)}});
+window.addEventListener('keyup',e=>{keys[e.code]=false});window.addEventListener('blur',()=>{keys={}});window.addEventListener('pointerdown',()=>{idle=0;if(state==='attract')title()});window.addEventListener('pointermove',e=>{if(e.movementX||e.movementY){idle=0;if(state==='attract')title()}});$('#touchSettings').onclick=()=>{sound();openSettings()};if(matchMedia('(pointer:coarse)').matches&&!matchMedia('(pointer:fine)').matches)document.body.classList.add('touch');
+const clientId=Math.random().toString(36).slice(2);try{channel=new BroadcastChannel('road-ruckus-roadshow-v1');channel.onmessage=e=>{let m=e.data;if(!m||m.id===clientId||AIHub.active)return;if(m.t==='leave'){let r=remote.get(m.id);if(r){scene.remove(r.mesh);remote.delete(m.id)}return}if(m.t==='rider'&&game&&state==='play'){let r=remote.get(m.id);if(!r){let mesh=bike(0xf2c84b);scene.add(mesh);r={mesh,z:m.z,x:m.x,last:0};remote.set(m.id,r)}r.z=m.z;r.x=m.x;r.last=performance.now()}}}catch{}
+function update(dt,inp){if(!game)return;clock+=dt;game.elapsed+=dt;game.hitCooldown=Math.max(0,game.hitCooldown-dt);game.attackCooldown=Math.max(0,game.attackCooldown-dt);game.attackAnim=Math.max(0,game.attackAnim-dt);game.crashTimer=Math.max(0,game.crashTimer-dt);if(callTime>0)callTime-=dt;
+if(state==='attract'){inp={gas:1,steer:Math.sin(game.z/85)*.4,boost:game.boost>15,left:false,right:false};if(Math.floor(game.elapsed*2)%8===0)attack(Math.random()<.5?-1:1);game.health=100}
+if(inp.left)attack(-1);if(inp.right)attack(1);let off=Math.abs(game.x)>6;let boosting=inp.boost&&game.boost>1&&game.speed>12&&!off;let max=off?22:boosting?56:CFG.cruise;game.speed+=((inp.gas||0)*15-(inp.brake||0)*24-3.4)*dt;if(!inp.gas)game.speed-=5*dt;if(game.speed>max)game.speed-=18*dt;game.speed=clamp(game.speed,0,boosting?58:48);if(boosting)game.boost=Math.max(0,game.boost-18*dt);else game.boost=Math.min(100,game.boost+2.2*dt);game.x=clamp(game.x+(inp.steer||0)*dt*(4+game.speed*.12),-14,14);game.z+=game.speed*dt;let px=curve(game.z)+game.x;playerBody.setNextKinematicTranslation({x:px,y:.8,z:game.z});world.timestep=dt;world.step(events);events.drainCollisionEvents((a,b,started)=>{if(!started)return;let h=a===playerCollider.handle?b:b===playerCollider.handle?a:null;if(h===null)return;let o=objects.find(x=>x.c.handle===h);if(o)collect(o)});
+playerBike.position.set(px,0,game.z);playerBike.rotation.y=heading(game.z);playerBike.userData.lean.rotation.z=-(inp.steer||0)*.27+(game.crashTimer>0?Math.sin(game.crashTimer*10)*.45:0);playerBike.userData.torso.rotation.z=game.attackAnim>0?-game.attackSide*.65:0;
+for(let r of racers){if(r.down>0){r.down-=dt;r.speed=Math.max(12,r.speed-3*dt)}else r.speed=mix(r.speed,31+(r.name.length%4)*1.7,dt*.3);r.z+=r.speed*dt;r.x=clamp(r.x+Math.sin(clock*.6+r.z*.01)*dt*.45,-5,5);r.mesh.position.set(curve(r.z)+r.x,0,r.z);r.mesh.rotation.y=heading(r.z);r.mesh.userData.lean.rotation.z=r.down>0?1.1:Math.sin(clock+r.z)*.08;if(r.down<=0&&Math.abs(r.z-game.z)<1.8&&Math.abs(r.x-game.x)<1.1&&game.hitCooldown===0){game.hitCooldown=1.2;game.speed*=.83;game.health=Math.max(5,game.health-5);game.x+=r.x>game.x?-1:1;tone(90,.12,'sawtooth',.09,.7);if(r.police)say('THE LAW WANTS A WORD!',1)}if(r.down<=0&&Math.abs(r.z-game.z)<3&&Math.abs(r.x-game.x)<2.5&&game.hitCooldown===0&&Math.random()<dt*.13){game.health-=7;game.hitCooldown=1.3;voice();say(r.name+' SAYS HELLO!',1)}}
+for(let [id,r] of remote){if(performance.now()-r.last>3000){scene.remove(r.mesh);remote.delete(id);continue}r.mesh.position.lerp(new THREE.Vector3(curve(r.z)+r.x,0,r.z),Math.min(1,dt*8));r.mesh.rotation.y=heading(r.z)}
+game.place=1+racers.filter(r=>r.z>game.z).length+[...remote.values()].filter(r=>r.z>game.z).length;let lookZ=game.z+24;let target=new THREE.Vector3(curve(game.z)+game.x*.65,5.1,game.z-10);camera.position.lerp(target,1-Math.exp(-dt*4));camera.lookAt(curve(lookZ)+game.x*.3,1,lookZ);updateHUD();networkTimer-=dt;if(networkTimer<=0){networkTimer=.1;if(channel&&!AIHub.active&&state==='play')channel.postMessage({t:'rider',id:clientId,z:game.z,x:game.x});if(AIHub.active)AIHub.progress({score:Math.round(game.z),label:`${Math.round(game.z)} m`})}if(game.z>=CFG.length){if(state==='attract')startRun(true);else endRun()}}
+async function init(){try{if(!navigator.gpu)throw Error('This game needs a WebGPU-capable browser and graphics device. Enable WebGPU or try a supported desktop browser.');const adapter=await navigator.gpu.requestAdapter();if(!adapter)throw Error('No WebGPU adapter was found. Check browser and graphics settings.');await RAPIER.init();world=new RAPIER.World({x:0,y:0,z:0});events=new RAPIER.EventQueue(true);renderer=new THREE.WebGPURenderer({antialias:true});renderer.setSize(innerWidth,innerHeight);renderer.setPixelRatio(Math.min(devicePixelRatio,2));await renderer.init();if(!renderer.backend.isWebGPUBackend)throw Error('WebGPU could not initialize. This game does not use a WebGL fallback.');renderer.backend.device.lost.then(info=>{if(info.reason!=='destroyed'){sessionStopped=true;muted=true;$('#error').style.display='flex';$('#errorText').textContent='The WebGPU device was lost. Reload the page or check your browser and graphics driver.';if(AIHub.active)AIHub.fail('WebGPU device lost')}});document.body.prepend(renderer.domElement);terrain();makeRoad();camera.position.set(0,5,-10);camera.lookAt(0,1,30);window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+AIHub.probe(()=>({scene:state==='attract'?'play':state==='settings'?'menu':state==='over'?'over':state==='play'?'play':state==='title'?'title':'menu',menu:state==='settings',world:clock,input:axis}));
+if(AIHub.active){let info=await AIHub.connect({mode:'parallel',seats:[1,4]});if(info){startRun();AIHub.on('time-up',()=>{if(game&&!game.finished)endRun('time')});AIHub.on('end',()=>{sessionStopped=true;muted=true;if(game&&!game.finished){game.finished=true;state='over';showOver('time')}});AIHub.ready()}else title()}else title();renderer.setAnimationLoop(frame)}catch(e){console.error(e);$('#error').style.display='flex';$('#errorText').textContent=e.message||String(e);if(AIHub.active)AIHub.fail(String(e.message||e))}}
+function frame(now){let dt=Math.min(.05,Math.max(0,(now-last)/1000));last=now;let inp=control();if(state==='title'){idle+=dt;if(idle>=10&&!document.body.classList.contains('touch'))startRun(true)}if((state==='play'||state==='attract')&&!sessionStopped&&(!AIHub.active||AIHub.time()>=0))update(dt,inp);else if(state==='title'||state==='menu'||state==='settings'||state==='over'){if(!game){clock+=dt;camera.position.set(Math.sin(clock*.15)*4,5,-10);camera.lookAt(curve(40),1,40)}}updateAudio(dt);renderer.render(scene,camera)}
+init();
+
+</script></body></html>

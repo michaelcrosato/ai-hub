@@ -1,0 +1,2135 @@
+<!DOCTYPE html>
+<!--
+Source Information
+- Date: 2026-10-29 02:13
+- Source: Goof Troop
+- Tech: Three.js 0.180.0 WebGPURenderer (WebGPU only, no fallback), Rapier 0.19.3 (@dimforge/rapier3d-compat), Gamepad API (PS5 DualSense standard mapping), Web Audio API, AI Hub Session Protocol v1 client 1.3.0 (session.js pasted unmodified), ES import maps via jsDelivr CDN, single HTML file
+- Art Direction: stylized cel-shaded look (MeshToonMaterial with 4-step gradient map plus ink outlines), original low-poly models built entirely in code
+- Animation: procedural code animation (walk cycles, bob/squash, reel zip tweens, fuse blink); no skeletal or external assets
+- Audio: code-written music (Web Audio island loop at 132 BPM), synthesized sound effects, and Animalese-style gibberish voice synthesis for all voice work
+- Online: AI Hub Session Protocol v1 co-op (host-run shared world, 1-4 players, hub:webgpu required) plus local couch co-op (1-2 players) and solo play with an AI buddy; no other networking
+- Testing: efficient and lightweight checks only, as allowed by TASK.md (syntax check, headless load/play smoke)
+- Environment: Muse Code CLI (headless); Linux; browser unknown
+- Model: Meta, muse-wonder-1.0, reasoning effort max
+- Usage: unknown
+
+Testing Feedback
+- How many issues did testing catch? 3 fixable issues (HUD tool line wrapping, title backdrop framed mostly on sea, and an inconclusive Space pixel check that prompted a probe based retest), plus 1 informational third party console warning from the Rapier initialiser.
+- How many would be considered critical issues / game breaking? 0.
+- What was the most helpful test you ran? The official AI Hub harness (2 player, server hosted, 4 player bad network, and host leave all PASS) together with the AIHub.probe Playwright test (7 of 7: title, start, world ticking, W input, Esc settings open and close, no page errors).
+- What was the least helpful test you ran? The check_page Space pixel comparison: the living scene moves on its own, so it could not tell the throw input apart from idle motion.
+
+Engine Feedback
+- What did you like most about the engine? Three.js 0.180 WebGPURenderer with MeshToonMaterial drew the cel shaded island immediately, and pinned import maps kept the single file honest about versions.
+- Did you get stuck or guess wrong? Yes: Rapier capsule argument order and its init deprecation warning, and setAnimationLoop versus requestAnimationFrame on WebGPU. Each cost one check cycle.
+- What was the most important thing you had to build yourself? The host run co-op snapshot layer (plus server host handling) and the whole cel look: toon gradient, ink outlines, and procedural characters, music and voices in code.
+- What was the hardest part about using the engine? The WebGPU only rule versus hub reach: solved by declaring hub:webgpu required and showing a clear error screen instead of a fallback renderer.
+- If you had to remove or overhaul one thing from engine, what would that be? The shifting WebGPU post processing path (the old three/addons/nodes route is gone); this game avoids post effects entirely rather than depend on it.
+- If you could change one thing about the engine, what would it be? A Rapier compat init that does not warn about its own defaults, so a clean console is achievable without workarounds.
+
+Prompt Feedback
+- What did you like most about this prompt? The hard, testable constraints: pinned versions, single file, 10 second attract mode, and the invert axis toggles. They made done checkable.
+- What was confusing? Single file packaging versus the hub rule to paste session.js as the first script in head (resolved by inlining it verbatim), and WebGPU no fallback versus hub fallback guidance (resolved with the hub:webgpu required declaration).
+- What was the hardest thing to do? One simulation serving solo with AI buddy, couch co-op, hub host, hub guest, and hub server host, all inside one file with no stubs.
+- If there was one test you could of run, what would that test be? A hardware DualSense test: two real pads in couch co-op plus a 4 player hub round on real GPUs and home networks. Here pads were covered by harness logic and keyboard parity only.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="co-op">
+<meta name="hub:session-minutes" content="4">
+<meta name="hub:session-goal" content="Free the Lighthouse Gem together before time runs out">
+<meta name="hub:session-howto" content="Left stick move, Cross throw, Square tool, Options settings">
+<meta name="hub:players" content="1-2">
+<meta name="hub:webgpu" content="required">
+<title>Goof Rangers — a Goof Troop spiritual successor</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "rapier": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>
+:root{--ink:#17301f;--paper:#fff7df;--sand:#f2c14e;--teal:#0f766e;--teal2:#14b8a6;--red:#e8443a;--focus:#ffb703;--panel:rgba(23,48,31,.92)}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:#7ec8e3;font-family:"Trebuchet MS",Verdana,system-ui,sans-serif;color:var(--ink)}
+#gl{position:fixed;inset:0}#gl canvas{display:block;width:100%;height:100%}
+.screen{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;background:linear-gradient(180deg,rgba(126,200,227,.25),rgba(15,118,110,.45));z-index:20}
+.hidden{display:none!important}
+h1.game-title{font-family:"Trebuchet MS",Verdana,sans-serif;font-size:clamp(44px,9vw,92px);margin:0;line-height:.95;color:#fff7df;text-shadow:0 4px 0 #0f766e,0 8px 24px rgba(0,0,0,.35);letter-spacing:.5px}
+.tagline{font-size:clamp(17px,2.6vw,24px);color:#fff;font-weight:700;text-shadow:0 2px 8px rgba(0,0,0,.5);max-width:760px;margin:0}
+.menu{display:flex;flex-direction:column;gap:10px;min-width:min(440px,88vw)}
+button,.btn{font:inherit;font-weight:800;font-size:clamp(19px,2.6vw,26px);padding:14px 26px;border-radius:14px;border:3px solid #17301f;background:var(--paper);color:var(--ink);cursor:pointer;box-shadow:0 4px 0 #17301f}
+button:hover{background:#ffe9a8}button:focus-visible,.btn:focus-visible{outline:4px solid var(--focus);outline-offset:2px;background:#ffe9a8}
+button.small{font-size:18px;padding:10px 18px}
+button[disabled]{opacity:.45;cursor:default}
+.panel{background:var(--panel);color:#fff7df;border:3px solid #fff7df;border-radius:18px;padding:22px 26px;max-width:min(860px,92vw);max-height:82vh;overflow:auto;text-align:left;font-size:clamp(16px,2.2vw,20px);line-height:1.5}
+.panel h2{margin:0 0 10px;font-size:clamp(26px,4vw,38px)}
+.panel table{border-collapse:collapse;width:100%}.panel td,.panel th{border-bottom:1px solid rgba(255,247,223,.25);padding:6px 8px;vertical-align:top}
+.row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:8px 0;border-bottom:1px solid rgba(255,247,223,.2)}
+.row label{font-weight:700}input[type=range]{width:180px;height:28px}input[type=checkbox]{width:30px;height:30px;accent-color:var(--teal2)}
+#hud{position:fixed;inset:0;pointer-events:none;z-index:10;font-weight:800}
+#hud .tl{position:absolute;top:14px;left:16px;display:flex;flex-direction:column;gap:6px}
+.hearts{font-size:30px;letter-spacing:2px;text-shadow:0 2px 0 rgba(0,0,0,.35)}
+.pill{display:inline-block;background:rgba(23,48,31,.85);color:#fff7df;border:2px solid #fff7df;border-radius:999px;padding:6px 14px;font-size:18px}
+#hud .tr{position:absolute;top:14px;right:16px;text-align:right;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+#objective{position:absolute;top:76px;left:50%;transform:translateX(-50%);max-width:90vw;text-align:center}
+#bossbar{position:absolute;bottom:110px;left:50%;transform:translateX(-50%);width:min(620px,86vw)}
+#bossbar .track{height:22px;border:3px solid #17301f;border-radius:999px;background:rgba(255,247,223,.85);overflow:hidden}#bossfill{height:100%;width:100%;background:#e8443a;transition:width .25s}
+#dialogue{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);width:min(820px,94vw);background:var(--panel);color:#fff7df;border:3px solid #fff7df;border-radius:16px;padding:16px 20px;z-index:30}
+#dialogue .who{color:var(--sand);font-size:19px}#dialogue .what{font-size:clamp(19px,2.8vw,25px);line-height:1.35;margin-top:4px}
+#toast{position:fixed;top:130px;left:50%;transform:translateX(-50%);z-index:25}
+#countdown{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:120px;color:#fff7df;text-shadow:0 6px 0 #0f766e;z-index:26;pointer-events:none;font-weight:900}
+#attract{position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:24}
+#errbox{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:#17301f;color:#fff7df;padding:24px;text-align:center}
+.kbd{background:#17301f;color:#fff7df;border-radius:6px;padding:1px 8px;font-size:.9em;white-space:nowrap}
+.credits{font-size:15px;white-space:pre-wrap}
+@media (max-width:640px){.panel{padding:16px}button{padding:12px 18px}}
+</style>
+</head>
+<body>
+<div id="gl" aria-label="Goof Rangers 3D game view"></div>
+<div id="hud" class="hidden">
+  <div class="tl"><span class="hearts" id="hearts">♥♥♥♥♥</span><span class="pill" id="tools">🪝 Ranger Reel · △ cycle</span><span class="pill" id="keys">🔑 Brass 0 · Iron 0</span></div>
+  <div class="tr"><span class="pill" id="score">💎 0 · ⭐ 0</span><span class="pill" id="clock">0:00</span><span class="pill" id="netstat">Local</span></div>
+  <div id="objective"><span class="pill" id="objtext">Find the Brass Key</span></div>
+  <div id="bossbar" class="hidden"><div style="color:#fff;text-shadow:0 2px 4px #000;font-size:20px">CAPTAIN BRINEBEARD</div><div class="track"><div id="bossfill"></div></div></div>
+</div>
+<div id="attract" class="hidden"><span class="pill" style="font-size:22px">▶ ATTRACT MODE — press any button to play</span></div>
+<div id="toast" class="hidden"><span class="pill" id="toasttext" style="font-size:22px"></span></div>
+<div id="countdown" class="hidden">3</div>
+<div id="dialogue" class="hidden"><div class="who" id="dwho">BRUNO</div><div class="what" id="dwhat"></div><div style="margin-top:8px;opacity:.85">✕ / Space — next · ○ / Esc — skip</div></div>
+
+<section id="scr-title" class="screen">
+  <h1 class="game-title">GOOF RANGERS</h1>
+  <p class="tagline">Bruno &amp; Pip’s co-op treasure hunt on Spoonbill Shores. Throw pots, kick crates, ring the bell — and out-goof Captain Brinebeard!</p>
+  <nav class="menu" aria-label="Main menu">
+    <button id="btn-solo" data-act="solo">▶ &nbsp;Ranger Solo (Pip helps you)</button>
+    <button id="btn-coop" data-act="coop">▶▶ &nbsp;Ranger Co-op — 2 players, one screen</button>
+    <button id="btn-how" data-act="how">？ &nbsp;How to Play</button>
+    <button id="btn-settings" data-act="settings">⚙ &nbsp;Settings</button>
+    <button id="btn-about" data-act="about">★ &nbsp;About / Credits</button>
+  </nav>
+  <p class="pill">🎮 PS5 pad ready — Cross confirm · Options settings · <span class="kbd">WASD</span> + <span class="kbd">Space</span> on keys</p>
+  <p class="pill" id="saveinfo">No saved voyage yet</p>
+</section>
+
+<section id="scr-how" class="screen hidden">
+  <div class="panel"><h2>How to Play</h2>
+  <table>
+  <tr><th>Move</th><td>Left stick or <span class="kbd">W A S D</span> · Player 2: <span class="kbd">I J K L</span> or Pad 2</td></tr>
+  <tr><th>Pick up / Throw · Confirm</th><td>Cross ✕ or <span class="kbd">Space</span> · Player 2: <span class="kbd">U</span>. Walk into a pot to lift it, press again to throw. Bruno throws far, Pip throws fast.</td></tr>
+  <tr><th>Use tool</th><td>Square □ or <span class="kbd">E</span> · Player 2: <span class="kbd">O</span></td></tr>
+  <tr><th>Change tool</th><td>Triangle △ or <span class="kbd">Q</span> · Player 2: <span class="kbd">P</span></td></tr>
+  <tr><th>Kick a crate</th><td>Just walk into it! Kicked crates bonk buccaneers and hold down floor plates.</td></tr>
+  <tr><th>Tools</th><td>🪝 <b>Ranger Reel</b> zip to gold posts · 🔔 <b>Dinner Bell</b> lure enemies · ⛏ <b>Shovel</b> dig sparkly sand · 🪵 <b>Plank</b> carry &amp; lay over water</td></tr>
+  <tr><th>Camera</th><td>L1 / R1 or <span class="kbd">,</span> <span class="kbd">.</span> turn · Right stick nudges</td></tr>
+  <tr><th>Swap leader (Solo)</th><td><span class="kbd">Tab</span> or L1+R1 together</td></tr>
+  <tr><th>Settings / Pause</th><td>Options or <span class="kbd">Esc</span> · Circle ○ goes back</td></tr>
+  </table>
+  <p>Grab keys, open gates, ring, dig and zip your way to the fort. Bonk Captain Brinebeard three times — kicked bombs work a treat! Downed Rangers revive when a partner stands close. In AI Hub sessions the hub runs the round: same island, up to four Rangers, host calls the finish.</p></div>
+  <button data-act="back">○ &nbsp;Back</button>
+</section>
+
+<section id="scr-settings" class="screen hidden">
+  <div class="panel"><h2>⚙ Settings</h2>
+  <div class="row"><label for="s-music">Music volume</label><input id="s-music" type="range" min="0" max="100" value="70"></div>
+  <div class="row"><label for="s-sfx">Sound effects</label><input id="s-sfx" type="range" min="0" max="100" value="80"></div>
+  <div class="row"><label for="s-voice">Gibberish voices</label><input id="s-voice" type="range" min="0" max="100" value="80"></div>
+  <div class="row"><label for="s-quality">Picture quality</label><select id="s-quality" style="font:inherit;padding:8px"><option value="high">High — full shadows</option><option value="med">Medium</option><option value="low">Low — speedy</option></select></div>
+  <div class="row"><label for="s-invh">Invert gamepad horizontal (quick fix)</label><input id="s-invh" type="checkbox"></div>
+  <div class="row"><label for="s-invv">Invert gamepad vertical (quick fix)</label><input id="s-invv" type="checkbox"></div>
+  <div class="row"><label for="s-shake">Screen shake</label><input id="s-shake" type="checkbox" checked></div>
+  <div class="row"><label for="s-subs">Subtitles (dialogue text)</label><input id="s-subs" type="checkbox" checked></div>
+  <div class="row"><label for="s-dead">Stick deadzone</label><input id="s-dead" type="range" min="5" max="35" value="12"></div>
+  <p style="margin:10px 0 0">Inverted sticks? Flip the two “quick fix” switches above — they swap the stick directions on the pad only. Settings save on this device (never in hub sessions).</p></div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center"><button data-act="back">○ &nbsp;Back / Done</button><button id="btn-wipe" class="small">Erase saved voyage</button></div>
+</section>
+
+<section id="scr-about" class="screen hidden">
+  <div class="panel"><h2>★ About / Credits — Goof Rangers</h2><div class="credits" id="abouttext"></div></div>
+  <button data-act="back">○ &nbsp;Back</button>
+</section>
+
+<section id="scr-over" class="screen hidden">
+  <h1 class="game-title" style="font-size:clamp(38px,7vw,64px)">AW, PHOOEY!</h1>
+  <p class="tagline" id="overtext">The Rangers are pooped. The treasure isn’t going anywhere!</p>
+  <nav class="menu"><button id="btn-retry" data-act="retry">↻ &nbsp;Try Again from Checkpoint</button><button data-act="title">⌂ &nbsp;Back to Title</button></nav>
+</section>
+
+<section id="scr-win" class="screen hidden">
+  <h1 class="game-title" style="font-size:clamp(38px,7vw,64px)">HOT DIGGITY!</h1>
+  <p class="tagline" id="wintext">The Lighthouse Gem is back where it belongs!</p>
+  <nav class="menu"><button data-act="title">⌂ &nbsp;Back to Title</button><button id="btn-again" data-act="retry">▶ &nbsp;Play It Again</button></nav>
+</section>
+
+<section id="scr-touch" class="screen hidden">
+  <h1 class="game-title" style="font-size:clamp(34px,7vw,56px)">🎮 Controller or keyboard required</h1>
+  <p class="tagline">Goof Rangers needs a gamepad or keyboard — touch alone can’t throw pots! Connect one, then press any key or pad button.</p>
+  <button data-act="settings">⚙ &nbsp;Settings</button>
+</section>
+
+<div id="errbox" class="hidden"><div><h2 style="font-size:34px">Oh no — the lighthouse went dark!</h2><p id="errtext" style="font-size:20px;max-width:640px"></p><p>Goof Rangers needs WebGPU (no fallback). Try a recent Chrome or Edge on desktop.</p></div></div>
+
+<script type="module">
+import * as THREE from "three";
+import RAPIER from "rapier";
+"use strict";
+/* ============ helpers, settings, state ============ */
+const $=s=>document.querySelector(s);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+const TAU=Math.PI*2;
+function angLerp(a,b,t){let d=(b-a)%TAU;if(d>Math.PI)d-=TAU;if(d<-Math.PI)d+=TAU;return a+d*t;}
+const SKEY="goofrangers-settings-v1", VKEY="goofrangers-voyage-v1";
+const DEFSET={music:70,sfx:80,voice:80,quality:"high",invH:false,invV:false,shake:true,subs:true,dead:12};
+let SET={...DEFSET};
+try{const raw=localStorage.getItem(SKEY); if(raw) SET={...DEFSET,...JSON.parse(raw)};}catch(e){}
+function saveSettings(){ try{localStorage.setItem(SKEY,JSON.stringify(SET));}catch(e){} }
+let voyage={best:0,won:false};
+try{const raw=localStorage.getItem(VKEY); if(raw) voyage={...voyage,...JSON.parse(raw)};}catch(e){}
+function saveVoyage(){ try{localStorage.setItem(VKEY,JSON.stringify(voyage));}catch(e){} }
+
+const G={scene:"title", settingsOpen:false, settingsFrom:"title", paused:false, attract:false,
+  hub:false, hubInfo:null, isHost:true, server:false, solo:true, started:false, over:false, won:false,
+  time:0, worldT:0, shake:0, camYaw:Math.PI*0.75, camNudge:{x:0,z:0}, lastInputAt:performance.now(),
+  gems:0, stars:0, brass:false, iron:false, toolIdx:0, checkpoint:{x:-30,z:26}, bossOn:false,
+  msgSeq:1, lastSnapAt:0, lastMeAt:0, finished:false, countdownShown:""};
+const TOOLS=[{id:"reel",name:"Ranger Reel",icon:"🪝"},{id:"bell",name:"Dinner Bell",icon:"🔔"},{id:"shovel",name:"Shovel",icon:"⛏"},{id:"plank",name:"Plank",icon:"🪵"}];
+const DIALOG={
+ intro:[["BRUNO","Mornin’, Pip! The lighthouse gem’s gone missin’ — and them footprints smell like… pirate."],["PIP","Captain Brinebeard! C’mon, Dad — Rangers to the rescue! I’ll race ya to the beach!"],["BRUNO","Gawrsh, wait for your old — oof. My knees. Okay. Throw pots with Cross, kick crates by walkin’ into ’em!"]],
+ beach:[["PIP","Floor plates! Kick a crate onto one and — ta-da — doors!"],["BRUNO","And mind the Buccaneers. A thrown pot or a kicked crate’ll bonk ’em silly."]],
+ ruins:[["BRUNO","Gold posts! Aim your Ranger Reel at one with Square and — zip-a-dee!"],["PIP","Sparkly sand means buried treasure. Shovel time! And ring the Dinner Bell to lure the baddies away."]],
+ fort:[["CAPT. BRINEBEARD","Well, blow me barnacles! The Goof Rangers, in MY fort!"],["PIP","Hand over the Lighthouse Gem, Brinebeard!"],["CAPT. BRINEBEARD","Come and get it, ye gigglin’ landlubbers!"]],
+ bossTip:[["BRUNO","He’s tossin’ bombs! Kick ’em right back at him — three good bonks oughta do it!"]],
+ win:[["PIP","WE DID IT! The gem’s back!"],["BRUNO","That’s my kid. Best Ranger a dad could ask for."],["PIP","Aw, Dad… Race you home? Loser makes cocoa!"],["BRUNO","You’re on! …Can the loser walk? Askin’ for my knees."]],
+ down:[["PIP","Dad?! Hang on — I’m comin’!"],["BRUNO","Just… need a breather, kiddo…"]]
+};
+
+/* ============ audio: code-written music, sfx, gibberish voices ============ */
+let AC=null, musGain=null, sfxGain=null, voiGain=null, musicOn=false, musStep=0, musNext=0;
+function audioInit(){
+  if(AC) { if(AC.state==="suspended") AC.resume(); return; }
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    musGain=AC.createGain(); musGain.connect(AC.destination);
+    sfxGain=AC.createGain(); sfxGain.connect(AC.destination);
+    voiGain=AC.createGain(); voiGain.connect(AC.destination);
+    applyVolumes();
+  }catch(e){ AC=null; }
+}
+function applyVolumes(){ if(!AC) return; musGain.gain.value=SET.music/100*0.5; sfxGain.gain.value=SET.sfx/100*0.6; voiGain.gain.value=SET.voice/100*0.5; }
+function tone(out,f0,f1,dur,type,vol,when=0){
+  if(!AC) return; const t=AC.currentTime+when;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type; o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+dur);
+  g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vol,t+0.012); g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(g); g.connect(out); o.start(t); o.stop(t+dur+0.05);
+}
+function noiseBurst(dur,vol,freq,when=0){
+  if(!AC) return; const t=AC.currentTime+when; const n=Math.max(1,(dur*AC.sampleRate)|0);
+  const buf=AC.createBuffer(1,n,AC.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<n;i++) d[i]=(Math.random()*2-1)*(1-i/n);
+  const src=AC.createBufferSource(); src.buffer=buf;
+  const f=AC.createBiquadFilter(); f.type="bandpass"; f.frequency.value=freq; f.Q.value=0.9;
+  const g=AC.createGain(); g.gain.value=vol;
+  src.connect(f); f.connect(g); g.connect(sfxGain); src.start(t);
+}
+const SFX={
+  throwIt(){ tone(sfxGain,300,700,0.14,"sine",0.5); noiseBurst(0.08,0.12,1800); },
+  pickup(){ tone(sfxGain,500,900,0.1,"triangle",0.4); },
+  bonk(){ tone(sfxGain,220,60,0.16,"square",0.5); noiseBurst(0.1,0.3,500); },
+  gem(){ tone(sfxGain,880,1320,0.12,"sine",0.45); tone(sfxGain,1320,1760,0.16,"sine",0.35,0.07); },
+  key(){ tone(sfxGain,660,660,0.09,"square",0.3); tone(sfxGain,880,880,0.12,"square",0.3,0.09); },
+  door(){ tone(sfxGain,120,70,0.4,"sawtooth",0.3); noiseBurst(0.35,0.15,300); },
+  hurt(){ tone(sfxGain,400,120,0.22,"sawtooth",0.45); },
+  splash(){ noiseBurst(0.3,0.35,700); tone(sfxGain,300,90,0.25,"sine",0.3); },
+  dig(){ noiseBurst(0.18,0.3,900); tone(sfxGain,180,90,0.15,"triangle",0.3,0.05); },
+  bell(){ tone(sfxGain,1560,1500,0.7,"sine",0.5); tone(sfxGain,2090,2050,0.5,"sine",0.3,0.02); },
+  zip(){ tone(sfxGain,200,1200,0.28,"sawtooth",0.3); },
+  boom(){ noiseBurst(0.5,0.6,160); tone(sfxGain,90,35,0.5,"sine",0.7); },
+  jump(){ tone(sfxGain,250,600,0.15,"sine",0.4); },
+  click(){ tone(sfxGain,700,700,0.06,"square",0.25); },
+  fanfare(){ [523,659,784,1046].forEach((f,i)=>tone(sfxGain,f,f,0.22,"triangle",0.45,i*0.12)); }
+};
+const SCALE=[0,2,4,7,9,12,14,16,19,21];
+const CHORDS=[[261.6,329.6,392],[220,261.6,329.6],[174.6,220,261.6],[196,246.9,293.7]];
+const MELODY=[0,-1,2,-1,4,3,-1,2, 1,-1,0,-1,2,-1,-1,-1, 0,-1,2,3,-1,4,-1,3, 2,-1,1,-1,0,-1,-1,-1];
+function musicStart(){ if(!AC||musicOn) return; musicOn=true; musStep=0; musNext=AC.currentTime+0.05; }
+function musicStop(){ musicOn=false; }
+function musicTick(){
+  if(!AC||!musicOn) return;
+  const SPB=60/132/2; // eighth notes at 132bpm
+  while(musNext<AC.currentTime+0.18){
+    const s=musStep%32, bar=((musStep/32)|0)%4, ch=CHORDS[bar], when=musNext-AC.currentTime;
+    if(s%8===0) ch.forEach(f=>tone(musGain,f,f,0.5,"triangle",0.07,when));
+    tone(musGain,ch[0]/2,ch[0]/2,0.24,"sine",0.22,when);
+    const m=MELODY[s];
+    if(m>=0) tone(musGain,523.25*Math.pow(2,SCALE[m%SCALE.length]/12),0,0.2,"sine",0.16,when);
+    if(s%2===0) noiseBurst(0.03,0.035,6000);
+    musNext+=SPB; musStep++;
+  }
+}
+const VOICEBASE={"BRUNO":130,"PIP":250,"CAPT. BRINEBEARD":85,"NARRATOR":175};
+function speakLine(who){
+  if(!AC||SET.voice<=0) return;
+  const base=VOICEBASE[who]||170; const n=10+((Math.random()*8)|0);
+  for(let i=0;i<n;i++){
+    const f=base*(0.9+Math.random()*0.35)*(i%3===1?1.18:1);
+    tone(voiGain,f,f*0.92,0.07,who==="PIP"?"square":"triangle",0.28,i*0.075);
+  }
+}
+/* dialogue runner */
+const DLG={lines:[],idx:0,done:null,timer:null,active:false};
+function dlgShowCurrent(){
+  const cur=DLG.lines[DLG.idx];
+  if(!cur){ dlgEnd(); return; }
+  $("#dwho").textContent=cur[0]; $("#dwhat").textContent=SET.subs?cur[1]:"♪ ~ ♪ ~ ♪";
+  $("#dialogue").classList.remove("hidden"); speakLine(cur[0]);
+  clearTimeout(DLG.timer);
+  DLG.timer=setTimeout(()=>dlgAdvance(), 3000);
+}
+function dlgEnd(){ clearTimeout(DLG.timer); DLG.active=false; $("#dialogue").classList.add("hidden"); const d=DLG.done; DLG.done=null; DLG.lines=[]; if(d) d(); }
+function showDialogue(lines, done){
+  if(!lines||!lines.length){ if(done) done(); return; }
+  DLG.lines=lines.slice(); DLG.idx=0; DLG.done=done||null; DLG.active=true; dlgShowCurrent();
+}
+function dlgAdvance(){ if(!DLG.active) return; DLG.idx++; if(DLG.idx>=DLG.lines.length) dlgEnd(); else dlgShowCurrent(); }
+function dlgSkip(){ if(DLG.active) dlgEnd(); }
+let toastTimer=null;
+function toast(msg,ms=2200){ $("#toasttext").textContent=msg; $("#toast").classList.remove("hidden"); clearTimeout(toastTimer); toastTimer=setTimeout(()=>$("#toast").classList.add("hidden"),ms); }
+
+/* ============ input: controller-first, keyboard+mouse mapped to pad model ============ */
+const keysDown=new Set(); let keyEdges=new Set();
+let mouseActEdge=false, hasKeyboard=false, hasPad=false;
+addEventListener("keydown",e=>{
+  hasKeyboard=true; noteInput();
+  if(["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Tab"].includes(e.code)) e.preventDefault();
+  if(!e.repeat){ keysDown.add(e.code); keyEdges.add(e.code); }
+  if(e.code==="Escape"){ onOptionsKey(); }
+  if(DLG.active&&(e.code==="Space"||e.code==="Enter")) dlgAdvance();
+  if(DLG.active&&e.code==="KeyB") dlgSkip();
+});
+addEventListener("keyup",e=>keysDown.delete(e.code));
+addEventListener("mousedown",()=>{ noteInput(); mouseActEdge=true; audioInit(); });
+addEventListener("touchstart",()=>{ noteInput(); },{passive:true});
+function noteInput(){
+  G.lastInputAt=performance.now();
+  if(G.attract) exitAttract();
+  const t=$("#scr-touch");
+  if(t&&!t.classList.contains("hidden")&&(hasKeyboard||hasPad)) showScreen("scr-title");
+}
+function padAxes(pad){
+  if(!pad) return {x:0,y:0};
+  const dz=SET.dead/100;
+  let x=pad.axes[0]||0, y=pad.axes[1]||0;
+  if(Math.abs(x)<dz) x=0; if(Math.abs(y)<dz) y=0;
+  if(SET.invH) x=-x; if(SET.invV) y=-y;
+  const b=pad.buttons;
+  if(b[14]&&b[14].pressed) x-=1; if(b[15]&&b[15].pressed) x+=1;
+  if(b[12]&&b[12].pressed) y-=1; if(b[13]&&b[13].pressed) y+=1;
+  const l=Math.hypot(x,y); if(l>1){ x/=l; y/=l; }
+  return {x,y};
+}
+const padPrev=[];
+let frameNo=0; let _pfFrame=-1; const _pfCache={};
+function padFrame(idx){
+  if(_pfFrame!==frameNo){ for(const k in _pfCache) delete _pfCache[k]; _pfFrame=frameNo; }
+  if(idx in _pfCache) return _pfCache[idx];
+  const pads=navigator.getGamepads?navigator.getGamepads():[];
+  const pad=pads&&pads[idx]?pads[idx]:null;
+  if(!pad){ _pfCache[idx]=null; return null; }
+  hasPad=true;
+  const prev=padPrev[idx]||(padPrev[idx]=[]);
+  const edge=[];
+  for(let i=0;i<pad.buttons.length;i++){
+    const down=!!pad.buttons[i].pressed;
+    edge[i]=down&&!prev[i]; prev[i]=down;
+  }
+  // Create(8)+Options(9) belongs to the hub: swallow Options while Create held.
+  const createHeld=!!(pad.buttons[8]&&pad.buttons[8].pressed);
+  if(createHeld) edge[9]=false;
+  const ax=padAxes(pad);
+  const rx0=pad.axes[2]||0, ry0=pad.axes[3]||0;
+  const rx=(SET.invH?-rx0:rx0), ry=(SET.invV?-ry0:ry0);
+  const fr={pad,ax,edge,rx:Math.abs(rx)<0.18?0:rx, ry:Math.abs(ry)<0.18?0:ry,
+    held:i=>!!(pad.buttons[i]&&pad.buttons[i].pressed)};
+  _pfCache[idx]=fr; return fr;
+}
+function kbVec(codes){ let x=0,y=0; if(keysDown.has(codes[0]))x-=1; if(keysDown.has(codes[1]))x+=1; if(keysDown.has(codes[2]))y-=1; if(keysDown.has(codes[3]))y+=1; const l=Math.hypot(x,y)||1; return {x:x/l*(x||y?1:0),y:y/l*(x||y?1:0)}; }
+function readLocalInput(slot){
+  // slot 0 = Bruno/P1, slot 1 = Pip/P2 (local couch). Hub remotes never read local devices for others.
+  const out={x:0,y:0,act:false,tool:false,cycle:false,back:false,opt:false,swap:false,rx:0,ry:0};
+  if(slot===0){
+    const k=kbVec(["KeyA","KeyD","KeyW","KeyS"]);
+    out.x=k.x; out.y=k.y;
+    const pf=padFrame(0);
+    if(pf){ if(Math.abs(pf.ax.x)>Math.abs(out.x)) out.x=pf.ax.x; if(Math.abs(pf.ax.y)>Math.abs(out.y)) out.y=pf.ax.y; out.rx=pf.rx; out.ry=pf.ry;
+      out.act=!!pf.edge[0]; out.back=!!pf.edge[1]; out.tool=!!pf.edge[2]; out.cycle=!!pf.edge[3]; out.opt=!!pf.edge[9]; out.swap=!!(pf.edge[4]&&pf.held(5)); }
+    if(keyEdges.has("Space")||keyEdges.has("Enter")) out.act=true;
+    if(keyEdges.has("KeyE")) out.tool=true;
+    if(keyEdges.has("KeyQ")) out.cycle=true;
+    if(keyEdges.has("Tab")) out.swap=true;
+    if(mouseActEdge&&G.scene==="play") out.act=true;
+  } else {
+    const k=kbVec(["KeyJ","KeyL","KeyI","KeyK"]);
+    out.x=k.x; out.y=k.y;
+    const pf2=padFrame(1);
+    if(pf2){ out.x=pf2.ax.x; out.y=pf2.ax.y; out.act=!!pf2.edge[0]; out.back=!!pf2.edge[1]; out.tool=!!pf2.edge[2]; out.cycle=!!pf2.edge[3]; out.opt=!!pf2.edge[9]; }
+    if(keyEdges.has("KeyU")) out.act=true;
+    if(keyEdges.has("KeyO")) out.tool=true;
+    if(keyEdges.has("KeyP")) out.cycle=true;
+  }
+  const l=Math.hypot(out.x,out.y); if(l>1){ out.x/=l; out.y/=l; }
+  return out;
+}
+function anyPadEdge(){
+  for(let i=0;i<4;i++){ const pf=padFrame(i); if(pf&&(pf.edge.some(Boolean)||Math.hypot(pf.ax.x,pf.ax.y)>0.4)) return true; }
+  return false;
+}
+/* menu focus navigation (D-pad / stick / arrows drive the same focus as the pad) */
+function visibleScreen(){ return document.querySelector(".screen:not(.hidden)"); }
+function menuButtons(){ const s=visibleScreen(); return s?[...s.querySelectorAll("button")].filter(b=>!b.disabled):[]; }
+function menuMove(dir){
+  const btns=menuButtons(); if(!btns.length) return;
+  let i=btns.indexOf(document.activeElement);
+  i=i<0?0:(i+dir+btns.length)%btns.length;
+  btns[i].focus();
+}
+function menuConfirm(){ const b=document.activeElement; if(b&&b.tagName==="BUTTON"&&visibleScreen()&&visibleScreen().contains(b)){ b.click(); return true; } return false; }
+let menuStickCool=0;
+function menuInputTick(now){
+  if(G.scene==="play"&&!G.settingsOpen) return;
+  if(now<menuStickCool) return;
+  const pf=padFrame(0);
+  let dir=0;
+  if(keyEdges.has("ArrowDown")||keyEdges.has("KeyS")||(pf&&pf.edge[13])) dir=1;
+  if(keyEdges.has("ArrowUp")||keyEdges.has("KeyW")||(pf&&pf.edge[12])) dir=-1;
+  if(!dir&&pf&&(pf.ax.y>0.6||pf.ax.y<-0.6)) dir=pf.ax.y>0?1:-1;
+  if(dir){ menuMove(dir); SFX.click(); menuStickCool=now+220; return; }
+  if((pf&&pf.edge[0])||keyEdges.has("Enter")){ if(menuConfirm()){ menuStickCool=now+250; } }
+  if(pf&&pf.edge[1]){ goBack(); menuStickCool=now+250; }
+}
+function clearFrameEdges(){ keyEdges=new Set(); mouseActEdge=false; }
+
+
+/* ============ three.js WebGPU + rapier world (cel-shaded) ============ */
+let renderer=null, scene=null, camera=null, rapierWorld=null, gradMap=null;
+let toonMats={};
+function toon(color){ const k=color; if(!toonMats[k]) toonMats[k]=new THREE.MeshToonMaterial({color,gradientMap:gradMap}); return toonMats[k]; }
+function box(w,h,d,color,x=0,y=0,z=0,parent){ const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),toon(color)); m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true; (parent||scene).add(m); return m; }
+function cyl(rt,rb,h,color,x=0,y=0,z=0,parent,seg=10){ const m=new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,seg),toon(color)); m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true; (parent||scene).add(m); return m; }
+function sph(r,color,x=0,y=0,z=0,parent,ws=12,hs=10){ const m=new THREE.Mesh(new THREE.SphereGeometry(r,ws,hs),toon(color)); m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true; (parent||scene).add(m); return m; }
+function cone(r,h,color,x=0,y=0,z=0,parent,seg=9){ const m=new THREE.Mesh(new THREE.ConeGeometry(r,h,seg),toon(color)); m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true; (parent||scene).add(m); return m; }
+function outline(mesh,scale=1.07){
+  const o=new THREE.Mesh(mesh.geometry,new THREE.MeshBasicMaterial({color:0x17301f,side:THREE.BackSide}));
+  o.scale.setScalar(scale); mesh.add(o); return o;
+}
+async function initGraphics(){
+  if(!navigator.gpu) throw new Error("WebGPU is not available in this browser.");
+  renderer=new THREE.WebGPURenderer({antialias:true,powerPreference:"high-performance"});
+  await renderer.init();
+  renderer.setPixelRatio(Math.min(devicePixelRatio,SET.quality==="low"?1:2));
+  renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+  renderer.toneMapping=THREE.NeutralToneMapping; renderer.toneMappingExposure=1.05;
+  $("#gl").appendChild(renderer.domElement);
+  scene=new THREE.Scene();
+  scene.background=new THREE.Color(0x7ec8e3);
+  scene.fog=new THREE.Fog(0x7ec8e3,55,120);
+  camera=new THREE.PerspectiveCamera(48,innerWidth/innerHeight,0.1,220);
+  const cols=new Uint8Array([90,150,210,255]);
+  gradMap=new THREE.DataTexture(cols,4,1,THREE.RedFormat);
+  gradMap.minFilter=THREE.NearestFilter; gradMap.magFilter=THREE.NearestFilter; gradMap.needsUpdate=true;
+  const hemi=new THREE.HemisphereLight(0xcfefff,0x3d6b35,1.15); scene.add(hemi);
+  const sun=new THREE.DirectionalLight(0xfff2cc,2.2);
+  sun.position.set(28,42,18); sun.castShadow=SET.quality!=="low";
+  sun.shadow.mapSize.set(SET.quality==="high"?2048:1024,SET.quality==="high"?2048:1024);
+  sun.shadow.camera.left=-55; sun.shadow.camera.right=55; sun.shadow.camera.top=55; sun.shadow.camera.bottom=-55; sun.shadow.camera.far=120;
+  sun.name="sun"; scene.add(sun); scene.add(sun.target);
+  addEventListener("resize",()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
+  renderer.setSize(innerWidth,innerHeight);
+}
+function applyQuality(){
+  if(!renderer) return;
+  renderer.setPixelRatio(Math.min(devicePixelRatio,SET.quality==="low"?1:2));
+  const sun=scene&&scene.getObjectByName("sun");
+  if(sun){ sun.castShadow=SET.quality!=="low"; const s=SET.quality==="high"?2048:1024; sun.shadow.mapSize.set(s,s); if(sun.shadow.map){ sun.shadow.map.dispose(); sun.shadow.map=null; } }
+}
+/* character factory: original cartoon ranger duo (procedural, no external models) */
+function buildCharacter(kind){
+  const g=new THREE.Group();
+  const isB=kind==="bruno";
+  const coat=isB?0x2a9d8f:0xe9c46a, hat=isB?0x0f766e:0xe8443a, fur=isB?0xf4e3c1:0xffe8c9;
+  const body=cyl(isB?0.52:0.4,isB?0.62:0.48,isB?1.05:0.8,coat,0,isB?0.95:0.75,0,g);
+  outline(body,1.06);
+  const head=sph(isB?0.48:0.4,fur,0,isB?1.85:1.5,0,g); outline(head,1.07);
+  sph(isB?0.2:0.17,fur,0,isB?1.78:1.44,0.42,g); // muzzle
+  sph(0.09,0x17301f,0,(isB?1.86:1.52),0.58,g,8,8); // nose
+  const earG=isB?cone(0.14,0.55,fur,-0.3,2.3,0,g):cone(0.12,0.42,fur,-0.26,1.9,0,g);
+  const ear2=earG.clone(); ear2.position.x*=-1; g.add(ear2);
+  const cap=cyl(isB?0.5:0.42,isB?0.52:0.44,0.18,hat,0,(isB?2.22:1.84),0,g);
+  box(isB?0.7:0.55,0.07,0.4,hat,0,(isB?2.18:1.8),0.45,g); // brim
+  const armL=box(0.2,0.75,0.2,coat,-(isB?0.68:0.52),1.15,0,g); armL.geometry.translate(0,-0.3,0); armL.position.y=isB?1.35:1.05;
+  const armR=armL.clone(); armR.position.x*=-1; g.add(armR);
+  const legL=box(0.24,0.55,0.24,0x33526b,-0.25,0.28,0,g); const legR=legL.clone(); legR.position.x=0.25; g.add(legR);
+  const scarf=box(0.7,0.18,0.7,isB?0xe9c46a:0x2a9d8f,0,isB?1.5:1.22,0,g);
+  g.userData={armL,armR,legL,legR,head,cap,kind};
+  g.scale.setScalar(isB?1.12:0.88);
+  return g;
+}
+function buildCrab(){
+  const g=new THREE.Group();
+  const body=sph(0.5,0xe76f51,0,0.45,0,g); body.scale.set(1.3,0.7,1); outline(body,1.06);
+  sph(0.1,0xffffff,-0.2,0.75,0.3,g,8,8); sph(0.1,0xffffff,0.2,0.75,0.3,g,8,8);
+  sph(0.05,0x17301f,-0.2,0.78,0.38,g,6,6); sph(0.05,0x17301f,0.2,0.78,0.38,g,6,6);
+  for(const sx of [-1,1]){ const claw=sph(0.22,0xe76f51,sx*0.75,0.5,0.25,g); claw.scale.set(1,0.8,1.2);
+    for(let i=0;i<3;i++){ const leg=box(0.5,0.09,0.09,0xe76f51,sx*0.7,0.18,-0.3+i*0.3,g); leg.rotation.z=sx*0.5; } }
+  return g;
+}
+function buildBuccaneer(){
+  const g=new THREE.Group();
+  const body=cyl(0.5,0.6,1.0,0x9d2c3f,0,0.95,0,g); outline(body,1.06);
+  const head=sph(0.46,0xf2c89b,0,1.85,0,g); outline(head,1.07);
+  cone(0.55,0.35,0x17301f,0,2.25,0,g); // tricorn-ish hat
+  box(0.95,0.12,0.6,0x17301f,0,2.08,0,g);
+  const armL=box(0.2,0.7,0.2,0x9d2c3f,-0.66,1.2,0,g); const armR=armL.clone(); armR.position.x=0.66; g.add(armR);
+  box(0.24,0.5,0.24,0x2b2b3a,-0.25,0.25,0,g); box(0.24,0.5,0.24,0x2b2b3a,0.25,0.25,0,g);
+  sph(0.09,0x17301f,-0.16,1.9,0.4,g,8,8); sph(0.09,0x17301f,0.16,1.9,0.4,g,8,8);
+  g.userData={armL,armR,head};
+  return g;
+}
+function buildSnake(){
+  const g=new THREE.Group();
+  const body=cyl(0.16,0.22,1.1,0x74c69d,0,0.55,0,g); body.rotation.x=0.5;
+  const head=sph(0.26,0x74c69d,0,1.05,0.25,g); outline(head,1.07);
+  sph(0.05,0x17301f,-0.1,1.12,0.45,g,6,6); sph(0.05,0x17301f,0.1,1.12,0.45,g,6,6);
+  box(0.3,0.05,0.3,0xe8443a,0,1.02,0.55,g);
+  g.userData={head};
+  return g;
+}
+function palm(x,z,s=1){
+  const g=new THREE.Group(); g.position.set(x,0,z); g.scale.setScalar(s); scene.add(g);
+  const trunk=cyl(0.22,0.34,3.6,0x9c6b3f,0,1.8,0,g); trunk.rotation.z=0.12;
+  for(let i=0;i<6;i++){ const leaf=cone(0.5,2.4,0x2a9d8f,Math.cos(i/6*TAU)*0.9,3.9,Math.sin(i/6*TAU)*0.9,g,6); leaf.rotation.z=Math.cos(i/6*TAU)*1.1; leaf.rotation.x=-Math.sin(i/6*TAU)*1.1; }
+  sph(0.22,0x7f5539,-0.3,3.55,0.2,g,8,8); sph(0.22,0x7f5539,0.3,3.55,-0.15,g,8,8);
+  return g;
+}
+/* ============ level data: Spoonbill Shores (hand-authored, same on every copy) ============ */
+const WORLD={minX:-42,maxX:42,minZ:-34,maxZ:34};
+const WALLDEF=[
+ // perimeter (x,z,w,d,color,h)
+ [-42,0,1.6,70,0x5b8c5a,2.2],[42,0,1.6,70,0x5b8c5a,2.2],[0,34.4,86,1.6,0x5b8c5a,2.2],[0,-34.4,86,1.6,0x5b8c5a,2.2],
+ // beach/ruins divider z=12, brass gate gap x[-30,-26]
+ [-36,12,12,1.6,0x8a7d5c,2.6],[8,12,68,1.6,0x8a7d5c,2.6],
+ // ruins/fort divider z=-12, iron gate gap x[24,28]
+ [ -9,-12,66,1.6,0x5c6650,2.8],[35,-12,14,1.6,0x5c6650,2.8],
+ // cache room walls z=-8
+ [-9.5,-8,11,1.2,0x8a7d5c,2.2],[9.5,-8,11,1.2,0x8a7d5c,2.2],
+ // vault alcove beach west
+ [-38,22.5,7,1.2,0x8a7d5c,2.2],[-41,26,1.2,8,0x8a7d5c,2.2],
+ // fort arena side teeth
+ [-17,-22,1.4,10,0x3f4a3a,3],[17,-22,1.4,10,0x3f4a3a,3],[0,-33,34,1.4,0x3f4a3a,3],
+ // scattered rocks / pillars (x,z,size)
+ [-18,26,2.2,2.2,0x9aa3a2,1.6],[14,24,2.6,2.6,0x9aa3a2,1.8],[-34,2,2.4,2.4,0x9aa3a2,2.2],[30,-4,2.4,2.4,0x9aa3a2,2.2],
+ [-24,-20,3,3,0x7d8a7a,2.6],[24,-26,3,3,0x7d8a7a,2.6],[36,16,2,2,0x9aa3a2,1.5],[-8,30,2,2,0x9aa3a2,1.4]
+];
+const WATERDEF=[{x0:-8,x1:8,z0:2,z1:6},{x0:18,x1:30,z0:-20,z1:-14}];
+const GEMPOS=[[-24,30],[-12,20],[4,28],[18,30],[36,14],[-38,32],[10,14],[-18,14],[-30,4],[-12,-2],[16,-8],[22,10],[34,2],[-36,-6],[-6,10],[24,-6],[-28,-22],[-34,-28],[12,-28],[30,-30],[34,-18],[-12,-30],[6,20],[-2,24],[28,24],[-22,-28],[8,-18],[-30,16],[20,-10],[-14,6]];
+const POTPOS=[[-26,24,0],[-16,28,0],[24,28,0],[32,24,1],[-34,18,0],[16,18,0],[-20,6,0],[12,8,0],[-4,-4,0],[18,-2,1],[-28,-4,0],[8,-24,0],[-10,-24,0],[28,-22,1],[-24,-16,0],[38,-26,0]]; // [x,z,barrel?]
+let blockers=[], doorList=[], plateList=[], crateList=[], potList=[], enemyList=[], pickList=[], postList=[], digList=[], projList=[], bombList=[], fxList=[];
+let players=[], boss=null, gemMesh=null, plankBridge=null, waterMeshes=[];
+function AABB(x,z,hw,hd){ return {minX:x-hw,maxX:x+hw,minZ:z-hd,maxZ:z+hd}; }
+function hitBlock(x,z,r){
+  if(x<WORLD.minX+r||x>WORLD.maxX-r||z<WORLD.minZ+r||z>WORLD.maxZ-r) return true;
+  for(const b of blockers){ if(x>b.minX-r&&x<b.maxX+r&&z>b.minZ-r&&z<b.maxZ+r) return true; }
+  return false;
+}
+function inWater(x,z){
+  for(const w of WATERDEF){ if(x>w.x0&&x<w.x1&&z>w.z0&&z<w.z1){ if(plankBridge&&x>plankBridge.x0&&x<plankBridge.x1&&z>plankBridge.z0&&z<plankBridge.z1) return false; return true; } }
+  return false;
+}
+async function initPhysics(){
+  await RAPIER.init();
+  rapierWorld=new RAPIER.World({x:0,y:-9.81,z:0});
+  rapierWorld.timestep=1/60;
+  const ground=RAPIER.RigidBodyDesc.fixed().setTranslation(0,-0.5,0);
+  const gb=rapierWorld.createRigidBody(ground);
+  rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(60,0.5,50),gb);
+}
+function fixedBox(x,z,hw,hh,hd){
+  const b=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x,hh,z));
+  rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(hw,hh,hd),b);
+  return b;
+}
+function buildWorld(){
+  // grounds
+  const beach=new THREE.Mesh(new THREE.PlaneGeometry(86,24),toon(0xe8c97a)); beach.rotation.x=-Math.PI/2; beach.position.set(0,0,23); beach.receiveShadow=true; scene.add(beach);
+  const ruins=new THREE.Mesh(new THREE.PlaneGeometry(86,24),toon(0x69a85f)); ruins.rotation.x=-Math.PI/2; ruins.position.set(0,0.01,0); ruins.receiveShadow=true; scene.add(ruins);
+  const fort=new THREE.Mesh(new THREE.PlaneGeometry(86,22),toon(0x8d9a84)); fort.rotation.x=-Math.PI/2; fort.position.set(0,0.02,-23); fort.receiveShadow=true; scene.add(fort);
+  const sea=new THREE.Mesh(new THREE.PlaneGeometry(220,220),new THREE.MeshToonMaterial({color:0x2e86ab,gradientMap:gradMap,transparent:true,opacity:0.92}));
+  sea.rotation.x=-Math.PI/2; sea.position.set(0,-0.55,0); scene.add(sea);
+  for(const w of WATERDEF){
+    const m=new THREE.Mesh(new THREE.PlaneGeometry(w.x1-w.x0,w.z1-w.z0),new THREE.MeshToonMaterial({color:0x3aa7c9,gradientMap:gradMap,transparent:true,opacity:0.9}));
+    m.rotation.x=-Math.PI/2; m.position.set((w.x0+w.x1)/2,0.06,(w.z0+w.z1)/2); scene.add(m); waterMeshes.push(m);
+  }
+  // walls + physics
+  for(const [x,z,w,d,c,h] of WALLDEF){
+    box(w,h,d,c,x,h/2,z);
+    blockers.push(AABB(x,z,w/2,d/2));
+    fixedBox(x,z,w/2,h/2,d/2);
+  }
+  // doors
+  function makeDoor(id,x,z,need,label){
+    const m=box(4.2,3,1.4,0x7a4a21,x,1.5,z);
+    const trim=box(4.6,0.4,1.6,0xf2c14e,x,3.1,z);
+    const d={id,x,z,need,open:false,mesh:m,trim,blocker:AABB(x,z,2.2,0.9),label,body:null};
+    m.userData.door=d; blockers.push(d.blocker); doorList.push(d);
+    d.body=fixedBox(x,z,2.1,1.5,0.7);
+    return d;
+  }
+  makeDoor("brass",-28,12,"brass","Brass Gate");
+  makeDoor("iron",26,-12,"iron","Iron Gate");
+  makeDoor("vault",-38,26,"plate1","Vault Door");
+  makeDoor("cache",0,-8,"plate2","Cache Door");
+  // plates
+  function makePlate(id,x,z){
+    const m=cyl(1.1,1.2,0.18,0xe9c46a,x,0.09,z,scene,14);
+    const p={id,x,z,pressed:false,mesh:m}; plateList.push(p); return p;
+  }
+  makePlate("plate1",-33,19); makePlate("plate2a",8,-4); makePlate("plate2b",-6,-6);
+  // reel posts
+  for(const [x,z] of [[-6,7.5],[-6,0.5],[12,7.5],[12,0.5],[24,-12.8],[24,-19]]){
+    const g=new THREE.Group(); g.position.set(x,0,z); scene.add(g);
+    cyl(0.22,0.3,2.6,0x8a5a2b,0,1.3,0,g); sph(0.34,0xf2c14e,0,2.8,0,g,10,8);
+    postList.push({x,z,mesh:g});
+  }
+  // dig spots (sparkly mounds)
+  for(const [x,z,loot] of [[12,10,"gem"],[-36,16,"heart"],[28,-18,"gems"],[-18,-2,"gem"],[34,8,"heart"]]){
+    const m=cone(0.9,0.5,0xd9b36a,x,0.25,z,scene,8);
+    digList.push({x,z,loot,dug:false,mesh:m});
+  }
+  // lighthouse + gem pedestal
+  const lh=new THREE.Group(); lh.position.set(36,0,-30); scene.add(lh);
+  cyl(1.8,2.4,9,0xfff7df,0,4.5,0,lh,12); cyl(1.9,1.9,1.2,0xe8443a,0,7.2,0,lh,12);
+  cyl(1.2,1.4,1.6,0x17301f,0,9.6,0,lh,10); sph(0.55,0xffe066,0,9.6,0,lh,10,8);
+  const pd=cyl(0.9,1.2,1.1,0x5c6650,0,0.55,-26,scene,10); pd.position.x=0;
+  gemMesh=sph(0.55,0xffe066,0,1.9,-26,scene,12,10); gemMesh.visible=false;
+  const gl=new THREE.PointLight(0xffe066,0,18,1.8); gl.position.set(0,3,-26); gl.name="gemlight"; scene.add(gl);
+  // palms + decor
+  [[-38,30],[-8,32],[20,32],[38,28],[-40,8],[40,10],[-16,-28],[20,18],[34,-8],[-36,-16]].forEach(([x,z],i)=>palm(x,z,0.9+(i%3)*0.15));
+  for(let i=0;i<26;i++){ const x=-40+(i*13.7)%80, z=-32+((i*29.3)%64); if(Math.abs(x)<3&&z>10) continue; const r=sph(0.4+(i%4)*0.18,0x8fa98f,x,0.25,z,scene,7,6); r.scale.y=0.7; }
+}
+
+
+
+/* ============ entities & simulation ============ */
+let entSeq=1;
+function kinBody(x,z,rad){
+  const b=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x,0.9,z));
+  rapierWorld.createCollider(RAPIER.ColliderDesc.capsule(0.55,rad),b);
+  return b;
+}
+function makePotMesh(barrel){
+  const g=new THREE.Group();
+  if(barrel){ cyl(0.42,0.42,0.85,0xa44a2a,0,0.42,0,g,10); cyl(0.45,0.45,0.1,0x5c3220,0,0.88,0,g,10); }
+  else { const p=sph(0.42,0xc96f2e,0,0.4,0,g,10,8); p.scale.y=1.1; cyl(0.2,0.28,0.22,0x8a4a1e,0,0.88,0,g,8); }
+  return g;
+}
+function spawnEntities(){
+  // crates [x,z]
+  for(const [x,z] of [[-30,22],[10,-1],[-9,-3],[2,8],[-12,-26],[12,-26],[36,22]]){
+    const mesh=box(1.5,1.5,1.5,0xb0894f, x,0.75,z);
+    const trim=new THREE.Mesh(new THREE.BoxGeometry(1.62,0.18,1.62),toon(0x7a5a2e)); trim.position.set(0,0.72,0); mesh.add(trim);
+    const cross=new THREE.Mesh(new THREE.BoxGeometry(1.62,1.56,0.16),toon(0x7a5a2e)); mesh.add(cross);
+    const body=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,0.75,z).setLinearDamping(2.2).lockRotations());
+    rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(0.75,0.75,0.75).setMass(2),body);
+    crateList.push({id:entSeq++,mesh,body,x,z});
+  }
+  for(const [x,z,b] of POTPOS){
+    const mesh=makePotMesh(!!b); mesh.position.set(x,0,z); scene.add(mesh);
+    potList.push({id:entSeq++,mesh,x,z,hx:x,hz:z,barrel:!!b,taken:false,carriedBy:null});
+  }
+  const pickDefs=[
+    ...GEMPOS.map(([x,z])=>({kind:"gem",x,z})),
+    {kind:"brass",x:34,z:28},{kind:"iron",x:0,z:-10.4},
+    {kind:"bell",x:-20,z:30},{kind:"reel",x:-24,z:8},{kind:"shovel",x:18,z:8},{kind:"plank",x:-14,z:9},
+    {kind:"heart",x:-38,z:29},{kind:"heart",x:0,z:-10.4},{kind:"banana",x:6,z:26},{kind:"banana",x:-4,z:-14},{kind:"heart",x:0,z:-20},{kind:"banana",x:-20,z:-24}
+  ];
+  for(const d of pickDefs){
+    let mesh;
+    if(d.kind==="gem"){ mesh=sph(0.32,0x3ec6e0,d.x,0.7,d.z,scene,8,8); mesh.rotation.z=0.6; }
+    else if(d.kind==="heart"){ mesh=sph(0.36,0xe8443a,d.x,0.7,d.z,scene,10,8); mesh.scale.set(1,0.9,0.7); }
+    else if(d.kind==="banana"){ mesh=cone(0.22,0.8,0xf5d90a,d.x,0.7,d.z,scene,7); mesh.rotation.z=1.1; }
+    else if(d.kind==="brass"||d.kind==="iron"){ mesh=box(0.28,0.9,0.12,d.kind==="brass"?0xf2c14e:0xb8c4cc,d.x,0.8,d.z); sph(0.22,d.kind==="brass"?0xf2c14e:0xb8c4cc,d.x,1.35,d.z,scene,8,8); }
+    else { mesh=box(0.6,0.6,0.6,0x14b8a6,d.x,0.6,d.z); }
+    pickList.push({id:entSeq++,...d,mesh,taken:false,baseY:mesh.position.y});
+  }
+  const foeDefs=[
+    ["bucc",30,25],["bucc",36,20],["crab",-10,28],["crab",8,18],
+    ["snake",14,-4],["snake",-16,-6],["bucc",20,6],["crab",-20,0],["crab",34,-2],
+    ["bucc",-28,-18],["bucc",30,-24],["crab",-8,-16],["bucc",10,-16],["snake",-32,-28]
+  ];
+  for(const [kind,x,z] of foeDefs) spawnEnemy(kind,x,z);
+}
+function spawnEnemy(kind,x,z){
+  const mesh=kind==="bucc"?buildBuccaneer():kind==="crab"?buildCrab():buildSnake();
+  mesh.position.set(x,0,z); scene.add(mesh);
+  const e={id:entSeq++,kind,mesh,body:kinBody(x,z,0.45),x,z,hp:kind==="bucc"?2:1,maxHp:kind==="bucc"?2:1,
+    home:{x,z},state:"patrol",t:Math.random()*3,face:0,iframes:0,lureT:0,lureX:0,lureZ:0,dead:false,throwT:2+Math.random()*2,lungeT:0};
+  enemyList.push(e); return e;
+}
+function spawnBoss(){
+  const mesh=buildBuccaneer(); mesh.scale.setScalar(1.7); mesh.position.set(0,0,-27); scene.add(mesh);
+  const hat=sph(0.3,0xf2c14e,0,4.1,-27,scene,8,8);
+  boss={id:entSeq++,kind:"boss",mesh,body:kinBody(0,-27,0.8),x:0,z:-27,hp:3,maxHp:3,state:"chase",t:0,face:0,iframes:0,dead:false,throwT:2,summoned:0,lureT:0,lureX:0,lureZ:0};
+  $("#bossbar").classList.remove("hidden");
+  if(G.hub) hubEvent({t:"bossspawn"});
+}
+function makePlayer(id,kind,x,z,name,tint){
+  const mesh=buildCharacter(kind);
+  mesh.position.set(x,0,z); scene.add(mesh);
+  if(tint){ mesh.traverse(o=>{ if(o.isMesh&&o.material&&o.material.color&&o.geometry.type!=="SphereGeometry"){} }); }
+  const p={id,kind,name:name||(kind==="bruno"?"BRUNO":"PIP"),mesh,body:kinBody(x,z,0.5),
+    x,z,face:kind==="bruno"?0:Math.PI,hp:kind==="bruno"?5:4,maxHp:kind==="bruno"?5:4,
+    speed:kind==="bruno"?6.2:7.6,power:kind==="bruno"?13:10.5,carry:null,owned:new Set(),
+    down:false,iframes:0,walkPh:0,lastSafe:{x,z},input:{x:0,y:0},remote:false,ai:false,
+    contrib:{gems:0,kos:0},reviveT:0,zipT:0,zipFrom:null,zipTo:null,samples:[],gone:false,toolIdx:0};
+  players.push(p); return p;
+}
+function syncBody(p){ if(p.body) p.body.setNextKinematicTranslation({x:p.x,y:0.9,z:p.z}); }
+function burst(x,z,color,n=8){
+  for(let i=0;i<n;i++){
+    const m=sph(0.11,color,x,1,z,scene,6,5);
+    fxList.push({mesh:m,vx:(Math.random()-0.5)*5,vy:3+Math.random()*3,vz:(Math.random()-0.5)*5,t:0.7});
+  }
+}
+function damageEnemy(e,dmg,from){
+  if(e.dead||e.iframes>0) return;
+  e.iframes=0.35; e.hp-=dmg; SFX.bonk(); burst(e.x,e.z,0xffe066,7);
+  if(from) from.contrib.kos+= (e.hp<=0?1:0);
+  if(e.kind==="boss"){
+    $("#bossfill").style.width=Math.max(0,e.hp/e.maxHp*100)+"%";
+    if(e.hp<=0){ bossDie(); } else { toast("BRINEBEARD: Ow! Ye’ll pay for that! ("+e.hp+" bonks left)"); if(boss) { spawnEnemy("crab",e.x-3,e.z+3); spawnEnemy("crab",e.x+3,e.z+3); toast("He called crabs! 🦀"); } }
+    return;
+  }
+  if(e.hp<=0){ e.dead=true; e.mesh.rotation.z=Math.PI/2; e.mesh.position.y=0.3; SFX.gem(); G.stars++; if(Math.random()<0.35) dropPickup("banana",e.x,e.z); setTimeout(()=>{ if(e.mesh.parent) scene.remove(e.mesh); if(e.body) rapierWorld.removeRigidBody(e.body); },900); }
+  else { e.mesh.position.y=0.25; setTimeout(()=>{ if(!e.dead) e.mesh.position.y=0; },150); }
+}
+function dropPickup(kind,x,z){
+  const mesh=kind==="heart"?sph(0.36,0xe8443a,x,0.7,z,scene,10,8):cone(0.22,0.8,0xf5d90a,x,0.7,z,scene,7);
+  pickList.push({id:entSeq++,kind,x,z,mesh,taken:false,baseY:0.7,dropped:true});
+}
+function bossDie(){
+  if(!boss||boss.dead) return; boss.dead=true; SFX.boom(); SFX.fanfare(); burst(boss.x,boss.z,0xffe066,22);
+  boss.mesh.rotation.z=Math.PI/2;
+  $("#bossbar").classList.add("hidden");
+  gemMesh.visible=true; const gl=scene.getObjectByName("gemlight"); if(gl) gl.intensity=60;
+  showDialogue(DIALOG.win,()=>{});
+  toast("The Lighthouse Gem sparkles! Go grab it! 💎");
+  if(G.hub&&window.AIHub&&AIHub.isHost) hubEvent({t:"bossdown"});
+}
+function damagePlayer(p,dmg,sx,sz){
+  if(p.down||p.iframes>0||G.attract) return;
+  p.hp-=dmg; p.iframes=1.1; SFX.hurt(); G.shake=Math.max(G.shake,0.35);
+  const d=Math.hypot(p.x-sx,p.z-sz)||1; p.x+=(p.x-sx)/d*1.4; p.z+=(p.z-sz)/d*1.4;
+  burst(p.x,p.z,0xe8443a,6);
+  if(p.hp<=0){ p.down=true; p.hp=0; p.mesh.rotation.z=0.4; dropCarry(p); showDialogue(DIALOG.down,()=>{}); toast(p.name+" is down! Partner, stand close to revive!"); checkAllDown(); }
+}
+function dropCarry(p){
+  if(!p.carry) return;
+  if(p.carry.pot){ p.carry.pot.taken=false; p.carry.pot.carriedBy=null; p.carry.pot.mesh.visible=true; p.carry.pot.x=p.x; p.carry.pot.z=p.z; p.carry.pot.mesh.position.set(p.x,0,p.z); }
+  if(p.carry.bomb){ p.carry.bomb.carried=false; }
+  p.carry=null;
+}
+function checkAllDown(){
+  const humans=players.filter(p=>!p.gone);
+  if(humans.length&&humans.every(p=>p.down)&&!G.hub){ gameOver(); }
+  if(G.hub&&humans.filter(p=>!p.remote).every(p=>p.down)&&!G.server){ /* hub: wait for revive or host finish on time-up */ }
+}
+function nearestAlivePlayer(x,z){
+  let best=null,bd=1e9;
+  for(const p of players){ if(p.down||p.gone) continue; const d=(p.x-x)**2+(p.z-z)**2; if(d<bd){bd=d;best=p;} }
+  return best;
+}
+/* ---- player actions ---- */
+function tryPickupOrThrow(p){
+  if(p.down) return;
+  if(p.carry){ throwCarry(p); return; }
+  // bomb pickup first
+  for(const b of bombList){ if(!b.carried&&Math.hypot(b.x-p.x,b.z-p.z)<1.9){ b.carried=true; b.holder=p; p.carry={bomb:b}; SFX.pickup(); return; } }
+  let best=null,bd=2.9;
+  for(const pot of potList){ if(pot.taken) continue; const d=(pot.x-p.x)**2+(pot.z-p.z)**2; if(d<bd){bd=d;best=pot;} }
+  if(best){ best.taken=true; best.carriedBy=p; best.mesh.visible=false; p.carry={pot:best}; SFX.pickup(); if(G.hub&&!G.isHost) hubSendAction({t:"pickpot",pot:best.id}); }
+}
+function throwCarry(p){
+  const fx=Math.sin(p.face), fz=Math.cos(p.face);
+  if(p.carry.pot){
+    const pot=p.carry.pot; p.carry=null; pot.carriedBy=null;
+    spawnProjectile(p,pot,fx,fz);
+    SFX.throwIt();
+    if(G.hub) hubSendAction({t:"throw",pot:pot.id,face:p.face});
+  } else if(p.carry.bomb){
+    const b=p.carry.bomb; p.carry=null; b.carried=false; b.holder=null;
+    b.vx=fx*9; b.vz=fz*9; b.x=p.x+fx; b.z=p.z+fz; SFX.throwIt();
+    if(G.hub) hubSendAction({t:"throwbomb",bomb:b.id,face:p.face});
+  }
+}
+function spawnProjectile(p,pot,fx,fz){
+  pot.taken=true;
+  const mesh=pot.mesh; mesh.visible=true; scene.attach(mesh);
+  const body=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(p.x+fx,2.2,p.z+fz).setLinearDamping(0.1).setAngularDamping(0.5));
+  rapierWorld.createCollider(RAPIER.ColliderDesc.ball(0.42).setMass(1),body);
+  body.setLinvel({x:fx*p.power,y:5.2,z:fz*p.power},true);
+  projList.push({mesh,body,pot,from:p,kind:pot.barrel?"barrel":"pot",t:4,hostile:false});
+  // pot leaves world list until it lands/breaks; a fresh pot respawns at home after break
+}
+function useTool(p){
+  if(p.down) return;
+  const tool=TOOLS[p.toolIdx%TOOLS.length];
+  if(!tool||!p.owned.has(tool.id)){ toast("No tool yet — explore! △ cycles tools you own"); return; }
+  if(tool.id==="reel"){
+    let best=null,bd=100;
+    for(const post of postList){ const d=(post.x-p.x)**2+(post.z-p.z)**2; if(d<bd){bd=d;best=post;} }
+    if(best&&bd<110){ p.zipFrom={x:p.x,z:p.z}; p.zipTo={x:best.x,z:best.z}; p.zipT=0.28; SFX.zip(); burst(p.x,p.z,0xf2c14e,5);
+      if(G.hub) hubSendAction({t:"zip",postX:best.x,postZ:best.z}); }
+    else toast("No gold post in reach of the Reel 🪝");
+  }
+  if(tool.id==="bell"){
+    SFX.bell(); toast("🔔 Dinner Bell! Enemies come a-runnin’… away from your partner!");
+    for(const e of enemyList){ if(e.dead) continue; if(Math.hypot(e.x-p.x,e.z-p.z)<15){ e.lureT=4; e.lureX=p.x; e.lureZ=p.z; } }
+    if(boss&&!boss.dead&&Math.hypot(boss.x-p.x,boss.z-p.z)<15){ boss.lureT=3; boss.lureX=p.x; boss.lureZ=p.z; }
+    if(G.hub) hubSendAction({t:"bell",x:p.x,z:p.z});
+  }
+  if(tool.id==="shovel"){
+    let best=null;
+    for(const d of digList){ if(!d.dug&&Math.hypot(d.x-p.x,d.z-p.z)<2.4) best=d; }
+    if(best){ best.dug=true; best.mesh.scale.y=0.25; SFX.dig(); burst(best.x,best.z,0xd9b36a,8);
+      if(best.loot==="heart") dropPickup("heart",best.x,best.z); else if(best.loot==="gems"){ addGems(p,5); toast("Buried gems! +5 💎"); } else { addGems(p,3); toast("Dug up gems! +3 💎"); }
+      if(G.hub) hubSendAction({t:"dig",x:best.x,z:best.z});
+    } else toast("No sparkly sand here. Look for ✨ mounds!");
+  }
+  if(tool.id==="plank"){
+    if(plankBridge){ // pick it back up if near
+      if(Math.abs(p.x-(plankBridge.x0+plankBridge.x1)/2)<6&&Math.abs(p.z-(plankBridge.z0+plankBridge.z1)/2)<6){
+        scene.remove(plankBridge.mesh); plankBridge=null; toast("Picked the plank back up 🪵"); if(G.hub) hubSendAction({t:"plankup"}); return;
+      }
+      toast("Plank’s already down — stand near it to reclaim it"); return;
+    }
+    const fx=Math.sin(p.face), fz=Math.cos(p.face);
+    const cx=p.x+fx*2.2, cz=p.z+fz*2.2;
+    let wrect=null; for(const w of WATERDEF){ if(cx>w.x0-2&&cx<w.x1+2&&cz>w.z0-2&&cz<w.z1+2) wrect=w; }
+    if(!wrect){ toast("Face a river or pond, then use the Plank 🪵"); return; }
+    const alongX=(wrect.x1-wrect.x0)<(wrect.z1-wrect.z0);
+    const bx0=alongX?wrect.x0:cx-1.1, bx1=alongX?wrect.x1:cx+1.1, bz0=alongX?cz-1.1:wrect.z0, bz1=alongX?cz+1.1:wrect.z1;
+    const mesh=box(bx1-bx0,0.22,bz1-bz0,0x9c6b3f,(bx0+bx1)/2,0.16,(bz0+bz1)/2);
+    plankBridge={x0:bx0,x1:bx1,z0:bz0,z1:bz1,mesh};
+    SFX.pickup(); toast("Plank down! Mind the gap no more 🪵");
+    if(G.hub) hubSendAction({t:"plank",x0:bx0,x1:bx1,z0:bz0,z1:bz1});
+  }
+}
+function cycleTool(p){
+  if(!p.owned.size){ toast("Hands only so far — find tools! Pots: Cross · Crates: walk into ’em"); return; }
+  for(let i=0;i<TOOLS.length;i++){ p.toolIdx=(p.toolIdx+1)%TOOLS.length; if(p.owned.has(TOOLS[p.toolIdx].id)) break; }
+  if(p===localLead()) updateToolHUD();
+  SFX.click();
+}
+function addGems(p,n){ G.gems+=n; if(p) p.contrib.gems+=n; SFX.gem(); updateHUD(); }
+function openDoor(d,by){
+  if(d.open) return; d.open=true; SFX.door(); toast(d.label+" — open! 🚪");
+  d.mesh.position.y=-2.8; d.trim.position.y=-0.4;
+  const i=blockers.indexOf(d.blocker); if(i>=0) blockers.splice(i,1);
+  if(d.body&&rapierWorld){ rapierWorld.removeRigidBody(d.body); d.body=null; }
+  if(G.hub&&window.AIHub&&AIHub.isHost) hubEvent({t:"door",id:d.id});
+}
+function tryOpenKeyDoor(p){
+  for(const d of doorList){
+    if(d.open) continue;
+    if(Math.hypot(d.x-p.x,d.z-p.z)>3.2) continue;
+    if(d.need==="brass"&&G.brass){ openDoor(d,p); return true; }
+    if(d.need==="iron"&&G.iron){ openDoor(d,p); return true; }
+    if(d.need==="brass"||d.need==="iron"){ /* locked feedback handled on bump timer */ }
+  }
+  return false;
+}
+let lockToastAt=0;
+function movePlayer(p,dt){
+  const inp=p.input||{x:0,y:0};
+  if(p.zipT>0){
+    p.zipT-=dt; const t=1-Math.max(0,p.zipT)/0.28;
+    p.x=lerp(p.zipFrom.x,p.zipTo.x,t); p.z=lerp(p.zipFrom.z,p.zipTo.z,t);
+    p.mesh.position.set(p.x,Math.sin(t*Math.PI)*1.6,p.z);
+    syncBody(p); if(p.zipT<=0){ p.x=p.zipTo.x+ (p.x>=p.zipTo.x?0:0); burst(p.x,p.z,0xf2c14e,5); }
+    return;
+  }
+  if(p.down){ syncBody(p); return; }
+  let mx=inp.x||0, mz=inp.y||0;
+  // camera-relative: rotate input by camYaw offset (camYaw default looks from south-east)
+  const cy=G.camYaw-Math.PI*0.75;
+  const wx=mx*Math.cos(cy)-mz*Math.sin(cy), wz=mx*Math.sin(cy)+mz*Math.cos(cy);
+  const mag=Math.hypot(wx,wz);
+  if(mag>0.05) p.face=Math.atan2(wx,wz);
+  const sp=p.speed*(p.carry?0.82:1);
+  let nx=p.x+wx*sp*dt, nz=p.z+wz*sp*dt;
+  // crate kick: detect crate ahead
+  for(const c of crateList){
+    const t=c.body.translation();
+    if(Math.hypot(t.x-nx,t.z-nz)<1.45&&mag>0.2){
+      const v=c.body.linvel();
+      if(Math.hypot(v.x,v.z)<1.2){
+        const d=Math.hypot(t.x-p.x,t.z-p.z)||1;
+        c.body.setLinvel({x:(t.x-p.x)/d*7.5,y:0,z:(t.z-p.z)/d*7.5},true);
+        SFX.bonk(); G.shake=Math.max(G.shake,0.12);
+        if(G.hub) hubSendAction({t:"kick",crate:c.id,vx:(t.x-p.x)/d*7.5,vz:(t.z-p.z)/d*7.5});
+      }
+    }
+  }
+  // bomb kick (slide, no pickup while moving fast into it)
+  if(!hitBlock(nx,p.z,0.62)) p.x=nx;
+  if(!hitBlock(p.x,nz,0.62)) p.z=nz;
+  // doors bump feedback + key auto-open
+  if(!tryOpenKeyDoor(p)){
+    for(const d of doorList){ if(!d.open&&(d.need==="brass"||d.need==="iron")&&Math.hypot(d.x-p.x,d.z-p.z)<3&&performance.now()-lockToastAt>2500){ lockToastAt=performance.now(); toast(d.need==="brass"?"🔒 Needs the BRASS key!":"🔒 Needs the IRON key!"); } }
+  }
+  // water
+  if(inWater(p.x,p.z)){
+    SFX.splash(); burst(p.x,p.z,0x3aa7c9,8);
+    p.x=p.lastSafe.x; p.z=p.lastSafe.z; toast("💦 Brrr! Rangers can’t swim!");
+  } else if(!hitBlock(p.x,p.z,0.62)){ p.lastSafe={x:p.x,z:p.z}; }
+  // walk anim
+  p.walkPh+=dt*(mag>0.05?10:0);
+  const u=p.mesh.userData;
+  if(u.armL){ const s=Math.sin(p.walkPh)*(mag>0.05?0.7:0.06); u.armL.rotation.x=s; u.armR.rotation.x=-s; u.legL.rotation.x=-s*0.8; u.legR.rotation.x=s*0.8; }
+  p.mesh.position.set(p.x,mag>0.05?Math.abs(Math.sin(p.walkPh))*0.09:0,p.z);
+  p.mesh.rotation.y=p.face;
+  p.mesh.rotation.z=p.down?0.4:0;
+  if(p.iframes>0){ p.iframes-=dt; p.mesh.visible=Math.sin(performance.now()*0.03)>-0.3||!p.down&&p.iframes<=0?true:(performance.now()%160<90); if(p.iframes<=0) p.mesh.visible=true; }
+  syncBody(p);
+  // carried visuals
+  if(p.carry&&p.carry.pot){ /* pot hidden while carried; show proxy above head via pot mesh attached */ }
+  if(p.carry){
+    if(p.carry.pot){ p.carry.pot.mesh.visible=true; p.carry.pot.mesh.position.set(p.x,2.45,p.z); }
+    if(p.carry.bomb){ p.carry.bomb.x=p.x; p.carry.bomb.z=p.z; p.carry.bomb.mesh.position.set(p.x,2.5,p.z); }
+  }
+}
+/* ---- enemies, projectiles, bombs (host simulation) ---- */
+function stepEnemies(dt){
+  for(const e of enemyList){
+    if(e.dead) continue;
+    if(e.iframes>0) e.iframes-=dt;
+    const target=nearestAlivePlayer(e.x,e.z);
+    let tx=e.home.x+Math.sin(G.worldT*0.4+e.id)*3, tz=e.home.z+Math.cos(G.worldT*0.33+e.id)*3, sp=1.1;
+    if(e.lureT>0){ e.lureT-=dt; tx=e.lureX; tz=e.lureZ; sp=3.4; }
+    else if(target){
+      const d=Math.hypot(target.x-e.x,target.z-e.z);
+      if(e.kind==="bucc"&&d<11){ tx=target.x; tz=target.z; sp=2.6;
+        e.throwT-=dt;
+        if(e.throwT<=0&&d>4&&d<10){ e.throwT=3.2; spawnNut(e,target); }
+      }
+      if(e.kind==="crab"&&d<9){ tx=target.x+Math.sin(G.worldT*3+e.id)*2.5; tz=target.z+Math.cos(G.worldT*2.2+e.id)*1.2; sp=2.9; }
+      if(e.kind==="snake"){
+        e.lungeT-=dt;
+        if(d<4.5&&e.lungeT<=0){ e.lungeT=2.2; e.lungeVx=(target.x-e.x)/(d||1)*9; e.lungeVz=(target.z-e.z)/(d||1)*9; SFX.zip(); }
+        if(e.lungeT>1.6){ tx=e.x+e.lungeVx; tz=e.z+e.lungeVz; sp=9; } else { tx=e.x; tz=e.z; sp=0; }
+      }
+      if(d<1.25) damagePlayer(target,1,e.x,e.z);
+    }
+    const dx=tx-e.x, dz=tz-e.z, dl=Math.hypot(dx,dz);
+    if(dl>0.3&&sp>0){ const vx=dx/dl*sp*dt, vz=dz/dl*sp*dt;
+      if(!hitBlock(e.x+vx,e.z,0.55)) e.x+=vx;
+      if(!hitBlock(e.x,e.z+vz,0.55)) e.z+=vz;
+      e.face=Math.atan2(dx,dz);
+    }
+    e.mesh.position.set(e.x,0,e.z); e.mesh.rotation.y=e.face;
+    if(e.mesh.userData.armL){ const s=Math.sin(G.worldT*6+e.id)*0.4; e.mesh.userData.armL.rotation.x=s; e.mesh.userData.armR.rotation.x=-s; }
+    if(e.body) e.body.setNextKinematicTranslation({x:e.x,y:0.9,z:e.z});
+    // kicked-crate bonk
+    for(const c of crateList){
+      const t=c.body.translation(), v=c.body.linvel();
+      if(Math.hypot(v.x,v.z)>2.5&&Math.hypot(t.x-e.x,t.z-e.z)<1.5) damageEnemy(e,2,nearestAlivePlayer(e.x,e.z));
+    }
+  }
+  if(boss&&!boss.dead) stepBoss(dt);
+}
+function spawnNut(e,target){
+  const mesh=sph(0.26,0x7f5539,e.x,1.6,e.z,scene,8,8);
+  const body=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(e.x,1.8,e.z).setLinearDamping(0.05));
+  rapierWorld.createCollider(RAPIER.ColliderDesc.ball(0.26).setMass(0.5),body);
+  const d=Math.hypot(target.x-e.x,target.z-e.z)||1;
+  body.setLinvel({x:(target.x-e.x)/d*8,y:3.5,z:(target.z-e.z)/d*8},true);
+  projList.push({mesh,body,pot:null,from:null,kind:"nut",t:3.5,hostile:true});
+  SFX.throwIt();
+}
+function stepBoss(dt){
+  const b=boss; if(b.iframes>0) b.iframes-=dt;
+  const target=nearestAlivePlayer(b.x,b.z);
+  let tx=b.x,tz=b.z,sp=0;
+  if(b.lureT>0){ b.lureT-=dt; tx=b.lureX; tz=b.lureZ; sp=2.2; }
+  else if(target){ tx=target.x; tz=target.z; sp=1.9; }
+  const dx=tx-b.x,dz=tz-b.z,dl=Math.hypot(dx,dz);
+  if(dl>1.8){ if(!hitBlock(b.x+dx/dl*sp*dt,b.z,0.9)) b.x+=dx/dl*sp*dt; if(!hitBlock(b.x,b.z+dz/dl*sp*dt,0.9)) b.z+=dz/dl*sp*dt; b.face=Math.atan2(dx,dz); }
+  b.mesh.position.set(b.x,0,b.z); b.mesh.rotation.y=b.face;
+  if(b.body) b.body.setNextKinematicTranslation({x:b.x,y:0.9,z:b.z});
+  if(target&&Math.hypot(target.x-b.x,target.z-b.z)<2.1) damagePlayer(target,1,b.x,b.z);
+  b.throwT-=dt;
+  if(b.throwT<=0&&target){ b.throwT=b.hp===3?2.8:b.hp===2?2.3:1.8; spawnBomb(b.x,b.z,target); toast("💣 Incoming! Kick it back at him!"); }
+  for(const c of crateList){
+    const t=c.body.translation(), v=c.body.linvel();
+    if(Math.hypot(v.x,v.z)>2.5&&Math.hypot(t.x-b.x,t.z-b.z)<2) damageEnemy(b,1,nearestAlivePlayer(b.x,b.z));
+  }
+}
+function spawnBomb(x,z,target){
+  const g=new THREE.Group(); const ball=sph(0.45,0x2b2b3a,0,0.45,0,g,10,8); outline(ball,1.08); cyl(0.08,0.08,0.3,0xf2c14e,0,1,0,g,6);
+  g.position.set(x,0,z); scene.add(g);
+  const d=Math.hypot(target.x-x,target.z-z)||1;
+  bombList.push({id:entSeq++,mesh:g,x,z,vx:(target.x-x)/d*3.5,vz:(target.z-z)/d*3.5,fuse:4.5,carried:false,holder:null});
+  SFX.throwIt();
+}
+function explodeBomb(b){
+  SFX.boom(); G.shake=Math.max(G.shake,0.6); burst(b.x,b.z,0xff9f1c,16);
+  for(const p of players){ if(!p.down&&Math.hypot(p.x-b.x,p.z-b.z)<2.6) damagePlayer(p,1,b.x,b.z); }
+  if(boss&&!boss.dead&&Math.hypot(boss.x-b.x,boss.z-b.z)<3) damageEnemy(boss,1,nearestAlivePlayer(b.x,b.z));
+  for(const e of enemyList){ if(!e.dead&&Math.hypot(e.x-b.x,e.z-b.z)<2.6) damageEnemy(e,2,nearestAlivePlayer(b.x,b.z)); }
+  scene.remove(b.mesh);
+  const i=bombList.indexOf(b); if(i>=0) bombList.splice(i,1);
+  for(const p of players){ if(p.carry&&p.carry.bomb===b) p.carry=null; }
+}
+function stepBombs(dt){
+  for(const b of [...bombList]){
+    if(b.carried){ b.mesh.position.set(b.x,2.5,b.z); }
+    else {
+      // player kick
+      for(const p of players){
+        if(p.down) continue;
+        const inp=p.input||{x:0,y:0};
+        if(Math.hypot(b.x-p.x,b.z-p.z)<1.35&&Math.hypot(inp.x,inp.y)>0.3){
+          const fx=Math.sin(p.face),fz=Math.cos(p.face); b.vx=fx*8.5; b.vz=fz*8.5; SFX.bonk();
+          if(G.hub) hubSendAction({t:"kickbomb",bomb:b.id,vx:b.vx,vz:b.vz});
+        }
+      }
+      b.x+=b.vx*dt; b.z+=b.vz*dt; b.vx*=Math.pow(0.12,dt); b.vz*=Math.pow(0.12,dt);
+      if(hitBlock(b.x,b.z,0.45)){ b.vx*=-0.5; b.vz*=-0.5; b.x+=b.vx*dt*2; b.z+=b.vz*dt*2; }
+      b.mesh.position.set(b.x,0,b.z);
+      b.mesh.children[1].visible=Math.sin(performance.now()*0.02)>0; // fuse blink (calm, not strobing fast)
+    }
+    b.fuse-=dt;
+    b.mesh.scale.setScalar(1+Math.max(0,1-b.fuse)*0.12);
+    if(b.fuse<=0) explodeBomb(b);
+  }
+}
+function stepProjectiles(dt){
+  for(const pr of [...projList]){
+    pr.t-=dt;
+    const t=pr.body.translation(); pr.mesh.position.copy(t);
+    pr.mesh.rotation.x+=dt*7; pr.mesh.rotation.z+=dt*5;
+    let done=pr.t<=0||t.y<0.45;
+    if(!pr.hostile){
+      for(const e of enemyList){ if(!e.dead&&Math.hypot(e.x-t.x,e.z-t.z)<1.2&&t.y<2.2){ if(pr.kind==="barrel"){ explodeAt(t.x,t.z,pr.from); } else damageEnemy(e,1,pr.from); done=true; break; } }
+      if(boss&&!boss.dead&&Math.hypot(boss.x-t.x,boss.z-t.z)<1.9&&t.y<2.6){
+        if(pr.kind==="barrel") explodeAt(t.x,t.z,pr.from);
+        else { SFX.bonk(); toast("Clank! Pots just bounce off Brinebeard — use 💣 bombs or crates!"); }
+        done=true;
+      }
+    } else {
+      for(const p of players){ if(!p.down&&Math.hypot(p.x-t.x,p.z-t.z)<1.1&&t.y<2){ damagePlayer(p,1,t.x,t.z); done=true; break; } }
+    }
+    if(done){
+      rapierWorld.removeRigidBody(pr.body);
+      projList.splice(projList.indexOf(pr),1);
+      burst(t.x,t.z,pr.kind==="barrel"?0xff9f1c:0xc96f2e,9);
+      if(pr.kind==="barrel") explodeAt(t.x,t.z,pr.from);
+      if(pr.pot){ const pot=pr.pot; pot.taken=false; pot.x=pot.hx; pot.z=pot.hz; pot.mesh.position.set(pot.hx,0,pot.hz); }
+      else scene.remove(pr.mesh);
+    }
+  }
+}
+function explodeAt(x,z,from){
+  SFX.boom(); G.shake=Math.max(G.shake,0.45); burst(x,z,0xff9f1c,14);
+  for(const e of enemyList){ if(!e.dead&&Math.hypot(e.x-x,e.z-z)<2.6) damageEnemy(e,2,from); }
+  if(boss&&!boss.dead&&Math.hypot(boss.x-x,boss.z-z)<3) damageEnemy(boss,1,from);
+  for(const p of players){ if(!p.down&&Math.hypot(p.x-x,p.z-z)<2.2) damagePlayer(p,1,x,z); }
+}
+/* ---- pickups, plates, objectives ---- */
+function stepPickups(dt){
+  for(const pk of pickList){
+    if(pk.taken) continue;
+    pk.mesh.position.y=pk.baseY+Math.sin(G.worldT*2.4+pk.id)*0.12;
+    pk.mesh.rotation.y+=dt*1.8;
+    for(const p of players){
+      if(p.down||p.gone) continue;
+      if(Math.hypot(pk.x-p.x,pk.z-p.z)<1.35){
+        pk.taken=true; pk.mesh.visible=false;
+        if(pk.kind==="gem"){ addGems(p,1); }
+        else if(pk.kind==="heart"){ p.hp=Math.min(p.maxHp,p.hp+2); SFX.pickup(); toast(p.name+" +2 ♥"); }
+        else if(pk.kind==="banana"){ p.hp=Math.min(p.maxHp,p.hp+1); SFX.pickup(); toast(p.name+" +1 ♥ — potassium power! 🍌"); }
+        else if(pk.kind==="brass"){ G.brass=true; SFX.key(); toast("🗝 BRASS KEY! The west gate will open!"); updateHUD(); if(G.hub) hubSendAction({t:"key",kind:"brass"}); }
+        else if(pk.kind==="iron"){ G.iron=true; SFX.key(); toast("🗝 IRON KEY! To the fort!"); updateHUD(); if(G.hub) hubSendAction({t:"key",kind:"iron"}); }
+        else if(["bell","reel","shovel","plank"].includes(pk.kind)){
+          for(const q of players) q.owned.add(pk.kind);
+          const tn={bell:"🔔 Dinner Bell",reel:"🪝 Ranger Reel",shovel:"⛏ Shovel",plank:"🪵 Plank"}[pk.kind];
+          SFX.fanfare(); toast("Got the "+tn+"! △ cycle · □ use");
+          for(const q of players){ if(![...q.owned].length) continue; if(q.toolIdx===0&&!q.owned.has(TOOLS[0].id)){ for(let i=0;i<TOOLS.length;i++) if(q.owned.has(TOOLS[i].id)){ q.toolIdx=i; break; } } }
+          updateToolHUD();
+          if(G.hub) hubSendAction({t:"tool",kind:pk.kind});
+        }
+        updateHUD();
+        break;
+      }
+    }
+  }
+  // plates (latching doors: friendly vertical-slice rule)
+  for(const pl of plateList){
+    let on=false;
+    for(const c of crateList){ const t=c.body.translation(); if(Math.hypot(t.x-pl.x,t.z-pl.z)<1.45) on=true; }
+    for(const p of players){ if(!p.down&&Math.hypot(p.x-pl.x,p.z-pl.z)<1.15) on=true; }
+    pl.pressed=on; pl.mesh.position.y=on?0.02:0.09; pl.mesh.material=toon(on?0x2a9d8f:0xe9c46a);
+  }
+  const vault=doorList.find(d=>d.id==="vault"), cache=doorList.find(d=>d.id==="cache");
+  if(vault&&!vault.open&&plateList.find(p=>p.id==="plate1").pressed) openDoor(vault,null);
+  if(cache&&!cache.open&&plateList.find(p=>p.id==="plate2a").pressed&&plateList.find(p=>p.id==="plate2b").pressed) openDoor(cache,null);
+}
+let zoneFlags={};
+function stepZones(){
+  const lead=localLead(); if(!lead) return;
+  if(lead.z<12&&!zoneFlags.ruins){ zoneFlags.ruins=true; G.checkpoint={x:-26,z:9}; showDialogue(DIALOG.beach.concat(DIALOG.ruins),()=>{}); toast("Checkpoint! Ruins ahead 🌿"); }
+  if(lead.z<-12&&!zoneFlags.fort){ zoneFlags.fort=true; G.checkpoint={x:24,z:-14}; showDialogue(DIALOG.fort,()=>{}); }
+  if(lead.z<-17&&lead.x>-18&&lead.x<18&&!zoneFlags.boss&&!G.won){
+    zoneFlags.boss=true;
+    if(!boss) spawnBoss();
+    showDialogue(DIALOG.bossTip,()=>{});
+    $("#objtext").textContent="Bonk Brinebeard 3× — kick his 💣 back!";
+  }
+  if(gemMesh&&gemMesh.visible){
+    for(const p of players){ if(!p.down&&Math.hypot(p.x-0,p.z+26)<2) { winGame(); return; } }
+  }
+}
+function currentObjective(){
+  if(G.won) return "You did it, Rangers! 🏆";
+  if(boss&&!boss.dead&&zoneFlags.boss) return "Bonk Brinebeard 3× — kick his 💣 back!";
+  if(boss&&boss.dead) return "Grab the Lighthouse Gem! 💎";
+  if(!G.brass) return "Beach: find the 🗝 BRASS KEY (east) · Bell is west!";
+  if(!zoneFlags.ruins) return "Open the Brass Gate (west) → Ruins";
+  if(!G.iron) return "Ruins: two gold plates together open the Cache (Iron Key)";
+  if(!zoneFlags.fort) return "Open the Iron Gate (east) → Brine Fort";
+  return "Fort: reach the arena (north-west) — face Brinebeard!";
+}
+/* ---- revive ---- */
+function stepRevive(dt){
+  for(const p of players){
+    if(!p.down||p.gone) continue;
+    let helper=false;
+    for(const q of players){ if(q!==p&&!q.down&&!q.gone&&Math.hypot(q.x-p.x,q.z-p.z)<2.3) helper=true; }
+    if(helper){ p.reviveT+=dt; if(p.reviveT>0.3&&Math.floor(p.reviveT*2)!==Math.floor((p.reviveT-dt)*2)) burst(p.x,p.z,0x2a9d8f,2);
+      if(p.reviveT>=1.6){ p.down=false; p.hp=2; p.reviveT=0; p.mesh.rotation.z=0; SFX.fanfare(); toast(p.name+" is back up! ♥♥"); } }
+    else p.reviveT=Math.max(0,p.reviveT-dt*0.5);
+  }
+}
+/* ---- solo AI buddy ---- */
+function stepBuddyAI(dt){
+  if(!G.solo||G.hub) return;
+  const lead=localLead(), buddy=players.find(p=>p!==lead&&!p.remote);
+  if(!buddy||buddy.down) return;
+  const d=Math.hypot(lead.x-buddy.x,lead.z-buddy.z);
+  let ix=0,iy=0;
+  if(d>3.2){ ix=(lead.x-buddy.x)/(d||1)*0.9; iy=(lead.z-buddy.z)/(d||1)*0.9; }
+  // buddy bonks nearby foes with pots now and then
+  buddy.aiT=(buddy.aiT||0)-dt;
+  if(buddy.aiT<=0){
+    buddy.aiT=2.4;
+    const foe=enemyList.find(e=>!e.dead&&Math.hypot(e.x-buddy.x,e.z-buddy.z)<6);
+    if(foe&&!buddy.carry){ buddy.face=Math.atan2(foe.x-buddy.x,foe.z-buddy.z);
+      const pot=potList.find(pt=>!pt.taken&&Math.hypot(pt.x-buddy.x,pt.z-buddy.z)<2.4);
+      if(pot){ pot.taken=true; pot.carriedBy=buddy; buddy.carry={pot}; }
+    } else if(buddy.carry){ buddy.face=Math.atan2((foe?foe.x:buddy.x)-buddy.x,(foe?foe.z:buddy.z)-buddy.z); throwCarry(buddy); }
+  }
+  buddy.input={x:ix,y:iy};
+}
+/* ---- attract mode AI (cheats: invincible, doors open for the show) ---- */
+const ATTRACT_WP=[[-30,26],[-20,30],[4,28],[30,26],[-28,14],[-26,9],[-18,0],[0,9],[12,9],[20,2],[26,-10],[24,-16],[8,-22],[0,-24],[-12,-22],[-26,-14],[-10,4],[-26,20]];
+let attractWp=0, attractActT=0;
+function stepAttract(dt){
+  for(const d of doorList){ if(!d.open){ const lead=players[0]; if(lead&&Math.hypot(d.x-lead.x,d.z-lead.z)<5) openDoor(d,null); } }
+  players.forEach((p,idx)=>{
+    if(p.down){ p.down=false; p.hp=p.maxHp; p.mesh.rotation.z=0; }
+    const wp=ATTRACT_WP[(attractWp+idx*3)%ATTRACT_WP.length];
+    const d=Math.hypot(wp[0]-p.x,wp[1]-p.z);
+    if(d<2){ if(idx===0) attractWp=(attractWp+1)%ATTRACT_WP.length; }
+    p.input={x:(wp[0]-p.x)/(d||1),y:(wp[1]-p.z)/(d||1)};
+  });
+  attractActT-=dt;
+  if(attractActT<=0){ attractActT=2.8; const p=players[0]; if(p) tryPickupOrThrow(p); const q=players[1]; if(q&&Math.random()<0.5) tryPickupOrThrow(q); }
+  if(Math.random()<dt*0.25){ const p=players[Math.floor(Math.random()*players.length)]; if(p&&p.owned.size) useTool(p); }
+}
+/* ---- HUD & camera ---- */
+function heartsStr(p){ return p?("♥".repeat(Math.max(0,p.hp))+"♡".repeat(Math.max(0,p.maxHp-p.hp))):""; }
+function localLead(){ if(G.hub){ return players.find(p=>p.id===(G.hubInfo?G.hubInfo.me:0))||players[0]; } return G.lead||players[0]; }
+function updateToolHUD(){
+  const lead=localLead(); if(!lead) return;
+  const t=TOOLS[lead.toolIdx%TOOLS.length];
+  const owned=TOOLS.filter(x=>lead.owned.has(x.id)).map(x=>x.icon).join(" ")||"—";
+  $("#tools").textContent=(t&&lead.owned.has(t.id)?t.icon+" "+t.name:"Hands")+" · △ · "+owned;
+}
+function updateHUD(){
+  const lead=localLead();
+  let h=heartsStr(lead);
+  if(!G.solo&&players[1]) h+="  |  P2 "+heartsStr(players[1]);
+  if(G.hub) h=players.filter(p=>!p.gone).map(p=>p.name.slice(0,6)+" "+heartsStr(p)).join(" · ");
+  $("#hearts").textContent=h||"♥";
+  $("#keys").textContent="🗝 Brass "+(G.brass?"✓":"✗")+" · Iron "+(G.iron?"✓":"✗");
+  $("#score").textContent="💎 "+G.gems+" · ⭐ "+G.stars;
+  $("#objtext").textContent=currentObjective();
+  updateToolHUD();
+}
+function updateCamera(dt){
+  const focusPts=G.hub?players.filter(p=>!p.gone&&(p.id===(G.hubInfo?G.hubInfo.me:0))):players.filter(p=>!p.gone);
+  const pts=(focusPts.length?focusPts:players).filter(p=>p);
+  if(!pts.length||!camera) return;
+  let cx=0,cz=0; for(const p of pts){ cx+=p.x; cz+=p.z; } cx/=pts.length; cz/=pts.length;
+  let spread=0; for(const p of pts) spread=Math.max(spread,Math.hypot(p.x-cx,p.z-cz));
+  if(!G.hub&&players.length>1){ let ax=0,az=0; for(const p of players){ax+=p.x;az+=p.z;} cx=ax/players.length; cz=az/players.length; spread=0; for(const p of players) spread=Math.max(spread,Math.hypot(p.x-cx,p.z-cz)); }
+  const dist=clamp(23+spread*0.9,23,36);
+  const lead=localLead();
+  if(lead&&lead.input){ cx+= (lead.input.rx||0)*3; cz+=(lead.input.ry||0)*3; }
+  G.shake=Math.max(0,G.shake-dt*1.6);
+  const shx=SET.shake?(Math.random()-0.5)*G.shake:0, shy=SET.shake?(Math.random()-0.5)*G.shake*0.6:0;
+  const tx=cx+Math.sin(G.camYaw)*dist*0.58+shx, tz=cz+Math.cos(G.camYaw)*dist*0.58;
+  camera.position.lerp(new THREE.Vector3(tx,dist*0.82+shy,tz),1-Math.pow(0.001,dt));
+  camera.lookAt(cx,0.6,cz);
+  const sun=scene.getObjectByName("sun"); if(sun){ sun.position.set(cx+28,42,cz+18); sun.target.position.set(cx,0,cz); }
+}
+
+
+
+
+/* ============ net: one simulation, two adapters (AI Hub session / local couch) ============ */
+function isSimHost(){ return !G.hub || G.isHost || G.server; }
+function myId(){ return G.hubInfo?G.hubInfo.me:-1; }
+function hubSendAction(obj){ if(G.hub&&window.AIHub&&!G.isHost&&!G.server){ try{ AIHub.send(obj,{reliable:true}); }catch(e){} } }
+function hubEvent(obj){ if(G.hub&&window.AIHub&&(G.isHost||G.server)){ try{ AIHub.send(obj,{reliable:true}); }catch(e){} } }
+let snapTaken=new Set();
+function buildSnapshot(){
+  const r2=n=>Math.round(n*10)/10;
+  return { t:"snap", at:(window.AIHub?AIHub.time():0),
+    pl:players.map(p=>[p.id,r2(p.x),r2(p.z),r2(p.face),p.hp,p.down?1:0,p.carry?(p.carry.pot?1:2):0,Math.max(0,p.toolIdx|0)]),
+    en:enemyList.map(e=>[e.id,r2(e.x),r2(e.z),e.hp,e.dead?1:0]),
+    bo:boss?[r2(boss.x),r2(boss.z),boss.hp,boss.dead?1:0]:0,
+    cr:crateList.map(c=>{ const t=c.body.translation(); return [c.id,r2(t.x),r2(t.z)]; }),
+    tk:pickList.filter(k=>k.taken).map(k=>k.id),
+    dr:doorList.filter(d=>d.open).map(d=>d.id),
+    sc:[G.gems,G.stars,G.brass?1:0,G.iron?1:0],
+    bm:bombList.map(b=>[b.id,r2(b.x),r2(b.z),Math.round(b.fuse*10)/10]),
+    ct:players.map(p=>[p.id,p.contrib.gems,p.contrib.kos])
+  };
+}
+function applySnapshot(s){
+  if(!s||s.at< (G.lastSnapAt||0)) return; G.lastSnapAt=s.at;
+  for(const [id,x,z,face,hp,down,carry,ti] of (s.pl||[])){
+    const p=players.find(q=>q.id===id); if(!p||id===myId()) continue;
+    p.tx=x; p.tz=z; p.tface=face; if(p.hp!==hp){ if(hp<p.hp) SFX.hurt(); p.hp=hp; } p.down=!!down; p.toolIdx=ti||0;
+    if(!p.mesh.visible) p.mesh.visible=true;
+  }
+  for(const [id,x,z,hp,dead] of (s.en||[])){
+    const e=enemyList.find(q=>q.id===id); if(!e) continue;
+    e.x=x; e.z=z; e.mesh.position.set(x,0,z);
+    if(dead&&!e.dead){ e.dead=true; e.mesh.rotation.z=Math.PI/2; }
+    e.hp=hp;
+  }
+  if(s.bo&&!boss&&zoneFlags.boss){ /* boss spawn synced via event */ }
+  if(s.bo&&boss){ boss.x=s.bo[0]; boss.z=s.bo[1]; boss.hp=s.bo[2]; boss.mesh.position.set(boss.x,0,boss.z); $("#bossfill").style.width=Math.max(0,boss.hp/boss.maxHp*100)+"%"; if(s.bo[3]&&!boss.dead){ boss.dead=true; boss.mesh.rotation.z=Math.PI/2; $("#bossbar").classList.add("hidden"); gemMesh.visible=true; } }
+  for(const [id,x,z] of (s.cr||[])){
+    const c=crateList.find(q=>q.id===id); if(!c) continue;
+    c.body.setTranslation({x,y:0.75,z},true); c.body.setLinvel({x:0,y:0,z:0},true);
+  }
+  snapTaken=new Set(s.tk||[]);
+  for(const pk of pickList){ const was=pk.taken; pk.taken=snapTaken.has(pk.id); if(pk.taken!==was) pk.mesh.visible=!pk.taken; }
+  for(const did of (s.dr||[])){ const d=doorList.find(q=>q.id===did); if(d&&!d.open){ d.open=true; d.mesh.position.y=-2.8; d.trim.position.y=-0.4; const i=blockers.indexOf(d.blocker); if(i>=0) blockers.splice(i,1); } }
+  if(s.sc){ G.gems=s.sc[0]; G.stars=s.sc[1]; G.brass=!!s.sc[2]; G.iron=!!s.sc[3]; }
+  for(const [id,g,k] of (s.ct||[])){ const p=players.find(q=>q.id===id); if(p){ p.contrib.gems=g; p.contrib.kos=k; } }
+  // bombs visual sync on clients
+  for(const [id,x,z] of (s.bm||[])){
+    let b=bombList.find(q=>q.id===id);
+    if(!b){ const g=new THREE.Group(); sph(0.45,0x2b2b3a,0,0.45,0,g,10,8); g.position.set(x,0,z); scene.add(g); b={id,mesh:g,x,z,vx:0,vz:0,fuse:4,carried:false,holder:null}; bombList.push(b); }
+    if(!b.carried){ b.x=x; b.z=z; b.mesh.position.set(x,0,z); }
+  }
+}
+function onHubMessage(data,from){
+  if(!data||typeof data!=="object") return;
+  if(data.t==="snap"){ if(!G.isHost) applySnapshot(data); return; }
+  if(data.t==="me"){
+    const p=players.find(q=>q.id===from); if(!p||from===myId()) return;
+    p.tx=data.x; p.tz=data.z; p.tface=data.face;
+    if(G.isHost||G.server){ p.x=data.x; p.z=data.z; p.face=data.face; p.mesh.position.set(p.x,0,p.z); p.mesh.rotation.y=p.face; syncBody(p); }
+    return;
+  }
+  if(!(G.isHost||G.server)){
+    // client-side events from host
+    if(data.t==="door"){ const d=doorList.find(q=>q.id===data.id); if(d&&!d.open){ d.open=true; d.mesh.position.y=-2.8; d.trim.position.y=-0.4; const i=blockers.indexOf(d.blocker); if(i>=0) blockers.splice(i,1); SFX.door(); } }
+    if(data.t==="bossdown"){ if(boss&&!boss.dead){ boss.dead=true; boss.mesh.rotation.z=Math.PI/2; } gemMesh.visible=true; $("#bossbar").classList.add("hidden"); }
+    if(data.t==="bossspawn"&&!boss){ spawnBoss(); }
+    return;
+  }
+  // host applies client actions (trusted copies, per hub guidance)
+  const p=players.find(q=>q.id===from); if(!p) return;
+  if(data.t==="pickpot"){ const pot=potList.find(q=>q.id===data.pot); if(pot&&!pot.taken){ pot.taken=true; pot.carriedBy=p; p.carry={pot}; } }
+  if(data.t==="throw"){ const pot=potList.find(q=>q.id===data.pot); if(pot){ p.face=data.face; p.carry=null; spawnProjectile(p,pot,Math.sin(data.face),Math.cos(data.face)); } }
+  if(data.t==="kick"){ const c=crateList.find(q=>q.id===data.crate); if(c) c.body.setLinvel({x:data.vx,y:0,z:data.vz},true); }
+  if(data.t==="bell"){ for(const e of enemyList){ if(!e.dead&&Math.hypot(e.x-data.x,e.z-data.z)<15){ e.lureT=4; e.lureX=data.x; e.lureZ=data.z; } } }
+  if(data.t==="dig"){ const d=digList.find(q=>Math.hypot(q.x-data.x,q.z-data.z)<1); if(d&&!d.dug){ d.dug=true; d.mesh.scale.y=0.25; } }
+  if(data.t==="zip"){ p.zipFrom={x:p.x,z:p.z}; p.zipTo={x:data.postX,z:data.postZ}; p.zipT=0.28; }
+  if(data.t==="plank"&&!plankBridge){ const mesh=box(data.x1-data.x0,0.22,data.z1-data.z0,0x9c6b3f,(data.x0+data.x1)/2,0.16,(data.z0+data.z1)/2); plankBridge={x0:data.x0,x1:data.x1,z0:data.z0,z1:data.z1,mesh}; }
+  if(data.t==="plankup"&&plankBridge){ scene.remove(plankBridge.mesh); plankBridge=null; }
+  if(data.t==="key"){ if(data.kind==="brass") G.brass=true; if(data.kind==="iron") G.iron=true; updateHUD(); }
+  if(data.t==="tool"){ for(const q of players) q.owned.add(data.kind); }
+  if(data.t==="kickbomb"){ const b=bombList.find(q=>q.id===data.bomb); if(b){ b.vx=data.vx; b.vz=data.vz; } }
+  if(data.t==="throwbomb"){ const b=bombList.find(q=>q.id===data.bomb); if(b){ b.carried=false; b.vx=Math.sin(data.face)*9; b.vz=Math.cos(data.face)*9; if(p.carry&&p.carry.bomb===b) p.carry=null; } }
+}
+function hubFinish(won){
+  if(!window.AIHub||G.finished) return; G.finished=true;
+  const ranked=[...players].filter(p=>!p.gone).sort((a,b)=>(b.contrib.gems+b.contrib.kos*3)-(a.contrib.gems+a.contrib.kos*3));
+  const standings=ranked.map(p=>[p.id]);
+  const scores={}; for(const p of players) scores[p.id]=G.gems;
+  try{ AIHub.finish({standings,scores,won:!!won,stats:Object.fromEntries(players.filter(p=>!p.gone).map(p=>[p.id,{gems:p.contrib.gems,bonks:p.contrib.kos}])),awards:ranked.length?[{id:ranked[0].id,title:"Top Ranger",detail:ranked[0].contrib.gems+" gems"}]:[]}); }catch(e){}
+}
+function hubStandaloneClock(){ return G.hub&&window.AIHub?Math.max(0,AIHub.time()):G.worldT*1000; }
+/* ============ screens & flow ============ */
+const SCREENS=["scr-title","scr-how","scr-settings","scr-about","scr-over","scr-win","scr-touch"];
+function showScreen(id){
+  for(const s of SCREENS) $("#"+s).classList.toggle("hidden",s!==id);
+  if(!id){ for(const s of SCREENS) $("#"+s).classList.add("hidden"); }
+  if(id){ const b=menuButtons(); if(b.length) b[0].focus(); }
+  G.scene=id==="scr-title"?"title":id?G.scene:G.scene;
+  if(id==="scr-title") G.scene="title";
+  if(id==="scr-over") G.scene="over";
+  if(id==="scr-win") G.scene="win";
+}
+function hideScreens(){ for(const s of SCREENS) $("#"+s).classList.add("hidden"); }
+function openSettings(from){
+  G.settingsFrom=from||G.scene;
+  G.settingsOpen=true;
+  if(G.scene==="play"&&!G.hub) G.paused=true;
+  showScreen("scr-settings");
+  // keep HUD visible state; settings overlays via screen bg
+  syncSettingsUI();
+}
+function closeSettings(){
+  G.settingsOpen=false; G.paused=false;
+  saveSettings(); applyVolumes(); applyQuality();
+  if(G.settingsFrom==="play"&&G.scene==="play"){ hideScreens(); $("#hud").classList.remove("hidden"); }
+  else if(G.hub&&G.scene==="play"){ hideScreens(); $("#hud").classList.remove("hidden"); }
+  else showScreen("scr-title");
+}
+function goBack(){
+  if(G.settingsOpen){ closeSettings(); return; }
+  const vis=visibleScreen();
+  if(vis&&(vis.id==="scr-how"||vis.id==="scr-about")) showScreen("scr-title");
+}
+function onOptionsKey(){
+  audioInit();
+  if(G.scene==="play"||G.settingsOpen){ if(G.settingsOpen) closeSettings(); else openSettings("play"); }
+  else { const vis=visibleScreen(); if(vis&&vis.id!=="scr-title") goBack(); else openSettings("title"); }
+}
+function resetRun(spawnAt){
+  // clear dynamic entities
+  for(const p of players){ scene.remove(p.mesh); if(p.body) rapierWorld.removeRigidBody(p.body); }
+  for(const e of enemyList){ scene.remove(e.mesh); if(e.body) rapierWorld.removeRigidBody(e.body); }
+  for(const c of crateList){ scene.remove(c.mesh); rapierWorld.removeRigidBody(c.body); }
+  for(const pk of [...potList]){ scene.remove(pk.mesh); }
+  for(const pk of pickList){ scene.remove(pk.mesh); }
+  for(const pr of projList){ rapierWorld.removeRigidBody(pr.body); scene.remove(pr.mesh); }
+  for(const b of bombList){ scene.remove(b.mesh); }
+  for(const f of fxList){ scene.remove(f.mesh); }
+  if(boss){ scene.remove(boss.mesh); if(boss.body) rapierWorld.removeRigidBody(boss.body); boss=null; }
+  if(plankBridge){ scene.remove(plankBridge.mesh); plankBridge=null; }
+  players=[]; enemyList=[]; crateList=[]; potList=[]; pickList=[]; projList=[]; bombList=[]; fxList=[];
+  for(const d of doorList){ if(d.open){ d.open=false; d.mesh.position.y=1.5; d.trim.position.y=3.1; blockers.push(d.blocker); if(!d.body) d.body=fixedBox(d.x,d.z,2.1,1.5,0.7); } }
+  for(const dg of digList){ dg.dug=false; dg.mesh.scale.y=1; }
+  if(gemMesh) gemMesh.visible=false;
+  const gl=scene.getObjectByName("gemlight"); if(gl) gl.intensity=0;
+  $("#bossbar").classList.add("hidden");
+  G.gems=0; G.stars=0; G.brass=false; G.iron=false; G.over=false; G.won=false; G.finished=false; G.lastSnapAt=0;
+  zoneFlags={}; entSeq=1;
+  spawnEntities();
+  const sp=spawnAt||{x:-30,z:26};
+  if(G.hub){
+    const info=G.hubInfo; const spawns=[[-30,26],[-27,26],[-30,23],[-27,23]];
+    info.players.forEach((pl,i)=>{
+      const kind=i%2===0?"bruno":"pip";
+      const p=makePlayer(pl.id,kind,spawns[i%4][0],spawns[i%4][1],(pl.name||("Ranger "+(i+1))).toUpperCase().slice(0,16));
+      p.remote=!(pl.id===info.me); p.seatColor=pl.color;
+      if(G.server) p.remote=true;
+    });
+    if(!players.length){ makePlayer(0,"bruno",sp.x,sp.z,"BRUNO"); }
+  } else if(G.solo){
+    const a=makePlayer(0,"bruno",sp.x,sp.z,"BRUNO"); const b=makePlayer(1,"pip",sp.x+3,sp.z,"PIP");
+    G.lead=a;
+  } else {
+    const a=makePlayer(0,"bruno",sp.x,sp.z,"BRUNO"); const b=makePlayer(1,"pip",sp.x+3,sp.z,"PIP");
+    G.lead=a;
+  }
+  G.checkpoint={x:sp.x,z:sp.z};
+  updateHUD();
+}
+function startGame(solo){
+  audioInit(); musicStart();
+  G.solo=solo; G.hub=false; G.attract=false;
+  $("#attract").classList.add("hidden");
+  resetRun({x:-30,z:26});
+  G.scene="play"; G.started=true; G.paused=false;
+  hideScreens(); $("#hud").classList.remove("hidden");
+  showDialogue(DIALOG.intro,()=>{});
+  toast(solo?"Solo Ranger! Pip’s got your back 🤝":"Co-op! P2: IJKL + U/O/P or Pad 2 🎮");
+  updateHUD();
+}
+function startHubGame(){
+  musicStart();
+  resetRun({x:-30,z:26});
+  G.scene="play"; G.started=true;
+  hideScreens(); $("#hud").classList.remove("hidden");
+  $("#netstat").textContent=G.server?"Hub · Server host":("Hub · "+(G.isHost?"Host":"Guest")+" · "+(G.hubInfo?G.hubInfo.players.length:1)+"P");
+  updateHUD();
+}
+function gameOver(){
+  if(G.scene==="over") return;
+  G.over=true; G.scene="over"; SFX.hurt();
+  if(G.hub){ if(G.isHost||G.server) hubFinish(false); showScreen("scr-over"); disableSessionButtons(); return; }
+  $("#overtext").textContent="The Rangers are pooped (💎 "+G.gems+" · ⭐ "+G.stars+"). The treasure isn’t going anywhere!";
+  showScreen("scr-over");
+}
+function winGame(){
+  if(G.won) return; G.won=true; SFX.fanfare(); G.scene="win";
+  voyage.best=Math.max(voyage.best,G.gems); voyage.won=true; saveVoyage(); refreshSaveInfo();
+  if(G.hub){ if(G.isHost||G.server) hubFinish(true); showScreen("scr-win"); disableSessionButtons(); return; }
+  $("#wintext").textContent="The Lighthouse Gem is back! 💎 "+G.gems+" gems · ⭐ "+G.stars+" bonks. Bruno & Pip save Spoonbill Shores!";
+  showScreen("scr-win");
+}
+function disableSessionButtons(){
+  // In a hub round there is no play-again: leave the final screen quiet.
+  document.querySelectorAll("#scr-over button,#scr-win button").forEach(b=>{ b.disabled=true; b.textContent="Round complete — hub has the results 🏆"; });
+}
+function retryFromCheckpoint(){
+  // Standalone only (hub never retries locally).
+  for(const p of players){ p.down=false; p.hp=p.maxHp; p.mesh.rotation.z=0; p.x=G.checkpoint.x+(p.kind==="pip"?3:0); p.z=G.checkpoint.z; p.iframes=1; syncBody(p); }
+  if(boss&&boss.dead===false&&!zoneFlags.boss){ /* keep boss as-is */ }
+  G.scene="play"; hideScreens(); $("#hud").classList.remove("hidden");
+  toast("Back at the checkpoint! 🚩");
+}
+function enterAttract(){
+  if(G.hub||G.scene!=="title") return;
+  G.attract=true; G.solo=true;
+  resetRun({x:-30,z:26});
+  // give the demo Rangers their tools so it can show them off (cheats allowed in attract)
+  for(const p of players){ p.owned.add("bell"); p.owned.add("reel"); p.owned.add("shovel"); p.owned.add("plank"); }
+  G.scene="play"; hideScreens(); $("#hud").classList.remove("hidden");
+  $("#attract").classList.remove("hidden");
+  $("#objtext").textContent="Attract mode — the Rangers show off! Press anything to play";
+  musicStart();
+}
+function exitAttract(){
+  if(!G.attract) return;
+  G.attract=false; G.scene="title";
+  $("#attract").classList.add("hidden"); $("#hud").classList.add("hidden");
+  dlgSkip();
+  showScreen("scr-title");
+}
+/* ============ settings UI, buttons, about ============ */
+const SOURCE_INFO="Source Information\n- Date: 2026-10-29 02:13\n- Source: Goof Troop\n- Tech: Three.js 0.180.0 WebGPURenderer (WebGPU only, no fallback), Rapier 0.19.3 (@dimforge/rapier3d-compat), Gamepad API (PS5 DualSense standard mapping), Web Audio API, AI Hub Session Protocol v1 client 1.3.0 (session.js pasted unmodified), ES import maps via jsDelivr CDN, single HTML file\n- Art Direction: stylized cel-shaded look (MeshToonMaterial with 4-step gradient map plus ink outlines), original low-poly models built entirely in code\n- Animation: procedural code animation (walk cycles, bob/squash, reel zip tweens, fuse blink); no skeletal or external assets\n- Audio: code-written music (Web Audio island loop at 132 BPM), synthesized sound effects, and Animalese-style gibberish voice synthesis for all voice work\n- Online: AI Hub Session Protocol v1 co-op (host-run shared world, 1-4 players, hub:webgpu required) plus local couch co-op (1-2 players) and solo play with an AI buddy; no other networking\n- Testing: efficient and lightweight checks only, as allowed by TASK.md (syntax check, headless load/play smoke)\n- Environment: Muse Code CLI (headless); Linux; browser unknown\n- Model: Meta, muse-wonder-1.0, reasoning effort max\n- Usage: unknown";
+const FEEDBACK_INFO="Testing Feedback\n- How many issues did testing catch? 3 fixable issues (HUD tool line wrapping, title backdrop framed mostly on sea, and an inconclusive Space pixel check that prompted a probe based retest), plus 1 informational third party console warning from the Rapier initialiser.\n- How many would be considered critical issues / game breaking? 0.\n- What was the most helpful test you ran? The official AI Hub harness (2 player, server hosted, 4 player bad network, and host leave all PASS) together with the AIHub.probe Playwright test (7 of 7: title, start, world ticking, W input, Esc settings open and close, no page errors).\n- What was the least helpful test you ran? The check_page Space pixel comparison: the living scene moves on its own, so it could not tell the throw input apart from idle motion.\n\nEngine Feedback\n- What did you like most about the engine? Three.js 0.180 WebGPURenderer with MeshToonMaterial drew the cel shaded island immediately, and pinned import maps kept the single file honest about versions.\n- Did you get stuck or guess wrong? Yes: Rapier capsule argument order and its init deprecation warning, and setAnimationLoop versus requestAnimationFrame on WebGPU. Each cost one check cycle.\n- What was the most important thing you had to build yourself? The host run co-op snapshot layer (plus server host handling) and the whole cel look: toon gradient, ink outlines, and procedural characters, music and voices in code.\n- What was the hardest part about using the engine? The WebGPU only rule versus hub reach: solved by declaring hub:webgpu required and showing a clear error screen instead of a fallback renderer.\n- If you had to remove or overhaul one thing from engine, what would that be? The shifting WebGPU post processing path (the old three/addons/nodes route is gone); this game avoids post effects entirely rather than depend on it.\n- If you could change one thing about the engine, what would it be? A Rapier compat init that does not warn about its own defaults, so a clean console is achievable without workarounds.\n\nPrompt Feedback\n- What did you like most about this prompt? The hard, testable constraints: pinned versions, single file, 10 second attract mode, and the invert axis toggles. They made done checkable.\n- What was confusing? Single file packaging versus the hub rule to paste session.js as the first script in head (resolved by inlining it verbatim), and WebGPU no fallback versus hub fallback guidance (resolved with the hub:webgpu required declaration).\n- What was the hardest thing to do? One simulation serving solo with AI buddy, couch co-op, hub host, hub guest, and hub server host, all inside one file with no stubs.\n- If there was one test you could of run, what would that test be? A hardware DualSense test: two real pads in couch co-op plus a 4 player hub round on real GPUs and home networks. Here pads were covered by harness logic and keyboard parity only.";
+function fillAbout(){ $("#abouttext").textContent=
+"GOOF RANGERS — an original spiritual successor to Goof Troop (Capcom, SNES, 1993).\nBruno & Pip, Spoonbill Shores and Captain Brinebeard are original characters; no Disney or Capcom assets are used.\n\n"+
+"HOW IT WAS MADE\n"+SOURCE_INFO+"\n\n"+FEEDBACK_INFO+"\n\n"+
+"CREDITS\nDesign, code, art, music & voices: generated in one Muse Code session (see above).\nEngine: Three.js WebGPURenderer + Rapier physics, all 3D models built in code (cel/toon shading with ink outlines).\nMusic & SFX: Web Audio synthesis. Voices: Animalese-style gibberish synthesis.\nMultiplayer: AI Hub Session Protocol v1 (co-op, host-run world) + local couch co-op.\n\n"+
+"Title picked by cryptographic RNG from 50 riff titles (index 20 of 50). Gawrsh, thanks for playing!";
+}
+function refreshSaveInfo(){
+  const el=$("#saveinfo"); if(!el) return;
+  el.textContent=voyage.won?("🏆 Voyage complete! Best haul: "+voyage.best+" gems — play again anytime!"):(voyage.best>0?("Best haul so far: "+voyage.best+" gems"):"No saved voyage yet");
+}
+function syncSettingsUI(){
+  $("#s-music").value=SET.music; $("#s-sfx").value=SET.sfx; $("#s-voice").value=SET.voice;
+  $("#s-quality").value=SET.quality; $("#s-invh").checked=SET.invH; $("#s-invv").checked=SET.invV;
+  $("#s-shake").checked=SET.shake; $("#s-subs").checked=SET.subs; $("#s-dead").value=SET.dead;
+}
+function wireUI(){
+  const bind=(sel,fn)=>{ const el=$(sel); if(el) el.addEventListener("click",()=>{ audioInit(); SFX.click(); fn(); }); };
+  document.querySelectorAll("[data-act]").forEach(b=>b.addEventListener("click",()=>{
+    audioInit();
+    const act=b.dataset.act;
+    if(act==="solo") startGame(true);
+    if(act==="coop") startGame(false);
+    if(act==="how") showScreen("scr-how");
+    if(act==="settings") openSettings(G.scene==="play"?"play":"title");
+    if(act==="about") showScreen("scr-about");
+    if(act==="back") goBack();
+    if(act==="title"){ G.scene="title"; G.attract=false; $("#hud").classList.add("hidden"); musicStop(); showScreen("scr-title"); refreshSaveInfo(); }
+    if(act==="retry"){ if(G.won) startGame(G.solo); else retryFromCheckpoint(); }
+  }));
+  const sm=(id,key,after)=>{ const el=$(id); if(el) el.addEventListener("input",()=>{ SET[key]=el.type==="checkbox"?el.checked:(el.tagName==="SELECT"?el.value:Number(el.value)); saveSettings(); if(after) after(); }); };
+  sm("#s-music","music",applyVolumes); sm("#s-sfx","sfx",applyVolumes); sm("#s-voice","voice",applyVolumes);
+  sm("#s-quality","quality",applyQuality); sm("#s-invh","invH"); sm("#s-invv","invV"); sm("#s-shake","shake"); sm("#s-subs","subs"); sm("#s-dead","dead");
+  const wipe=$("#btn-wipe"); if(wipe) wipe.addEventListener("click",()=>{ try{localStorage.removeItem(VKEY);}catch(e){} voyage={best:0,won:false}; refreshSaveInfo(); toast("Saved voyage erased 🧹"); });
+}
+function showError(err){
+  const box=$("#errbox"); $("#errtext").textContent=String((err&&err.message)||err||"Unknown error");
+  box.classList.remove("hidden");
+}
+/* ============ main loop ============ */
+let lastT=performance.now(), hudT=0, snapT=0, meT=0;
+function tick(){
+  const now=performance.now();
+  let dt=Math.min(0.05,(now-lastT)/1000); lastT=now; frameNo++;
+  musicTick();
+  const pf0=padFrame(0);
+  if(anyPadEdge()) noteInput();
+  // Options (pad) toggles settings; Esc handled on keydown.
+  if(pf0&&pf0.edge[9]) onOptionsKey();
+  menuInputTick(now);
+  // attract trigger
+  if(G.scene==="title"&&!G.settingsOpen&&!G.hub&&now-G.lastInputAt>10000) enterAttract();
+  const hubWaiting=G.hub&&G.started&&window.AIHub&&AIHub.time()<0;
+  // countdown overlay (hub 3-2-1)
+  if(G.hub&&G.started&&window.AIHub){
+    const t=AIHub.time();
+    if(t<0&&t>-4000){ $("#countdown").textContent=String(Math.max(1,Math.ceil(-t/1000))); $("#countdown").classList.remove("hidden"); }
+    else $("#countdown").classList.add("hidden");
+  } else $("#countdown").classList.add("hidden");
+  if(G.scene==="play"&&!G.paused){
+    if(!hubWaiting) G.worldT+=dt;
+    // ---- gather inputs ----
+    let leadInput=null;
+    if(G.attract){ stepAttract(dt); }
+    else if(G.hub){
+      const me=players.find(p=>p.id===myId());
+      if(me&&!G.server){ me.input=G.settingsOpen?{x:0,y:0}:readLocalInput(0); leadInput=me.input;
+        me.actEdge=me.input.act; me.toolEdge=me.input.tool; me.cycleEdge=me.input.cycle;
+        if(me.input.rx||me.input.ry){ /* camera nudge read in updateCamera via input */ }
+      }
+    } else if(G.solo){
+      const lead=localLead(); const inp=readLocalInput(0);
+      if(inp.swap&&lead){ const other=players.find(p=>p!==lead); if(other){ G.lead=other; toast("Leader swap! Now playing "+other.name+" 🎮"); } }
+      if(lead){ lead.input=inp; lead.actEdge=inp.act; lead.toolEdge=inp.tool; lead.cycleEdge=inp.cycle; leadInput=inp; }
+      stepBuddyAI(dt);
+      const buddy=players.find(p=>p!==localLead());
+      if(buddy){ buddy.actEdge=false; buddy.toolEdge=false; buddy.cycleEdge=false; }
+    } else {
+      const i0=readLocalInput(0), i1=readLocalInput(1);
+      if(players[0]){ players[0].input=i0; players[0].actEdge=i0.act; players[0].toolEdge=i0.tool; players[0].cycleEdge=i0.cycle; }
+      if(players[1]){ players[1].input=i1; players[1].actEdge=i1.act; players[1].toolEdge=i1.tool; players[1].cycleEdge=i1.cycle; }
+      leadInput=i0;
+    }
+    // camera rotate (P1 bumpers / , .)
+    if(pf0&&pf0.edge[4]) G.camYaw+=Math.PI/4;
+    if(pf0&&pf0.edge[5]) G.camYaw-=Math.PI/4;
+    if(keyEdges.has("Comma")) G.camYaw+=Math.PI/4;
+    if(keyEdges.has("Period")) G.camYaw-=Math.PI/4;
+    if(DLG.active&&pf0&&pf0.edge[0]) dlgAdvance();
+    if(DLG.active&&pf0&&pf0.edge[1]) dlgSkip();
+    // ---- actions + movement ----
+    if(!hubWaiting&&!G.settingsOpen){
+      for(const p of players){
+        if(p.remote&&G.hub){
+          // ease toward host/network state
+          if(p.tx!==undefined){ p.x=lerp(p.x,p.tx,1-Math.pow(0.0005,dt)); p.z=lerp(p.z,p.tz,1-Math.pow(0.0005,dt)); p.face=angLerp(p.face,p.tface||p.face,1-Math.pow(0.001,dt)); p.mesh.position.set(p.x,0,p.z); p.mesh.rotation.y=p.face; syncBody(p); }
+          continue;
+        }
+        if(G.server) continue;
+        if(p.actEdge&&!DLG.active) tryPickupOrThrow(p);
+        if(p.toolEdge) useTool(p);
+        if(p.cycleEdge) cycleTool(p);
+        movePlayer(p,dt);
+      }
+      // host steps the shared world; every copy steps its own view of crates via physics below
+      if(isSimHost()){ stepEnemies(dt); stepBombs(dt); }
+      stepProjectiles(dt);
+      stepPickups(dt);
+      stepRevive(dt);
+      if(isSimHost()||!G.hub) stepZones();
+      // FX
+      for(const f of [...fxList]){ f.t-=dt; f.vy-=9*dt; f.mesh.position.x+=f.vx*dt; f.mesh.position.y+=f.vy*dt; f.mesh.position.z+=f.vz*dt; if(f.t<=0){ scene.remove(f.mesh); fxList.splice(fxList.indexOf(f),1); } }
+      if(rapierWorld) rapierWorld.step();
+      for(const c of crateList){ const t=c.body.translation(); c.mesh.position.copy(t); c.x=t.x; c.z=t.z; }
+      for(const pk of potList){ if(!pk.taken) pk.mesh.position.set(pk.x,0,pk.z); }
+      // gems spin handled in stepPickups; water shimmer
+      for(const w of waterMeshes) w.position.y=0.06+Math.sin(G.worldT*1.7)*0.02;
+      if(gemMesh&&gemMesh.visible){ gemMesh.rotation.y+=dt*2; gemMesh.position.y=1.9+Math.sin(G.worldT*2.5)*0.2; }
+    }
+    // ---- hub traffic (rate-limited, small snapshots) ----
+    if(G.hub&&window.AIHub&&G.started&&!hubWaiting){
+      if((G.isHost||G.server)&&now-snapT>66){ snapT=now; try{ AIHub.send(buildSnapshot(),{reliable:false}); }catch(e){} }
+      const me=players.find(p=>p.id===myId());
+      if(me&&!G.server&&now-meT>66){ meT=now; try{ AIHub.send({t:"me",at:AIHub.time(),x:Math.round(me.x*10)/10,z:Math.round(me.z*10)/10,face:Math.round(me.face*100)/100},{reliable:false}); }catch(e){} }
+    }
+    if(now-hudT>140){ hudT=now;
+      if(G.hub&&window.AIHub){ const t=Math.max(0,AIHub.time()); const rem=Math.max(0,(G.hubInfo?G.hubInfo.limitMs:240000)-t); $("#clock").textContent="⏱ "+Math.floor(rem/60000)+":"+String(Math.floor(rem/1000)%60).padStart(2,"0"); }
+      else { const s=Math.floor(G.worldT); $("#clock").textContent="⏱ "+Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); }
+      updateHUD();
+    }
+  }
+  if(G.scene==="title"&&camera){
+    const a=now*0.00006;
+    camera.position.set(-6+Math.sin(a)*9,19,52);
+    camera.lookAt(-24,1,25);
+    for(const p of players){ p.mesh.position.y=Math.sin(now*0.002+p.id*2)*0.05; }
+  }
+  if(G.scene==="play"&&camera) updateCamera(dt);
+  if(renderer&&scene&&camera) renderer.render(scene,camera);
+  clearFrameEdges();
+}
+/* ============ hub session setup ============ */
+function setupHub(info){
+  G.hubInfo=info; G.isHost=info.isHost; G.server=!!info.server; G.solo=false;
+  AIHub.on("message",onHubMessage);
+  AIHub.on("leave",({id})=>{
+    const p=players.find(q=>q.id===id);
+    if(p){ p.gone=true; p.mesh.visible=false; toast((p.name||"A Ranger")+" left the round — carry on, Rangers!"); }
+  });
+  AIHub.on("time-up",()=>{ toast("⏰ Time! Wrapping up…"); if(G.isHost||G.server) hubFinish(!!(boss&&boss.dead)||G.won); });
+  AIHub.on("end",()=>{ musicStop(); G.started=false; $("#countdown").classList.add("hidden"); if(G.scene==="play"){ showScreen(G.won?"scr-win":"scr-over"); disableSessionButtons(); } });
+  AIHub.on("start",()=>{ audioInit(); if(AC&&AC.state==="suspended") AC.resume(); });
+  startHubGame();
+  if(info.splash){ AIHub.ready(); }
+  else {
+    toast("Hub round — press any key, click or pad button when ready!");
+    const once=()=>{ try{ AIHub.ready(); }catch(e){} removeEventListener("keydown",once); removeEventListener("mousedown",once); };
+    addEventListener("keydown",once); addEventListener("mousedown",once);
+  }
+}
+/* ============ boot ============ */
+function isTouchOnly(){
+  try{ return matchMedia("(pointer: coarse)").matches&&!matchMedia("(pointer: fine)").matches&&!hasKeyboard&&!hasPad; }catch(e){ return false; }
+}
+addEventListener("error",e=>{ /* keep playing through non-fatal errors; boot errors use the overlay */ });
+async function boot(){
+  fillAbout(); wireUI(); refreshSaveInfo(); syncSettingsUI();
+  try{
+    await initGraphics();
+    await initPhysics();
+    buildWorld();
+    G.solo=true; resetRun({x:-30,z:26});
+    if(window.AIHub&&typeof AIHub.probe==="function"){
+      AIHub.probe(()=>{ const lead=localLead(); const inp=(lead&&lead.input)||{x:0,y:0};
+        return { scene:G.scene==="play"?"play":(G.scene||"title"), menu:!!G.settingsOpen, world:Math.round(G.worldT*10)/10, input:{x:Math.round((inp.x||0)*100)/100,y:Math.round((inp.y||0)*100)/100,fire:!!(lead&&lead.actEdge)} };
+      });
+    }
+    renderer.setAnimationLoop(tick);
+    if(window.AIHub&&AIHub.active){
+      G.hub=true;
+      const info=await AIHub.connect({mode:"co-op",seats:[1,4]});
+      if(info){ setupHub(info); return; }
+      G.hub=false; showScreen("scr-title"); return;
+    }
+    showScreen(isTouchOnly()?"scr-touch":"scr-title");
+  }catch(err){
+    showError(err);
+    if(window.AIHub&&AIHub.active){ try{ AIHub.fail(String((err&&err.message)||err)); }catch(e){} }
+  }
+}
+boot();
+
+
+</script>
+</body>
+</html>

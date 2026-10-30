@@ -1,0 +1,3616 @@
+<!DOCTYPE html>
+<!--
+Source Information
+Date: 2026-10-29 09:53 (America/Vancouver)
+Original title: Goofaloop — The Bell of Bumblebay
+Source inspiration: Goof Troop. Original characters, setting, writing, geometry and score; no source assets used.
+Tech: Three.js r180 (0.180.0), WebGPU only, Rapier 3D 0.19.3, Gamepad API, Web Audio API, ES modules. PeerJS 1.5.5. AI Hub Session Protocol v1.
+Art Direction: cel-shaded toy island dioramas, faceted geometry, ink outlines, warm sand and turquoise sea.
+Animation: procedural skeletal-group transforms, walk cycles, squash, recoil, grapple arcs and particles.
+Audio: code-written tropical score, percussion, musical effects and synthesized gibberish voices.
+Online: AI Hub co-op 1–4; standalone PeerJS/WebRTC room codes; local shared-screen 1–2. No chat.
+Testing: efficient lightweight module, browser, gameplay and protocol checks. No FPS or optimization targets.
+Environment: Codex CLI (headless); Linux (WSL2). End-user browser unknown. Visual test browser Chromium 156 under Xvfb, SwiftShader WebGPU; module/transport smoke checks also used Chrome 154.
+Model: OpenAI, gpt-6-astra, reasoning effort ultra.
+Usage: estimated API cost unknown; token total unknown; session time approximately 40 minutes.
+
+Testing Feedback
+Issues caught: automated/browser tests caught 3 code/UI defects (settings state, Escape handling and premature rendering-resource disposal), both corrected. Review additionally caught and corrected 3 potential blockers, plus smaller visual and state issues. A separate headless-browser presentation issue was isolated in the test environment.
+Critical/game-breaking: 4 potential blockers (premature rendering-resource disposal, invalid avatar animation, lone online player downed forever, stale colliders during a co-op room transition).
+Results: 10/10 gameplay tests; dedicated-host hub check 25/25; host-leave hub check 24/24; actual standalone WebRTC connection passed; audio/input/UI smoke checks passed. Hub checks used test-only drawing suppression after separate WebGPU screenshot validation, with 150 ms latency, 50 ms jitter and 5% packet loss. Physical controllers and cross-network end-to-end play remain untested.
+Most helpful test: actual browser execution with WebGPU and simulated controller input.
+Least helpful test: syntax checks alone cannot exercise rendering or gameplay.
+
+Engine Feedback
+Liked most: Three.js scene graph makes an expressive procedural world straightforward; Rapier supplies solid collision queries.
+Got stuck or guessed wrong: WebGPU materials differ from the older WebGL shader path; custom node materials were required. String avatar IDs initially produced invalid animation phases and were corrected.
+Most important custom system: shared puzzle state, room authoring data and responsive multiplayer player prediction.
+Hardest part: keeping host authority, local prediction, physics and room transitions consistent.
+Would overhaul: renderer fallback being implicit; this demo explicitly disables it to require WebGPU.
+Would change: add a first-party cel material and ready-made co-op interpolation tools.
+
+Prompt Feedback
+Liked most: the combination of a specific mechanical inspiration, original procedural audio and a controller-first presentation.
+Confusing: the general hub guide recommends a fallback, while this brief explicitly requires WebGPU only; the explicit brief wins and the hub metadata declares WebGPU required.
+Hardest: fitting a complete solo/co-op puzzle campaign, standalone online play and the hub lifecycle into one shareable HTML.
+One additional test: an end-to-end four-person run with physical DualSense controllers on separate networks.
+
+-->
+<html lang="en"><head><meta charset="UTF-8"><script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:players" content="1-4">
+<meta name="hub:session-mode" content="co-op">
+<meta name="hub:session-minutes" content="8">
+<meta name="hub:session-goal" content="Recover the picnic bell and defeat Captain Clatter">
+<meta name="hub:session-howto" content="Stick/WASD move; Cross/Space lift; Square/E kick; Triangle/Q hook; Circle dodge">
+<meta name="hub:webgpu" content="required"><meta name="theme-color" content="#5bc5c7"><title>Goofaloop · The Bell of Bumblebay</title><style>html,body{margin:0;overflow:hidden;background:#81d5d7}#world{position:fixed;inset:0}#world canvas{display:block;width:100%;height:100%}#boot-note{position:fixed;bottom:20px;left:0;right:0;text-align:center;font:14px sans-serif;color:#23444e;z-index:99}@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Nunito+Sans:wght@500;600;700;800;900;1000&display=swap');
+:root{--ink:#18343c;--paper:#fff4d9;--orange:#e66b3c;--sun:#f9c565;--teal:#248b8c;--muted:#72807b;--line:rgba(24,52,60,.16);font-family:'Nunito Sans',system-ui,sans-serif;color:var(--ink);font-synthesis:none}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#173e4b}button,input{font:inherit}button{cursor:pointer}button:disabled{opacity:.35;pointer-events:none}button:focus-visible,input:focus-visible{outline:none}button{touch-action:manipulation}canvas{display:block;width:100%;height:100%}[hidden]{display:none!important}#goof-ui{position:fixed;inset:0;z-index:10;pointer-events:none;isolation:isolate}#goof-ui button,#goof-ui input{pointer-events:auto}.screen-layer{position:absolute;inset:0;overflow:auto;pointer-events:none}.screen-layer::before{content:'';position:fixed;inset:0;background:rgba(12,36,39,.34);backdrop-filter:blur(5px);z-index:-1}.screen-layer:has(.title-panel)::before{background:linear-gradient(90deg,rgba(255,242,214,.99) 0%,rgba(255,242,214,.97) 22%,rgba(255,242,214,.76) 33%,rgba(255,242,214,.15) 48%,transparent 59%);backdrop-filter:none}.ui-vignette{position:absolute;inset:0;box-shadow:inset 0 0 110px rgba(19,51,52,.14);pointer-events:none}.game-header{position:absolute;left:3.6vw;right:3.6vw;top:3.4vh;display:flex;align-items:center;justify-content:space-between;gap:20px;z-index:2}.small-brand{display:flex;gap:10px;align-items:center;font-size:20px;font-weight:1000;letter-spacing:1.5px;line-height:1}.small-brand>svg{width:42px;height:42px}.small-brand small{display:block;font-size:8px;letter-spacing:1.9px;margin-top:7px;font-weight:900}.edition-label{font-size:10px;font-weight:1000;letter-spacing:2.5px;color:#fff5dd;text-align:right;text-shadow:0 1px 5px #25455066}.edition-label span{display:block;font-size:12px;letter-spacing:1.8px;margin-top:6px}.title-panel{position:absolute;left:6.1vw;top:17.5vh;width:min(470px,40vw);animation:rise-in .65s ease-out}.eyebrow{font-size:11px;font-weight:1000;letter-spacing:2.3px;margin:0 0 17px;line-height:1.5}.tiny-star{font-size:21px;color:var(--orange);vertical-align:-2px;margin-right:6px}h1{font-weight:1000;font-size:clamp(78px,8.1vw,134px);line-height:.77;letter-spacing:-7px;margin:27px 0 26px;transform:rotate(-4deg);font-style:italic;text-shadow:3px 5px 0 #e9d7b8}h1>span{display:block;color:var(--orange);margin-left:5px}h1 .title-dot{color:var(--ink)}.title-tagline{font-size:15px;letter-spacing:3px;line-height:1.5;font-weight:1000;margin:37px 0 23px}.menu-stack{display:flex;flex-direction:column;gap:9px}.menu-button{width:100%;min-height:49px;padding:12px 18px;border:1.5px solid var(--ink);border-radius:6px;background:rgba(255,247,226,.85);color:var(--ink);display:flex;align-items:center;justify-content:space-between;text-align:left;font-size:16px;font-weight:900;line-height:1.3;transition:transform .12s,box-shadow .12s,background .12s}.menu-button .button-arrow{font-size:21px;opacity:.55;margin-left:14px}.menu-button:focus,.menu-button:hover{background:#fffaf0;transform:translate(-2px,-2px);box-shadow:4px 4px 0 var(--ink)}.menu-button.primary{color:var(--paper);background:var(--ink);border:2px solid var(--ink);box-shadow:0 4px 0 #0b232b}.menu-button.primary:focus,.menu-button.primary:hover{background:var(--orange);color:#fff5df;box-shadow:4px 5px 0 var(--ink)}.menu-button.primary .button-arrow{opacity:1}.menu-button.secondary{background:#fff4ddbf}.title-panel .menu-stack{max-width:330px}.small-menu{display:flex;gap:18px;padding-top:14px}.small-menu .menu-button{width:auto;min-height:25px;padding:0;border:0;border-bottom:2px solid transparent;border-radius:0;box-shadow:none;background:none;font-size:12px;letter-spacing:.2px}.small-menu .button-arrow{display:none}.small-menu .menu-button:focus,.small-menu .menu-button:hover{border-bottom-color:var(--orange);color:var(--orange);transform:none}.episode-ticket{position:absolute;right:4vw;bottom:13vh;display:flex;align-items:center;gap:15px;background:var(--paper);border:1.5px solid var(--ink);box-shadow:5px 5px 0 #18343c6b;padding:19px 23px;transform:rotate(2deg);max-width:400px}.ticket-number{font:800 58px/.9 'Barlow Condensed',sans-serif;border-right:1px solid var(--line);padding-right:17px;color:var(--orange)}.episode-ticket p{font-weight:1000;letter-spacing:1px;font-size:12px;margin:0 0 8px}.episode-ticket span{font-size:12px;line-height:1.5;font-weight:700}.episode-ticket>i{font-size:27px;font-style:normal;margin-left:8px}.title-bottom{position:absolute;bottom:3.2vh;left:3.6vw;right:3.6vw;display:flex;justify-content:space-between;font-size:9px;font-weight:1000;letter-spacing:1.4px}.title-bottom b{margin:0 10px;color:var(--orange)}.title-attract-hint{color:var(--paper);text-shadow:0 1px 3px #18343c}.menu-footer{position:absolute;bottom:2.8vh;left:4vw;right:4vw;display:flex;justify-content:space-between;color:var(--paper);font-size:12px;font-weight:800;letter-spacing:.5px}.menu-footer kbd{margin-left:18px}.menu-footer kbd:first-child{margin-left:0}kbd{font:900 15px/1 'Nunito Sans',sans-serif;border:1.5px solid currentColor;min-width:25px;height:25px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;padding:2px;margin-right:7px;vertical-align:middle}.footer-keyboard{opacity:.7}.menu-card{pointer-events:auto;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(600px,90vw);background:var(--paper);padding:32px 38px;border:2px solid var(--ink);border-radius:12px;box-shadow:9px 10px 0 #102b36aa;max-height:79vh;overflow:auto;animation:card-in .2s ease-out}.menu-card>.eyebrow{color:var(--teal);margin-bottom:12px}.menu-card h2{font-size:clamp(32px,3vw,49px);font-weight:1000;letter-spacing:-1.6px;line-height:1.05;margin:0 0 25px}.menu-card h2>span{display:block;color:var(--orange)}.menu-card p{line-height:1.5}.pause-card{width:min(470px,90vw)}.wide-card{width:min(720px,90vw)}.setting-list{border-top:1.5px solid var(--line);margin-bottom:15px}.setting-row{background:transparent;border:0;border-bottom:1.5px solid var(--line);padding:15px 12px;display:flex;align-items:center;justify-content:space-between;width:100%;text-align:left;border-radius:3px;gap:15px;color:var(--ink)}.setting-row:focus,.setting-row:hover{background:#efd9ad;outline:2px solid var(--ink)}.setting-row b{font-size:18px;font-weight:900}.setting-row small{display:block;font-size:12px;opacity:.65;margin-top:3px}.setting-value{display:flex;gap:12px;align-items:center;font-weight:1000;color:var(--teal);min-width:80px;justify-content:flex-end;font-size:16px}.setting-value b{font-size:13px}.setting-arrows{font-size:23px;letter-spacing:6px;color:var(--ink)}.volume-track{display:block;width:88px;background:#d6d4b9;height:7px;border-radius:4px;overflow:hidden}.volume-track i{display:block;height:100%;background:var(--teal)}.settings-help{font-size:11px;opacity:.6;text-align:center;margin:12px 0 18px}.menu-description{font-size:16px;font-weight:700;margin-top:-10px;margin-bottom:25px}.together-card{width:min(900px,93vw)}.together-card h2{margin-bottom:20px}.together-grid{display:grid;grid-template-columns:1fr 1fr;gap:34px}.together-grid .menu-button{font-size:15px}.secondary-description{font-size:12px;opacity:.7;margin:12px 0 23px}.join-panel{border-left:1px solid var(--line);padding-left:30px}.join-panel .eyebrow{font-size:10px;margin-bottom:10px}#room-code{width:100%;border:2px solid var(--ink);border-radius:4px;background:#fff9e9;padding:9px 10px;color:var(--ink);font-size:22px;letter-spacing:4px;text-transform:uppercase;font-weight:1000;text-align:center}#room-code:focus{outline:3px solid var(--orange);outline-offset:2px}.code-picker{display:flex;gap:5px;margin-top:8px}.code-picker button{width:16.67%;background:var(--ink);color:var(--paper);border:0;border-radius:3px;padding:7px 0;font-size:17px;font-weight:1000}.code-picker button:focus,.code-picker button:hover{background:var(--orange);outline:2px solid var(--ink);outline-offset:1px}.code-help{font-size:10px;opacity:.7;margin:8px 0 15px}.network-status{font-size:12px;line-height:1.5;padding:13px 0;font-weight:700;color:var(--teal)}.room-code-display{font-size:26px;font-weight:1000;letter-spacing:5px;margin:7px 0 14px}.text-button{border:0;background:transparent;margin-top:15px}.text-button:focus{box-shadow:none;outline:2px solid var(--ink)}.guide-card{width:min(1000px,94vw);padding:30px 36px}.guide-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px 30px}.guide-grid article{position:relative;padding-left:48px}.guide-icon{position:absolute;left:0;top:0;width:34px;height:34px;display:flex;align-items:center;justify-content:center;background:var(--ink);color:var(--sun);border-radius:50%;font-size:22px;font-weight:900}.guide-grid h3{font-size:19px;font-weight:1000;margin:0 0 7px;letter-spacing:-.5px}.guide-grid p{font-size:14px;font-weight:600;margin:0;line-height:1.5}.guide-grid p.guide-control{font-size:10px;text-transform:uppercase;color:var(--teal);letter-spacing:.7px;font-weight:1000;margin-bottom:8px}.page-controls{display:flex;gap:14px;margin-top:30px}.page-controls .menu-button{font-size:13px;min-height:42px;justify-content:center;text-align:center}.page-controls .button-arrow{display:none}.credits-card{width:min(860px,94vw)}.credits-card h2{font-size:35px}.credits-copy{white-space:pre-wrap;font-size:14px;line-height:1.65;font-weight:650;max-height:48vh;overflow:auto;scrollbar-color:var(--teal) transparent;padding-right:9px}.win-card{text-align:center;width:min(550px,90vw)}.win-card h2{font-size:63px;letter-spacing:-3px;margin-bottom:15px}.win-bell{width:68px;height:68px;margin:0 auto 15px;color:var(--orange);transform:rotate(-12deg)}.win-copy{font-size:16px;font-weight:700}.win-stats{display:flex;justify-content:center;gap:34px;padding:16px 0;margin:18px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:9px;letter-spacing:1.5px;font-weight:1000}.win-stats b{display:block;font-size:30px;letter-spacing:-1px}.win-quote{font-size:12px;font-style:italic;margin-bottom:22px}.win-card .menu-button{text-align:left}.loading-card{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:var(--paper)}.loading-card>svg{width:70px;height:70px;margin:0 auto 20px}.loading-card h2{font-size:32px;letter-spacing:-1px;margin:16px 0 26px}.loading-card p:last-child{font-size:13px;opacity:.65}.loading-line{width:230px;height:4px;background:#fff4d93b;margin:0 auto;overflow:hidden;border-radius:3px}.loading-line i{display:block;width:45%;height:100%;background:var(--sun);animation:load 1.3s infinite ease-in-out}.touch-notice{padding:17px;border:2px solid var(--ink);font-size:17px;font-weight:900;background:#fff4dd}.error-card .menu-description{line-height:1.7}.error-card .menu-button+.menu-button{margin-top:10px}.game-hud{position:absolute;inset:0}.hud-top{position:absolute;top:22px;left:26px;right:26px;display:flex;justify-content:space-between;align-items:flex-start;gap:15px}.player-badges{display:flex;gap:12px;flex-wrap:wrap;max-width:42%}.player-badge{display:flex;align-items:center;background:var(--paper);border:2px solid var(--ink);border-radius:6px;box-shadow:3px 3px 0 #18343c72;padding:8px 12px 8px 7px;gap:9px}.player-face{display:flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;background:var(--orange);color:var(--paper)}.player-face svg{width:31px;height:31px}.player-1 .player-face{background:var(--teal)}.player-2 .player-face{background:#aa69b6}.player-3 .player-face{background:#e5ac29}.player-badge p{font-size:10px;font-weight:1000;letter-spacing:1px;margin:0 0 2px;text-transform:uppercase;display:flex;justify-content:space-between;gap:30px}.player-badge p>span{opacity:.4;font-size:8px}.hearts{display:flex;gap:3px}.heart{color:#d5c7aa;font-size:20px;font-style:normal;line-height:1}.heart.filled{color:var(--orange);filter:drop-shadow(0 1px 0 #943e2a)}.room-badge{text-align:center;position:absolute;left:50%;transform:translateX(-50%);min-width:230px;padding-top:4px;color:var(--paper);text-shadow:0 2px 4px #193737b0}.room-badge .eyebrow{display:block;font-size:9px;letter-spacing:3px;margin-bottom:4px;color:#fff1c3}.room-badge strong{font-size:19px;font-weight:1000;letter-spacing:-.4px}.inventory{display:flex;align-items:center;gap:14px;background:var(--paper);border:2px solid var(--ink);border-radius:6px;padding:9px 10px 9px 15px;box-shadow:3px 3px 0 #18343c72}.inventory>span{display:flex;align-items:center;gap:7px;font-size:23px;line-height:1}.inventory>span b{font-size:17px}.shell-counter svg{width:21px;height:21px;color:var(--orange)}.key-counter{color:var(--teal);border-left:1px solid var(--line);padding-left:13px}.hud-pause{border:0;border-left:1px solid var(--line);background:transparent;color:var(--ink);font-size:23px;font-weight:900;padding:0 6px 0 13px;line-height:1}.hud-pause:focus,.hud-pause:hover{color:var(--orange)}.objective{position:absolute;top:103px;left:28px;display:flex;gap:11px;max-width:350px;align-items:center;color:var(--paper);filter:drop-shadow(0 2px 3px #1339349c)}.objective-diamond{font-size:30px;color:var(--sun)}.objective small{font-size:8px;letter-spacing:1.5px;font-weight:1000;color:var(--sun)}.objective p{font-size:13px;line-height:1.4;font-weight:900;margin:3px 0 0}.hud-bottom{position:absolute;bottom:23px;left:50%;transform:translateX(-50%);display:flex;gap:22px;align-items:center;white-space:nowrap;background:var(--paper);border:1.5px solid var(--ink);border-radius:6px;padding:10px 18px;box-shadow:3px 3px 0 #18343c72;font-size:11px;font-weight:1000}.hud-bottom kbd{font-size:14px;width:23px;height:23px;min-width:23px;margin-right:5px}.hud-bottom small{font-size:8px;letter-spacing:.6px;opacity:.5;border-left:1px solid var(--line);padding-left:15px}.boss-health{position:absolute;bottom:93px;left:50%;transform:translateX(-50%);width:min(440px,60vw);color:var(--paper);text-shadow:0 1px 3px #18343c;padding:10px 14px;background:#18343ce6;border:1.5px solid var(--paper);border-radius:5px}.boss-health>div{display:flex;justify-content:space-between;font-size:12px;font-weight:1000;margin-bottom:8px;letter-spacing:.6px}.boss-health>i{display:block;height:8px;border-radius:2px;background:#fff3d230;overflow:hidden}.boss-health>i>i{display:block;height:100%;background:var(--orange);transition:width .2s}.toast{position:absolute;top:19%;left:50%;transform:translate(-50%,-15px);opacity:0;background:var(--paper);border:2px solid var(--ink);border-radius:6px;padding:13px 24px;box-shadow:4px 4px 0 #18343c80;font-size:15px;font-weight:900;text-align:center;max-width:650px;width:max-content;max-width:min(650px,85vw);transition:opacity .2s,transform .2s;z-index:5}.toast.show{opacity:1;transform:translate(-50%,0)}.toast[data-kind="success"]{border-color:var(--teal)}.toast[data-kind="error"]{border-color:var(--orange)}.dialogue{position:absolute;bottom:84px;left:50%;transform:translateX(-50%);width:min(800px,88vw);display:flex;align-items:center;gap:20px;background:var(--paper);border:2px solid var(--ink);border-radius:9px;box-shadow:5px 5px 0 #18343c7d;padding:20px 23px;z-index:5}.dialogue-avatar{width:60px;height:60px;flex-shrink:0;background:var(--sun);border:2px solid var(--ink);border-radius:50%;display:flex;align-items:center;justify-content:center}.dialogue-avatar svg{width:48px;height:48px}.dialogue-body{flex:1}.dialogue-body .speaker{font-size:10px;letter-spacing:1.8px;font-weight:1000;text-transform:uppercase;color:var(--teal);margin:0 0 6px}.dialogue-body p:last-child{font-size:17px;font-weight:800;line-height:1.5;margin:0}.dialogue button{border:0;background:transparent;color:var(--ink);padding:7px;font-weight:900;align-self:flex-end}.dialogue button>span{display:block;font-size:8px;letter-spacing:1px;text-transform:uppercase;margin-top:7px}.dialogue button:focus{outline:2px solid var(--orange);border-radius:4px}.attract-banner{position:absolute;top:17px;left:50%;transform:translateX(-50%);background:var(--paper);border:2px solid var(--ink);padding:12px 20px;box-shadow:4px 4px 0 #18343c70;font-size:12px;font-weight:1000;letter-spacing:1.5px;z-index:6;text-align:center}.attract-banner i{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--orange);margin-right:8px;animation:blink 1.5s infinite}.attract-banner span{display:block;font-size:10px;letter-spacing:.5px;opacity:.65;margin-top:5px}.network-corner{position:absolute;bottom:23px;right:25px;background:var(--ink);color:var(--paper);border:1px solid #fff1d655;border-radius:3px;padding:6px 9px;font-size:9px;max-width:230px;line-height:1.5}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}.reduce-motion *{animation:none!important;transition:none!important}@keyframes rise-in{from{opacity:0;translate:0 14px}to{opacity:1;translate:0 0}}@keyframes card-in{from{opacity:0;scale:.97}to{opacity:1;scale:1}}@keyframes load{0%{transform:translateX(-110%)}100%{transform:translateX(330%)}}@keyframes blink{50%{opacity:.3}}
+@media(min-width:1600px){.title-panel .menu-stack{max-width:400px}.menu-button{font-size:20px;min-height:61px}.small-menu .menu-button{font-size:15px}.title-tagline{font-size:20px;margin-top:42px}.title-panel>.eyebrow{font-size:14px}.episode-ticket{scale:1.2;transform-origin:right bottom}.game-header{scale:1.1;transform-origin:top left;right:12vw}.title-bottom{font-size:11px}.menu-card{zoom:1.12}.hud-top,.objective,.hud-bottom,.dialogue,.toast{zoom:1.13}.hud-top{right:2vw}.room-badge{position:static;transform:none}.objective{top:103px}}
+@media(max-height:760px){.title-panel{top:16vh}.title-panel h1{font-size:clamp(74px,7.8vw,110px);margin-top:17px;margin-bottom:20px}.title-tagline{margin-top:27px;margin-bottom:16px;font-size:12px}.title-panel .menu-button{min-height:42px;font-size:14px;padding:9px 15px}.title-panel .small-menu .menu-button{font-size:11px;min-height:22px;padding:0}.title-panel .eyebrow{font-size:9px;margin-bottom:10px}.small-menu{padding-top:9px}.menu-card{padding:24px 30px;max-height:78vh}.menu-card h2{font-size:34px;margin-bottom:20px}.setting-row{padding:10px}.guide-grid{gap:18px 24px}.guide-grid h3{font-size:17px}.guide-grid p{font-size:12px}.credits-copy{font-size:12px}.page-controls{margin-top:23px}.win-card{padding:20px 30px}.win-bell{width:45px;height:45px;margin-bottom:10px}.win-card h2{font-size:44px;margin-bottom:12px}.win-copy{font-size:14px}.win-stats{margin:12px 0;padding:10px 0}.win-quote{margin:10px 0 15px}.episode-ticket{bottom:11vh}.game-header{top:3vh}}
+@media(max-width:900px){.small-brand{font-size:15px}.small-brand>svg{width:33px;height:33px}.small-brand small{font-size:6px}.title-panel{left:5vw;width:44vw}.title-panel h1{font-size:85px;letter-spacing:-5px}.title-panel .menu-stack{max-width:290px}.episode-ticket{padding:14px 17px;right:3vw;bottom:15vh;max-width:330px;gap:12px}.ticket-number{font-size:45px;padding-right:12px}.episode-ticket p{font-size:9px}.episode-ticket span{font-size:10px}.episode-ticket>i{font-size:22px}.title-attract-hint{display:none}.hud-top{left:15px;right:15px;top:15px}.player-badge{padding:6px 9px 6px 5px}.player-face{width:30px;height:30px}.player-face svg{width:25px;height:25px}.heart{font-size:16px}.room-badge strong{font-size:15px}.room-badge{min-width:180px}.objective{left:18px;top:84px;max-width:290px}.inventory{gap:10px;padding:9px}.inventory>span{font-size:20px}.hud-bottom{gap:13px;font-size:10px;bottom:15px}.hud-bottom small{display:none}.dialogue-body p:last-child{font-size:15px}.dialogue{padding:15px;gap:14px}.player-badges{gap:7px}.network-corner{bottom:70px;right:15px}.title-bottom{font-size:8px}.edition-label{font-size:8px}.edition-label span{font-size:9px}}
+@media(max-width:600px){.title-panel{width:78vw;top:17vh}.screen-layer:has(.title-panel)::before{background:linear-gradient(90deg,#fff2d6f5,#fff2d6cc 60%,#fff2d644)}.title-panel h1{font-size:91px}.title-panel .menu-stack{max-width:300px}.edition-label{display:none}.episode-ticket{display:none}.title-panel>.eyebrow{font-size:9px}.title-bottom{line-height:1.7;max-width:84vw;font-size:8px}.title-bottom b{margin:0 4px}.guide-grid{grid-template-columns:1fr;gap:16px}.guide-card,.credits-card{top:51%;max-height:77vh;padding:22px}.guide-card h2,.credits-card h2{font-size:28px}.guide-grid p{font-size:13px}.guide-grid p.guide-control{font-size:9px}.page-controls{gap:7px}.page-controls .menu-button{font-size:11px;padding:10px 6px}.together-grid{grid-template-columns:1fr;gap:20px}.join-panel{border-left:0;border-top:1px solid var(--line);padding:20px 0 0}.together-card h2{font-size:32px}.menu-card{padding:23px;max-height:76vh}.menu-footer{font-size:10px;bottom:2vh}.footer-keyboard{display:none}.setting-row b{font-size:15px}.setting-row small{font-size:10px;max-width:180px}.setting-row{padding:13px 4px;gap:8px}.setting-value{gap:4px;font-size:13px}.volume-track{display:none}.setting-arrows{font-size:18px;letter-spacing:1px}.settings-help{font-size:9px}.room-badge{top:65px;left:auto;right:0;transform:none;min-width:0;text-align:right}.room-badge strong{font-size:12px}.room-badge .eyebrow{font-size:7px}.objective{top:140px;max-width:230px}.objective p{font-size:11px}.player-badges{max-width:55%;flex-direction:column}.player-badge{gap:6px}.hud-top{gap:5px}.inventory{gap:7px}.inventory>span b{font-size:14px}.shell-counter svg{width:17px;height:17px}.inventory .key-counter{padding-left:7px}.hud-pause{font-size:19px;padding-left:8px}.hud-bottom{gap:9px;padding:8px 10px;max-width:97vw;font-size:9px}.hud-bottom kbd{width:19px;height:19px;min-width:19px;font-size:12px;margin-right:3px}.dialogue{width:92vw;bottom:70px;gap:10px;padding:13px}.dialogue-avatar{display:none}.dialogue-body p:last-child{font-size:14px}.toast{font-size:12px;padding:11px 15px;top:26%}.boss-health{bottom:75px;width:80vw}.attract-banner{width:260px;font-size:10px;top:13px}.network-corner{max-width:160px;font-size:8px}.win-card h2{font-size:43px}.credits-copy{font-size:12px}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.key-counter svg{width:21px;height:21px}.credits-copy{font-size:15px}@media(max-height:760px){.credits-copy{font-size:13px}}
+
+.hub-wait{font-size:17px;font-weight:1000;color:var(--teal);padding:13px 0 4px;margin:0}.hub-wait span{display:block;font-size:12px;font-weight:700;color:var(--ink);opacity:.65;margin-top:7px}
+/* Legible at sofa distance, even over sunlit water and sand. */
+.objective{left:26px;top:104px;max-width:350px;gap:11px;padding:12px 16px 13px 13px;background:rgba(255,244,217,.97);border:1.5px solid var(--ink);border-radius:6px;box-shadow:3px 3px 0 #18343c55;color:var(--ink);filter:none}
+.objective-diamond{color:var(--orange);font-size:29px;flex-shrink:0}
+.objective small{color:var(--teal);font-size:9px;letter-spacing:1.4px}
+.objective p{font-size:15px;line-height:1.4;margin-top:4px;font-weight:900}
+.room-badge{padding:9px 22px 11px;background:rgba(24,52,60,.9);border:1px solid rgba(255,244,217,.35);border-radius:6px;box-shadow:2px 3px 0 #18343c35;text-shadow:none}
+.room-badge strong{font-size:20px}
+.room-badge .eyebrow{font-size:9px;margin-bottom:3px}
+.hud-bottom{font-size:13px}
+.player-badge p{font-size:11px}
+.title-panel .menu-stack>.menu-button{font-size:18px;min-height:52px}
+.title-panel .small-menu .menu-button{font-size:13px}
+@media(min-width:1600px){.title-panel .menu-stack>.menu-button{font-size:20px;min-height:61px}.title-panel .small-menu .menu-button{font-size:15px}}
+@media(max-height:760px) and (min-width:901px){.title-panel .menu-stack>.menu-button{font-size:17px;min-height:46px}.objective{top:97px}.objective p{font-size:14px}}
+@media(max-width:900px){.objective{left:16px;top:91px;max-width:300px;padding:10px 13px}.objective p{font-size:13px}.objective small{font-size:8px}.room-badge{padding:8px 15px}.room-badge strong{font-size:16px}.hud-bottom{font-size:11px}.title-panel .menu-stack>.menu-button{font-size:16px;min-height:46px}}
+@media(max-width:600px){.objective{top:140px;max-width:235px;padding:9px 11px;gap:8px}.objective p{font-size:11px}.objective-diamond{font-size:24px}.room-badge{padding:7px 10px}.room-badge strong{font-size:12px}.room-badge .eyebrow{font-size:7px}.hud-bottom{font-size:9px}.player-badge p{font-size:10px}}
+</style><script type="importmap">
+{
+  "imports": {
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "@dimforge/rapier3d-compat": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script></head><body><div id="world"></div><div id="boot-note">WebGPU adventure · Connecting to the island…</div><script>setTimeout(()=>{const e=document.getElementById('boot-note');if(e)e.textContent='Still loading? This game requires internet access for its pinned engine libraries and a WebGPU-enabled browser.'},20000)</script><script type="module">// world.js
+import * as THREE from "three/webgpu";
+import { color, normalWorld, vec3, dot, floor, max } from "three/tsl";
+var C = { ink: 2374729, sand: 16046235, edge: 13933667, grass: 9353082, leaf: 4034677, leaf2: 8632946, wood: 12023887, wood2: 14789744, cream: 16773072, coral: 15956053, blue: 4369065, water: 5818060, stone: 9546141, gold: 16763493 };
+var mats = /* @__PURE__ */ new Map();
+function mat(c, outline = false) {
+  const key = c + ":" + outline;
+  if (mats.has(key)) return mats.get(key);
+  const m = new THREE.MeshStandardNodeMaterial({ color: c, roughness: 1, metalness: 0, flatShading: true });
+  if (!outline) {
+    const bands = floor(max(dot(normalWorld, vec3(-0.38, 0.85, 0.45)), 0).mul(3)).div(3).mul(0.34).add(0.72);
+    m.colorNode = color(c).mul(bands);
+  }
+  mats.set(key, m);
+  return m;
+}
+var outlineMat = new THREE.MeshBasicNodeMaterial({ color: C.ink, side: THREE.BackSide });
+var geo = { box: new THREE.BoxGeometry(1, 1, 1), sphere: new THREE.SphereGeometry(1, 12, 8), cyl: new THREE.CylinderGeometry(1, 1, 1, 10), cone: new THREE.ConeGeometry(1, 1, 8) };
+function mesh(g, c, x = 0, y = 0, z = 0, sx = 1, sy = 1, sz = 1, parent, ink = false) {
+  const m = new THREE.Mesh(g, mat(c));
+  m.position.set(x, y, z);
+  m.scale.set(sx, sy, sz);
+  m.castShadow = true;
+  m.receiveShadow = true;
+  if (parent) parent.add(m);
+  if (ink) {
+    const o = new THREE.Mesh(g, outlineMat);
+    o.scale.set(1.045, 1.045, 1.045);
+    o.castShadow = false;
+    m.add(o);
+  }
+  return m;
+}
+function box(c, x, y, z, w, h, d, p, ink = false) {
+  return mesh(geo.box, c, x, y, z, w, h, d, p, ink);
+}
+function ball(c, x, y, z, w, h, d, p, ink = false) {
+  return mesh(geo.sphere, c, x, y, z, w, h, d, p, ink);
+}
+function cyl(c, x, y, z, r, h, p, ink = false) {
+  return mesh(geo.cyl, c, x, y, z, r, h, r, p, ink);
+}
+function group(p, x = 0, y = 0, z = 0) {
+  const g = new THREE.Group();
+  g.position.set(x, y, z);
+  if (p) p.add(g);
+  return g;
+}
+function label(text, p, x, y, z, size = 1.5, bg = "#fff0d0", fg = "#294451") {
+  const can = document.createElement("canvas");
+  can.width = 512;
+  can.height = 128;
+  const ctx = can.getContext("2d");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, 512, 128);
+  ctx.strokeStyle = fg;
+  ctx.lineWidth = 8;
+  ctx.strokeRect(5, 5, 502, 118);
+  ctx.fillStyle = fg;
+  ctx.font = "bold 48px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, 256, 66, 475);
+  const tex = new THREE.CanvasTexture(can);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(size * 4, size), new THREE.MeshBasicNodeMaterial({ map: tex, side: THREE.DoubleSide }));
+  m.position.set(x, y, z);
+  p.add(m);
+  return m;
+}
+function palm(p, x, z, s = 1, lean = 0.15) {
+  const g = group(p, x, 0, z);
+  g.scale.setScalar(s);
+  const trunk = mesh(new THREE.CylinderGeometry(0.18, 0.31, 3.4, 7), C.wood, lean, 1.7, 0, 1, 1, 1, g, true);
+  trunk.rotation.z = -lean;
+  for (let i = 0; i < 6; i++) {
+    const leaf = group(g, lean * 2, 3.25, 0);
+    leaf.rotation.y = i * Math.PI / 3;
+    leaf.rotation.z = 0.2;
+    const shape = new THREE.Shape();
+    shape.moveTo(0, 0);
+    shape.quadraticCurveTo(0.7, 0.65, 2.5, -0.5);
+    shape.quadraticCurveTo(0.8, -0.3, 0, 0);
+    const l = mesh(new THREE.ShapeGeometry(shape), i % 2 ? C.leaf : C.leaf2, 0, 0, 0, 1, 1, 1, leaf);
+    l.material = mat(i % 2 ? C.leaf : C.leaf2);
+    l.material.side = THREE.DoubleSide;
+    l.rotation.x = -0.75;
+  }
+  for (let j = 0; j < 3; j++) ball(8544838, lean * 2 + Math.cos(j * 2) * 0.3, 3.05, Math.sin(j * 2) * 0.3, 0.22, 0.24, 0.22, g);
+  return g;
+}
+function bush(p, x, z, s = 1) {
+  for (let i = 0; i < 3; i++) ball(i % 2 ? C.leaf2 : C.leaf, x + Math.cos(i * 2) * s * 0.35, 0.35 * s, z + Math.sin(i * 2) * s * 0.3, 0.6 * s, 0.55 * s, 0.6 * s, p);
+}
+function crate(p, x, z, s = 1) {
+  const g = group(p, x, 0, z);
+  box(C.wood2, 0, 0.6 * s, 0, 1.15 * s, 1.2 * s, 1.15 * s, g, true);
+  for (const z2 of [-0.6, 0.6]) {
+    box(C.wood, 0, 0.12 * s, z2 * s, 1.22 * s, 0.14 * s, 0.08 * s, g);
+    box(C.wood, 0, 1.06 * s, z2 * s, 1.22 * s, 0.14 * s, 0.08 * s, g);
+    const q = box(C.wood, 0, 0.6 * s, z2 * s, 0.13 * s, 1.35 * s, 0.08 * s, g);
+    q.rotation.z = 0.72;
+  }
+  return g;
+}
+function barrel(p, x, z) {
+  const g = group(p, x, 0, z);
+  mesh(new THREE.CylinderGeometry(0.43, 0.48, 1, 10), C.wood, 0, 0.5, 0, 1, 1, 1, g, true);
+  for (const y of [0.2, 0.8]) cyl(C.ink, 0, y, 0, 0.48, 0.09, g);
+  return g;
+}
+function rock(p, x, z, s = 1) {
+  const r = mesh(new THREE.DodecahedronGeometry(1, 0), C.stone, x, 0.32 * s, z, 0.75 * s, 0.65 * s, 0.7 * s, p, true);
+  r.rotation.set(0.1, x, 0.3);
+}
+var SceneView = class {
+  constructor() {
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(8508887);
+    this.camera = new THREE.OrthographicCamera(-20, 20, 12, -12, 0.1, 180);
+    this.target = new THREE.Vector3();
+    this.room = new THREE.Group();
+    this.scene.add(this.room);
+    this.entities = /* @__PURE__ */ new Map();
+    this.particles = [];
+    this.ripples = [];
+    this.time = 0;
+    this.shake = 0;
+    this.title = true;
+    this.reducedMotion = false;
+  }
+  async init() {
+    if (!navigator.gpu) throw new Error("WebGPU is required. Open this adventure in a WebGPU-enabled browser on HTTPS or localhost.");
+    this.renderer = new THREE.WebGPURenderer({ antialias: true, alpha: false });
+    this.renderer._getFallback = null;
+    await this.renderer.init();
+    const lost = this.renderer.onDeviceLost.bind(this.renderer);
+    this.renderer.onDeviceLost = (info) => {
+      lost(info);
+      this.onError?.("The WebGPU device was lost. Reload the island to reconnect.");
+    };
+    if (!this.renderer.backend.isWebGPUBackend) throw new Error("A WebGPU device could not be initialized.");
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    this.renderer.setSize(innerWidth, innerHeight);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.18;
+    document.getElementById("world").appendChild(this.renderer.domElement);
+    const ambient = new THREE.HemisphereLight(16774357, 6399408, 2.25);
+    this.scene.add(ambient);
+    const sun = new THREE.DirectionalLight(16772561, 3.1);
+    sun.position.set(-9, 18, 11);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -22;
+    sun.shadow.camera.right = 22;
+    sun.shadow.camera.top = 22;
+    sun.shadow.camera.bottom = -22;
+    sun.shadow.normalBias = 0.045;
+    sun.shadow.bias = -25e-5;
+    this.scene.add(sun);
+    this.scene.add(sun.target);
+    this.sun = sun;
+    this.resize();
+    addEventListener("resize", () => this.resize());
+  }
+  resize() {
+    if (!this.renderer) return;
+    this.renderer.setSize(innerWidth, innerHeight);
+    const a = innerWidth / innerHeight, h = innerWidth < 900 ? 15.8 : 13;
+    this.camera.left = -h * a;
+    this.camera.right = h * a;
+    this.camera.top = h;
+    this.camera.bottom = -h;
+    this.camera.updateProjectionMatrix();
+  }
+  removeEntity(id) {
+    const g = this.entities.get(id);
+    if (g) {
+      g.removeFromParent();
+      this.entities.delete(id);
+    }
+  }
+  build(def, index = 0) {
+    this.index = index;
+    this.room.clear();
+    this.entities.clear();
+    this.particles = [];
+    this.ripples = [];
+    this.gaps = [];
+    const sea = box(C.water, 0, -0.85, 0, 160, 0.2, 160, this.room);
+    sea.receiveShadow = true;
+    for (let i = 0; i < 78; i++) {
+      const x = Math.sin(i * 12.97) * 34, z = Math.cos(i * 7.7) * 28;
+      if (Math.abs(x) < 11.5 && Math.abs(z) < 9.5) continue;
+      const m = box(i % 2 ? 11331034 : 8574679, x, -0.71, z, 0.6 + i % 4 * 0.35, 0.018, 0.06, this.room);
+      m.rotation.y = 0.13;
+      this.ripples.push(m);
+    }
+    box(C.edge, 0, -0.7, 0, 22.4, 0.9, 18.4, this.room, true);
+    box(index === 4 ? C.stone : C.sand, 0, -0.15, 0, 22, 0.35, 18, this.room, true);
+    for (let x = -10; x <= 10; x += 2) for (let z = -8; z <= 8; z += 2) {
+      if ((x + z) % 6 === 0) {
+        const t = box(index > 3 ? 12239525 : 16244651, x, 0.035, z, 1.91, 0.035, 1.91, this.room);
+        t.rotation.y = x % 3 * 0.015;
+      }
+    }
+    for (let i = 0; i < 11; i++) {
+      const x = -10.9 + i * 2.17;
+      box(C.wood, x, -0.1, 9, 1.7, 0.25, 0.2, this.room);
+      cyl(C.wood, x, 0.35, 9, 0.13, 1.1, this.room);
+    }
+    for (let i = 0; i < 8; i++) {
+      rock(this.room, -11.3 + i * 0.07, -7 + i * 2, 0.7 + i % 3 * 0.2);
+      rock(this.room, 11.2, -7 + i * 2, 0.7);
+    }
+    for (const [x, z, s] of [[-9, -6, 1.25], [9, -6, 1.2], [-9.7, 4, 0.9], [9.5, 4, 1.1], [-7.5, -8, 1], [7.8, -8, 1.3]]) palm(this.room, x, z, s, x * 0.018);
+    for (const [x, z] of [[-10, 0], [10, -2], [-8, -7], [8, 7], [-9, 7]]) bush(this.room, x, z, 1.1);
+    for (let i = 0; i < 26; i++) {
+      const x = Math.sin(i * 22) * 9.8, z = Math.cos(i * 31) * 7.8;
+      if (Math.abs(x) < 7 && Math.abs(z) < 6) continue;
+      ball(i % 3 === 0 ? C.coral : 16773567, x, 0.1, z, 0.12, 0.07, 0.2, this.room);
+    }
+    for (const [x, z, s] of [[-19, -14, 2.4], [18, -18, 3], [23, 7, 1.8]]) {
+      cyl(C.edge, x, -0.6, z, s, 0.4, this.room);
+      cyl(C.sand, x, -0.36, z, s * 0.92, 0.15, this.room);
+      palm(this.room, x, z, 0.8);
+    }
+    const boat = group(this.room, 15, -0.2, 2);
+    const hull = ball(C.coral, 0, 0, 0, 0.8, 0.45, 2, boat, true);
+    box(C.wood, 0, 0.3, 0, 1.5, 0.15, 2.5, boat);
+    cyl(C.wood, 0, 2, 0, 0.06, 3.4, boat);
+    const sail = new THREE.Shape();
+    sail.moveTo(0, 0);
+    sail.lineTo(1.7, 0);
+    sail.lineTo(0, 2.6);
+    sail.closePath();
+    mesh(new THREE.ShapeGeometry(sail), C.cream, 0.02, 0.8, 0, 1, 1, 1, boat);
+    this.boat = boat;
+    if (index === 0) {
+      this.house(-7, -4);
+      for (let i = 0; i < 7; i++) box(C.wood2, -3 + i, 0.08, 6.6, 0.92, 0.16, 3.5, this.room);
+      for (let i = 0; i < 4; i++) barrel(this.room, 7.5 + i % 2, -5 + Math.floor(i / 2) * 1.3);
+      crate(this.room, -8, 1);
+      crate(this.room, -7.5, 2.4, 0.8);
+      const sign = group(this.room, 3, 0, 7);
+      cyl(C.wood, 0, 0.7, 0, 0.09, 1.4, sign);
+      label("BUMBLEBAY", sign, 0, 1.5, 0, 0.38);
+    } else if (index === 5) {
+      for (const x of [-7.5, 7.5]) for (const z of [-6, 0, 6]) this.pillar(x, z, 2.2);
+      const throne = group(this.room, 0, 0, -6.8);
+      box(C.wood, 0, 1.7, 0, 4, 3.4, 0.5, throne, true);
+      box(C.coral, 0, 1.6, 0.32, 3, 2.5, 0.2, throne);
+      label("CAPTAIN CLATTER", throne, 0, 3.5, 0.35, 0.65);
+      const bell2 = group(throne, 0, 4.6, 0);
+      mesh(new THREE.CylinderGeometry(0.3, 0.66, 0.8, 12), C.gold, 0, 0, 0, 1, 1, 1, bell2, true);
+      cyl(C.gold, 0, -0.4, 0, 0.75, 0.12, bell2, true);
+      ball(C.wood, 0, -0.55, 0, 0.16, 0.2, 0.16, bell2);
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.07, 8, 14), mat(C.gold));
+      ring.position.y = 0.55;
+      bell2.add(ring);
+    } else {
+      for (const [x, z] of [[-8, -5], [8, -5], [-8, 5], [8, 5]]) {
+        if (index >= 3) this.pillar(x, z, 1.5 + index * 0.2);
+        else {
+          crate(this.room, x, z);
+          barrel(this.room, x + 1, z);
+        }
+      }
+    }
+    for (const w of def.walls || []) {
+      const [x, z, wid, dep, h = 1.2] = w;
+      box(index > 2 ? C.stone : C.wood, x, h / 2, z, wid, h, dep, this.room, true);
+      box(index > 2 ? 13160626 : C.wood2, x, h + 0.04, z, wid + 0.12, 0.16, dep + 0.12, this.room, true);
+    }
+    for (const gap of def.gaps || []) {
+      const [x, z, w, d] = gap;
+      const water = group(this.room);
+      this.gaps.push(water);
+      box(3513766, x, 0.045, z, w, 0.12, d, water);
+      for (let i = 0; i < 5; i++) box(7854290, x - w * 0.4 + i * w * 0.2, 0.12, z, w * 0.12, 0.02, 0.08, water);
+    }
+    for (const [x, z] of def.anchors || []) {
+      cyl(C.wood, x, 0.5, z, 0.18, 1, this.room, true);
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.09, 8, 16), mat(C.gold));
+      ring.position.set(x, 1.15, z);
+      this.room.add(ring);
+      ring.castShadow = true;
+      ball(C.cream, x, 1.15, z, 0.09, 0.09, 0.09, this.room);
+    }
+    this.exit = group(this.room, 0, 0, -7.8);
+    for (const x of [-1.65, 1.65]) {
+      box(C.ink, x, 1.4, 0, 0.42, 2.8, 0.6, this.exit, true);
+      box(C.gold, x, 2.8, 0, 0.75, 0.25, 0.85, this.exit);
+    }
+    box(C.wood, 0, 2.8, 0, 3.6, 0.35, 0.5, this.exit, true);
+    this.door = group(this.exit);
+    for (let x = -1.35; x < 1.5; x += 0.45) box(C.wood2, x, 1.35, 0, 0.33, 2.55, 0.2, this.door, true);
+    label(index === 5 ? "LUNCH AWAITS" : "ONWARD", this.exit, 0, 3.3, 0.05, 0.42);
+    this.doorGlow = box(16768106, 0, 0.06, -7.2, 2.4, 0.04, 1.5, this.room);
+    this.doorGlow.visible = false;
+  }
+  house(x, z) {
+    const g = group(this.room, x, 0, z);
+    box(C.cream, 0, 1.2, 0, 3, 2.4, 2.6, g, true);
+    const roof = mesh(new THREE.CylinderGeometry(0, 2.6, 1.35, 4), C.coral, 0, 3, 0, 1, 1, 0.85, g, true);
+    roof.rotation.y = Math.PI / 4;
+    box(C.wood, 0, 0.85, 1.33, 0.8, 1.7, 0.1, g, true);
+    for (const x2 of [-0.95, 0.95]) {
+      box(C.blue, x2, 1.5, 1.34, 0.55, 0.65, 0.09, g, true);
+      box(C.cream, x2, 1.5, 1.4, 0.06, 0.65, 0.04, g);
+    }
+    label("LOST & FOUND", g, 0, 2.25, 1.5, 0.38);
+    for (let i = 0; i < 6; i++) box(i % 2 ? C.cream : C.blue, -1.5 + i * 0.6, 2, 2, 0.58, 0.14, 1.3, g);
+    for (const x2 of [-1.5, 1.5]) cyl(C.wood, x2, 1, 2.5, 0.06, 2, g);
+  }
+  pillar(x, z, h) {
+    const g = group(this.room, x, 0, z);
+    box(C.stone, 0, h / 2, 0, 0.65, h, 0.65, g, true);
+    for (const y of [0.15, h]) box(12110251, 0, y, 0, 1.1, 0.3, 1.1, g, true);
+    bush(g, 0.4, 0.2, 0.55);
+  }
+  character(id, colorHex = 15566674, npc = false) {
+    const g = group(this.room);
+    const root = group(g);
+    const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.55, 24), new THREE.MeshBasicNodeMaterial({ color: 3300696, opacity: 0.18, transparent: true, depthWrite: false }));
+    shadow.rotation.x = -Math.PI / 2;
+    shadow.position.y = 0.07;
+    g.add(shadow);
+    const body = ball(colorHex, 0, 0.65, 0, 0.46, 0.55, 0.4, root, true);
+    const head = ball(C.cream, 0, 1.25, 0.06, 0.43, 0.43, 0.4, root, true);
+    const beak = ball(16759891, 0, 1.14, 0.43, 0.29, 0.12, 0.25, root, true);
+    for (const x of [-0.16, 0.16]) {
+      ball(C.ink, x, 1.38, 0.395, 0.055, 0.09, 0.045, root);
+      ball(16777215, x - 0.014, 1.415, 0.43, 0.017, 0.025, 0.01, root);
+    }
+    const cap = ball(colorHex, 0, 1.57, 0, 0.45, 0.16, 0.4, root, true);
+    box(C.ink, 0, 1.54, 0.35, 0.52, 0.06, 0.32, root);
+    const scarf = mesh(new THREE.TorusGeometry(0.29, 0.09, 5, 12), id === 0 ? 16175468 : 15378031, 0, 0.96, 0, 1, 1, 1, root);
+    scarf.rotation.x = Math.PI / 2;
+    const arms = [];
+    for (const x of [-0.46, 0.46]) {
+      const a = group(root, x, 0.88, 0);
+      ball(colorHex, 0, -0.12, 0, 0.15, 0.3, 0.16, a, true);
+      ball(C.cream, 0, -0.35, 0, 0.15, 0.13, 0.15, a);
+      arms.push(a);
+    }
+    const feet = [];
+    for (const x of [-0.22, 0.22]) {
+      const f = group(root, x, 0.15, 0.08);
+      ball(15242302, 0, 0, 0.08, 0.19, 0.11, 0.3, f, true);
+      feet.push(f);
+    }
+    g.userData = { root, arms, feet, shadow, phase: (Number(String(id).replace(/\D/g, "")) || 0) * 2 };
+    if (!npc) {
+      const ring = new THREE.Mesh(new THREE.RingGeometry(0.6, 0.67, 32), new THREE.MeshBasicNodeMaterial({ color: colorHex, side: THREE.DoubleSide }));
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.y = 0.08;
+      g.add(ring);
+    }
+    return g;
+  }
+  entity(e) {
+    let g = group(this.room);
+    if (e.type === "player" || e.type === "npc") {
+      this.room.remove(g);
+      g = this.character(e.id, e.color, e.type === "npc");
+    } else if (e.type === "pot") {
+      mesh(new THREE.CylinderGeometry(0.3, 0.43, 0.68, 9), e.variant ? C.blue : C.coral, 0, 0.38, 0, 1, 1, 1, g, true);
+      cyl(C.cream, 0, 0.7, 0, 0.33, 0.12, g, true);
+      cyl(C.ink, 0, 0.77, 0, 0.23, 0.02, g);
+      for (let i = 0; i < 4; i++) ball(C.cream, Math.cos(i * Math.PI / 2) * 0.38, 0.4, Math.sin(i * Math.PI / 2) * 0.38, 0.08, 0.06, 0.08, g);
+    } else if (e.type === "bomb" || e.type === "hazard") {
+      ball(C.ink, 0, 0.4, 0, 0.38, 0.4, 0.38, g, true);
+      cyl(C.wood2, 0, 0.85, 0, 0.055, 0.2, g);
+      ball(C.gold, 0, 0.95, 0, 0.1, 0.1, 0.1, g);
+    } else if (e.type === "block") {
+      box(10205092, 0, 0.62, 0, 1.3, 1.24, 1.3, g, true);
+      box(13883053, 0, 1.26, 0, 1.42, 0.16, 1.42, g, true);
+      for (const x of [-0.66, 0.66]) {
+        const m = box(C.ink, x, 0.7, 0, 0.02, 0.35, 0.35, g);
+        m.rotation.x = Math.PI / 4;
+      }
+      const q = box(C.gold, 0, 1.36, 0, 0.47, 0.025, 0.47, g);
+      q.rotation.y = Math.PI / 4;
+    } else if (e.type === "plate") {
+      cyl(C.ink, 0, 0.1, 0, 0.75, 0.14, g, true);
+      cyl(C.gold, 0, 0.2, 0, 0.6, 0.1, g, true);
+      const q = box(C.wood, 0, 0.26, 0, 0.4, 0.025, 0.4, g);
+      q.rotation.y = Math.PI / 4;
+    } else if (e.type === "switch") {
+      cyl(C.ink, 0, 0.25, 0, 0.35, 0.5, g, true);
+      ball(C.coral, 0, 0.65, 0, 0.25, 0.23, 0.25, g, true);
+    } else if (e.type === "key") {
+      const tor = new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.065, 6, 14), mat(C.gold));
+      tor.position.y = 0.65;
+      g.add(tor);
+      box(C.gold, 0, 0.31, 0, 0.1, 0.5, 0.1, g);
+      box(C.gold, 0.1, 0.1, 0, 0.25, 0.1, 0.1, g);
+    } else if (e.type === "shell") {
+      const s = mesh(new THREE.SphereGeometry(0.22, 7, 5), C.gold, 0, 0.35, 0, 1, 1, 0.5, g, true);
+      for (let i = -1; i <= 1; i++) box(C.wood, i * 0.1, 0.35, 0.12, 0.025, 0.22, 0.025, g);
+    } else if (e.type === "heart") {
+      ball(C.coral, -0.12, 0.4, 0, 0.18, 0.18, 0.12, g);
+      ball(C.coral, 0.12, 0.4, 0, 0.18, 0.18, 0.12, g);
+      const b = box(C.coral, 0, 0.27, 0, 0.28, 0.28, 0.18, g);
+      b.rotation.z = Math.PI / 4;
+    } else if (e.type === "chest") {
+      box(C.wood, 0, 0.4, 0, 1, 0.8, 0.7, g, true);
+      box(C.gold, 0, 0.45, 0.37, 0.18, 0.3, 0.04, g);
+      for (const x of [-0.36, 0.36]) box(C.gold, x, 0.45, 0, 0.1, 0.86, 0.73, g);
+    } else if (e.type === "enemy" || e.type === "boss") {
+      const boss = e.type === "boss", s = boss ? 2.5 : 1;
+      g.scale.setScalar(s);
+      const root = group(g);
+      ball(boss ? 10118793 : C.coral, 0, 0.5, 0, 0.57, 0.42, 0.46, root, true);
+      for (const x of [-0.21, 0.21]) {
+        cyl(C.coral, x, 0.9, 0.05, 0.055, 0.36, root);
+        ball(C.cream, x, 1.06, 0.05, 0.13, 0.16, 0.12, root, true);
+        ball(C.ink, x, 1.07, 0.16, 0.05, 0.08, 0.04, root);
+      }
+      for (const dir of [-1, 1]) {
+        for (let j = 0; j < 3; j++) {
+          const leg = box(C.coral, dir * 0.66, 0.2, -0.3 + j * 0.3, 0.55, 0.12, 0.12, root, true);
+          leg.rotation.z = dir * 0.35;
+        }
+        ball(C.coral, dir * 0.75, 0.65, 0.4, 0.3, 0.24, 0.32, root, true);
+        box(C.ink, dir * 0.76, 0.7, 0.63, 0.04, 0.2, 0.18, root);
+      }
+      if (boss) {
+        const hat = mesh(new THREE.ConeGeometry(0.7, 0.6, 3), C.ink, 0, 1.45, 0, 1, 1, 0.45, root, true);
+        hat.rotation.y = Math.PI;
+        ball(C.cream, 0, 1.5, 0.2, 0.14, 0.15, 0.07, root);
+        mesh(new THREE.ConeGeometry(0.5, 1.5, 8), 14922877, 0, 0.85, -0.34, 1, 1, 1, root, true).rotation.x = -0.45;
+        box(C.wood, 0, 0.5, -0.65, 0.15, 1.8, 0.15, root);
+      }
+      g.userData.root = root;
+    }
+    this.entities.set(e.id, g);
+    return g;
+  }
+  updateEntity(e, t, dt) {
+    let g = this.entities.get(e.id);
+    if (!g) g = this.entity(e);
+    g.visible = !e.dead;
+    if (e.dead) return;
+    g.position.set(e.x, e.y || 0, e.z);
+    if (e.type === "player" || e.type === "npc") {
+      g.rotation.y = Math.atan2(e.fx || 0, e.fz ?? 1);
+      const d = g.userData;
+      const run = e.moving ? Math.sin(t * 13 + d.phase) : 0;
+      d.root.position.y = Math.abs(run) * 0.075;
+      d.feet[0].rotation.x = run * 0.65;
+      d.feet[1].rotation.x = -run * 0.65;
+      d.arms[0].rotation.x = e.carrying ? -2.65 : run * 0.55;
+      d.arms[1].rotation.x = e.carrying ? -2.65 : -run * 0.55;
+      d.root.rotation.z = e.dash ? Math.sin(t * 20) * 0.13 : 0;
+      g.visible = !(e.invuln > 0 && Math.floor(t * 15) % 2 === 0);
+      if (e.hp <= 0) {
+        d.root.rotation.z = Math.PI / 2;
+        g.visible = true;
+      }
+    } else if (["shell", "key", "heart"].includes(e.type)) {
+      g.rotation.y = t * 1.8;
+      g.position.y = 0.14 + Math.sin(t * 3 + e.x) * 0.13;
+    } else if (e.type === "plate") {
+      g.children[1].position.y = e.active ? 0.12 : 0.2;
+      g.children[1].material = mat(e.active ? C.blue : C.gold);
+    } else if (e.type === "switch") {
+      g.children[1].material = mat(e.active ? C.blue : C.coral);
+    } else if (e.type === "enemy" || e.type === "boss") {
+      g.rotation.y = Math.atan2(e.fx || 0, e.fz ?? 1);
+      if (g.userData.root) {
+        g.userData.root.position.y = Math.abs(Math.sin(t * 9)) * 0.055;
+        g.userData.root.rotation.z = e.stun ? Math.sin(t * 12) * 0.13 : 0;
+      }
+      if (e.type === "boss") {
+        g.scale.setScalar(2.5 + (e.flash > 0 ? 0.15 : 0));
+        if (e.phase === "charge") g.userData.root.rotation.z = Math.sin(t * 25) * 0.12;
+      }
+    } else if (e.type === "bomb") {
+      g.children[2].scale.setScalar(1 + Math.sin(t * 18) * 0.3);
+    }
+    if (e.thrown) g.rotation.x += dt * 9;
+  }
+  effect(x, z, c = C.gold, count = 12, y = 0.6) {
+    for (let i = 0; i < count; i++) {
+      const m = mesh(geo.box, c, x, y, z, 0.09, 0.09, 0.09, this.room);
+      const a = Math.random() * Math.PI * 2, s = 1 + Math.random() * 3;
+      this.particles.push({ m, vx: Math.cos(a) * s, vy: 2 + Math.random() * 3, vz: Math.sin(a) * s, life: 0.6 + Math.random() * 0.4 });
+    }
+  }
+  hook(x, z, tx, tz) {
+    const points = [new THREE.Vector3(x, 0.85, z), new THREE.Vector3(tx, 0.8, tz)];
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), new THREE.LineBasicNodeMaterial({ color: C.cream }));
+    this.room.add(line);
+    this.particles.push({ m: line, vx: 0, vy: 0, vz: 0, life: 0.18 });
+    this.effect(tx, tz, C.blue, 6);
+  }
+  update(game2, dt, mode2 = "play") {
+    this.time += dt;
+    const t = this.time;
+    this.title = mode2 === "title";
+    const desired = new THREE.Vector3(this.title ? -7 : 0, 0, 0);
+    this.target.lerp(desired, Math.min(1, dt * 2));
+    this.camera.position.set(this.target.x, 24, 19 + this.target.z);
+    this.camera.lookAt(this.target.x, 0, this.target.z - 1);
+    if (this.shake > 0 && !this.reducedMotion) {
+      this.camera.position.x += (Math.random() - 0.5) * this.shake;
+      this.shake = Math.max(0, this.shake - dt * 2);
+    }
+    if (this.boat) this.boat.rotation.z = Math.sin(t * 1.2) * 0.045;
+    for (const r of this.ripples) r.scale.x = 1 + Math.sin(t * 1.4 + r.position.x) * 0.18;
+    if (game2) {
+      for (const gap of this.gaps || []) gap.visible = !game2.tideDown;
+      for (const e of game2.entities) this.updateEntity(e, t, dt);
+      for (const p of game2.players) this.updateEntity(p, t, dt);
+      if (game2.companion) this.updateEntity(game2.companion, t, dt);
+      this.door.position.y = THREE.MathUtils.lerp(this.door.position.y, game2.gateOpen ? -3 : 0, Math.min(1, dt * 5));
+      this.doorGlow.visible = game2.gateOpen;
+    }
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.life -= dt;
+      p.m.position.x += p.vx * dt;
+      p.m.position.z += p.vz * dt;
+      p.m.position.y += p.vy * dt;
+      if (p.vy) p.vy -= 8 * dt;
+      if (p.life <= 0) {
+        this.room.remove(p.m);
+        if (p.m.isLine) p.m.geometry.dispose();
+        this.particles.splice(i, 1);
+      }
+    }
+    this.renderer.render(this.scene, this.camera);
+  }
+};
+
+// game.js
+import RAPIER from "@dimforge/rapier3d-compat";
+var ROOMS = [
+  { name: "Wobble Wharf", tag: "01 \xB7 A SMALL DELIVERY PROBLEM", objective: "Lift a pot. Toss it at both crabs to recover the brass key.", walls: [[-7, -4, 3.1, 2.8, 2.4]], pots: [[-3, 3], [0, 3], [4, 2], [-4, -2], [5, -2]], enemies: [[-2, -3], [3, -4]], chests: [[7, 3]], dialogue: ["Mallow", "Good news: we delivered the lunch bell. Bad news: the customer had eight legs and a pirate hat."] },
+  { name: "Crate Expectations", tag: "02 \xB7 THINK OUTSIDE THE CRATE", objective: "Kick the stone crates onto both gold plates. Line up behind each crate.", walls: [[-4, -5.6, 3, 0.5], [4, -5.6, 3, 0.5], [0, -1, 2, 2]], blocks: [[-4, 3], [4, 3]], plates: [[-4, -4.4], [4, -4.4]], pots: [[-7, 1], [7, 1]], chests: [[7, -4]], dialogue: ["Pip", "A puzzle! My specialty. Right after deliveries. And apologies."] },
+  { name: "Hook, Line & Sinker", tag: "03 \xB7 A LITTLE STRING ATTACHED", objective: "Open the toolbox, then hook a gold anchor across the water. Ring the red switch.", walls: [[5, -6.2, 3, 0.6]], gaps: [[0, -1.5, 22, 2.1]], anchors: [[0, 1], [0, -3.5]], switches: [[5, -4.8]], pots: [[-5, 3], [6, -3]], enemies: [[-5, -4]], chests: [[-4, 4]], dialogue: ["Mallow", "My hookshot! Point it at a gold ring and zip. Please keep all feathers inside the zip."] },
+  { name: "The Tidal Turn", tag: "04 \xB7 TWO HEADS, TWO CRATES", objective: "Weight both plates to lower the tide. Clear the crabs to open the gate.", walls: [[-4, 0.1, 3, 0.5], [4, 0.1, 3, 0.5]], blocks: [[-4, 5], [4, 5]], plates: [[-4, 1.3], [4, 1.3]], gaps: [[0, -2, 22, 2]], anchors: [[0, 0], [0, -4]], pots: [[-7, 3], [7, 3], [-6, -5], [5, -5]], enemies: [[-5, -4], [5, -5]], hazards: [[-7, -0.3], [7, -0.3]], chests: [[8, -6]], dialogue: ["Pip", "The tide has a switch? I have been asking the moon very politely for YEARS."] },
+  { name: "The Bell Vault", tag: "05 \xB7 FOR WHOM THE BELL WOBBLES", objective: "Hook all three red gongs within 18 seconds. Open the chest for the vault key.", walls: [[-6, -5.8, 3, 0.5], [0, -6.7, 3, 0.5], [6, -5.8, 3, 0.5], [-3, -2, 1, 3], [3, -2, 1, 3]], switches: [[-6, -4.5], [0, -5.4], [6, -4.5]], pots: [[-6, 2], [0, 2], [6, 2]], chests: [[0, 4]], hazards: [[-6, 0], [6, 0]], dialogue: ["Mallow", "Three gongs. One echo. No pressure. Except the actual pressure plates we already passed."] },
+  { name: "Captain Clatter", tag: "06 \xB7 A CRAB WITH A PLAN", objective: "Catch a landing bomb, then toss it back at Captain Clatter. Dodge his charge!", pots: [[-6, 4], [6, 4]], boss: true, dialogue: ["Captain Clatter", "I STOLE THE BELL TO ANNOUNCE MY EVIL PLANS! ...Does it also announce soup?"] }
+];
+var COLORS = [15303250, 4499885, 8630121, 14924885];
+var dist = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
+var clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+var Game = class {
+  constructor(view2, audio2, events = {}) {
+    this.view = view2;
+    this.audio = audio2;
+    this.events = events;
+    this.players = [];
+    this.entities = [];
+    this.roomIndex = 0;
+    this.elapsed = 0;
+    this.shells = 0;
+    this.keys = 0;
+    this.score = 0;
+    this.done = false;
+    this.attract = false;
+    this.nextId = 10;
+    this.roster = [{ id: 0, name: "Pip" }];
+    this.stats = { throws: 0, crabs: 0, deaths: 0, secrets: 0 };
+    this.simTime = 0;
+    this.hookUnlocked = false;
+    this.remote = /* @__PURE__ */ new Map();
+    this.hudClock = 0;
+    this.fxQueue = [];
+  }
+  async init() {
+    await RAPIER.init();
+  }
+  start({ room = 0, shells = 0, roster, attract: attract2 = false, elapsed = 0 } = {}) {
+    this.hookUnlocked = room >= 3;
+    this.attract = attract2;
+    this.roster = roster?.length ? roster : [{ id: 0, name: "Pip" }];
+    this.shells = shells;
+    this.keys = 0;
+    this.elapsed = elapsed;
+    this.done = false;
+    this.score = room * 500 + shells * 10;
+    this.stats = { throws: 0, crabs: 0, deaths: 0, secrets: 0 };
+    this.loadRoom(room);
+  }
+  loadRoom(index) {
+    this.roomIndex = clamp(index, 0, 5);
+    const def = ROOMS[this.roomIndex];
+    this.def = def;
+    this.entities = [];
+    this.players = [];
+    this.nextId = 10;
+    this.gateOpen = false;
+    this.solved = false;
+    this.tideDown = false;
+    this.keySpawned = false;
+    this.keys = 0;
+    this.roomTime = 0;
+    this.switchClock = 0;
+    this.bossClock = 0;
+    this.transition = 0;
+    this.requestNext = false;
+    this.supplyTimer = 0;
+    this.hookUnlocked = this.hookUnlocked || index >= 3;
+    if (this.world) this.world.free();
+    this.world = new RAPIER.World({ x: 0, y: -16, z: 0 });
+    this.controller = this.world.createCharacterController(0.025);
+    this.controller.setSlideEnabled(true);
+    this.controller.enableAutostep(0.15, 0.2, true);
+    this.controller.enableSnapToGround(0.25);
+    this.world.createCollider(RAPIER.ColliderDesc.cuboid(11, 0.25, 9).setTranslation(0, -0.25, 0));
+    this.wallColliders = [];
+    const addWall = (x, z, w, d, h = 2) => {
+      const c = this.world.createCollider(RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2).setTranslation(x, h / 2, z));
+      this.wallColliders.push(c);
+    };
+    addWall(-11, 0, 0.3, 18);
+    addWall(11, 0, 0.3, 18);
+    addWall(0, 9, 22, 0.3);
+    addWall(0, -9, 22, 0.3);
+    for (const w of def.walls || []) addWall(...w);
+    this.gateCollider = this.world.createCollider(RAPIER.ColliderDesc.cuboid(1.7, 1.4, 0.3).setTranslation(0, 1.4, -7.8));
+    this.view.build(def, index);
+    for (const [i, r] of this.roster.entries()) this.addPlayer(r, i);
+    this.updateCompanion();
+    for (const [x, z] of def.pots || []) this.spawn("pot", x, z, { variant: x > 0 ? 1 : 0 });
+    for (const [x, z] of def.enemies || []) this.spawn("enemy", x, z, { hp: 1, stun: 0, fx: 0, fz: 1, attack: 0 });
+    for (const [x, z] of def.blocks || []) this.spawn("block", x, z, { homeX: x, homeZ: z, vx: 0, vz: 0 });
+    for (const [x, z] of def.plates || []) this.spawn("plate", x, z, { active: false });
+    for (const [x, z] of def.switches || []) this.spawn("switch", x, z, { active: false });
+    for (const [x, z] of def.chests || []) this.spawn("chest", x, z, { opened: false });
+    for (const [x, z] of def.hazards || []) this.spawn("hazard", x, z, { homeX: x, homeZ: z });
+    if (def.boss) this.spawn("boss", 0, -4, { hp: 6, maxHp: 6, phase: "watch", stun: 0, fx: 0, fz: 1, flash: 0 });
+    if (def.blocks) this.spawn("switch", -7, 5.5, { reset: true, active: false });
+    this.world.step();
+    this.audio.setScene(index === 5 ? "boss" : "explore");
+    this.events.onRoom?.(index, def);
+    if (!this.attract) this.say(...def.dialogue);
+    this.save();
+  }
+  addPlayer(r, i = 0) {
+    if (this.players.some((p2) => p2.id === "p" + r.id)) return;
+    const p = { id: "p" + r.id, pid: r.id, type: "player", name: r.name || ["Pip", "Mallow", "Coco", "Tuck"][i], color: r.color ? parseInt(r.color.replace("#", ""), 16) : COLORS[i % 4], x: i % 2 * 1.4 - 0.7, z: 6 + Math.floor(i / 2) * 1.2, y: 0, fx: 0, fz: -1, hp: 5, maxHp: 5, carrying: null, invuln: 0, cooldown: 0, dash: 0, hookCD: 0, moving: false };
+    p.body = this.world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(p.x, 0.63, p.z));
+    p.collider = this.world.createCollider(RAPIER.ColliderDesc.capsule(0.28, 0.32), p.body);
+    this.players.push(p);
+    return p;
+  }
+  setRoster(roster) {
+    this.roster = roster;
+    for (const p of [...this.players]) if (!roster.some((r) => r.id === p.pid)) {
+      this.drop(p);
+      this.world.removeRigidBody(p.body);
+      this.players.splice(this.players.indexOf(p), 1);
+      this.view.entities.get(p.id)?.removeFromParent();
+      this.view.entities.delete(p.id);
+    }
+    roster.forEach((r, i) => this.addPlayer(r, i));
+    this.updateCompanion();
+  }
+  updateCompanion() {
+    if (this.players.length === 1 && !this.events.online?.()) {
+      this.companion = { id: "companion", type: "npc", x: 2, z: 6, y: 0, fx: 0, fz: -1, color: COLORS[1], moving: false, hp: 5 };
+    } else {
+      this.companion = null;
+      this.view.entities.get("companion")?.removeFromParent();
+      this.view.entities.delete("companion");
+    }
+  }
+  spawn(type, x, z, extra = {}) {
+    const e = { id: this.nextId++, type, x, z, y: 0, dead: false, ...extra };
+    if (type === "block") {
+      e.body = this.world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x, 0.63, z));
+      e.collider = this.world.createCollider(RAPIER.ColliderDesc.cuboid(0.65, 0.62, 0.65), e.body);
+    }
+    this.entities.push(e);
+    return e;
+  }
+  kill(e) {
+    e.dead = true;
+    if (e.body) {
+      this.world.removeRigidBody(e.body);
+      e.body = null;
+      e.collider = null;
+    }
+    if (this.view.removeEntity) this.view.removeEntity(e.id);
+    else {
+      this.view.entities.get(e.id)?.removeFromParent();
+      this.view.entities.delete(e.id);
+    }
+  }
+  say(name, text) {
+    this.events.onDialogue?.(name, text);
+    this.audio.speak(text, name === "Pip" ? 0 : name === "Mallow" ? 1 : 2);
+  }
+  hint(text) {
+    this.events.onHint?.(text);
+  }
+  effect(x, z, c, count = 12, y = 0.6) {
+    this.view.effect(x, z, c, count, y);
+    this.fxQueue.push([+x.toFixed(2), +z.toFixed(2), c, count, y]);
+    if (this.fxQueue.length > 8) this.fxQueue.shift();
+  }
+  player(pid) {
+    return this.players.find((p) => p.pid === pid);
+  }
+  acceptInput(input2, pid) {
+    const p = this.player(pid);
+    if (!p) return;
+    const s = input2.state;
+    if (s && Number.isFinite(s.x) && Number.isFinite(s.z)) {
+      if (s.room === this.roomIndex) {
+        p.x = clamp(s.x, -10.5, 10.5);
+        p.z = clamp(s.z, -8.5, 8.5);
+        p.fx = s.fx || 0;
+        p.fz = s.fz || -1;
+        p.body.setTranslation({ x: p.x, y: 0.63, z: p.z }, true);
+      }
+    }
+    const old = this.remote.get(pid) || {};
+    this.remote.set(pid, { ...input2, action: old.action || input2.pressed?.action || input2.action, kick: old.kick || input2.pressed?.kick || input2.kick, hook: old.hook || input2.pressed?.hook || input2.hook, dodge: old.dodge || input2.pressed?.dodge || input2.dodge, age: 0 });
+  }
+  action(p, input2) {
+    if (p.hp <= 0) return;
+    p.cooldown = Math.max(0, p.cooldown);
+    if (input2.dodge && p.cooldown <= 0) {
+      if (p.carrying) this.drop(p);
+      else {
+        p.dash = 0.25;
+        p.invuln = Math.max(p.invuln, 0.35);
+        p.cooldown = 0.6;
+        this.audio.sfx("dash");
+      }
+    }
+    if (input2.hook && p.hookCD <= 0) this.hook(p);
+    if (input2.kick && p.cooldown <= 0) {
+      const b = this.nearest(p, (e) => e.type === "block" && !e.dead, 1.9);
+      if (b) {
+        let dx = b.x - p.x, dz = b.z - p.z;
+        if (Math.abs(dx) > Math.abs(dz)) {
+          b.vx = Math.sign(dx) * 8;
+          b.vz = 0;
+        } else {
+          b.vz = Math.sign(dz) * 8;
+          b.vx = 0;
+        }
+        p.cooldown = 0.3;
+        this.audio.sfx("switch");
+        this.effect(b.x, b.z, 16768416, 8);
+      } else this.hint("Stand beside a stone crate, then kick.");
+    }
+    if (!input2.action || p.cooldown > 0) return;
+    p.cooldown = 0.24;
+    if (p.carrying) {
+      this.throw(p);
+      return;
+    }
+    const down = this.players.find((q) => q !== p && q.hp <= 0 && dist(q, p) < 2);
+    if (down) {
+      down.hp = 3;
+      down.invuln = 2;
+      this.audio.sfx("pickup");
+      this.effect(down.x, down.z, 15956053, 18);
+      this.hint("Back on your webbed feet!");
+      return;
+    }
+    const object = this.nearest(p, (e) => !e.dead && !e.held && !e.thrown && (e.type === "pot" || e.type === "bomb" || e.type === "enemy" && e.stun > 0), 1.7);
+    if (object) {
+      p.carrying = object.id;
+      object.held = p.id;
+      object.y = 1.9;
+      if (object.body) {
+        this.world.removeRigidBody(object.body);
+        object.body = null;
+      }
+      this.audio.sfx("pickup");
+      return;
+    }
+    const chest = this.nearest(p, (e) => e.type === "chest" && !e.opened, 1.8);
+    if (chest) {
+      chest.opened = true;
+      this.kill(chest);
+      this.audio.sfx("door");
+      this.effect(chest.x, chest.z, 16763749, 22);
+      if (this.roomIndex === 2) {
+        this.hookUnlocked = true;
+        this.say("Mallow", "Grapple-matic, reporting for duty! Triangle or Q. Gold rings pull you; red gongs ring.");
+      } else if (this.roomIndex === 4) {
+        this.keys++;
+        this.hint("Vault key found. Now for those three gongs!");
+      } else {
+        this.shells += 10;
+        this.stats.secrets++;
+        this.spawn("heart", chest.x, chest.z);
+        this.hint("Secret stash! +10 shells and a heart.");
+      }
+      return;
+    }
+    const reset = this.nearest(p, (e) => e.reset, 1.8);
+    if (reset) {
+      for (const b of this.entities.filter((e) => e.type === "block")) {
+        b.x = b.homeX;
+        b.z = b.homeZ;
+        b.vx = 0;
+        b.vz = 0;
+        b.body.setTranslation({ x: b.x, y: 0.63, z: b.z }, true);
+      }
+      this.hint("Crates returned. A fresh start!");
+      this.audio.sfx("switch");
+      return;
+    }
+    const sw = this.nearest(p, (e) => e.type === "switch" && !e.reset, 1.7);
+    if (sw) {
+      this.activate(sw);
+      return;
+    }
+    if (p.z < -5.8 && Math.abs(p.x) < 2.4) {
+      if (this.gateOpen) this.requestNext = true;
+      else this.hint(this.objective());
+      return;
+    }
+    if (this.companion && dist(p, this.companion) < 2.2) this.say("Mallow", this.roomIndex === 1 ? "The red reset buoy puts crates back if your brilliant plan becomes furniture." : this.objective());
+  }
+  nearest(p, pred, max2) {
+    let best = null, d = max2;
+    for (const e of this.entities) {
+      if (!pred(e)) continue;
+      const n = dist(p, e);
+      if (n < d) {
+        d = n;
+        best = e;
+      }
+    }
+    return best;
+  }
+  throw(p) {
+    const e = this.entities.find((e2) => e2.id === p.carrying);
+    p.carrying = null;
+    if (!e) return;
+    e.held = null;
+    e.thrown = true;
+    e.owner = p.pid;
+    e.y = 1.7;
+    e.x = p.x + p.fx * 0.7;
+    e.z = p.z + p.fz * 0.7;
+    e.life = 1.5;
+    e.body = this.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(e.x, e.y, e.z).setLinvel(p.fx * 10, 3.5, p.fz * 10).setCcdEnabled(true));
+    e.collider = this.world.createCollider(RAPIER.ColliderDesc.ball(0.24).setRestitution(0.25), e.body);
+    e.collider.setCollisionGroups(131073);
+    this.stats.throws++;
+    this.audio.sfx("throw");
+  }
+  drop(p) {
+    if (!p.carrying) return;
+    const e = this.entities.find((e2) => e2.id === p.carrying);
+    p.carrying = null;
+    if (e) {
+      e.held = null;
+      e.y = 0;
+      e.x = clamp(p.x + p.fx * 0.9, -10, 10);
+      e.z = clamp(p.z + p.fz * 0.9, -8, 8);
+      e.fuse = Math.max(e.fuse || 0, 3);
+    }
+    this.audio.sfx("pickup");
+  }
+  hook(p) {
+    if (!this.hookUnlocked) {
+      this.hint(this.roomIndex === 2 ? "Open the toolbox first." : "The hookshot is waiting on the next island.");
+      return;
+    }
+    p.hookCD = 0.55;
+    const targets = [];
+    for (const [x, z] of this.def.anchors || []) targets.push({ x, z, anchor: true });
+    for (const e of this.entities) if (!e.dead && !e.reset && (e.type === "enemy" || e.type === "switch" || e.type === "shell" || e.type === "key" || e.type === "pot")) targets.push(e);
+    let chosen = null, best = 100;
+    for (const t of targets) {
+      const d = dist(p, t);
+      if (d > 0.6 && d < 8) {
+        const alignment = ((t.x - p.x) * p.fx + (t.z - p.z) * p.fz) / d;
+        if (alignment > 0.55) {
+          const score = d * (1.7 - alignment);
+          if (score < best) {
+            best = score;
+            chosen = t;
+          }
+        }
+      }
+    }
+    if (chosen) {
+      this.view.hook(p.x, p.z, chosen.x, chosen.z);
+      this.audio.sfx("hook");
+      if (chosen.anchor) {
+        p.pull = { sx: p.x, sz: p.z, x: chosen.x, z: chosen.z, t: 0 };
+        p.invuln = 0.6;
+      } else if (chosen.type === "enemy") {
+        chosen.stun = 4;
+        this.hint("Stunned! Lift the crab and toss it.");
+      } else if (chosen.type === "switch") this.activate(chosen);
+      else {
+        chosen.x = p.x + p.fx * 0.8;
+        chosen.z = p.z + p.fz * 0.8;
+      }
+    } else {
+      this.view.hook(p.x, p.z, p.x + p.fx * 6, p.z + p.fz * 6);
+      this.audio.sfx("hook");
+    }
+  }
+  activate(sw) {
+    if (sw.active) return;
+    sw.active = true;
+    this.audio.sfx("switch");
+    this.effect(sw.x, sw.z, 16766315, 14);
+    if (this.roomIndex === 4 && !this.switchClock) this.switchClock = 18;
+  }
+  hurt(p, n = 1) {
+    if (p.invuln > 0 || p.hp <= 0 || this.attract) return;
+    p.hp = Math.max(0, p.hp - n);
+    p.invuln = 1.5;
+    this.view.shake = 0.35;
+    this.audio.sfx("hurt");
+    this.effect(p.x, p.z, 15956053, 10);
+    if (p.hp <= 0) {
+      this.drop(p);
+      p.downTime = 0;
+      this.hint(this.players.length > 1 ? "Partner down! Stand nearby and press lift to revive." : "Mallow is coming. Hold tight!");
+    }
+  }
+  movePlayer(p, input2, dt, predict = false) {
+    if (p.hp <= 0) {
+      p.downTime = (p.downTime || 0) + dt;
+      return;
+    }
+    p.invuln = Math.max(0, p.invuln - dt);
+    p.cooldown = Math.max(0, p.cooldown - dt);
+    p.hookCD = Math.max(0, p.hookCD - dt);
+    p.dash = Math.max(0, p.dash - dt);
+    let x = input2.x || 0, z = input2.y || 0;
+    const len = Math.hypot(x, z);
+    if (len > 1) {
+      x /= len;
+      z /= len;
+    }
+    p.moving = len > 0.1;
+    if (Math.hypot(input2.aimX || 0, input2.aimY || 0) > 0.3) {
+      p.fx = input2.aimX;
+      p.fz = input2.aimY;
+      const l = Math.hypot(p.fx, p.fz);
+      p.fx /= l;
+      p.fz /= l;
+    } else if (p.moving) {
+      p.fx = x / (Math.hypot(x, z) || 1);
+      p.fz = z / (Math.hypot(x, z) || 1);
+    }
+    if (p.pull) {
+      const q = p.pull;
+      q.t += dt * 3.5;
+      const t = Math.min(1, q.t);
+      p.x = q.sx + (q.x - q.sx) * t;
+      p.z = q.sz + (q.z - q.sz) * t;
+      p.y = Math.sin(t * Math.PI) * 0.6;
+      if (t === 1) {
+        p.pull = null;
+        p.y = 0;
+      }
+    } else {
+      const speed = p.dash ? 10 : p.carrying ? 3.7 : 4.7;
+      if (p.dash) {
+        x = p.fx;
+        z = p.fz;
+      }
+      const delta = { x: x * speed * dt, y: 0, z: z * speed * dt };
+      this.controller.computeColliderMovement(p.collider, delta, void 0, void 0, (c) => !this.players.some((q) => q.collider.handle === c.handle));
+      const v = this.controller.computedMovement();
+      p.x = clamp(p.x + v.x, -10.5, 10.5);
+      p.z = clamp(p.z + v.z, -8.5, 8.5);
+      if (!this.tideDown && (this.def.gaps || []).some(([gx, gz, w, d]) => Math.abs(p.x - gx) < w / 2 && Math.abs(p.z - gz) < d / 2)) {
+        this.hurt(p);
+        p.z = p.z < this.def.gaps[0][1] ? this.def.gaps[0][1] - this.def.gaps[0][3] / 2 - 0.6 : this.def.gaps[0][1] + this.def.gaps[0][3] / 2 + 0.6;
+        this.effect(p.x, p.z, 11071472, 15);
+      }
+    }
+    p.body.setTranslation({ x: p.x, y: 0.63, z: p.z }, true);
+    if (!predict) this.action(p, input2);
+    if (p.carrying) {
+      const e = this.entities.find((e2) => e2.id === p.carrying);
+      if (e) {
+        e.x = p.x;
+        e.z = p.z;
+        e.y = 1.85 + (p.y || 0);
+      }
+    }
+  }
+  objective() {
+    if (this.gateOpen) return "Gate open! Head north together. Press lift at the gate.";
+    if (this.roomIndex === 2 && !this.hookUnlocked) return "Open the toolbox beside you. Press lift to get the hookshot.";
+    if (this.roomIndex === 4 && this.switchClock > 0) return `Ring the remaining gongs \xB7 ${Math.ceil(this.switchClock)} seconds`;
+    if (this.roomIndex === 5) {
+      const b = this.entities.find((e) => e.type === "boss" && !e.dead);
+      return b?.phase === "charge" ? "Claws up! Dodge the charge, then return a bomb." : this.def.objective;
+    }
+    return this.def.objective;
+  }
+  update(dt, inputs = /* @__PURE__ */ new Map()) {
+    if (this.done) return;
+    this.elapsed += dt;
+    this.simTime += dt;
+    this.roomTime += dt;
+    this.world.timestep = dt;
+    this.world.step();
+    for (const p of this.players) {
+      let input2 = inputs.get(p.pid) || this.remote.get(p.pid) || {};
+      if (!inputs.has(p.pid) && this.remote.has(p.pid)) {
+        input2.age += dt;
+        if (input2.age > 0.4) input2 = {};
+      }
+      this.movePlayer(p, input2, dt);
+      if (this.remote.has(p.pid)) {
+        const r = this.remote.get(p.pid);
+        r.action = r.kick = r.hook = r.dodge = false;
+      }
+    }
+    if (this.requestNext) {
+      this.nextRoom();
+      return;
+    }
+    if (this.companion) {
+      const p = this.players[0], c = this.companion;
+      const target = p.hp <= 0 ? p : { x: p.x + 1.6, z: p.z + 1 };
+      const d = dist(c, target);
+      c.moving = d > 0.6;
+      if (d > 0.6) {
+        const v = Math.min(d, dt * 3.8);
+        c.fx = (target.x - c.x) / d;
+        c.fz = (target.z - c.z) / d;
+        c.x += c.fx * v;
+        c.z += c.fz * v;
+      }
+      if (p.hp <= 0 && p.downTime > 2 && d < 1.5) {
+        p.hp = 3;
+        p.invuln = 2;
+        this.stats.deaths++;
+        this.shells = Math.max(0, this.shells - 3);
+        this.audio.sfx("pickup");
+        this.hint("Mallow: There. Good as slightly used! \u22123 shells");
+      }
+    }
+    if (!this.companion && this.players.length && this.players.every((p) => p.hp <= 0) && this.players.every((p) => p.downTime > 2)) {
+      this.stats.deaths++;
+      this.shells = Math.max(0, this.shells - 5);
+      this.loadRoom(this.roomIndex);
+      return;
+    }
+    for (const e of [...this.entities]) {
+      if (e.dead || e.held) continue;
+      if (e.thrown) {
+        e.life -= dt;
+        const pos = e.body.translation();
+        e.x = pos.x;
+        e.y = pos.y;
+        e.z = pos.z;
+        let hit = false;
+        for (const target of this.entities) {
+          if (target.dead || target === e || target.held) continue;
+          if ((target.type === "enemy" || target.type === "boss") && dist(e, target) < (target.type === "boss" ? 1.65 : 0.85) && e.y < 2.9) {
+            if (target.type === "boss" && e.type !== "bomb") {
+              target.stun = 0.6;
+              this.hint("That shell is pot-proof. Try his bombs!");
+            } else {
+              target.hp--;
+              target.flash = 0.3;
+              target.stun = 0.6;
+              this.audio.sfx("hit");
+              this.effect(target.x, target.z, 16766575, 18);
+              if (target.hp <= 0) {
+                this.kill(target);
+                this.stats.crabs++;
+                this.shells += 3;
+                this.score += 100;
+                this.spawn("heart", target.x, target.z);
+                if (target.type === "boss") this.finish();
+              }
+            }
+            hit = true;
+            break;
+          }
+          if (target.type === "switch" && !target.reset && dist(e, target) < 0.9) {
+            this.activate(target);
+            hit = true;
+            break;
+          }
+        }
+        if (hit || e.life <= 0 || e.y < 0.27 || Math.abs(e.x) > 11 || Math.abs(e.z) > 9) {
+          this.effect(e.x, e.z, e.type === "bomb" ? 16762460 : 15767141, 14);
+          this.audio.sfx("break");
+          if (e.type === "bomb") {
+            for (const p of this.players) if (dist(p, e) < 1.5) this.hurt(p);
+          } else if (e.type === "pot" && Math.random() < 0.75) this.spawn("shell", e.x, e.z);
+          this.kill(e);
+        }
+        continue;
+      }
+      if (e.type === "enemy") {
+        e.stun = Math.max(0, e.stun - dt);
+        e.attack = Math.max(0, e.attack - dt);
+        const p = this.players.filter((p2) => p2.hp > 0).sort((a, b) => dist(a, e) - dist(b, e))[0];
+        if (p && !e.stun) {
+          const d = dist(e, p);
+          if (d < 8 && d > 0.65) {
+            e.fx = (p.x - e.x) / d;
+            e.fz = (p.z - e.z) / d;
+            const nx = e.x + e.fx * dt * 1.35, nz = e.z + e.fz * dt * 1.35;
+            if (!this.inWall(nx, nz, 0.4) && !this.inGap(nx, nz)) {
+              e.x = nx;
+              e.z = nz;
+            }
+          }
+          if (d < 0.85 && e.attack <= 0) {
+            this.hurt(p);
+            e.attack = 1.2;
+          }
+        }
+      }
+      if (e.type === "block" && (e.vx || e.vz)) {
+        const nx = e.x + e.vx * dt, nz = e.z + e.vz * dt;
+        const other = this.entities.some((b) => b !== e && b.type === "block" && Math.abs(b.x - nx) < 1.32 && Math.abs(b.z - nz) < 1.32);
+        if (Math.abs(nx) > 9.8 || Math.abs(nz) > 7.8 || this.inWall(nx, nz, 0.7) || other) {
+          e.vx = e.vz = 0;
+          this.audio.sfx("switch");
+          this.effect(e.x, e.z, 13096618, 6);
+        } else {
+          e.x = nx;
+          e.z = nz;
+          e.body.setTranslation({ x: e.x, y: 0.63, z: e.z }, true);
+          for (const p of this.players) if (dist(e, p) < 1) {
+            this.hurt(p);
+            p.x = clamp(p.x + Math.sign(e.vx) * 0.7, -10, 10);
+            p.z = clamp(p.z + Math.sign(e.vz) * 0.7, -8, 8);
+          }
+        }
+      }
+      if (e.type === "plate") {
+        e.active = this.entities.some((b) => !b.dead && !b.held && !b.thrown && ["block", "pot"].includes(b.type) && dist(e, b) < 1) || this.players.some((p) => p.hp > 0 && dist(e, p) < 0.7);
+      }
+      if (["shell", "heart", "key"].includes(e.type)) {
+        const p = this.players.find((p2) => p2.hp > 0 && dist(p2, e) < 0.85);
+        if (p) {
+          if (e.type === "shell") {
+            this.shells++;
+            this.score += 10;
+          }
+          if (e.type === "heart") {
+            p.hp = Math.min(5, p.hp + 1);
+          }
+          if (e.type === "key") {
+            this.keys++;
+            this.hint("Brass key recovered! The northern gate is open.");
+          }
+          this.kill(e);
+          this.audio.sfx("coin");
+          this.effect(e.x, e.z, 16765532, 7);
+        }
+      }
+      if (e.type === "hazard") {
+        e.x = e.homeX + Math.sin(this.roomTime * 1.8) * 1.5;
+        if (!this.view.entities.has(e.id)) {
+          const p = this.view.entity({ ...e, type: "bomb" });
+          p.scale.set(1.1, 0.5, 1.1);
+        }
+        for (const p of this.players) if (dist(p, e) < 0.8) this.hurt(p);
+      }
+      if (e.type === "bomb") {
+        e.fuse -= dt;
+        if (e.fuse < 0) {
+          this.effect(e.x, e.z, 16760420, 24);
+          this.audio.sfx("break");
+          this.view.shake = 0.3;
+          for (const p of this.players) if (dist(p, e) < 1.65) this.hurt(p);
+          this.kill(e);
+        }
+      }
+      if (e.type === "boss") this.updateBoss(e, dt);
+    }
+    const aliveEnemies = this.entities.filter((e) => e.type === "enemy" && !e.dead);
+    if (this.roomIndex === 0 && aliveEnemies.length === 0 && !this.keySpawned) {
+      this.keySpawned = true;
+      this.spawn("key", 0, -4);
+      this.hint("The crab dropped a brass key!");
+    }
+    const plates = this.entities.filter((e) => e.type === "plate");
+    if (plates.length && plates.every((e) => e.active) && !this.solved) {
+      this.solved = true;
+      this.tideDown = true;
+      this.effect(0, -2, 9233365, 24);
+      this.audio.sfx("door");
+      this.hint(this.roomIndex === 3 ? "Tide lowered! Clear the crabs and head north." : "Nice footwork! Both plates are locked in.");
+    }
+    if (this.roomIndex === 4 && this.switchClock > 0 && !this.solved) {
+      this.switchClock -= dt;
+      if (this.entities.filter((e) => e.type === "switch" && !e.reset).every((e) => e.active)) {
+        this.solved = true;
+        this.hint("A perfect terrible chord. The vault is open!");
+      } else if (this.switchClock <= 0) {
+        this.switchClock = 0;
+        for (const e of this.entities) if (e.type === "switch") e.active = false;
+        this.hint("The echo faded. Hook the three gongs in one quick loop.");
+      }
+    }
+    const open = this.roomIndex === 0 ? this.keys > 0 : this.roomIndex === 1 ? this.solved : this.roomIndex === 2 ? this.entities.some((e) => e.type === "switch" && e.active) : this.roomIndex === 3 ? this.solved && !aliveEnemies.length : this.roomIndex === 4 ? this.solved && this.keys > 0 : false;
+    if (open && !this.gateOpen) {
+      this.gateOpen = true;
+      this.gateCollider.setEnabled(false);
+      this.audio.sfx("door");
+      this.effect(0, -7, 16768107, 20);
+      this.save();
+    }
+    if (this.gateOpen && this.players.some((p) => p.hp > 0 && p.z < -7.35 && Math.abs(p.x) < 1.6)) {
+      this.nextRoom();
+      return;
+    }
+    this.supplyTimer += dt;
+    if (this.supplyTimer > 4) {
+      this.supplyTimer = 0;
+      if (!this.entities.some((e) => e.type === "pot" && !e.dead) && this.roomIndex !== 5) {
+        for (const [x, z] of (this.def.pots || []).slice(0, 2)) this.spawn("pot", x, z);
+      }
+    }
+    this.hudClock += dt;
+    if (this.hudClock > 0.1) {
+      this.hudClock = 0;
+      this.events.onHud?.(this.hud());
+    }
+  }
+  inWall(x, z, r = 0) {
+    return (this.def.walls || []).some(([wx, wz, w, d]) => Math.abs(x - wx) < w / 2 + r && Math.abs(z - wz) < d / 2 + r);
+  }
+  inGap(x, z) {
+    return !this.tideDown && (this.def.gaps || []).some(([gx, gz, w, d]) => Math.abs(x - gx) < w / 2 && Math.abs(z - gz) < d / 2);
+  }
+  updateBoss(b, dt) {
+    this.bossClock += dt;
+    b.flash = Math.max(0, b.flash - dt);
+    b.stun = Math.max(0, b.stun - dt);
+    const p = this.players.filter((p2) => p2.hp > 0).sort((a, c) => dist(a, b) - dist(c, b))[0];
+    if (!p) return;
+    const cycle = this.bossClock % 9;
+    b.phase = cycle > 5.4 && cycle < 6.4 ? "charge" : cycle > 6.4 && cycle < 7.8 ? "rush" : "watch";
+    if (b.phase === "charge") {
+      b.tx = p.x;
+      b.tz = p.z;
+      b.fx = (p.x - b.x) / (dist(p, b) || 1);
+      b.fz = (p.z - b.z) / (dist(p, b) || 1);
+      if (!b.warned) {
+        this.hint("Claws up! Dodge sideways!");
+        b.warned = true;
+      }
+    } else if (b.phase === "rush" && !b.stun) {
+      b.x = clamp(b.x + b.fx * dt * 7, -8, 8);
+      b.z = clamp(b.z + b.fz * dt * 7, -6, 6);
+    } else {
+      b.warned = false;
+      const d = dist(b, { x: 0, z: -4 });
+      if (d > 0.1 && !b.stun) {
+        b.x += (0 - b.x) * dt * 0.65;
+        b.z += (-4 - b.z) * dt * 0.65;
+      }
+      b.fx = (p.x - b.x) / (dist(p, b) || 1);
+      b.fz = (p.z - b.z) / (dist(p, b) || 1);
+    }
+    b.bombTimer = (b.bombTimer || 0) + dt;
+    if (b.bombTimer > 2.9) {
+      b.bombTimer = 0;
+      const x = clamp(p.x + (Math.random() - 0.5) * 2, -8, 8), z = clamp(p.z - 1, -6, 6);
+      this.spawn("bomb", x, z, { fuse: 6 });
+      this.effect(x, z, 16766074, 6);
+      this.audio.sfx("throw");
+    }
+    for (const q of this.players) if (dist(q, b) < 1.9) this.hurt(q);
+  }
+  nextRoom() {
+    if (this.transition || this.done) return;
+    this.transition = 1;
+    this.score += 500;
+    this.events.onHint?.("Checkpoint saved \xB7 " + (ROOMS[this.roomIndex + 1]?.name || "Lunch is served!"));
+    if (this.roomIndex < 5) this.loadRoom(this.roomIndex + 1);
+    else this.finish();
+  }
+  finish() {
+    if (this.done) return;
+    this.done = true;
+    this.score += 1e3;
+    this.audio.setScene("win");
+    this.audio.sfx("win");
+    this.effect(0, -4, 16766575, 65, 2);
+    try {
+      if (!this.attract && !this.events.online?.()) localStorage.removeItem("goofaloop-save");
+    } catch {
+    }
+    this.events.onWin?.({ won: true, score: this.score + this.shells * 10, shells: this.shells, time: this.elapsed, stats: this.stats });
+  }
+  hud() {
+    const boss = this.entities.find((e) => e.type === "boss" && !e.dead);
+    return { hearts: this.players[0]?.hp || 0, maxHearts: 5, players: this.players.map((p) => ({ name: p.name, hearts: p.hp, maxHearts: 5 })), partnerHearts: this.players[1]?.hp, partnerName: this.players[1]?.name, room: this.def.name, roomIndex: this.roomIndex, roomCount: 6, objective: this.objective(), keys: this.keys, shells: this.shells, carrying: !!this.players[0]?.carrying, hook: this.hookUnlocked, boss: boss ? { name: "Captain Clatter", hp: boss.hp, maxHp: 6 } : null };
+  }
+  save() {
+    if (this.attract || this.events.online?.()) return;
+    try {
+      localStorage.setItem("goofaloop-save", JSON.stringify({ room: this.roomIndex, shells: this.shells, elapsed: this.elapsed }));
+    } catch {
+    }
+  }
+  snapshot() {
+    const round = (n) => Math.round((n || 0) * 100) / 100;
+    return { r: this.roomIndex, t: round(this.simTime), et: round(this.elapsed), s: this.shells, k: this.keys, g: this.gateOpen, h: this.hookUnlocked, td: this.tideDown, so: this.solved, sc: round(this.switchClock), score: this.score, done: this.done, p: this.players.map((p) => [p.pid, round(p.x), round(p.z), p.hp, round(p.fx), round(p.fz), p.carrying, round(p.invuln), p.moving ? 1 : 0]), e: this.entities.filter((e) => !e.dead).map((e) => [e.id, e.type, round(e.x), round(e.z), round(e.y), e.hp || 0, e.active ? 1 : 0, e.held || null, e.thrown ? 1 : 0, round(e.stun), e.opened ? 1 : 0, round(e.fuse), e.reset ? 1 : 0, round(e.fx), round(e.fz), e.phase || "", round(e.flash)]), fx: this.fxQueue.splice(0) };
+  }
+  applySnapshot(s, localId) {
+    if (!s || !Number.isInteger(s.r)) return;
+    const changed = this.roomIndex !== s.r;
+    if (changed) this.loadRoom(s.r);
+    this.simTime = s.t;
+    this.elapsed = s.et;
+    this.shells = s.s;
+    this.keys = s.k;
+    this.gateOpen = s.g;
+    this.hookUnlocked = s.h;
+    this.tideDown = s.td;
+    this.solved = s.so;
+    this.switchClock = s.sc;
+    this.score = s.score;
+    if (this.gateCollider) this.gateCollider.setEnabled(!s.g);
+    for (const row of s.p || []) {
+      const [id, x, z, hp, fx, fz, carry, inv, moving] = row;
+      let p = this.player(id);
+      if (!p) p = this.addPlayer({ id, name: ["Pip", "Mallow", "Coco", "Tuck"][id] || "Pal" }, id);
+      if (id !== localId || changed || hp <= 0 || dist(p, { x, z }) > 5) {
+        p.targetX = x;
+        p.targetZ = z;
+        if (changed || dist(p, { x, z }) > 5) {
+          p.x = x;
+          p.z = z;
+        }
+        if (id === localId) {
+          p.x = x;
+          p.z = z;
+        }
+        p.fx = fx;
+        p.fz = fz;
+        p.moving = !!moving;
+      }
+      p.hp = hp;
+      p.carrying = carry;
+      p.invuln = inv;
+    }
+    const ids = new Set((s.e || []).map((e) => e[0]));
+    for (const e of [...this.entities]) if (!ids.has(e.id)) {
+      this.kill(e);
+      this.entities.splice(this.entities.indexOf(e), 1);
+    }
+    for (const row of s.e || []) {
+      const [id, type, x, z, y, hp, active, held, thrown, stun, opened, fuse, reset, fx, fz, phase, flash] = row;
+      let e = this.entities.find((e2) => e2.id === id);
+      if (!e) {
+        e = this.spawn(type, x, z);
+        e.id = id;
+      }
+      Object.assign(e, { type, x, z, y, hp, active: !!active, held, thrown: !!thrown, stun, opened: !!opened, fuse, reset: !!reset, fx, fz, phase, flash, dead: false });
+      if (e.body && !thrown) e.body.setTranslation({ x, y: 0.63, z }, true);
+    }
+    for (const [x, z, c, count, y] of s.fx || []) this.view.effect(x, z, c, count, y);
+    this.events.onHud?.(this.hud());
+    if (s.done && !this.done) {
+      this.done = true;
+      this.events.onWin?.({ won: true, score: s.score, shells: s.s, time: s.et, stats: this.stats });
+    }
+  }
+  predict(dt, pid, input2) {
+    const p = this.player(pid);
+    if (p) {
+      this.world.timestep = dt;
+      this.world.step();
+      this.movePlayer(p, input2, dt, true);
+      if (input2.hook) this.hook(p);
+      if (input2.dodge && !p.carrying && p.cooldown <= 0) {
+        p.dash = 0.25;
+        p.cooldown = 0.6;
+        this.audio.sfx("dash");
+      }
+    }
+    for (const q of this.players) if (q.pid !== pid && q.targetX !== void 0) {
+      q.x += (q.targetX - q.x) * Math.min(1, dt * 12);
+      q.z += (q.targetZ - q.z) * Math.min(1, dt * 12);
+    }
+  }
+};
+
+// ui.js
+var esc = (s = "") => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+var button = (action2, label2, extra = "", cls = "") => `<button class="menu-button ${cls}" data-action="${action2}" ${extra}><span>${label2}</span><span class="button-arrow" aria-hidden="true">\u2197</span></button>`;
+var shell = '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M5 21C-3 5 10-3 16 9 22-3 35 5 27 21L20 28H12Z" fill="currentColor"/><path d="m16 10 0 14M9 10l5 14m9-14-5 14" fill="none" stroke="#172e37" stroke-width="2"/></svg>';
+var keyIcon = '<svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="11" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="4"/><path d="m15 15 11 11m-6-6 4-4m-1 7 4-4" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/></svg>';
+var bell = '<svg viewBox="0 0 80 80" aria-hidden="true"><path d="M28 14a12 12 0 0 1 24 0v8H28Z" fill="none" stroke="currentColor" stroke-width="5"/><path d="M19 39c0-26 42-26 42 0v14l9 10H10l9-10Z" fill="currentColor"/><path d="M30 69a10 10 0 0 0 20 0" fill="none" stroke="currentColor" stroke-width="6"/></svg>';
+var duck = '<svg viewBox="0 0 44 44" aria-hidden="true"><path d="M10 24C6 13 15 4 25 10c4 2 5 5 5 9l10 2-11 7c-1 12-19 16-25 3 6 3 8-1 6-7Z" fill="currentColor"/><circle cx="25" cy="17" r="2" fill="#18323b"/><path d="m13 10 2-6 7 4" fill="currentColor"/></svg>';
+var UI = class {
+  constructor(actions = () => {
+  }) {
+    this.actions = typeof actions === "function" ? actions : actions.action || (() => {
+    });
+    this.currentScreen = "loading";
+    this.settings = { music: 0.5, sfx: 0.75, invertX: false, invertY: false, reducedMotion: false };
+    this.returnScreen = "title";
+    this.guidePage = 0;
+    this.creditsPage = 0;
+    this.code = "111111";
+    this.networkStatus = "A friend makes every wrong turn better.";
+    this.credits = "Source Information\nDate: unknown\nSource: Goof Troop\nOriginal game: Goofaloop\nTech: Three.js r180, WebGPU only, Rapier 0.19.3, Gamepad API, Web Audio.\nArt direction: procedural cel-shaded island dioramas.\nAnimation: procedural transform animation.\nEnvironment: Codex CLI (headless); Linux; browser unknown.\nModel: OpenAI, gpt-6-astra, reasoning effort ultra.\nUsage: unknown.";
+    this.el = document.createElement("div");
+    this.el.id = "goof-ui";
+    this.el.innerHTML = `<div class="ui-vignette"></div><div class="screen-layer" id="goof-screen"></div><div class="game-hud" id="goof-hud" hidden></div><div class="toast" id="goof-toast" role="status" aria-live="polite"></div><div class="dialogue" id="goof-dialogue" hidden></div><div class="attract-banner" id="goof-attract" hidden><i></i> THE DUCKS ARE DRIVING <span>Press any button to play</span></div><div class="network-corner" id="goof-network" hidden></div>`;
+    document.body.append(this.el);
+    this.layer = this.el.querySelector("#goof-screen");
+    this.hudEl = this.el.querySelector("#goof-hud");
+    this.el.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-action]");
+      if (b) this._act(b.dataset.action, b);
+    });
+    this.el.addEventListener("pointerover", (e) => {
+      const b = e.target.closest("button");
+      if (b && !b.disabled) b.focus({ preventScroll: true });
+    });
+    this.screen("loading");
+  }
+  _buttons() {
+    return [...this.layer.querySelectorAll("button:not([disabled]), input")].filter((b) => b.getClientRects().length);
+  }
+  _focus(index = 0) {
+    const bs = this._buttons();
+    if (bs.length) bs[(index + bs.length) % bs.length].focus({ preventScroll: true });
+  }
+  _act(name, el) {
+    this.actions("ui-sound");
+    if (["settings", "guide", "about", "together"].includes(name)) {
+      this.returnScreen = this.currentScreen;
+      this.screen(name, this.data);
+      return;
+    }
+    if (name === "back") {
+      this.back();
+      return;
+    }
+    if (name.startsWith("setting:")) {
+      this._changeSetting(name.split(":")[1], 1);
+      return;
+    }
+    if (name === "guide-next" || name === "guide-prev") {
+      this.guidePage = (this.guidePage + (name === "guide-next" ? 1 : 2)) % 3;
+      this.screen("guide", this.data);
+      return;
+    }
+    if (name === "credits-next" || name === "credits-prev") {
+      this.creditsPage = Math.max(0, Math.min(this.creditPages.length - 1, this.creditsPage + (name === "credits-next" ? 1 : -1)));
+      this.screen("about", this.data);
+      return;
+    }
+    if (name === "code-digit") {
+      this._cycleCode(Number(el.dataset.index), 1);
+      return;
+    }
+    if (name === "join") {
+      const field = this.layer.querySelector("#room-code");
+      this.actions("join", (field?.value || this.code).trim().toUpperCase());
+      return;
+    }
+    if (name === "copy") {
+      navigator.clipboard?.writeText(String(this.roomCode || "")).then(() => this.toast("Room code copied. Send it to your co-pilot.")).catch(() => this.toast("Share the room code shown above."));
+      return;
+    }
+    this.actions(name, el?.dataset.value);
+  }
+  _changeSetting(key, direction) {
+    if (key === "music" || key === "sfx") {
+      this.settings[key] = Math.max(0, Math.min(1, Math.round((this.settings[key] + direction * 0.1) * 10) / 10));
+    } else this.settings[key] = !this.settings[key];
+    this.data.settings = { ...this.settings };
+    const old = this._buttons().indexOf(document.activeElement);
+    this.screen("settings", this.data);
+    this._focus(old);
+    this.actions("settings", { ...this.settings });
+    document.body.classList.toggle("reduce-motion", this.settings.reducedMotion);
+  }
+  _cycleCode(index, d) {
+    const alphabet = this.codeAlphabet || "0123456789";
+    const parts = this.code.split("");
+    parts[index] = alphabet[(Math.max(0, alphabet.indexOf(parts[index])) + d + alphabet.length) % alphabet.length];
+    this.code = parts.join("");
+    const digit = this.layer.querySelector(`[data-index="${index}"]`);
+    if (digit) digit.textContent = parts[index];
+    const input2 = this.layer.querySelector("#room-code");
+    if (input2) input2.value = this.code;
+  }
+  screen(name, data = {}) {
+    this.currentScreen = name;
+    this.data = { ...this.data, ...data };
+    if (data.settings) this.settings = { ...this.settings, ...data.settings };
+    this.el.dataset.screen = name;
+    const isGame = name === "game" || name === "attract";
+    this.layer.hidden = isGame;
+    this.hudEl.hidden = !isGame;
+    this.el.querySelector("#goof-attract").hidden = name !== "attract";
+    if (isGame) {
+      this.layer.innerHTML = "";
+      return;
+    }
+    let html = "";
+    const top = `<header class="game-header"><div class="small-brand">${duck}<span>GOOFALOOP<small>A SMALL ISLAND. A BIG MIX-UP.</small></span></div><div class="edition-label">A CO-OP ISLAND CAPER<span>THE BELL OF BUMBLEBAY</span></div></header>`;
+    const footer = `<footer class="menu-footer"><span><kbd>\u2195</kbd> Select <kbd>\xD7</kbd> Confirm <kbd>\u25CB</kbd> Back</span><span class="footer-keyboard">Arrow keys \xB7 Enter \xB7 Esc</span></footer>`;
+    if (name === "loading") html = `<div class="loading-card">${duck}<p class="eyebrow">WELCOME TO BUMBLEBAY</p><h2>Putting the kettle on\u2026</h2><div class="loading-line"><i></i></div><p>Loading the island</p></div>`;
+    if (name === "title") {
+      const touchOnly = data.touchOnly || matchMedia("(pointer: coarse)").matches && !navigator.getGamepads?.().some(Boolean);
+      html = `${top}<main class="title-panel"><div class="eyebrow"><span class="tiny-star">\u2726</span> A BEAUTIFULLY BAD IDEA</div><h1>Goofa<span>loop<span class="title-dot">.</span></span></h1><p class="title-tagline">TWO ODD DUCKS.<br>ONE BIG OOPS.</p><div class="menu-stack">${touchOnly ? '<p class="touch-notice">Controller or keyboard required</p>' : button("start", "Let\u2019s make a splash", "", "primary") + (data.hasSave ? button("continue", "Continue adventure") : "") + button("together", "Play together", "", "secondary")}<div class="small-menu">${button("settings", "Settings")}${button("guide", "Field guide")}${button("about", "About")}</div></div></main><aside class="episode-ticket"><div class="ticket-number">01</div><div><p>THE BELL OF BUMBLEBAY</p><span>Six stops. One stolen lunch bell.<br>Soup waits for no duck.</span></div><i>\u2197</i></aside><div class="title-bottom"><span>1\u20134 PLAYERS <b>\xB7</b> BIG HEARTS <b>\xB7</b> QUESTIONABLE PLANS</span><span class="title-attract-hint">STAY AWHILE. THE ISLAND PLAYS ITSELF.</span></div>`;
+    }
+    if (name === "pause") html = `${top}<section class="menu-card pause-card"><p class="eyebrow">TAKE A BREATHER</p><h2>Soup can wait.<span>A little.</span></h2><div class="menu-stack">${button("resume", "Back to the adventure", "", "primary")}${button("settings", "Settings")}${button("guide", "Field guide")}${!data.inHub ? button("restart", "Restart this room") + button("menu", "Save & return to title") : ""}</div></section>${footer}`;
+    if (name === "settings") {
+      const set = this.settings;
+      const setting = (key, label2, desc) => `<button class="setting-row" data-action="setting:${key}"><span><b>${label2}</b><small>${desc}</small></span><span class="setting-value">${typeof set[key] === "boolean" ? set[key] ? "ON" : "OFF" : `<i class="volume-track"><i style="width:${set[key] * 100}%"></i></i><b>${Math.round(set[key] * 100)}%</b>`}<span class="setting-arrows">\u2039 \u203A</span></span></button>`;
+      html = `${top}<section class="menu-card wide-card"><p class="eyebrow">MAKE YOURSELF AT HOME</p><h2>The little things.</h2><div class="setting-list">${setting("music", "Music", "A little sunshine for your ears")}${setting("sfx", "Sound & voices", "Bonks, splashes, and duck-ish chatter")}${setting("invertX", "Invert horizontal", "Reverse the left stick\u2019s left / right")}${setting("invertY", "Invert vertical", "Reverse the left stick\u2019s up / down")}${setting("reducedMotion", "Reduced motion", "Gentler camera and screen effects")}</div><p class="settings-help">Select with \u2191 \u2193 \xB7 Adjust with \u2190 \u2192 \xB7 Enter toggles or increases</p>${button("back", "All set", "", "primary")}</section>${footer}`;
+    }
+    if (name === "together") {
+      html = `${top}<section class="menu-card together-card"><p class="eyebrow">BETTER WITH A CO-PILOT</p><h2>Two heads.<span>Same bad idea.</span></h2><p class="menu-description">Share a couch or bring a friend across the sea.</p><div class="together-grid"><div>${button("local", "Play on this screen", "", "primary")}<p class="secondary-description">Second controller, or I J K L + O / U / Y / H.</p>${button("host", "Host an online room")}<div class="network-status" role="status">${esc(this.networkStatus)}</div>${this.roomCode ? `<div class="room-code-display">${esc(this.roomCode)}</div>${button("copy", "Copy room code")}` : ""}</div><div class="join-panel"><p class="eyebrow">HAVE A ROOM CODE?</p><label class="sr-only" for="room-code">Room code</label><input id="room-code" maxlength="6" inputmode="numeric" spellcheck="false" autocomplete="off" value="${esc(this.code)}" aria-label="Room code"><div class="code-picker">${this.code.split("").map((d, i) => `<button data-action="code-digit" data-index="${i}" aria-label="Code character ${i + 1}: ${d}">${d}</button>`).join("")}</div><p class="code-help">Controller: select a digit, then \u2190 \u2192 to change.</p>${button("join", "Join their adventure")}${this.data.connected ? button("leave", "Leave room") : ""}</div></div>${button("back", "Back to shore", "", "text-button")}</section>${footer}`;
+      requestAnimationFrame(() => this.layer.querySelector("#room-code")?.addEventListener("input", (e) => {
+        this.code = e.target.value.toUpperCase().replace(/[^0-9]/g, "");
+      }));
+    }
+    if (name === "guide") {
+      const pages = [
+        { title: "A duck\u2019s field guide.", tag: "01 / 03 \u2014 THE BASICS", cards: [["\u2195", "Waddle with purpose", "Left stick \xB7 WASD \xB7 Arrow keys", "Explore every corner. Follow the gold exit marker when the room\u2019s job is done."], ["\xD7", "Hands up!", "Cross \xB7 Space", "Lift a pot, a bomb, or a stunned crab, then throw it. Talk, open chests, and revive a friend with the same button."], ["\u25CB", "A graceful escape", "Circle \xB7 Shift", "Dodge a lunge or a flying nuisance. Carrying something? Set it down gently instead."], ["\u2665", "No duck left behind", "Stay close to a fallen friend", "Use the action button to revive them. Room checkpoints keep a bad plan from becoming a long walk."]] },
+        { title: "Tools of the trade.", tag: "02 / 03 \u2014 PUZZLES & TRICKS", cards: [["\u25A1", "Kick it into place", "Square \xB7 E", "Send stone blocks sliding into switches. Line up your kick; blocks stop at obstacles."], ["\u25B3", "Hook, line & duck", "Triangle \xB7 Q", "Your hookshot stuns trouble and reaches distant anchors. Find it as the adventure unfolds."], ["\u25C7", "A little weight helps", "Pots, crates, or a cooperative duck", "Pressure plates like company. Your partner can help, and a well-placed object works too."], ["\u2667", "Pocket the shiny bits", "Keys \xB7 Shells \xB7 Hearts", "Keys open the way forward. Shells reward curious ducks. Hearts keep your questionable plans alive."]] },
+        { title: "Adventure is a team sport.", tag: "03 / 03 \u2014 THE BIG PICTURE", cards: [["1", "Meet Pip & Mallow", "Courier + mechanic = mostly competent", "We delivered the lunch bell to a pirate crab. We\u2019re getting it back. Preferably before anyone notices."], ["2", "Bring a friend", "Shared screen or online", "Join with another controller or IJKL. Player two uses O to act, U to kick, Y to hook, and H to dodge."], ["!", "Watch the wind-up", "Captain Clatter has a pattern", "Dodge sideways at the charge warning. Pick up one of his bombs and throw it back at his shell."], ["\u263C", "Take the scenic route", "Six rooms, one delicious destination", "Break pots, try your tools, read the island, and help each other. Every room adds a new wrinkle."]] }
+      ];
+      const p = pages[this.guidePage];
+      html = `${top}<section class="menu-card guide-card"><p class="eyebrow">${p.tag}</p><h2>${p.title}</h2><div class="guide-grid">${p.cards.map(([icon, title, control, copy]) => `<article><div class="guide-icon">${icon}</div><h3>${title}</h3><p class="guide-control">${control}</p><p>${copy}</p></article>`).join("")}</div><div class="page-controls">${button("guide-prev", "\u2190 Previous")}${button("back", "Got it", "", "primary")}${button("guide-next", "Next \u2192")}</div></section>${footer}`;
+    }
+    if (name === "about") {
+      this.creditPages = this._creditPages();
+      this.creditsPage = Math.min(this.creditsPage, this.creditPages.length - 1);
+      html = `${top}<section class="menu-card credits-card"><p class="eyebrow">BEHIND THE BELL \xB7 ${this.creditsPage + 1} / ${this.creditPages.length}</p><h2>A little island. Made with care.</h2><div class="credits-copy">${esc(this.creditPages[this.creditsPage])}</div><div class="page-controls">${button("credits-prev", "\u2190 Previous", this.creditsPage === 0 ? "disabled" : "")}${button("back", "Back", "", "primary")}${button("credits-next", "Next \u2192", this.creditsPage === this.creditPages.length - 1 ? "disabled" : "")}</div></section>${footer}`;
+    }
+    if (name === "win") html = `${top}<section class="menu-card win-card"><div class="win-bell">${bell}</div><p class="eyebrow">THE BELL OF BUMBLEBAY</p><h2>A ringing<span>success!</span></h2><p class="win-copy">The bell is home. The soup is warm.<br>The delivery service is under review.</p><div class="win-stats"><span><b>${esc(data.shells ?? 0)}</b> SHELLS FOUND</span><span><b>${esc(data.time || "6 / 6")}</b>${data.time ? " ADVENTURE TIME" : " ROOMS CLEARED"}</span></div><p class="win-quote">\u201CNext time, we check the address.\u201D \u2014 Mallow</p><div class="menu-stack">${data.inHub ? '<p class="hub-wait">Waiting for AI Hub<span>Your score is on its way to the scoreboard.</span></p>' : button("start", "One more adventure?", "", "primary") + button("menu", "Back to shore")}</div></section>${data.inHub ? "" : footer}`;
+    if (name === "over") html = `${top}<section class="menu-card win-card"><div class="win-bell">${bell}</div><p class="eyebrow">THE BELL OF BUMBLEBAY</p><h2>${esc(data.title || "The tide called time.")}</h2><p class="win-copy">${esc(data.message || "A little adventure. A lot of questionable decisions. Every shell still counts.")}</p><div class="win-stats"><span><b>${esc(data.score ?? 0)}</b> POINTS</span><span><b>${esc(data.shells ?? 0)}</b> SHELLS FOUND</span></div><p class="win-quote">\u201CWe were just getting to the good bit!\u201D \u2014 Pip</p><div class="menu-stack">${data.inHub ? '<p class="hub-wait">Waiting for AI Hub<span>Your score is on its way to the scoreboard.</span></p>' : button("start", "Another adventure?", "", "primary") + button("menu", "Back to shore")}</div></section>${data.inHub ? "" : footer}`;
+    if (name === "error") html = `${top}<section class="menu-card error-card"><p class="eyebrow">A LITTLE SNAG</p><h2>${esc(data.title || "The island needs WebGPU.")}</h2><p class="menu-description">${esc(data.message || "Open this game in a browser with WebGPU enabled. A secure HTTPS address or localhost is required.")}</p>${button("reload", "Try again", "", "primary")}${button("settings", "Settings")}</section>`;
+    this.layer.innerHTML = html;
+    this._focus();
+  }
+  _creditPages() {
+    const sections = String(this.credits).split(/\n\s*\n/);
+    const pages = [];
+    let current = "";
+    for (let section of sections) {
+      if (section.length > 1050) {
+        for (const line of section.split("\n")) {
+          if (current.length + line.length > 1050) {
+            pages.push(current);
+            current = "";
+          }
+          current += (current ? "\n" : "") + line;
+        }
+      } else {
+        if (current.length + section.length > 1050) {
+          pages.push(current);
+          current = "";
+        }
+        current += (current ? "\n\n" : "") + section;
+      }
+    }
+    if (current) pages.push(current);
+    return pages.length ? pages : ["unknown"];
+  }
+  hud(state = {}) {
+    const hearts = (n, max2 = 5) => Array.from({ length: max2 }, (_, i) => `<i class="heart ${i < n ? "filled" : ""}">\u2665</i>`).join("");
+    const players = state.players || [{ name: "Pip", hearts: state.hearts ?? 5, maxHearts: state.maxHearts ?? 5 }, ...state.partnerHearts != null ? [{ name: state.partnerName || "Mallow", hearts: state.partnerHearts, maxHearts: state.maxHearts ?? 5 }] : []];
+    const html = `<div class="hud-top"><div class="player-badges">${players.map((p, i) => `<div class="player-badge player-${i}"><span class="player-face">${duck}</span><div><p>${esc(p.name || ["Pip", "Mallow", "Poppy", "Finn"][i])}<span>P${i + 1}</span></p><div class="hearts" aria-label="${p.hearts} hearts">${hearts(p.hearts ?? p.hp ?? 5, p.maxHearts || 5)}</div></div></div>`).join("")}</div><div class="room-badge"><span class="eyebrow">${String((state.roomIndex ?? 0) + 1).padStart(2, "0")} / ${String(state.roomCount || 6).padStart(2, "0")}</span><strong>${esc(state.room || "Wobble Wharf")}</strong></div><div class="inventory"><span class="shell-counter">${shell}<b>${state.shells || 0}</b></span><span class="key-counter">${keyIcon}<b>${state.keys || 0}</b></span><button class="hud-pause" data-action="pause" aria-label="Pause">\u2161</button></div></div><div class="objective"><span class="objective-diamond">\u25C7</span><div><small>A LITTLE PLAN</small><p>${esc(state.objective || "Find out who took the lunch bell.")}</p></div></div>${state.boss ? `<div class="boss-health"><div><span>${esc(state.boss.name || "Captain Clatter")}</span><span>${Math.ceil(state.boss.hp)} / ${state.boss.maxHp}</span></div><i><i style="width:${Math.max(0, 100 * state.boss.hp / state.boss.maxHp)}%"></i></i></div>` : ""}<div class="hud-bottom"><span><kbd>\xD7</kbd> ${state.carrying ? "Throw" : "Lift / interact"}</span><span><kbd>\u25A1</kbd> Kick</span>${state.hook !== false ? "<span><kbd>\u25B3</kbd> Hook</span>" : ""}<span><kbd>\u25CB</kbd> ${state.carrying ? "Set down" : "Dodge"}</span><small>SPACE \xB7 E \xB7 Q \xB7 SHIFT</small></div>`;
+    if (html !== this.lastHud) {
+      this.hudEl.innerHTML = html;
+      this.lastHud = html;
+    }
+  }
+  toast(text, kind = "info") {
+    const el = this.el.querySelector("#goof-toast");
+    clearTimeout(this.toastTimeout);
+    el.textContent = text;
+    el.dataset.kind = kind;
+    el.classList.add("show");
+    this.toastTimeout = setTimeout(() => el.classList.remove("show"), 4400);
+  }
+  dialogue(name, text) {
+    const el = this.el.querySelector("#goof-dialogue");
+    el.hidden = false;
+    el.innerHTML = `<div class="dialogue-avatar">${duck}</div><div class="dialogue-body"><p class="speaker">${esc(name)}</p><p>${esc(text)}</p></div><button data-action="dialogue" aria-label="Continue dialogue"><kbd>\xD7</kbd><span>Continue</span></button>`;
+  }
+  hideDialogue() {
+    this.el.querySelector("#goof-dialogue").hidden = true;
+  }
+  setCredits(text) {
+    this.credits = typeof text === "string" ? text : Object.entries(text).map(([k, v]) => `${k}
+${v}`).join("\n\n");
+    if (this.currentScreen === "about") this.screen("about", this.data);
+  }
+  setNetwork(status) {
+    if (typeof status === "string") this.networkStatus = status;
+    else {
+      this.networkStatus = status.message || status.status || "";
+      this.roomCode = status.code || status.roomCode || this.roomCode;
+      this.data = { ...this.data, connected: status.connected };
+    }
+    if (this.currentScreen === "together") {
+      const i = this._buttons().indexOf(document.activeElement);
+      this.screen("together", this.data);
+      this._focus(i);
+    }
+    const tag = this.el.querySelector("#goof-network");
+    tag.textContent = this.networkStatus;
+    tag.hidden = !this.data?.connected;
+  }
+  navigate(dx, dy) {
+    const el = document.activeElement;
+    if (dx && el?.dataset.action?.startsWith("setting:")) {
+      this._changeSetting(el.dataset.action.split(":")[1], Math.sign(dx));
+      return;
+    }
+    if (dx && el?.dataset.action === "code-digit") {
+      this._cycleCode(Number(el.dataset.index), Math.sign(dx));
+      return;
+    }
+    if (this.currentScreen === "about" && !dy && dx) {
+      this._act(dx > 0 ? "credits-next" : "credits-prev");
+      return;
+    }
+    if (!dx && !dy) return;
+    const bs = this._buttons();
+    const i = bs.indexOf(el);
+    this._focus(i + Math.sign(dy || dx));
+  }
+  confirm() {
+    const dialogue = this.el.querySelector("#goof-dialogue");
+    if (!dialogue.hidden && ["game", "attract"].includes(this.currentScreen)) {
+      this.actions("dialogue");
+      return;
+    }
+    const el = document.activeElement;
+    if (this.layer.contains(el)) {
+      if (el.tagName === "INPUT") this.actions("join", el.value.trim().toUpperCase());
+      else el.click();
+    } else this._focus();
+  }
+  back() {
+    if (this.currentScreen === "pause") this.actions("resume");
+    else if (["settings", "guide", "about", "together"].includes(this.currentScreen)) {
+      if (this.returnScreen === "game") this.actions("resume");
+      else this.screen(this.returnScreen, this.data);
+    } else if (this.currentScreen === "game") this.actions("pause");
+  }
+};
+
+// audio.js
+var NOTE = (midi) => 440 * 2 ** ((midi - 69) / 12);
+var clamp2 = (n, a, b) => Math.min(b, Math.max(a, Number(n) || 0));
+var AudioEngine = class {
+  constructor() {
+    this.context = null;
+    this.scene = "menu";
+    this.musicVolume = 0.48;
+    this.sfxVolume = 0.7;
+    this.paused = false;
+    this.step = 0;
+    this.nextNote = 0;
+    this.timer = null;
+    this.voiceSources = /* @__PURE__ */ new Set();
+    this._lastSfx = /* @__PURE__ */ new Map();
+  }
+  async unlock() {
+    if (!this.context) {
+      const Context = globalThis.AudioContext || globalThis.webkitAudioContext;
+      if (!Context) return false;
+      this.context = new Context({ latencyHint: "interactive" });
+      const ctx = this.context;
+      this.master = ctx.createDynamicsCompressor();
+      this.master.threshold.value = -14;
+      this.master.knee.value = 18;
+      this.master.ratio.value = 5;
+      this.master.attack.value = 6e-3;
+      this.master.release.value = 0.18;
+      this.master.connect(ctx.destination);
+      this.musicBus = ctx.createGain();
+      this.sfxBus = ctx.createGain();
+      this.voiceBus = ctx.createGain();
+      this.musicBus.gain.value = this.musicVolume;
+      this.sfxBus.gain.value = this.sfxVolume;
+      this.voiceBus.gain.value = this.sfxVolume * 0.7;
+      this.musicBus.connect(this.master);
+      this.sfxBus.connect(this.master);
+      this.voiceBus.connect(this.master);
+      this.echo = ctx.createDelay(1);
+      this.echo.delayTime.value = 0.218;
+      const feedback = ctx.createGain();
+      feedback.gain.value = 0.19;
+      const wet = ctx.createGain();
+      wet.gain.value = 0.12;
+      const damp = ctx.createBiquadFilter();
+      damp.type = "lowpass";
+      damp.frequency.value = 2200;
+      this.echo.connect(damp);
+      damp.connect(feedback);
+      feedback.connect(this.echo);
+      damp.connect(wet);
+      wet.connect(this.musicBus);
+      this.noise = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+      const samples = this.noise.getChannelData(0);
+      let seed = 117;
+      for (let i = 0; i < samples.length; i++) {
+        seed = seed * 1664525 + 1013904223 >>> 0;
+        samples[i] = seed / 4294967296 * 2 - 1;
+      }
+      this.nextNote = ctx.currentTime + 0.06;
+      this.timer = setInterval(() => this._schedule(), 25);
+    }
+    try {
+      if (this.context.state !== "running") await this.context.resume();
+      if (this.nextNote < this.context.currentTime) this.nextNote = this.context.currentTime + 0.035;
+      this._schedule();
+      return this.context.state === "running";
+    } catch {
+      return false;
+    }
+  }
+  setVolume(music, sfx) {
+    this.musicVolume = clamp2(music, 0, 1);
+    this.sfxVolume = clamp2(sfx, 0, 1);
+    if (!this.context) return;
+    const t = this.context.currentTime;
+    this.musicBus.gain.setTargetAtTime(this.paused ? 0 : this.musicVolume, t, 0.04);
+    this.sfxBus.gain.setTargetAtTime(this.sfxVolume, t, 0.02);
+    this.voiceBus.gain.setTargetAtTime(this.sfxVolume * 0.7, t, 0.02);
+  }
+  setScene(scene) {
+    if (!["menu", "explore", "boss", "win"].includes(scene) || scene === this.scene) return;
+    this.scene = scene;
+    this.step = 0;
+    if (this.context) this.nextNote = this.context.currentTime + 0.08;
+  }
+  // Pause the score while preserving menu sounds and user-gesture audio access.
+  suspend(paused) {
+    this.paused = Boolean(paused);
+    if (!this.context) return;
+    this.musicBus.gain.setTargetAtTime(this.paused ? 0 : this.musicVolume, this.context.currentTime, 0.04);
+    if (!this.paused) this.nextNote = this.context.currentTime + 0.06;
+  }
+  _tone(freq, start, duration, level, type = "sine", bus = this.sfxBus, options = {}) {
+    const ctx = this.context;
+    if (!ctx || !bus) return;
+    const osc = ctx.createOscillator();
+    const amp = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(Math.max(25, freq), start);
+    if (options.end) osc.frequency.exponentialRampToValueAtTime(Math.max(25, options.end), start + duration * 0.9);
+    const attack = Math.min(options.attack || 6e-3, duration * 0.2);
+    amp.gain.setValueAtTime(1e-4, start);
+    amp.gain.exponentialRampToValueAtTime(Math.max(2e-4, level), start + attack);
+    amp.gain.exponentialRampToValueAtTime(1e-4, start + duration);
+    osc.connect(amp);
+    let pan;
+    if (options.pan && ctx.createStereoPanner) {
+      pan = ctx.createStereoPanner();
+      pan.pan.value = options.pan;
+      amp.connect(pan);
+      pan.connect(bus);
+    } else amp.connect(bus);
+    if (options.echo) amp.connect(this.echo);
+    osc.start(start);
+    osc.stop(start + duration + 0.015);
+    osc.onended = () => {
+      osc.disconnect();
+      amp.disconnect();
+      pan?.disconnect();
+    };
+  }
+  _noise(start, duration, level, frequency, type = "highpass", bus = this.sfxBus) {
+    const ctx = this.context;
+    const source = ctx.createBufferSource();
+    source.buffer = this.noise;
+    const filter = ctx.createBiquadFilter();
+    filter.type = type;
+    filter.frequency.value = frequency;
+    filter.Q.value = type === "bandpass" ? 2.5 : 0.7;
+    const amp = ctx.createGain();
+    amp.gain.setValueAtTime(1e-4, start);
+    amp.gain.exponentialRampToValueAtTime(level, start + 3e-3);
+    amp.gain.exponentialRampToValueAtTime(1e-4, start + duration);
+    source.connect(filter);
+    filter.connect(amp);
+    amp.connect(bus);
+    source.start(start);
+    source.stop(start + duration + 0.01);
+    source.onended = () => {
+      source.disconnect();
+      filter.disconnect();
+      amp.disconnect();
+    };
+  }
+  _mallet(midi, start, strength = 1, pan = 0) {
+    const frequency = NOTE(midi);
+    this._tone(frequency, start, 0.46, 0.135 * strength, "sine", this.musicBus, { pan, echo: true });
+    this._tone(frequency * 2, start, 0.15, 0.04 * strength, "sine", this.musicBus, { pan });
+    this._tone(frequency * 3.01, start, 0.055, 0.022 * strength, "sine", this.musicBus, { pan });
+  }
+  _schedule() {
+    const ctx = this.context;
+    if (!ctx || ctx.state !== "running" || this.paused) return;
+    if (this.nextNote < ctx.currentTime - 0.2) this.nextNote = ctx.currentTime + 0.025;
+    let guard = 0;
+    while (this.nextNote < ctx.currentTime + 0.13 && guard++ < 8) {
+      this._beat(this.step++, this.nextNote);
+      const bpm = this.scene === "boss" ? 144 : this.scene === "menu" ? 98 : 116;
+      const swing = this.scene === "boss" ? 1 : this.step % 2 ? 1.08 : 0.92;
+      this.nextNote += 60 / bpm / 4 * swing;
+    }
+  }
+  _beat(step, t) {
+    const boss = this.scene === "boss";
+    const menu = this.scene === "menu";
+    const win2 = this.scene === "win";
+    const beat = step % 16;
+    const bar = Math.floor(step / 16) % 8;
+    const progression = boss ? [50, 50, 46, 46, 43, 43, 45, 49] : [50, 50, 55, 55, 47, 52, 57, 57];
+    const root = progression[bar];
+    const minor = boss ? bar !== 7 : bar === 4 || bar === 5;
+    const third = minor ? 3 : 4;
+    const bass = root - 12;
+    const amount = menu ? 0.5 : 1;
+    if (beat === 0 || beat === 8 || !menu && beat === 11) {
+      this._tone(NOTE(bass + (beat === 8 ? 7 : 0)), t, 0.31, 0.18 * amount, "triangle", this.musicBus);
+      this._tone(104, t, 0.13, 0.16 * amount, "sine", this.musicBus, { end: 43 });
+    }
+    if (!menu && (beat === 4 || beat === 12)) {
+      this._noise(t, 0.11, 0.072, 1500, "highpass", this.musicBus);
+      this._tone(190, t, 0.1, 0.08, "triangle", this.musicBus, { end: 112, pan: -0.15 });
+    }
+    if (beat % 2 === 0 && (!menu || beat % 4 === 2)) this._noise(t, 0.035, menu ? 0.018 : 0.038, 5400, "highpass", this.musicBus);
+    if (!menu && (beat === 6 || beat === 14 || bar % 2 && beat === 15)) {
+      this._tone(beat === 6 ? 380 : 510, t, 0.075, 0.075, "sine", this.musicBus, { end: beat === 6 ? 190 : 290, pan: 0.38 });
+    }
+    if ((menu ? [2, 10] : [2, 6, 10, 14]).includes(beat)) {
+      [0, third, 7].forEach((interval, i) => {
+        this._tone(
+          NOTE(root + 12 + interval),
+          t + i * 8e-3,
+          menu ? 0.32 : 0.19,
+          0.027 * amount,
+          "triangle",
+          this.musicBus,
+          { pan: -0.35, echo: true }
+        );
+      });
+    }
+    const motifs = [
+      [0, null, 4, null, 7, null, 9, 7, null, null, 4, null, 2, null, 0, null],
+      [7, null, 9, null, 12, null, 9, 7, null, 4, null, null, 2, null, null, null],
+      [0, null, 4, null, 7, null, 4, 2, null, 0, null, null, 4, null, 7, null],
+      [9, null, 7, null, 4, null, 2, 0, null, null, 2, null, 4, null, null, null]
+    ];
+    const bossMotifs = [0, null, 0, 7, 3, null, 2, null, 0, 0, null, 10, 7, null, 3, 2];
+    let melody = boss ? bossMotifs[beat] : motifs[bar % 4][beat];
+    if (melody !== null && (!menu || beat % 4 === 0 && bar % 2 === 0)) {
+      if (minor && (melody === 4 || melody === 9)) melody--;
+      this._mallet(root + 24 + melody, t, menu ? 0.48 : win2 ? 1.05 : 0.8, 0.22);
+    }
+    if (win2 && beat % 4 === 0) this._mallet(root + 36 + [0, third, 7, 12][beat / 4], t, 0.35, -0.3);
+    if (boss && beat % 2 === 1) this._tone(NOTE(root + 12), t, 0.07, 0.025, "sawtooth", this.musicBus);
+  }
+  sfx(name) {
+    if (!this.context || this.context.state !== "running" || this.sfxVolume <= 0) return;
+    const t = this.context.currentTime + 5e-3;
+    const last = this._lastSfx.get(name) ?? -100;
+    if (t - last < (name === "coin" ? 0.035 : 0.055)) return;
+    this._lastSfx.set(name, t);
+    const tone = (f, d, v = 0.18, type = "sine", end, delay = 0) => this._tone(f, t + delay, d, v, type, this.sfxBus, { end });
+    switch (name) {
+      case "pickup":
+        tone(350, 0.12, 0.18, "triangle", 700);
+        tone(900, 0.13, 0.08, "sine", 1100, 0.06);
+        break;
+      case "throw":
+        this._noise(t, 0.14, 0.1, 1e3, "bandpass");
+        tone(420, 0.14, 0.15, "triangle", 115);
+        break;
+      case "hit":
+        tone(120, 0.13, 0.29, "sine", 45);
+        this._noise(t, 0.075, 0.13, 1e3, "lowpass");
+        tone(650, 0.055, 0.08, "square", 180);
+        break;
+      case "break":
+        this._noise(t, 0.22, 0.18, 2300, "highpass");
+        [820, 490, 1190, 640].forEach((f, i) => tone(f, 0.1, 0.075, "triangle", f * 0.5, i * 0.025));
+        break;
+      case "coin":
+        tone(NOTE(88), 0.1, 0.13, "sine");
+        tone(NOTE(95), 0.23, 0.1, "sine", void 0, 0.055);
+        break;
+      case "door":
+        this._noise(t, 0.35, 0.08, 420, "lowpass");
+        [62, 66, 69, 74].forEach((n, i) => tone(NOTE(n), 0.24, 0.11, "triangle", void 0, i * 0.075));
+        break;
+      case "hook":
+        tone(700, 0.15, 0.12, "triangle", 1600);
+        this._noise(t, 0.16, 0.055, 3400, "bandpass");
+        tone(210, 0.12, 0.16, "sine", 100, 0.16);
+        break;
+      case "switch":
+        tone(230, 0.06, 0.17, "square", 120);
+        tone(NOTE(81), 0.2, 0.11, "sine", void 0, 0.06);
+        break;
+      case "dash":
+        this._noise(t, 0.18, 0.13, 1800, "bandpass");
+        tone(280, 0.1, 0.08, "sine", 520);
+        break;
+      case "win":
+        [62, 66, 69, 74, 78, 81, 86].forEach((n, i) => tone(NOTE(n), 0.48, 0.14, "triangle", void 0, i * 0.095));
+        break;
+      case "hurt":
+        tone(330, 0.12, 0.14, "sawtooth", 170);
+        tone(180, 0.22, 0.16, "triangle", 90, 0.1);
+        break;
+      case "click":
+        tone(670, 0.045, 0.09, "sine", 900);
+        break;
+      default:
+        tone(470, 0.07, 0.08, "triangle", 630);
+    }
+  }
+  speak(text, character = 0) {
+    const ctx = this.context;
+    if (!ctx || ctx.state !== "running" || !this.sfxVolume) return;
+    for (const source of this.voiceSources) {
+      try {
+        source.stop();
+      } catch {
+      }
+    }
+    this.voiceSources.clear();
+    const words = String(text || "").replace(/[^a-z0-9]/gi, "");
+    const count = Math.min(24, Math.max(3, Math.ceil(words.length * 0.42)));
+    let time = ctx.currentTime + 0.025;
+    const vowels = [[760, 1220], [400, 1900], [350, 2200], [500, 900], [300, 800]];
+    for (let i = 0; i < count; i++) {
+      const seed = (words.charCodeAt(i % (words.length || 1)) || 71) + i * 13;
+      const formants = vowels[seed % vowels.length];
+      const duration = 0.065 + seed % 5 * 9e-3;
+      const osc = ctx.createOscillator();
+      osc.type = "sawtooth";
+      const pitch = (character % 2 ? 235 : 155) + seed % 7 * 14;
+      osc.frequency.setValueAtTime(pitch, time);
+      osc.frequency.exponentialRampToValueAtTime(pitch * (i % 3 === 0 ? 1.2 : 0.86), time + duration);
+      const amp = ctx.createGain();
+      amp.gain.setValueAtTime(1e-4, time);
+      amp.gain.exponentialRampToValueAtTime(0.08, time + 8e-3);
+      amp.gain.exponentialRampToValueAtTime(1e-4, time + duration);
+      const filters = formants.map((frequency) => {
+        const filter = ctx.createBiquadFilter();
+        filter.type = "bandpass";
+        filter.frequency.value = frequency * (character % 2 ? 1.12 : 0.95);
+        filter.Q.value = 5;
+        osc.connect(filter);
+        filter.connect(amp);
+        return filter;
+      });
+      amp.connect(this.voiceBus);
+      this.voiceSources.add(osc);
+      osc.start(time);
+      osc.stop(time + duration + 0.01);
+      osc.onended = () => {
+        this.voiceSources.delete(osc);
+        osc.disconnect();
+        amp.disconnect();
+        filters.forEach((f) => f.disconnect());
+      };
+      time += duration + (i % 5 === 4 ? 0.13 : 0.025);
+    }
+  }
+  dispose() {
+    clearInterval(this.timer);
+    this.timer = null;
+    for (const source of this.voiceSources) {
+      try {
+        source.stop();
+      } catch {
+      }
+    }
+    this.voiceSources.clear();
+    if (this.context) this.context.close().catch(() => {
+    });
+    this.context = null;
+  }
+};
+
+// input.js
+var DEADZONE = 0.18;
+var PRIMARY = ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "Enter", "KeyE", "KeyQ", "ShiftLeft", "ShiftRight", "Escape"];
+var SECONDARY = ["KeyI", "KeyJ", "KeyK", "KeyL", "KeyO", "KeyU", "KeyY", "KeyH"];
+var CONTROL_KEYS = /* @__PURE__ */ new Set([...PRIMARY, ...SECONDARY, "Backspace"]);
+var blank = () => ({ x: 0, y: 0, aimX: 0, aimY: 0, action: false, kick: false, hook: false, dodge: false, pause: false, join: false });
+var deadzone = (value) => Math.abs(value || 0) <= DEADZONE ? 0 : Math.sign(value) * Math.min(1, (Math.abs(value) - DEADZONE) / (1 - DEADZONE));
+var editable = (target) => target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target?.tagName || "");
+var normalize = (x, y) => {
+  const length = Math.hypot(x, y);
+  return length > 1 ? [x / length, y / length] : [x, y];
+};
+var Input = class {
+  constructor(onActivity = () => {
+  }) {
+    this.onActivity = onActivity;
+    this.settings = { invertX: false, invertY: false };
+    this.lastDevice = "keyboard";
+    this.hasController = false;
+    this.secondaryJoined = false;
+    this.keys = /* @__PURE__ */ new Set();
+    this.pressed = /* @__PURE__ */ new Set();
+    this.pads = /* @__PURE__ */ new Map();
+    this.pendingActivity = false;
+    this.repeat = { x: { direction: 0, timer: 0 }, y: { direction: 0, timer: 0 } };
+    this.listeners = [];
+    this.pointer = null;
+    this._listen("keydown", (event) => {
+      this._activity("keyboard");
+      if (editable(event.target) || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (CONTROL_KEYS.has(event.code)) event.preventDefault();
+      if (!this.keys.has(event.code)) this.pressed.add(event.code);
+      this.keys.add(event.code);
+    });
+    this._listen("keyup", (event) => {
+      this._activity("keyboard");
+      this.keys.delete(event.code);
+      if (!editable(event.target) && CONTROL_KEYS.has(event.code)) event.preventDefault();
+    });
+    this._listen("pointerdown", () => this._activity("keyboard"));
+    this._listen("pointermove", (event) => {
+      if (this.pointer && Math.hypot(event.clientX - this.pointer.x, event.clientY - this.pointer.y) > 2) this._activity("keyboard");
+      this.pointer = { x: event.clientX, y: event.clientY };
+    });
+    this._listen("wheel", () => this._activity("keyboard"), { passive: true });
+    this._listen("blur", () => {
+      this.keys.clear();
+      this.pressed.clear();
+      this.resetEdges();
+    });
+    this._listen("gamepadconnected", () => {
+      this.hasController = true;
+      this._activity("gamepad");
+    });
+    this._listen("gamepaddisconnected", () => {
+      this._activity("gamepad");
+      this.resetEdges();
+    });
+  }
+  _listen(type, callback, options) {
+    globalThis.addEventListener(type, callback, options);
+    this.listeners.push([type, callback, options]);
+  }
+  _activity(device) {
+    this.lastDevice = device;
+    this.pendingActivity = true;
+    this.onActivity?.(device);
+  }
+  _gamepads() {
+    try {
+      return Array.from(navigator.getGamepads?.() || []).filter((pad) => pad && pad.connected);
+    } catch {
+      return [];
+    }
+  }
+  _held(...codes) {
+    return codes.some((code) => this.keys.has(code));
+  }
+  _pressed(...codes) {
+    return codes.some((code) => this.pressed.has(code));
+  }
+  _repeatDirection(axis, value, dt) {
+    const direction = Math.abs(value) > 0.4 ? Math.sign(value) : 0;
+    const state = this.repeat[axis];
+    if (!direction) {
+      state.direction = 0;
+      state.timer = 0;
+      return 0;
+    }
+    if (direction !== state.direction) {
+      state.direction = direction;
+      state.timer = 0.3;
+      return direction;
+    }
+    state.timer -= Math.min(0.1, Math.max(0, dt || 0));
+    if (state.timer <= 0) {
+      state.timer += 0.16;
+      return direction;
+    }
+    return 0;
+  }
+  update(dt = 1 / 60) {
+    const players = [blank(), blank()];
+    const p1 = players[0];
+    const p2 = players[1];
+    p1.x = Number(this._held("KeyD", "ArrowRight")) - Number(this._held("KeyA", "ArrowLeft"));
+    p1.y = Number(this._held("KeyS", "ArrowDown")) - Number(this._held("KeyW", "ArrowUp"));
+    p1.action = this._pressed("Space", "Enter");
+    p1.kick = this._pressed("KeyE");
+    p1.hook = this._pressed("KeyQ");
+    p1.dodge = this._pressed("ShiftLeft", "ShiftRight");
+    p1.pause = this._pressed("Escape");
+    p2.x = Number(this._held("KeyL")) - Number(this._held("KeyJ"));
+    p2.y = Number(this._held("KeyK")) - Number(this._held("KeyI"));
+    p2.action = this._pressed("KeyO");
+    p2.kick = this._pressed("KeyU");
+    p2.hook = this._pressed("KeyY");
+    p2.dodge = this._pressed("KeyH");
+    let menuBack = this._pressed("Escape", "Backspace");
+    const activePads = this._gamepads();
+    this.hasController = activePads.length > 0;
+    const activeIndices = /* @__PURE__ */ new Set();
+    activePads.slice(0, 2).forEach((pad, slot) => {
+      const player = players[slot];
+      activeIndices.add(pad.index);
+      const buttons = Array.from(pad.buttons, (button2) => Boolean(button2.pressed || button2.value > 0.5));
+      const axes = [0, 1, 2, 3].map((i) => deadzone(pad.axes[i]));
+      const previous = this.pads.get(pad.index);
+      const changed = previous ? buttons.some((value, i) => value !== previous.buttons[i]) || axes.some((value, i) => Math.abs(value - previous.activityAxes[i]) > 0.08 || Boolean(value) !== Boolean(previous.activityAxes[i])) : buttons.some(Boolean) || axes.some((value) => Math.abs(value) > 0.08);
+      const edge = (index) => Boolean(buttons[index] && !previous?.buttons[index]);
+      const horizontal = this.settings.invertX ? -1 : 1;
+      const vertical = this.settings.invertY ? -1 : 1;
+      const padX = (axes[0] || Number(Boolean(buttons[15])) - Number(Boolean(buttons[14]))) * horizontal;
+      const padY = (axes[1] || Number(Boolean(buttons[13])) - Number(Boolean(buttons[12]))) * vertical;
+      if (Math.abs(padX) > Math.abs(player.x)) player.x = padX;
+      if (Math.abs(padY) > Math.abs(player.y)) player.y = padY;
+      player.aimX = axes[2] * horizontal;
+      player.aimY = axes[3] * vertical;
+      player.action ||= edge(0);
+      player.dodge ||= edge(1);
+      player.kick ||= edge(2);
+      player.hook ||= edge(3);
+      player.pause ||= edge(9) && !buttons[8];
+      if (slot === 0) menuBack ||= edge(1);
+      this.pads.set(pad.index, { buttons, axes, activityAxes: changed || !previous ? axes : previous.activityAxes });
+      if (changed) this._activity("gamepad");
+    });
+    for (const index of this.pads.keys()) if (!activeIndices.has(index)) this.pads.delete(index);
+    [p1.x, p1.y] = normalize(p1.x, p1.y);
+    [p2.x, p2.y] = normalize(p2.x, p2.y);
+    [p1.aimX, p1.aimY] = normalize(p1.aimX, p1.aimY);
+    [p2.aimX, p2.aimY] = normalize(p2.aimX, p2.aimY);
+    if (!this.secondaryJoined && (Math.hypot(p2.x, p2.y, p2.aimX, p2.aimY) > 0.1 || p2.action || p2.dodge || p2.kick || p2.hook || p2.pause)) {
+      p2.join = true;
+      this.secondaryJoined = true;
+    }
+    const menu = {
+      x: this._repeatDirection("x", p1.x, dt),
+      y: this._repeatDirection("y", p1.y, dt),
+      confirm: Boolean(p1.action),
+      back: Boolean(menuBack),
+      pause: Boolean(p1.pause)
+    };
+    const activity = this.pendingActivity;
+    this.pendingActivity = false;
+    this.pressed.clear();
+    return { players, menu, activity };
+  }
+  resetEdges() {
+    this.pressed.clear();
+    this.pendingActivity = false;
+    this.repeat.x = { direction: 0, timer: 0 };
+    this.repeat.y = { direction: 0, timer: 0 };
+    for (const pad of this._gamepads()) {
+      const axes = [0, 1, 2, 3].map((i) => deadzone(pad.axes[i]));
+      this.pads.set(pad.index, {
+        buttons: Array.from(pad.buttons, (button2) => Boolean(button2.pressed || button2.value > 0.5)),
+        axes,
+        activityAxes: axes
+      });
+    }
+  }
+  dispose() {
+    this.listeners.forEach(([type, callback, options]) => globalThis.removeEventListener(type, callback, options));
+    this.listeners = [];
+    this.keys.clear();
+    this.pressed.clear();
+    this.pads.clear();
+  }
+};
+
+// net.js
+var COLORS2 = ["#e8443a", "#3b82f6", "#22c55e", "#f5b700"];
+var NAMES = ["Pip", "Mallow", "Coco", "Tuck"];
+var rosterEntry = (id) => ({ id, name: NAMES[id] || "Island friend", color: COLORS2[id] || COLORS2[0] });
+var noop = () => {
+};
+var Network = class {
+  constructor(callbacks = {}) {
+    for (const name of ["onStatus", "onSnapshot", "onInput", "onRole", "onEnd", "onLeave", "onRoster", "onFinish"]) {
+      this[name] = callbacks[name] || noop;
+    }
+    this.role = "offline";
+    this.inHub = false;
+    this.connected = false;
+    this.playerId = 0;
+    this.hostId = 0;
+    this.players = [rosterEntry(0)];
+    this.server = false;
+    this.ended = false;
+    this.finished = false;
+    this.code = "";
+    this.peer = null;
+    this.links = /* @__PURE__ */ new Map();
+    this.disposers = [];
+    this.elapsed = 0;
+    this.sendElapsed = 0;
+    this.sequence = 0;
+    this.lastSnapshotSeq = -1;
+    this.lastInputSeq = /* @__PURE__ */ new Map();
+    this.pendingPressed = {};
+    this.pendingFlags = {};
+    this.lastSnapshot = null;
+    this.lastScore = 0;
+    this.generation = 0;
+  }
+  get running() {
+    return !this.ended && (!this.inHub || globalThis.AIHub.time() >= 0);
+  }
+  get isHost() {
+    return this.role !== "guest";
+  }
+  get shared() {
+    return this.inHub || this.role !== "offline";
+  }
+  get info() {
+    return { me: this.playerId, host: this.hostId, isHost: this.role === "host", players: this.players, server: this.server, inHub: this.inHub, code: this.code };
+  }
+  status(text) {
+    this.onStatus(text);
+  }
+  roleChanged() {
+    this.onRole(this.role, this.info);
+  }
+  async init() {
+    const hub = globalThis.AIHub;
+    if (!hub?.active) return null;
+    this.status("Joining the island with AI Hub\u2026");
+    const info = await hub.connect({ mode: "co-op", seats: [1, 4] });
+    if (!info) {
+      this.status("Ready for a seaside adventure.");
+      return null;
+    }
+    this.inHub = true;
+    this.connected = true;
+    this.playerId = info.me;
+    this.hostId = info.host;
+    this.players = info.players.slice();
+    this.server = info.server === true;
+    this.role = info.isHost ? "host" : "guest";
+    this.disposers.push(
+      hub.on("message", (data, from) => this.receive(data, from)),
+      hub.on("leave", ({ id }) => {
+        this.players = this.players.filter((p) => p.id !== id);
+        this.onLeave(id);
+        this.onRoster(this.players);
+        if (id === this.hostId) this.stop("The host has left. Waiting for AI Hub.");
+      }),
+      hub.on("time-up", () => {
+        if (this.role === "host") this.finish({ won: false, score: this.lastScore });
+      }),
+      hub.on("end", (detail) => this.stop(detail.reason || "Round complete")),
+      hub.on("start", () => this.status("All paws on deck!"))
+    );
+    this.roleChanged();
+    return info;
+  }
+  ready() {
+    if (this.inHub) globalThis.AIHub.ready();
+  }
+  probe(fn) {
+    globalThis.AIHub?.probe(fn);
+  }
+  fail(reason) {
+    if (this.inHub || globalThis.AIHub?.active) globalThis.AIHub?.fail(reason);
+  }
+  async getPeerClass() {
+    if (this.inHub) throw new Error("AI Hub owns the session transport.");
+    const module = await import("https://esm.sh/peerjs@1.5.5?bundle");
+    return module.Peer || module.default;
+  }
+  async openPeer(id) {
+    const generation = this.generation;
+    const Peer = await this.getPeerClass();
+    if (generation !== this.generation) throw new Error("Connection cancelled.");
+    const peer = new Peer(id, { debug: 0 });
+    this.peer = peer;
+    return new Promise((resolve, reject) => {
+      let opened = false;
+      const timeout = setTimeout(() => {
+        if (!opened) {
+          peer.destroy();
+          reject(new Error("The room service did not answer. Try again."));
+        }
+      }, 18e3);
+      peer.on("open", () => {
+        opened = true;
+        clearTimeout(timeout);
+        resolve(peer);
+      });
+      peer.on("error", (error) => {
+        clearTimeout(timeout);
+        const messages = {
+          "peer-unavailable": "That room could not be found. Check the six-digit code.",
+          "unavailable-id": "That room code is busy. Please create another room.",
+          "network": "Connection lost. Check your internet connection.",
+          "browser-incompatible": "This browser cannot create an online connection.",
+          "webrtc": "The connection could not cross this network. Try another network."
+        };
+        const text = messages[error.type] || "The online connection failed. Please try again.";
+        this.status(text);
+        if (!opened) reject(new Error(text));
+      });
+      peer.on("disconnected", () => this.status("Room service disconnected. Existing friends can keep playing."));
+    });
+  }
+  async host() {
+    if (this.inHub) return this.code;
+    this.leave(false);
+    const generation = this.generation;
+    this.status("Making a room\u2026");
+    const random = new Uint32Array(1);
+    crypto.getRandomValues(random);
+    const code = String(1e5 + random[0] % 9e5);
+    try {
+      const peer = await this.openPeer(`goofaloop-v1-${code}`);
+      if (generation !== this.generation) {
+        peer.destroy();
+        return null;
+      }
+      this.role = "host";
+      this.connected = true;
+      this.code = code;
+      this.playerId = this.hostId = 0;
+      this.players = [rosterEntry(0)];
+      peer.on("connection", (link) => this.accept(link));
+      this.status(`Room ${code} \xB7 Share this code with up to three friends.`);
+      this.roleChanged();
+      return code;
+    } catch (error) {
+      if (generation === this.generation) {
+        this.leave(false);
+        this.status(error.message);
+      }
+      return null;
+    }
+  }
+  accept(link) {
+    const used = /* @__PURE__ */ new Set([0, ...this.links.keys()]);
+    const id = [1, 2, 3].find((value) => !used.has(value));
+    if (id === void 0) {
+      link.on("open", () => {
+        link.send({ t: "full" });
+        setTimeout(() => link.close(), 500);
+      });
+      return;
+    }
+    this.links.set(id, link);
+    link.on("open", () => {
+      if (!this.players.some((p) => p.id === id)) this.players.push(rosterEntry(id));
+      this.players.sort((a, b) => a.id - b.id);
+      link.send({ t: "welcome", id, host: 0, players: this.players, code: this.code });
+      this.send({ t: "roster", players: this.players }, true);
+      if (this.lastSnapshot) link.send({ t: "s", q: ++this.sequence, state: this.lastSnapshot });
+      this.onRoster(this.players);
+      this.status(`Room ${this.code} \xB7 ${this.players.length} island friends connected.`);
+    });
+    link.on("data", (data) => this.receive(data, id));
+    link.on("close", () => this.removeLink(id));
+    link.on("error", () => this.removeLink(id));
+  }
+  removeLink(id) {
+    if (!this.links.has(id)) return;
+    this.links.delete(id);
+    this.players = this.players.filter((p) => p.id !== id);
+    this.onLeave(id);
+    this.onRoster(this.players);
+    if (this.role === "host") {
+      this.send({ t: "roster", players: this.players }, true);
+      this.status(`A friend disconnected. Room ${this.code} is still open.`);
+    } else {
+      this.connected = false;
+      this.stop("The host disconnected. Return to the title to start another adventure.");
+    }
+  }
+  async join(rawCode) {
+    if (this.inHub) return false;
+    const code = String(rawCode).replace(/\D/g, "").slice(0, 6);
+    if (code.length !== 6) {
+      this.status("Enter the six-digit room code.");
+      return false;
+    }
+    this.leave(false);
+    const generation = this.generation;
+    this.status(`Looking for room ${code}\u2026`);
+    try {
+      const peer = await this.openPeer(void 0);
+      if (generation !== this.generation) {
+        peer.destroy();
+        return false;
+      }
+      const link = peer.connect(`goofaloop-v1-${code}`, { reliable: true, serialization: "json" });
+      this.links.set(0, link);
+      return await new Promise((resolve) => {
+        let settled = false;
+        const timeout = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          this.leave(false);
+          this.status("The room did not answer. Check its code and try again.");
+          resolve(false);
+        }, 18e3);
+        const settle = (success) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            resolve(success);
+          }
+        };
+        link.on("data", (data) => {
+          if (data?.t === "welcome") {
+            this.role = "guest";
+            this.connected = true;
+            this.playerId = data.id;
+            this.hostId = 0;
+            this.code = code;
+            this.players = data.players;
+            this.ended = false;
+            this.status(`Room ${code} \xB7 You are ${NAMES[data.id]}.`);
+            this.roleChanged();
+            settle(true);
+          } else if (data?.t === "full") {
+            this.leave(false);
+            this.status("That boat already has four friends aboard.");
+            settle(false);
+          } else this.receive(data, 0);
+        });
+        link.on("close", () => {
+          this.removeLink(0);
+          settle(false);
+        });
+        link.on("error", () => {
+          this.removeLink(0);
+          settle(false);
+        });
+      });
+    } catch (error) {
+      if (generation === this.generation) {
+        this.leave(false);
+        this.status(error.message);
+      }
+      return false;
+    }
+  }
+  send(data, reliable = false, to) {
+    if (this.ended) return;
+    if (this.inHub) {
+      globalThis.AIHub.send(data, { reliable, to });
+      return;
+    }
+    for (const [id, link] of this.links) {
+      if (link.open && (to === void 0 || to === id)) {
+        try {
+          link.send(data);
+        } catch {
+        }
+      }
+    }
+  }
+  receive(data, from) {
+    if (!data || typeof data !== "object" || this.ended) return;
+    if (data.t === "s" && this.role === "guest" && from === this.hostId) {
+      if (!Number.isFinite(data.q) || data.q <= this.lastSnapshotSeq) return;
+      this.lastSnapshotSeq = data.q;
+      this.onSnapshot(data.state);
+    } else if (data.t === "i" && this.role === "host" && this.players.some((p) => p.id === from)) {
+      if (!Number.isFinite(data.q) || data.q <= (this.lastInputSeq.get(from) ?? -1)) return;
+      this.lastInputSeq.set(from, data.q);
+      this.onInput(data.input, from);
+    } else if (data.t === "roster" && !this.inHub && from === this.hostId && Array.isArray(data.players)) {
+      const before = this.players;
+      this.players = data.players.slice(0, 4);
+      for (const p of before) if (!this.players.some((next) => next.id === p.id)) this.onLeave(p.id);
+      this.onRoster(this.players);
+    } else if (data.t === "finish" && this.role === "guest" && from === this.hostId) {
+      if (data.state) this.onSnapshot(data.state);
+      this.finished = true;
+      this.onFinish(data.outcome);
+    }
+  }
+  update(dt, input2, snapshot) {
+    this.elapsed += dt;
+    if (snapshot) this.lastSnapshot = snapshot;
+    if (!this.shared || !this.connected || !this.running || this.finished) return;
+    if (input2?.pressed) {
+      for (const key in input2.pressed) if (input2.pressed[key]) this.pendingPressed[key] = true;
+    }
+    for (const key of ["action", "kick", "grab", "throw", "hook", "roll", "dodge", "call", "swap"]) {
+      if (input2?.[key] === true) this.pendingFlags[key] = true;
+    }
+    this.sendElapsed += dt;
+    if (this.sendElapsed < 1 / 15) return;
+    this.sendElapsed %= 1 / 15;
+    if (this.role === "host" && snapshot) {
+      this.send({ t: "s", q: ++this.sequence, state: snapshot }, false);
+    } else if (this.role === "guest" && !this.server) {
+      const packet = { ...input2, ...this.pendingFlags };
+      if (input2?.pressed || Object.keys(this.pendingPressed).length) packet.pressed = { ...this.pendingPressed };
+      this.pendingPressed = {};
+      this.pendingFlags = {};
+      this.send({ t: "i", q: ++this.sequence, input: packet }, true, this.hostId);
+    }
+  }
+  progress(score, label2) {
+    this.lastScore = Number(score) || 0;
+    if (this.inHub && !this.finished && !this.ended) globalThis.AIHub.progress({ score: this.lastScore, label: label2 });
+  }
+  finish({ won = true, score = this.lastScore, stats = {} } = {}) {
+    if (this.finished || this.ended || this.role === "guest") return;
+    this.finished = true;
+    const ids = this.players.map((p) => p.id);
+    const outcome = { won, standings: [ids], scores: Object.fromEntries(ids.map((id) => [id, score])), stats: Object.fromEntries(ids.map((id) => [id, stats])) };
+    this.send({ t: "finish", outcome, state: this.lastSnapshot }, true);
+    if (this.inHub) globalThis.AIHub.finish(outcome);
+    this.onFinish(outcome);
+  }
+  stop(reason) {
+    if (this.ended) return;
+    this.ended = true;
+    this.status(reason);
+    this.onEnd(reason);
+  }
+  leave(notify = true) {
+    if (this.inHub) return;
+    this.generation++;
+    const peer = this.peer;
+    this.peer = null;
+    this.links.clear();
+    if (peer) peer.destroy();
+    for (const dispose of this.disposers) dispose();
+    this.disposers = [];
+    this.role = "offline";
+    this.connected = false;
+    this.ended = false;
+    this.finished = false;
+    this.playerId = this.hostId = 0;
+    this.players = [rosterEntry(0)];
+    this.server = false;
+    this.code = "";
+    this.sequence = 0;
+    this.lastSnapshotSeq = -1;
+    this.lastInputSeq.clear();
+    this.pendingPressed = {};
+    this.pendingFlags = {};
+    this.lastSnapshot = null;
+    this.sendElapsed = 0;
+    if (notify) {
+      this.status("Back on dry land.");
+      this.roleChanged();
+    }
+  }
+};
+
+// credits.js
+var CREDITS = `Source Information
+Date: 2026-10-29 09:53 (America/Vancouver)
+Original title: Goofaloop \u2014 The Bell of Bumblebay
+Source inspiration: Goof Troop. Original characters, setting, writing, geometry and score; no source assets used.
+Tech: Three.js r180 (0.180.0), WebGPU only, Rapier 3D 0.19.3, Gamepad API, Web Audio API, ES modules. PeerJS 1.5.5. AI Hub Session Protocol v1.
+Art Direction: cel-shaded toy island dioramas, faceted geometry, ink outlines, warm sand and turquoise sea.
+Animation: procedural skeletal-group transforms, walk cycles, squash, recoil, grapple arcs and particles.
+Audio: code-written tropical score, percussion, musical effects and synthesized gibberish voices.
+Online: AI Hub co-op 1\u20134; standalone PeerJS/WebRTC room codes; local shared-screen 1\u20132. No chat.
+Testing: efficient lightweight module, browser, gameplay and protocol checks. No FPS or optimization targets.
+Environment: Codex CLI (headless); Linux (WSL2). End-user browser unknown. Visual test browser Chromium 156 under Xvfb, SwiftShader WebGPU; module/transport smoke checks also used Chrome 154.
+Model: OpenAI, gpt-6-astra, reasoning effort ultra.
+Usage: estimated API cost unknown; token total unknown; session time approximately 40 minutes.
+
+Testing Feedback
+Issues caught: automated/browser tests caught 3 code/UI defects (settings state, Escape handling and premature rendering-resource disposal), both corrected. Review additionally caught and corrected 3 potential blockers, plus smaller visual and state issues. A separate headless-browser presentation issue was isolated in the test environment.
+Critical/game-breaking: 4 potential blockers (premature rendering-resource disposal, invalid avatar animation, lone online player downed forever, stale colliders during a co-op room transition).
+Results: 10/10 gameplay tests; dedicated-host hub check 25/25; host-leave hub check 24/24; actual standalone WebRTC connection passed; audio/input/UI smoke checks passed. Hub checks used test-only drawing suppression after separate WebGPU screenshot validation, with 150 ms latency, 50 ms jitter and 5% packet loss. Physical controllers and cross-network end-to-end play remain untested.
+Most helpful test: actual browser execution with WebGPU and simulated controller input.
+Least helpful test: syntax checks alone cannot exercise rendering or gameplay.
+
+Engine Feedback
+Liked most: Three.js scene graph makes an expressive procedural world straightforward; Rapier supplies solid collision queries.
+Got stuck or guessed wrong: WebGPU materials differ from the older WebGL shader path; custom node materials were required. String avatar IDs initially produced invalid animation phases and were corrected.
+Most important custom system: shared puzzle state, room authoring data and responsive multiplayer player prediction.
+Hardest part: keeping host authority, local prediction, physics and room transitions consistent.
+Would overhaul: renderer fallback being implicit; this demo explicitly disables it to require WebGPU.
+Would change: add a first-party cel material and ready-made co-op interpolation tools.
+
+Prompt Feedback
+Liked most: the combination of a specific mechanical inspiration, original procedural audio and a controller-first presentation.
+Confusing: the general hub guide recommends a fallback, while this brief explicitly requires WebGPU only; the explicit brief wins and the hub metadata declares WebGPU required.
+Hardest: fitting a complete solo/co-op puzzle campaign, standalone online play and the hub lifecycle into one shareable HTML.
+One additional test: an end-to-end four-person run with physical DualSense controllers on separate networks.
+`;
+
+// main.js
+var mode = "loading";
+var lastActivity = performance.now();
+var dialogueUntil = 0;
+var frameTime = 0;
+var attractTime = 0;
+var attractRoomTime = 0;
+var attractStep = 0;
+var localCoop = false;
+var initializing = true;
+var stopped = false;
+var discardAttractInput = false;
+var lastProbe = { x: 0, y: 0, fire: false };
+var audio = new AudioEngine();
+var view = new SceneView();
+var ui = new UI(action);
+ui.setCredits(CREDITS);
+var settings = { music: 0.5, sfx: 0.75, invertX: false, invertY: false, reducedMotion: false };
+try {
+  settings = { ...settings, ...JSON.parse(localStorage.getItem("goofaloop-settings") || "{}") };
+} catch {
+}
+var input = new Input(() => {
+  lastActivity = performance.now();
+  if (mode === "attract") {
+    showTitle();
+    discardAttractInput = true;
+  }
+});
+input.settings = settings;
+ui.settings = settings;
+audio.setVolume(settings.music, settings.sfx);
+view.reducedMotion = settings.reducedMotion;
+var game = new Game(view, audio, {
+  online: () => net.shared,
+  onRoom: () => {
+    attractRoomTime = 0;
+    attractStep = 0;
+    ui.hud(game.hud());
+  },
+  onDialogue: (name, text) => {
+    if (mode === "attract" || net.inHub) return;
+    ui.dialogue(name, text);
+    dialogueUntil = performance.now() + 6500;
+  },
+  onHint: (text) => ui.toast(text),
+  onHud: (s) => ui.hud(s),
+  onWin: (outcome) => {
+    if (mode === "attract") return;
+    net.finish(outcome);
+    win(outcome);
+  }
+});
+var net = new Network({
+  onStatus: (message) => {
+    ui.setNetwork({ message, code: net.code, connected: net.connected });
+  },
+  onRole: (role, info) => {
+    if (initializing) return;
+    if (role === "offline") return;
+    localCoop = false;
+    mode = "play";
+    stopped = false;
+    game.start({ roster: info.players });
+    ui.hideDialogue();
+    ui.screen("game", { inHub: net.inHub });
+    audio.setScene("explore");
+    input.resetEdges();
+  },
+  onRoster: (players) => {
+    if (mode === "play") game.setRoster(players);
+  },
+  onSnapshot: (s) => {
+    if (mode === "play") game.applySnapshot(s, net.playerId);
+  },
+  onInput: (i, id) => game.acceptInput(i, id),
+  onLeave: () => ui.toast("A friend returned to shore. The adventure continues."),
+  onFinish: (o) => {
+    if (!o.won) {
+      game.done = true;
+      mode = "over";
+      ui.hideDialogue();
+      ui.screen("over", { inHub: net.inHub, score: o.score });
+      audio.suspend(true);
+    } else if (mode !== "win") win(o);
+  },
+  onEnd: (reason) => {
+    stopped = true;
+    if (mode === "win") {
+      audio.suspend(true);
+      return;
+    }
+    mode = "over";
+    audio.suspend(true);
+    ui.hideDialogue();
+    ui.screen("over", { inHub: net.inHub, message: reason, score: game.score });
+  }
+});
+view.onError = (message) => {
+  stopped = true;
+  mode = "error";
+  audio.suspend(true);
+  ui.hideDialogue();
+  ui.screen("error", { message });
+  net.fail(message);
+};
+net.probe(() => ({ scene: mode === "play" ? net.running ? "play" : "ready" : mode === "title" ? "title" : ["win", "over"].includes(mode) ? "over" : "menu", menu: ["pause", "settings"].includes(ui.currentScreen), world: game.simTime, input: lastProbe }));
+function saveData() {
+  try {
+    return JSON.parse(localStorage.getItem("goofaloop-save") || "null");
+  } catch {
+    return null;
+  }
+}
+function showTitle() {
+  if (initializing) return;
+  mode = "title";
+  stopped = false;
+  localCoop = false;
+  dialogueUntil = 0;
+  ui.hideDialogue();
+  input.secondaryJoined = false;
+  game.start({ attract: true });
+  audio.setScene("menu");
+  audio.suspend(false);
+  ui.screen("title", { hasSave: !!saveData(), settings, inHub: false });
+  ui.hud(game.hud());
+  lastActivity = performance.now();
+  input.resetEdges();
+}
+function begin(saved = null, coop = false) {
+  if (net.inHub) return;
+  mode = "play";
+  stopped = false;
+  localCoop = coop;
+  audio.unlock();
+  audio.suspend(false);
+  game.start({ ...saved, roster: coop ? [{ id: 0, name: "Pip" }, { id: 1, name: "Mallow" }] : [{ id: 0, name: "Pip" }] });
+  ui.screen("game", { inHub: false });
+  input.secondaryJoined = coop;
+  input.resetEdges();
+}
+function win(o) {
+  mode = "win";
+  ui.hideDialogue();
+  const secs = Math.floor(o.time || game.elapsed);
+  ui.screen("win", { inHub: net.inHub, shells: o.shells ?? game.shells, time: `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}` });
+  audio.setScene("win");
+  input.resetEdges();
+}
+function resume() {
+  ui.hideDialogue();
+  dialogueUntil = 0;
+  ui.screen("game", { inHub: net.inHub });
+  audio.suspend(false);
+  input.resetEdges();
+}
+function pause() {
+  if (mode !== "play") return;
+  ui.hideDialogue();
+  dialogueUntil = 0;
+  if (net.inHub) {
+    ui.returnScreen = "game";
+    ui.screen("settings", { inHub: true, settings });
+  } else ui.screen("pause", { inHub: false });
+  if (!net.shared) audio.suspend(true);
+}
+async function action(name, value) {
+  if (name !== "settings") audio.unlock();
+  if (name === "ui-sound") {
+    audio.sfx("click");
+    return;
+  }
+  if (name === "start") {
+    net.leave();
+    begin();
+  }
+  if (name === "continue") {
+    begin(saveData());
+  }
+  if (name === "resume") resume();
+  if (name === "pause") pause();
+  if (name === "restart" && !net.inHub) {
+    game.loadRoom(game.roomIndex);
+    resume();
+  }
+  if (name === "menu" && !net.inHub) {
+    if (mode === "play") game.save();
+    net.leave();
+    showTitle();
+  }
+  if (name === "local") {
+    net.leave();
+    begin(null, true);
+  }
+  if (name === "host") {
+    const code = await net.host();
+    if (code) {
+      ui.setNetwork({ message: `Room ${code} \xB7 Friends can join at any time`, code, connected: true });
+      ui.toast(`Room ${code} \xB7 Share this code with your crew`);
+    }
+  }
+  if (name === "join") {
+    await net.join(value);
+  }
+  if (name === "leave") {
+    net.leave();
+    showTitle();
+  }
+  if (name === "settings") {
+    settings = value;
+    input.settings = settings;
+    audio.setVolume(settings.music, settings.sfx);
+    view.reducedMotion = settings.reducedMotion;
+    try {
+      localStorage.setItem("goofaloop-settings", JSON.stringify(settings));
+    } catch {
+    }
+  }
+  if (name === "dialogue") {
+    ui.hideDialogue();
+    dialogueUntil = 0;
+    input.resetEdges();
+  }
+  if (name === "reload") location.reload();
+}
+function attract() {
+  mode = "attract";
+  attractTime = 0;
+  game.start({ attract: true });
+  ui.hideDialogue();
+  ui.screen("attract");
+  audio.setScene("menu");
+  ui.hud(game.hud());
+}
+function driveAttract(dt) {
+  attractTime += dt;
+  attractRoomTime += dt;
+  const p = game.players[0];
+  if (!p) return /* @__PURE__ */ new Map();
+  p.hp = 5;
+  p.invuln = 10;
+  let control = {};
+  const go = (x, z) => {
+    const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz);
+    control.x = d > 0.2 ? dx / d : 0;
+    control.y = d > 0.2 ? dz / d : 0;
+    return d < 0.5;
+  };
+  const aim = (t) => {
+    const d = Math.hypot(t.x - p.x, t.z - p.z) || 1;
+    control.aimX = (t.x - p.x) / d;
+    control.aimY = (t.z - p.z) / d;
+  };
+  if (game.roomIndex === 0) {
+    const enemy = game.entities.find((e) => e.type === "enemy" && !e.dead);
+    if (p.carrying && enemy) {
+      aim(enemy);
+      control.action = dist2(p, enemy) < 7;
+    } else {
+      const pot = game.entities.find((e) => e.type === "pot" && !e.dead && !e.held && !e.thrown);
+      if (pot && go(pot.x, pot.z + 0.3)) control.action = true;
+    }
+    if (p.carrying && enemy && dist2(p, enemy) >= 7) go(enemy.x, enemy.z + 3);
+  } else if (game.roomIndex === 1 || game.roomIndex === 3) {
+    const blocks = game.entities.filter((e) => e.type === "block");
+    const b = blocks.find((e) => e.z > 2);
+    if (b) {
+      if (go(b.x, b.z + 1.25)) {
+        control.aimX = 0;
+        control.aimY = -1;
+        control.kick = true;
+      }
+    } else go(0, -5);
+  } else if (game.roomIndex === 2) {
+    game.hookUnlocked = true;
+    if (p.z > 0) {
+      if (go(0, 1.8)) {
+        control.aimX = 0;
+        control.aimY = -1;
+        control.hook = true;
+      }
+    } else {
+      const sw = game.entities.find((e) => e.type === "switch");
+      if (go(2, -3.5)) {
+        aim(sw);
+        control.hook = true;
+      }
+    }
+  } else if (game.roomIndex === 4) {
+    game.hookUnlocked = true;
+    const s = game.entities.find((e) => e.type === "switch" && !e.active);
+    if (s) {
+      if (go(s.x, s.z + 3)) {
+        aim(s);
+        control.hook = true;
+      }
+    }
+  } else {
+    const boss = game.entities.find((e) => e.type === "boss" && !e.dead);
+    if (p.carrying && boss) {
+      aim(boss);
+      control.action = true;
+    } else {
+      const bomb = game.entities.find((e) => e.type === "bomb" && !e.dead && !e.held && !e.thrown);
+      if (bomb) {
+        if (go(bomb.x, bomb.z)) control.action = true;
+      } else go(Math.sin(attractRoomTime) * 4, 4);
+    }
+  }
+  if (attractRoomTime > 17) {
+    if (game.roomIndex === 5) {
+      game.start({ attract: true });
+      audio.setScene("menu");
+    } else game.loadRoom(game.roomIndex + 1);
+    ui.hideDialogue();
+    ui.screen("attract");
+  }
+  return /* @__PURE__ */ new Map([[p.pid, control]]);
+}
+function dist2(a, b) {
+  return Math.hypot(a.x - b.x, a.z - b.z);
+}
+function loop(now, background = false) {
+  const dt = Math.min(0.05, (now - frameTime) / 1e3 || 1 / 60);
+  frameTime = now;
+  const controls = input.update(dt);
+  if (discardAttractInput) {
+    discardAttractInput = false;
+    controls.menu = {};
+    controls.players = [{}, {}];
+    input.resetEdges();
+  }
+  const raw = controls.players[0];
+  let heldFace = input.keys.has("Space") || input.keys.has("Enter");
+  try {
+    heldFace = heldFace || Array.from(navigator.getGamepads?.() || []).some((p) => p?.buttons[0]?.pressed);
+  } catch {
+  }
+  lastProbe = { x: raw.x, y: raw.y, fire: heldFace, hook: raw.hook };
+  if (mode === "title" && now - lastActivity > 1e4 && ui.currentScreen === "title") attract();
+  if (!["loading", "attract"].includes(mode)) {
+    if (mode === "play") {
+      if (controls.menu.pause) {
+        if (ui.currentScreen === "game") pause();
+        else resume();
+        controls.menu.back = false;
+        controls.menu.confirm = false;
+      }
+      if (ui.currentScreen !== "game") {
+        ui.navigate(controls.menu.x, controls.menu.y);
+        if (controls.menu.confirm) ui.confirm();
+        if (controls.menu.back) ui.back();
+      } else if (dialogueUntil) {
+        if (now > dialogueUntil || raw.action) {
+          ui.hideDialogue();
+          dialogueUntil = 0;
+          raw.action = false;
+        }
+      }
+      if (controls.players[1].join && !net.shared && !localCoop) {
+        localCoop = true;
+        game.setRoster([{ id: 0, name: "Pip" }, { id: 1, name: "Mallow" }]);
+        ui.toast("Mallow joined the adventure!");
+      }
+    } else {
+      ui.navigate(controls.menu.x, controls.menu.y);
+      if (controls.menu.confirm) ui.confirm();
+      if (controls.menu.back || controls.menu.pause) ui.back();
+    }
+  }
+  if (mode === "attract") game.update(dt, driveAttract(dt));
+  if (mode === "play" && !stopped) {
+    const menu = ui.currentScreen !== "game";
+    const local = menu ? {} : raw;
+    const p = game.player(net.playerId);
+    const localInput = { ...local, pressed: { action: !!local.action, kick: !!local.kick, hook: !!local.hook, dodge: !!local.dodge }, state: p ? { x: p.x, z: p.z, fx: p.fx, fz: p.fz, room: game.roomIndex } : null };
+    if (net.running && (net.shared || !menu)) {
+      if (net.isHost) {
+        const map = /* @__PURE__ */ new Map();
+        if (!net.server) map.set(net.playerId, local);
+        if (localCoop) map.set(1, menu ? {} : controls.players[1]);
+        game.update(dt, map);
+      } else game.predict(dt, net.playerId, local);
+    }
+    if (p) localInput.state = { x: p.x, z: p.z, fx: p.fx, fz: p.fz, room: game.roomIndex };
+    net.update(dt, localInput, net.isHost ? game.snapshot() : void 0);
+    net.progress(game.score + game.shells * 10, `${game.roomIndex + 1}/6 \xB7 ${game.def.name}`);
+  }
+  if (!background && view.renderer && !view.renderer._isDeviceLost) view.update(game, dt, mode === "title" ? "title" : "play");
+  if (!background) requestAnimationFrame(loop);
+}
+setInterval(() => {
+  if (document.hidden && net.shared && !stopped && mode === "play") loop(performance.now(), true);
+}, 50);
+async function boot() {
+  try {
+    await Promise.all([view.init(), game.init()]);
+    initializing = false;
+    const info = await net.init();
+    if (info) {
+      mode = "play";
+      game.start({ roster: info.players });
+      ui.hideDialogue();
+      ui.screen("game", { inHub: true });
+      net.ready();
+    } else showTitle();
+    frameTime = performance.now();
+    requestAnimationFrame(loop);
+    document.getElementById("boot-note")?.remove();
+    window.__goof = { game, view, net, ui, input, begin, showTitle, get mode() {
+      return mode;
+    }, attract };
+  } catch (e) {
+    console.error(e);
+    net.fail(e.message);
+    initializing = false;
+    mode = "error";
+    ui.screen("error", { message: e.message });
+    document.getElementById("boot-note")?.remove();
+  }
+}
+boot();
+</script></body></html>

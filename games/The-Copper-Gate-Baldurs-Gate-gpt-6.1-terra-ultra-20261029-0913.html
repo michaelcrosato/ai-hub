@@ -1,0 +1,979 @@
+<!doctype html>
+<!--
+Source Information
+Date: 2026-10-29 09:13
+Source: Baldur's Gate
+Tech: Three.js r180 WebGPU; Rapier 0.19.3; JavaScript, Web Audio API, Gamepad API; PeerJS (see About).
+Art Direction: original stylized, low-poly cel-shaded fantasy.
+Animation: procedural articulated characters and ambient motion.
+Audio: code-generated music, effects and gibberish voices.
+Online: ai-hub parallel sessions and two-player peer-to-peer shared story and combat; see About.
+Testing: lightweight local browser and syntax checks; exact browser/GPU coverage unknown.
+Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort ultra.
+Usage: unknown.
+Engine Feedback: Three.js provides a flexible scene graph; WebGPU initialization and cross-browser support require care. The quest, controller UI, procedural art and audio were built for this game. The hardest part was integrating a complete game around a rendering engine. More unified WebGPU diagnostics would help. The implicit WebGL fallback merits an explicit opt-out.
+Testing Feedback: Eight issues observed: two game-breaking startup errors, a missing co-op ending broadcast, incorrect hub metadata, blank headless GPU output, and three hub conformance failures. Most helpful: the ai-hub conformance harness. Least helpful: the headless screenshot could not verify the scene.
+Prompt Feedback: The controller-first direction and attract mode were useful constraints. Multiplayer deployment details were the least clear. The hardest part was delivering a complete cohesive slice in one file. An extended real-controller, multi-device multiplayer playtest would be valuable.
+-->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><link rel="icon" href="data:,"><meta name="theme-color" content="#141e1a">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="4"><meta name="hub:goal" content="Recover the ember and quiet the bell"><meta name="hub:howto" content="Move with left stick; interact with Cross; strike with Square"><meta name="hub:webgpu" content="required"><title>The Copper Gate</title>
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=DM+Sans:wght@400;500;700&display=swap');
+:root{--ink:#f5ead4;--muted:#c8c1a8;--gold:#e6c889;--dark:#16221c;--line:#bda774;--red:#ad6053}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#101914;color:var(--ink);font-family:'DM Sans',sans-serif}button,input{font:inherit}button{cursor:pointer;color:inherit}#game{position:absolute;inset:0;width:100%;height:100%;display:block}#shade{position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(7,16,12,.32),transparent 32%,transparent 75%,rgba(7,16,12,.18)),linear-gradient(0deg,rgba(6,13,10,.5),transparent 28%)}.hidden{display:none!important}.overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(8,16,12,.72);backdrop-filter:blur(7px);padding:24px}.panel{width:min(760px,95vw);max-height:90vh;overflow:auto;background:linear-gradient(145deg,rgba(37,53,40,.98),rgba(16,27,21,.98));border:1px solid #aa9568;box-shadow:0 0 0 5px #17271d,0 22px 80px #000b;padding:36px 44px;position:relative}.panel:before,.panel:after{content:'✦';color:var(--gold);position:absolute;top:14px;font-size:14px}.panel:before{left:17px}.panel:after{right:17px}.eyebrow{text-transform:uppercase;letter-spacing:.25em;font-size:11px;font-weight:700;color:var(--gold)}h1,h2,h3,p{margin:0}h1,h2,h3{font-family:'Cormorant Garamond',Georgia,serif;font-weight:600}h1{font-size:clamp(52px,6vw,82px);line-height:.86;letter-spacing:-.035em}h2{font-size:48px;line-height:1}h3{font-size:28px}.sub{color:var(--muted);line-height:1.55;margin-top:16px}.rule{height:1px;background:linear-gradient(90deg,transparent,var(--line),transparent);margin:23px 0}.buttonlist{display:grid;gap:8px}.btn{display:flex;align-items:center;justify-content:space-between;text-align:left;border:1px solid #73836b;background:#263b2d;padding:13px 18px;font-size:17px;font-weight:700;transition:.15s}.btn:hover,.btn:focus,.btn.selected{outline:none;background:#d0b477;color:#142219;border-color:#f2dca2}.btn small{font-size:12px;opacity:.75;font-weight:500}.row{display:flex;gap:10px;flex-wrap:wrap}.row .btn{flex:1;min-width:140px}.key{display:inline-grid;place-items:center;border:1px solid #ceb887;border-radius:50%;width:25px;height:25px;font-size:12px;color:#f6dfab;margin-right:8px;flex-shrink:0}.tiny{font-size:12px;color:#b6bda9;line-height:1.5}.title-panel{width:min(620px,95vw);margin-right:auto;margin-left:7vw;background:linear-gradient(90deg,rgba(20,34,25,.98),rgba(24,42,29,.9));padding:32px 40px}.title-panel .tagline{font:italic 23px 'Cormorant Garamond',serif;color:#e5d6b2;margin-top:17px}.title-panel .buttonlist{max-width:340px}.title-panel .tiny{margin-top:20px}.crest{font-size:28px;color:var(--gold);margin-bottom:12px}.rightnote{position:absolute;right:4vw;bottom:4vh;text-align:right;color:#e2d4b6;font:italic 19px 'Cormorant Garamond',serif;text-shadow:0 2px 4px #000}.hud{position:absolute;inset:0;pointer-events:none;text-shadow:0 2px 3px #000}.topbar{position:absolute;top:22px;left:25px;display:flex;gap:10px;align-items:start}.portrait{background:rgba(20,32,24,.92);border:1px solid #b29e70;min-width:180px;padding:10px 13px;box-shadow:0 4px 18px #0005}.portrait .name{font:700 20px 'Cormorant Garamond',serif}.portrait .role{float:right;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--gold)}.bar{height:6px;background:#39382c;margin-top:7px}.bar i{display:block;height:100%;background:#bb6c5c}.quest{position:absolute;right:25px;top:22px;width:270px;background:rgba(20,32,24,.88);border-left:3px solid var(--gold);padding:13px 16px}.quest strong{display:block;font:600 23px 'Cormorant Garamond',serif}.quest span{display:block;font-size:13px;color:#e1dac6;line-height:1.4;margin-top:4px}.prompt{position:absolute;bottom:105px;left:50%;transform:translateX(-50%);background:#1a2a20e8;border:1px solid #a99568;padding:10px 18px;font-size:15px;white-space:nowrap}.actionbar{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);display:flex;gap:8px}.action{background:rgba(19,31,23,.91);border:1px solid #9a8a63;padding:8px 12px;min-width:95px;text-align:center;font-size:12px}.action b{display:block;color:#f5d795;font-size:15px;margin-bottom:2px}.notice{position:absolute;top:21%;left:50%;transform:translateX(-50%);background:#26392de8;border:1px solid #bba36d;padding:10px 20px;font:600 21px 'Cormorant Garamond',serif;transition:opacity .5s}.dialogue-panel{width:min(780px,92vw);margin-top:auto;margin-bottom:4vh}.dialogue-panel p{font:500 24px/1.32 'Cormorant Garamond',serif;margin:13px 0 20px}.dialogue-panel .btn{font-size:15px;padding:10px 15px}.settings-line{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #60715a;padding:13px 0;gap:20px}.settings-line button{min-width:110px}.about{font-size:14px;line-height:1.55;color:#e1deca}.about p{margin:9px 0}.about strong{color:var(--gold)}input{background:#0d1b14;border:1px solid #8c997d;padding:12px;color:white;min-width:0}.error{color:#f4b3a4}.attract-label{position:absolute;top:24px;left:50%;transform:translateX(-50%);background:#1a2b20dd;border:1px solid #ccb37a;padding:9px 18px;color:#f3d6a0;letter-spacing:.18em;font-size:11px;text-transform:uppercase}.touch-warning{position:absolute;bottom:25px;right:25px;background:#1a2b20;border:1px solid #ccb37a;padding:12px 18px;font-weight:700}@media(max-width:700px){.panel{padding:28px}.title-panel{margin:0;width:100%}.quest{width:190px;right:10px;top:10px}.topbar{top:10px;left:10px}.portrait{min-width:130px}.portrait:nth-child(2){display:none}.action{min-width:auto;padding:7px}.rightnote{display:none}h2{font-size:38px}}
+</style></head><body>
+<canvas id="game"></canvas><div id="shade"></div>
+<div id="hud" class="hud hidden"><div class="topbar" id="portraits"></div><div class="quest"><div class="eyebrow">The road ahead</div><strong id="quest-title">A debt of copper</strong><span id="quest-text"></span></div><div id="enemy-info" class="notice hidden" style="top:15%"></div><div id="notice" class="notice hidden"></div><div id="prompt" class="prompt hidden"></div><div class="actionbar"><div class="action"><b>✕ / E</b>Interact</div><div class="action"><b>□ / J</b>Strike</div><div class="action"><b>△ / K</b>Ability</div><div class="action"><b>○ / Q</b><span id="potion-count">Remedy</span></div><div class="action"><b>R1 / Tab</b>Switch</div></div></div>
+<div id="attract" class="attract-label hidden">A tale in motion · press any button to return</div>
+<div id="menu" class="overlay"><div class="panel title-panel"><div class="crest">✧ ─── ❖ ─── ✧</div><div class="eyebrow">A roadward adventure</div><h1>The<br>Copper Gate</h1><div class="tagline">Every debt has a keeper.</div><div class="rule"></div><div class="buttonlist" id="main-buttons"><button class="btn" data-do="new">Begin the journey <small>✕</small></button><button class="btn" data-do="continue">Continue journey <small>↻</small></button><button class="btn" data-do="online">Travel together <small>Online</small></button><button class="btn" data-do="settings">Settings <small>⚙</small></button><button class="btn" data-do="about">About & credits <small>✧</small></button></div><div class="tiny">A controller-first adventure for one or two travellers.<br>Left stick to move · ✕ to choose · Options to pause<br>Keyboard: WASD / arrows, Enter or E, J, K, Q, Tab, Esc</div></div><div class="rightnote">A small tale from the long road<br>✦</div></div>
+<div id="modal" class="overlay hidden"><div class="panel" id="modal-panel"></div></div>
+<div id="dialogue" class="overlay hidden"><div class="panel dialogue-panel"><div class="eyebrow" id="speaker"></div><p id="dialogue-text"></p><div class="buttonlist" id="choices"></div></div></div>
+<div id="touch" class="touch-warning hidden">Controller or keyboard required <button class="btn" data-do="settings">Settings</button></div>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+
+/* The Copper Gate: procedural, low-poly stage and cast. */
+async function createWorld(THREE, canvas) {
+  const renderer = new THREE.WebGPURenderer({ canvas, antialias: true, alpha: false });
+  renderer._getFallback = null; // WebGPU is required; do not fall back to WebGL.
+  await renderer.init();
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.shadowMap.enabled = true;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x91a5a1);
+  scene.fog = new THREE.Fog(0x91a5a1, 45, 90);
+  const camera = new THREE.OrthographicCamera(-14, 14, 8, -8, .1, 130);
+  const hemi = new THREE.HemisphereLight(0xdcebdc, 0x4d4939, 2.2); scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xffe2ae, 2.8); sun.position.set(-15, 25, 12); scene.add(sun);
+  const mat = (c, extra={}) => new THREE.MeshToonMaterial({color:c, ...extra});
+  const mats = {
+    grass:mat(0x657a58), grass2:mat(0x82916b), grass3:mat(0x526e53), soil:mat(0x8b7458), path:mat(0xb9a382),
+    stone:mat(0x858c7f), darkstone:mat(0x58645c), lightstone:mat(0xa7ab96), wood:mat(0x594638), lightwood:mat(0x947554),
+    roof:mat(0x8a5445), roof2:mat(0x5c554d), leaf:mat(0x4e6e50), leaf2:mat(0x6f895a), leaf3:mat(0x9b9d66),
+    gold:mat(0xd9b66c), blue:mat(0x668b98), red:mat(0x9f5046), purple:mat(0x68536d), black:mat(0x292f2e),
+    skin:mat(0xd5a57d), pale:mat(0xc5c5ac), flame:mat(0xffc45f, {emissive:0xf07120, emissiveIntensity:.5}),
+    water:mat(0x6b9a98), rune:mat(0x90e4d1, {emissive:0x3da999, emissiveIntensity:.8})
+  };
+  function box(w,h,d,m,x,y,z,rx=0,ry=0,rz=0,parent=scene) { const o=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),m); o.position.set(x,y,z);o.rotation.set(rx,ry,rz);o.castShadow=true;o.receiveShadow=true;parent.add(o);return o; }
+  function cyl(rt,rb,h,segments,m,x,y,z,parent=scene) {const o=new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,segments),m);o.position.set(x,y,z);o.castShadow=true;o.receiveShadow=true;parent.add(o);return o;}
+  function cone(r,h,m,x,y,z,parent=scene,n=7) {const o=new THREE.Mesh(new THREE.ConeGeometry(r,h,n),m);o.position.set(x,y,z);o.castShadow=true;parent.add(o);return o;}
+  function ball(r,m,x,y,z,parent=scene,detail=0){const o=new THREE.Mesh(new THREE.IcosahedronGeometry(r,detail),m);o.position.set(x,y,z);o.castShadow=true;parent.add(o);return o;}
+  let seed=76251; function rand(){ seed=(seed*1664525+1013904223)>>>0;return seed/4294967296; }
+  // Raised board with a broad old road winding through it.
+  box(48,1.1,34,mats.soil,0,-.68,0); box(48,.22,34,mats.grass,0,-.08,0);
+  for(let x=-23;x<24;x+=1.8) { const z=Math.sin(x*.24)*.6; box(1.9,.04,5.5+rand()*.45,mats.path,x,.055,z,0,(rand()-.5)*.04); }
+  for(let i=0;i<340;i++){let x=rand()*46-23,z=rand()*32-16;if(Math.abs(z-Math.sin(x*.24)*.6)<2.8)continue;let m=[mats.grass2,mats.grass3,mats.grass][Math.floor(rand()*3)];box(.3+rand()*.9,.025,.15+rand()*.55,m,x,.07,z,0,rand()*3);}
+  // Cracked stones set into the track.
+  for(let i=0;i<90;i++){let x=rand()*46-23,z=rand()*4.7-2.35;box(.15+rand()*.55,.045,.13+rand()*.4,rand()>.5?mats.lightstone:mats.soil,x,.09,z,0,rand()*3);}
+  function tree(x,z,s=1,kind=0){let g=new THREE.Group();g.position.set(x,0,z);g.scale.setScalar(s);scene.add(g);cyl(.18,.28,2.4,7,mats.wood,0,1.2,0,g); if(kind===0){ball(1.15,mats.leaf,0,3,0,g);ball(.85,mats.leaf2,-.65,2.8,.1,g);ball(.8,mats.leaf3,.55,3.15,0,g);}else{cone(1.2,2,mats.leaf,0,2.5,0,g);cone(.9,1.8,mats.leaf2,0,3.5,0,g);cone(.55,1.3,mats.leaf3,0,4.2,0,g);}return g;}
+  for(let i=0;i<80;i++){let x=rand()*46-23,z=(rand()>.5?1:-1)*(6+rand()*10);if(x < -6 && Math.abs(z)<9)continue; if(x>11&&Math.abs(z)<8)continue; tree(x,z,.65+rand()*.65,rand()>.55?1:0);}
+  function rock(x,z,s=1){let o=ball(1,mats.stone,x,.35*s,z);o.scale.set(1.3*s,.65*s,.8*s);o.rotation.y=rand()*3;}
+  for(let i=0;i<55;i++){let x=rand()*46-23,z=(rand()>.5?1:-1)*(4+rand()*12);if(x< -8 && Math.abs(z)<7)continue;rock(x,z,.2+rand()*.5);}
+  // Village houses, roof beams, windows and chimneys.
+  function house(x,z,s=1,roof=mats.roof){const g=new THREE.Group();g.position.set(x,0,z);g.scale.setScalar(s);scene.add(g);
+    box(4,2.8,3.3,mats.lightstone,0,1.4,0,0,0,0,g);box(4.15,.25,3.45,mats.wood,0,2.7,0,0,0,0,g);
+    const r=new THREE.Mesh(new THREE.ConeGeometry(3.3,2,4),roof);r.rotation.y=Math.PI/4;r.position.set(0,3.7,0);r.castShadow=true;g.add(r);
+    box(.55,1.2,.55,mats.stone,1,3.9,-.3,0,0,0,g);box(1,1.8,.08,mats.wood,0,.9,1.69,0,0,0,g);box(.75,.65,.09,mats.gold,-1.3,1.6,1.7,0,0,0,g);box(.1,.65,.11,mats.wood,-1.3,1.6,1.72,0,0,0,g);box(.75,.1,.11,mats.wood,-1.3,1.6,1.72,0,0,0,g);
+    for(let xx of [-1.9,1.9])box(.16,2.8,.18,mats.wood,xx,1.4,1.72,0,0,0,g);return g;}
+  house(-18,-6,1.05);house(-13,-8,.85,mats.roof2);house(-20,7,.8,mats.roof2);house(-9,8,.9);
+  // Village fence and market details.
+  for(let x=-22;x<-7;x+=1.2){for(let z of [-4.6,5.1]){if(x>-14&&x<-10)continue;cyl(.07,.08,.8,5,mats.wood,x,.4,z);box(1.2,.1,.1,mats.lightwood,x+.55,.55,z);}}
+  function barrel(x,z){cyl(.37,.43,.85,9,mats.lightwood,x,.43,z);cyl(.4,.4,.08,9,mats.black,x,.2,z);cyl(.4,.4,.08,9,mats.black,x,.7,z);}
+  barrel(-19,3.8);barrel(-18.1,4);barrel(-10,5.5);box(1,.85,.8,mats.wood,-8,.43,-4);box(1.05,.1,.85,mats.gold,-8,.87,-4);box(.13,.2,.88,mats.gold,-8,.55,-4);
+  // Ancient shrine: a circle of stones and a hovering blue rune.
+  cyl(2.1,2.25,.22,12,mats.darkstone,0,.13,-2);cyl(1.6,1.7,.12,12,mats.lightstone,0,.3,-2);cyl(.65,.8,.8,8,mats.stone,0,.75,-2);cyl(.48,.5,.2,8,mats.gold,0,1.2,-2);
+  const shrine=ball(.32,mats.rune,0,1.8,-2,scene,1); for(let a=0;a<8;a++){const t=a*Math.PI/4;box(.23,.05,.65,mats.rune,Math.cos(t)*1.25,.39,-2+Math.sin(t)*1.25,0,-t);}
+  // Ruins flank the road, their broken arch frames the final altar.
+  function pillar(x,z,h=3){box(.9,.35,.9,mats.darkstone,x,.18,z);box(.55,h,.55,mats.stone,x,h/2+.3,z);box(.8,.22,.8,mats.lightstone,x,h+.3,z);}
+  for(let [x,z,h] of [[5,-5,2.5],[5,5,3],[11,-5,3.8],[11,5,3.8],[18,-4,4.2],[18,4,4.2],[21,-5,2],[21,5,2]])pillar(x,z,h);
+  box(.8,.6,8.6,mats.stone,18,4.8,0); box(.95,.12,8.7,mats.gold,18,4.55,0);
+  for(let i=0;i<20;i++){const x=4+rand()*18,z=(rand()>.5?1:-1)*(3.2+rand()*3); box(.3+rand(),.2+rand()*.4,.4,mats.darkstone,x,.25,z,0,rand()*3,rand()*.3);}
+  // The seal is visually distinct from the shrine.
+  cyl(1.6,1.9,.35,10,mats.darkstone,18,.25,0);cyl(1.25,1.35,.2,10,mats.stone,18,.52,0);cyl(.65,.8,.85,8,mats.stone,18,1,0);cyl(.75,.8,.16,8,mats.gold,18,1.48,0);const seal=ball(.42,mats.rune,18,2,0,scene,1);
+  for(let z of [-3.2,3.2]){cyl(.22,.3,1.5,8,mats.darkstone,14,.75,z);ball(.3,mats.flame,14,1.65,z);}
+  // Character construction uses a shared articulated silhouette.
+  function person(kind){const g=new THREE.Group();scene.add(g);const isEnemy=kind==='enemy',guard=kind==='guardian',npc=kind==='elder';const clothes=guard?mats.darkstone:isEnemy?mats.red:npc?mats.purple:kind==='companion'?mats.blue:mats.gold;const skin=guard?mats.pale:mats.skin;let scale=guard?1.42:1;
+    g.scale.setScalar(scale);const legs=new THREE.Group();g.add(legs);const l=box(.22,.75,.25,mats.black,-.19,.38,0,0,0,0,legs),r=box(.22,.75,.25,mats.black,.19,.38,0,0,0,0,legs);
+    const torso=box(.72,.9,.42,clothes,0,1.05,0,0,0,0,g);box(.78,.12,.48,mats.wood,0,.72,0,0,0,0,g);ball(.28,skin,0,1.75,0,g,1);
+    if(isEnemy){cone(.4,.55,mats.darkstone,0,2.08,0,g);box(.7,.18,.6,mats.darkstone,0,1.9,0,0,0,0,g);}else if(guard){box(.65,.2,.55,mats.gold,0,1.92,0,0,0,0,g);cone(.3,.45,mats.darkstone,0,2.15,0,g);}else {ball(.3,mats.wood,0,1.92,-.05,g);}
+    const armL=new THREE.Group(),armR=new THREE.Group();armL.position.set(-.48,1.4,0);armR.position.set(.48,1.4,0);g.add(armL,armR);box(.22,.7,.25,clothes,0,-.3,0,0,0,.13,armL);box(.22,.7,.25,clothes,0,-.3,0,0,0,-.13,armR);
+    if(kind==='companion'||npc){box(.11,1.65,.11,mats.wood,0,-.5,.17,0,0,-.1,armR);ball(.15,mats.rune,0,.34,.17,armR);}else{box(.1,1.1,.12,mats.lightstone,0,-.62,.18,0,0,-.1,armR);box(.34,.1,.13,mats.gold,0,-.2,.18,0,0,0,armR);}
+    if(kind==='hero'){box(.6,.7,.1,mats.red,0,1,-.3,0,0,0,g);}
+    g.userData={l,r,armL,armR,torso,moving:false};return g;}
+  const actors={hero:person('hero'),companion:person('companion'),remote:person('companion'),elder:person('elder'),enemy0:person('enemy'),enemy1:person('enemy'),enemy2:person('enemy'),guardian:person('guardian')};
+  actors.remote.visible=false;actors.elder.position.set(-12,0,1);actors.hero.position.set(-16,0,0);actors.companion.position.set(-17,0,1);actors.enemy0.position.set(5,0,0);actors.enemy1.position.set(8,0,-3);actors.enemy2.position.set(9,0,3);actors.guardian.position.set(15,0,0);
+  const marker = new THREE.Mesh(new THREE.RingGeometry(.7,.78,32),mats.gold);marker.rotation.x=-Math.PI/2;marker.position.y=.12;scene.add(marker);
+  let focus='hero';const cameraTarget=new THREE.Vector3(-15,0,0), desired=new THREE.Vector3();
+  function resize(){const w=canvas.clientWidth||innerWidth,h=canvas.clientHeight||innerHeight;renderer.setSize(w,h,false);const aspect=w/h;const size=10;camera.left=-size*aspect;camera.right=size*aspect;camera.top=size;camera.bottom=-size;camera.updateProjectionMatrix();}
+  function setActor(name,x,z,angle=0,visible=true){const a=actors[name];if(!a)return;const dx=x-a.position.x,dz=z-a.position.z;a.userData.moving=dx*dx+dz*dz>.00001;a.position.set(x,0,z);a.rotation.y=angle;a.visible=visible;}
+  function setFocus(name){if(actors[name])focus=name;}
+  function update(dt,time){const p=actors[focus].position;desired.set(p.x,0,p.z);cameraTarget.lerp(desired,1-Math.exp(-dt*3));camera.position.set(cameraTarget.x+13,22,cameraTarget.z+20);camera.lookAt(cameraTarget.x,0,cameraTarget.z);marker.position.x=p.x;marker.position.z=p.z;for(const a of Object.values(actors)){const d=a.userData;const swing=d.moving?Math.sin(time*10)*.5:Math.sin(time*2)*.025;d.l.rotation.x=swing;d.r.rotation.x=-swing;d.armL.rotation.x=-swing*.5;d.armR.rotation.x=swing*.5;}shrine.position.y=1.8+Math.sin(time*2)*.12;shrine.rotation.y+=dt;seal.position.y=2+Math.sin(time*2.5)*.12;seal.rotation.y+=dt;renderer.render(scene,camera);}
+  resize();window.addEventListener('resize',resize);
+  return {scene,camera,renderer,actors,setActor,setFocus,update,resize};
+}
+
+// The Copper Gate: simulation and story. Rendering, input and presentation are injected.
+function createGameplay({world, ui, audio, RAPIER}) {
+  const initial = () => ({
+    party: [
+      {id:'hero', name:'Rowan', role:'Warden', hp:100, maxHp:100, energy:100, x:-16, z:0, angle:Math.PI/2, cooldown:0, strike:0},
+      {id:'companion', name:'Moth', role:'Spellweaver', hp:75, maxHp:75, energy:100, x:-17, z:1, angle:Math.PI/2, cooldown:0, strike:0}
+    ],
+    enemies: [
+      {id:'enemy0', name:'Hollow raider', x:5, z:0, hp:44, maxHp:44, speed:1.7, strike:0, angle:0},
+      {id:'enemy1', name:'Hollow raider', x:8, z:-3, hp:44, maxHp:44, speed:1.7, strike:0, angle:0},
+      {id:'enemy2', name:'Hollow archer', x:9, z:3, hp:36, maxHp:36, speed:1.45, strike:0, angle:0},
+      {id:'guardian', name:'The Bellkeeper', x:15, z:0, hp:125, maxHp:125, speed:1.25, strike:0, angle:0}
+    ],
+    active:0, quest:0, talked:false, chest:false, ward:false, guardianPeace:false,
+    potions:2, xp:0, level:1, paused:false, dialogue:false, prompt:'', elapsed:0, finished:false,
+    objective:'Speak with Keeper Sable in Coppercross.', log:'The road has brought you to Coppercross.'
+  });
+  let s = initial(), choices = [], tickUI = 0, networkRole='offline', networkSend=()=>{}, networkTimer=0;
+  // Rapier character controllers resolve motion against fixed boundary colliders.
+  const physics = RAPIER ? new RAPIER.World({x:0,y:0,z:0}) : null;
+  const bodies = {};
+  let controller;
+  if (physics) {
+    controller = physics.createCharacterController(0.02);
+    const wall = (x,z,hx,hz) => physics.createCollider(RAPIER.ColliderDesc.cuboid(hx,1,hz).setTranslation(x,.6,z).setCollisionGroups(0x00020001));
+    wall(-21.5,0,.5,14); wall(21.5,0,.5,14); wall(0,-13.5,22,.5); wall(0,13.5,22,.5);
+    for (const actor of [...s.party,...s.enemies]) {
+      const body = physics.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(actor.x,.6,actor.z));
+      const collider = physics.createCollider(RAPIER.ColliderDesc.capsule(.25,.3).setCollisionGroups(0x00010002),body);
+      bodies[actor.id]={body,collider};
+    }
+    physics.step();
+  }
+  function resetPhysics() {
+    if(!physics)return;
+    for(const actor of [...s.party,...s.enemies]) bodies[actor.id]?.body.setTranslation({x:actor.x,y:.6,z:actor.z},true);
+    physics.step();
+  }
+  const say = (text) => { s.log=text; ui.notice?.(text); };
+  const sound = (name) => audio.play?.(name);
+  const dist = (a,b) => Math.hypot(a.x-b.x,a.z-b.z);
+  const alive = a => a.hp > 0;
+  const current = () => s.party[s.active];
+  const livingEnemies = () => s.enemies.filter(e => alive(e) && !(e.id === 'guardian' && s.guardianPeace));
+  function refreshObjective() {
+    s.objective = s.finished ? 'The bell is quiet. Coppercross endures.' : !s.talked ? 'Speak with Keeper Sable in Coppercross.' : !s.ward ? 'Find the old shrine and claim its ward.' : !s.guardianPeace && alive(s.enemies[3]) ? 'Reach the Bellkeeper. Fight or seek a truce.' : 'Return the bell’s ember at the eastern altar.';
+  }
+  function show(speaker,text,options) {
+    s.dialogue=true; choices=options;
+    const data={speaker,text,choices:options.map(o=>o[0])};
+    ui.dialogue?.(data); if(networkRole==='host') networkSend({kind:'dialogue',data}); sound('voice');
+  }
+  function close() { s.dialogue=false; choices=[]; ui.closeDialogue?.(); if(networkRole==='host') networkSend({kind:'close'}); }
+  function choose(i) {
+    if(networkRole==='guest'){networkSend({kind:'choose',index:i});return;}
+    if(!s.dialogue || !choices[i]) return;
+    const fn=choices[i][1]; close(); fn?.(); refreshObjective(); sync();
+  }
+  function elder() {
+    if(s.finished) return show('Keeper Sable','The bell is quiet, and for once the village has a dawn to look forward to. You have my thanks, and the thanks of those too stubborn to say it.',[['Farewell.',null]]);
+    if(s.talked) return show('Keeper Sable', s.ward ? 'The ward remembers what the Bellkeeper has forgotten. Whether you answer grief with steel or with mercy, bring the ember home to the altar.' : 'The shrine lies east along the old road. Take its ward; the dead have grown quarrelsome, and the living no less so.', [['We are on our way.',null],['Who is Moth?',mothStory]]);
+    show('Keeper Sable','A bell rings beneath the earth, though its tower fell a century ago. Each night it calls the hollowed dead a little nearer. You look capable, or at least very difficult to discourage.',[
+      ['Tell me what needs doing.',()=>show('Keeper Sable','Find the shrine east of here and take its ward. Beyond it, the Bellkeeper guards a stolen ember. Return that ember to the altar, and the road may sleep again.',[
+        ['We will see it done.',()=>{s.talked=true;s.quest=1;say('Quest begun: The Bell Below.');}],
+        ['What is in it for us?',()=>show('Keeper Sable','Your lives, if fortune is generous. Also the contents of the old supply chest. I am not entirely without charm.',[['A fair bargain.',()=>{s.talked=true;s.quest=1;say('Quest begun: The Bell Below.');}]])]
+      ])],
+      ['Who travels with me?',mothStory]
+    ]);
+  }
+  function mothStory(){show('Moth','I used to catalogue ghosts. Then one followed me home and corrected all my spelling. Now I travel; the work is less respectable, but the company is better.',[['Let us find Sable’s bell.',()=>{if(!s.talked) elder();}]]);}
+  function chest() {
+    if(s.chest) return say('The supply chest is empty.');
+    s.chest=true;s.potions+=2;sound('loot');say('Supply chest: found two healing draughts.');
+  }
+  function shrine() {
+    if(!s.ward) show('The Roadside Shrine','A copper hand rises from the stone, palm open. Its inscription reads: “A promise kept is a light that does not go out.”',[
+      ['Take the ward.',()=>{s.ward=true;s.quest=2; s.party.forEach(p=>{p.hp=p.maxHp;p.energy=100});sound('heal');say('The ward is yours. The party is restored.');}],
+      ['Leave it for now.',null]
+    ]);
+    else show('The Roadside Shrine','The ward warms in your hand. A moment’s rest here knits flesh and settles the mind.',[
+      ['Rest and restore the party.',()=>{s.party.forEach(p=>{p.hp=p.maxHp;p.energy=100});sound('heal');say('The shrine restores the party.');}],['Continue.',null]
+    ]);
+  }
+  function guardian() {
+    if(s.guardianPeace) return say('The Bellkeeper has laid down its burden.');
+    if(!alive(s.enemies[3])) return say('The Bellkeeper is silent. The altar waits beyond.');
+    show('The Bellkeeper','“They rang for help,” says the figure beneath its iron crown. “I answered. They buried the bell, and left me listening.”',[
+      ['The dead deserve rest. Let the ember go.',()=>{
+        if(s.ward) show('The Bellkeeper','The copper ward gleams. “That promise was made to me.” Its fingers open, and the ember rises, warm as a living heart.',[['Accept the ember.',()=>{s.guardianPeace=true;s.quest=3;award(70);sound('loot');say('The Bellkeeper yields the ember peacefully.');}]]);
+        else show('The Bellkeeper','“Pretty words. Bring me the promise they broke, or bring me a blade.” The shrine on the road may hold that promise.',[['We will return.',null]]);
+      }],
+      ['Then we will silence you by force.',()=>{s.enemies[3].hostile=true;say('The Bellkeeper draws its weapon.');}],
+      ['Leave.',null]
+    ]);
+  }
+  function altar() {
+    if(s.finished) return;
+    if(!s.guardianPeace && alive(s.enemies[3])) return say('The altar is cold. The Bellkeeper still holds the ember.');
+    show('The Ember Altar','The ember hangs above a hollow in the stone. For the first time in many years, the bell does not ring.',[
+      ['Set the ember in its place.',()=>{s.finished=true;s.quest=4;refreshObjective();sound('victory');const ending={title:'THE BELL BELOW',text:s.guardianPeace ? 'The Bellkeeper remembers its promise, and the road is quiet. Coppercross has bought another dawn with mercy.' : 'The Bellkeeper falls, and the road is quiet. Coppercross has bought another dawn with steel.'};ui.ending?.(ending);if(networkRole==='host')networkSend({kind:'ending',data:ending});}],
+      ['Wait a moment.',null]
+    ]);
+  }
+  function award(amount) {
+    s.xp+=amount;
+    if(s.level===1 && s.xp>=100) {s.level=2;s.party.forEach(p=>{p.maxHp+=20;p.hp=p.maxHp;p.energy=100});say('Level 2! The party is restored and gains 20 maximum health.');sound('heal');}
+  }
+  function sync() {
+    for(const p of s.party) world.setActor(p.id,p.x,p.z,p.angle,alive(p));
+    for(const e of s.enemies) world.setActor(e.id,e.x,e.z,e.angle,alive(e) && !(e.id==='guardian' && s.guardianPeace));
+    refreshObjective(); world.setFocus?.(s.party[s.active].id); ui.update?.(s);
+  }
+  function move(a,dx,dz) {
+    if(!dx && !dz) return;
+    let x=Math.max(-21,Math.min(21,a.x+dx)),z=Math.max(-13,Math.min(13,a.z+dz));
+    if(physics && bodies[a.id]) {
+      const {body,collider}=bodies[a.id];
+      body.setTranslation({x:a.x,y:.6,z:a.z},true);
+      controller.computeColliderMovement(collider,{x:x-a.x,y:0,z:z-a.z});
+      const offset=controller.computedMovement(); x=a.x+offset.x; z=a.z+offset.z;
+      body.setNextKinematicTranslation({x,y:.6,z});
+    } else if(world.move){const p=world.move(a.id,x,z);if(p && Number.isFinite(p.x) && Number.isFinite(p.z)){x=p.x;z=p.z;}}
+    a.x=x;a.z=z;a.angle=Math.atan2(dx,dz);
+  }
+  function damage(e,amount) {
+    if(!e || !alive(e)) return;
+    e.hp=Math.max(0,e.hp-amount); sound('hit');
+    if(!alive(e)){award(e.id==='guardian'?70:35);say(e.id==='guardian'?'The Bellkeeper falls. The ember is free.':`${e.name} defeated.`);}
+  }
+  function target(range) {return livingEnemies().filter(e=>dist(current(),e)<=range).sort((a,b)=>dist(current(),a)-dist(current(),b))[0];}
+  function nearest() {
+    const p=current();
+    const items=[{x:-12,z:1,label:'Speak to Keeper Sable',fn:elder},{x:-8,z:-4,label:s.chest?'Empty chest':'Open supply chest',fn:chest},{x:0,z:-2,label:'Examine the shrine',fn:shrine},{x:18,z:0,label:'Examine the altar',fn:altar}];
+    const g=s.enemies[3]; if(alive(g)&&!g.hostile&&!s.guardianPeace) items.push({x:g.x,z:g.z,label:'Speak to the Bellkeeper',fn:guardian});
+    return items.map(v=>({...v,d:dist(p,v)})).filter(v=>v.d<2.8).sort((a,b)=>a.d-b.d)[0];
+  }
+  function action(name) {
+    if(s.finished || s.dialogue) return;
+    if(networkRole==='guest'){if(name==='switch')return say('In a shared journey, each player guides one companion.'); networkSend({kind:'action',name,x:current().x,z:current().z});return;}
+    if(networkRole==='host'&&name==='switch')return say('In a shared journey, each player guides one companion.');
+    const p=current();
+    if(name==='pause'){s.paused=!s.paused;say(s.paused?'Tactical pause. Plan your next move.':'The world moves again.');sync();return;}
+    if(name==='switch') {const next=1-s.active;if(alive(s.party[next])){s.active=next;say(`Controlling ${current().name}.`);} else say('Your companion has fallen. Rest at the shrine.');sync();return;}
+    if(name==='potion') {if(s.potions<=0) return say('No healing draughts remain.');if(p.hp>=p.maxHp) return say('Health is already full.');s.potions--;p.hp=Math.min(p.maxHp,p.hp+50);sound('heal');say(`${p.name} drinks a healing draught.`);sync();return;}
+    if(s.paused) return say('Resume time before acting.');
+    if(name==='interact') {const n=nearest();if(n)n.fn();else say('Nothing close enough to examine.');}
+    if(name==='attack') {
+      if(p.strike>0)return;
+      const e=target(p.id==='hero'?3.2:6.5);p.strike=.65;
+      if(e){if(e.id==='guardian')e.hostile=true;damage(e,p.id==='hero'?18:12);} else say('No enemy in reach.');
+    }
+    if(name==='skill') {
+      if(p.cooldown>0) return say(`${p.name} needs ${Math.ceil(p.cooldown)}s to recover.`);
+      if(p.energy<25) return say('Not enough focus.');
+      const targets=livingEnemies().filter(e=>dist(p,e)<(p.id==='hero'?4:7));
+      if(!targets.length)return say('No enemy in range for that ability.');
+      p.energy-=25;p.cooldown=5;sound('spell');
+      if(p.id==='hero'){targets.forEach(e=>{if(e.id==='guardian')e.hostile=true;damage(e,25)});say('Rowan sweeps the field with Warden’s arc.');}
+      else {targets.sort((a,b)=>dist(p,a)-dist(p,b));if(targets[0].id==='guardian')targets[0].hostile=true;damage(targets[0],38);say('Moth casts a bright bolt.');}
+    }
+    sync();
+  }
+  function update(dt,input={x:0,z:0}) {
+    dt=Math.min(.05,Math.max(0,dt));
+    if(networkRole==='guest') {
+      if(!s.paused&&!s.dialogue&&!s.finished&&alive(current())) {
+        const len=Math.hypot(input.x||0,input.z||0);
+        if(len>.08)move(current(),(input.x/Math.max(1,len))*3.5*dt,(input.z/Math.max(1,len))*3.5*dt);
+      }
+      if(physics)physics.step();
+      networkTimer+=dt;if(networkTimer>.1){networkTimer=0;networkSend({kind:'position',x:current().x,z:current().z,angle:current().angle});}
+      const n=nearest();s.prompt=n?.label||'';sync();return;
+    }
+    if(!s.paused&&!s.dialogue&&!s.finished){
+      s.elapsed+=dt;
+      let p=current(), len=Math.hypot(input.x||0,input.z||0);
+      if(len>.08)move(p,(input.x/Math.max(1,len))*3.5*dt,(input.z/Math.max(1,len))*3.5*dt);
+      for(const member of s.party){member.cooldown=Math.max(0,member.cooldown-dt);member.strike=Math.max(0,member.strike-dt);member.energy=Math.min(100,member.energy+2.7*dt);}
+      const ally=s.party[1-s.active];
+      if(alive(ally)&&networkRole!=='host'){
+        const d=dist(ally,p);
+        if(d>2.2)move(ally,(p.x-ally.x)/d*Math.min(d-1.8,3*dt),(p.z-ally.z)/d*Math.min(d-1.8,3*dt));
+        const enemy=livingEnemies().filter(e=>(e.id!=='guardian'||e.hostile)&&dist(ally,e)<(ally.id==='hero'?2.8:5.5)).sort((a,b)=>dist(ally,a)-dist(ally,b))[0];
+        if(enemy&&ally.strike<=0){ally.strike=1.6;damage(enemy,ally.id==='hero'?11:8);}
+      }
+      for(const e of livingEnemies()){
+        if(e.id==='guardian'&&!e.hostile)continue;
+        e.strike=Math.max(0,e.strike-dt);
+        const victims=s.party.filter(alive).sort((a,b)=>dist(a,e)-dist(b,e));if(!victims.length)break;
+        const victim=victims[0], d=dist(victim,e); if(d>9)continue;
+        if(d>1.65){move(e,(victim.x-e.x)/d*e.speed*dt,(victim.z-e.z)/d*e.speed*dt);}
+        else if(e.strike<=0){e.strike=e.id==='guardian'?1.4:1.8;victim.hp=Math.max(0,victim.hp-(e.id==='guardian'?15:8));sound('hit');if(!alive(victim)){if(networkRole==='host'){victim.hp=Math.ceil(victim.maxHp*.4);victim.x=-1;victim.z=-1;say(`${victim.name} returns at the shrine.`);} else {say(`${victim.name} has fallen.`);if(victim===current()&&alive(s.party[1-s.active]))s.active=1-s.active;}}}
+      }
+      if(!s.party.some(alive)){
+        s.party.forEach((a,i)=>{a.hp=Math.ceil(a.maxHp*.6);a.energy=100;a.x=-1-i;a.z=-1+i});
+        s.enemies.filter(alive).forEach(e=>{e.hostile=false;e.strike=1;});s.active=0;say('The shrine draws you back from the brink.');sound('heal');
+      }
+    }
+    if(physics) physics.step();
+    if(networkRole==='host'){networkTimer+=dt;if(networkTimer>.15){networkTimer=0;networkSend({kind:'snapshot',state:s});}}
+    const n=nearest();s.prompt=n?.label||'';
+    tickUI+=dt;if(tickUI>.1){tickUI=0;sync();}else {for(const a of [...s.party,...s.enemies])world.setActor(a.id,a.x,a.z,a.angle,alive(a)&&!(a.id==='guardian'&&s.guardianPeace));}
+  }
+  function start(){s=initial();s.active=networkRole==='guest'?1:0;choices=[];resetPhysics();sync();}
+  function save(){return JSON.stringify(s);}
+  function load(data){try{const value=typeof data==='string'?JSON.parse(data):data;if(!value||!Array.isArray(value.party)||!Array.isArray(value.enemies))return false;s={...initial(),...value,dialogue:false,paused:false};choices=[];resetPhysics();ui.closeDialogue?.();sync();say('Journey restored.');return true;}catch{return false;}}
+  function setNetwork(role,send) {
+    networkRole=role==='host'||role==='guest'?role:'offline';networkSend=send||(()=>{});networkTimer=0;
+    s.active=networkRole==='guest'?1:0;s.dialogue=false;choices=[];ui.closeDialogue?.();sync();
+  }
+  function receiveNetwork(msg) {
+    if(!msg || typeof msg!=='object')return;
+    if(networkRole==='host') {
+      if((msg.kind==='position'||msg.kind==='action')&&Number.isFinite(msg.x)&&Number.isFinite(msg.z)) {
+        const p=s.party[1];p.x=Math.max(-21,Math.min(21,msg.x));p.z=Math.max(-13,Math.min(13,msg.z));if(Number.isFinite(msg.angle))p.angle=msg.angle;
+      }
+      if(msg.kind==='action' && ['interact','attack','skill','potion','pause'].includes(msg.name)) {
+        const before=s.active;s.active=1;action(msg.name);s.active=before;sync();
+      }
+      if(msg.kind==='choose'&&Number.isInteger(msg.index))choose(msg.index);
+    } else if(networkRole==='guest') {
+      if(msg.kind==='snapshot'&&msg.state&&Array.isArray(msg.state.party)&&Array.isArray(msg.state.enemies)) {
+        const previous=s.party[1], snapshot=msg.state; const localDialogue=s.dialogue;
+        s={...initial(),...snapshot,active:1,dialogue:localDialogue};
+        if(previous&&alive(previous)&&alive(s.party[1])) {s.party[1].x=previous.x;s.party[1].z=previous.z;s.party[1].angle=previous.angle;}
+        sync();
+      } else if(msg.kind==='dialogue'&&msg.data) {s.dialogue=true;ui.dialogue?.(msg.data);sound('voice');}
+      else if(msg.kind==='close') {s.dialogue=false;ui.closeDialogue?.();}
+      else if(msg.kind==='ending'&&msg.data) {s.finished=true;ui.ending?.(msg.data);sound('victory');}
+    }
+  }
+  return {get state(){return s;},start,update,action,choose,save,load,setNetwork,receiveNetwork};
+}
+
+/* Standalone room transport. Only position/appearance and game state are exchanged; no chat. */
+class CopperOnline {
+  constructor() {
+    this.peer = null; this.hostConnection = null; this.connections = new Map();
+    this.code = ''; this.status = 'Offline'; this.isHost = false;
+    this.onState = () => {}; this.onLeave = () => {}; this.onStatus = () => {};
+  }
+  setStatus(s) { this.status = s; this.onStatus(s); }
+  static load() {
+    if (window.Peer) return Promise.resolve();
+    if (!CopperOnline.loading) CopperOnline.loading = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js';
+      s.onload = resolve; s.onerror = () => reject(new Error('Could not load the room service'));
+      document.head.appendChild(s);
+    });
+    return CopperOnline.loading;
+  }
+  static newCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const b = crypto.getRandomValues(new Uint8Array(6));
+    return Array.from(b, n => chars[n % chars.length]).join('');
+  }
+  async host() {
+    this.close(); await CopperOnline.load(); this.isHost = true;
+    this.code = CopperOnline.newCode(); this.setStatus('Opening room…');
+    return new Promise((resolve, reject) => {
+      const p = this.peer = new Peer('copper-gate-' + this.code, { debug: 0 });
+      let settled = false;
+      p.on('open', () => { settled = true; this.setStatus('Room ' + this.code + ' · waiting for companions'); resolve(this.code); });
+      p.on('connection', c => {
+        if (this.connections.size >= 1) { c.on('open', () => c.close()); return; }
+        this.connections.set(c.peer, c); this.attach(c);
+      });
+      p.on('error', e => { this.setStatus('Room error: ' + e.type); if (!settled) { settled = true; reject(e); } });
+      p.on('disconnected', () => this.setStatus('Room service disconnected'));
+    });
+  }
+  async join(code) {
+    this.close(); await CopperOnline.load();
+    code = String(code || '').trim().toUpperCase();
+    if (!/^[A-Z2-9]{6}$/.test(code)) throw new Error('Enter a six-character room code');
+    this.code = code; this.isHost = false; this.setStatus('Joining room…');
+    return new Promise((resolve, reject) => {
+      const p = this.peer = new Peer(undefined, { debug: 0 }); let settled = false;
+      p.on('open', () => {
+        const c = this.hostConnection = p.connect('copper-gate-' + code, { reliable: true });
+        this.attach(c);
+        c.on('open', () => { settled = true; this.setStatus('Joined room ' + code); resolve(code); });
+        c.on('error', e => { if (!settled) { settled = true; reject(e); } });
+        c.on('close', () => { if (!settled) { settled = true; reject(new Error('The room is unavailable or full')); } });
+      });
+      p.on('error', e => { this.setStatus('Room error: ' + e.type); if (!settled) { settled = true; reject(e); } });
+      p.on('disconnected', () => this.setStatus('Room service disconnected'));
+    });
+  }
+  attach(c) {
+    c.on('open', () => { if (this.isHost) this.setStatus('Room ' + this.code + ' · ' + (this.connections.size + 1) + ' adventurers'); });
+    c.on('data', packet => {
+      if (!packet || packet.v !== 1) return;
+      if (packet.type === 'state' && packet.state && typeof packet.state === 'object') {
+        // The host assigns the sender id and relays it to the other guests.
+        const id = this.isHost ? c.peer : packet.id;
+        if (typeof id !== 'string') return;
+        this.onState(id, packet.state);
+        if (this.isHost) for (const other of this.connections.values()) if (other !== c && other.open) other.send({v:1,type:'state',id,state:packet.state});
+      } else if (!this.isHost && packet.type === 'leave' && typeof packet.id === 'string') this.onLeave(packet.id);
+    });
+    c.on('close', () => {
+      if (this.isHost) {
+        this.connections.delete(c.peer); this.onLeave(c.peer);
+        for (const other of this.connections.values()) if (other.open) other.send({v:1,type:'leave',id:c.peer});
+        this.setStatus('Room ' + this.code + ' · ' + (this.connections.size + 1) + ' adventurers');
+      } else { this.onLeave('host'); this.setStatus('Host disconnected'); }
+    });
+  }
+  send(state) {
+    if (!this.peer || !state) return;
+    if (this.isHost) for (const c of this.connections.values()) if (c.open) c.send({v:1,type:'state',id:'host',state});
+    else if (this.hostConnection && this.hostConnection.open) this.hostConnection.send({v:1,type:'state',state});
+  }
+  close() {
+    if (this.peer) this.peer.destroy();
+    this.peer = null; this.hostConnection = null; this.connections.clear(); this.code = ''; this.isHost = false;
+    this.setStatus('Offline');
+  }
+}
+window.CopperOnline = CopperOnline;
+
+const $=id=>document.getElementById(id), menu=$('menu'), modal=$('modal'), dialog=$('dialogue'), hud=$('hud');
+let world,game,online,started=false,attracting=false,lastInput=performance.now(),selected=0,dialogueIndex=0,lastButtons=[],lastNav=0,noticeTimer,clock=0,saveTimer=0,networkTimer=0,attractTimer=0,attractStep=0,attractAction=0;
+let settings={invertX:false,invertY:false,music:true,sound:true};try{settings={...settings,...JSON.parse(localStorage.getItem('copper-settings')||'{}')}}catch{}
+const saveSettings=()=>localStorage.setItem('copper-settings',JSON.stringify(settings));
+const touchOnly=matchMedia('(pointer: coarse)').matches&&!matchMedia('(pointer: fine)').matches;$('touch').classList.toggle('hidden',!touchOnly);if(touchOnly)document.querySelectorAll('#main-buttons .btn:not([data-do=settings])').forEach(b=>b.classList.add('hidden'));
+const audio={ctx:null,master:null,step:0,next:0,init(){if(this.ctx){this.ctx.resume();return}try{this.ctx=new AudioContext();this.master=this.ctx.createGain();this.master.gain.value=.16;this.master.connect(this.ctx.destination)}catch{}},tone(f,d,type='sine',volume=.3,when=0){if(!this.ctx)return;let t=this.ctx.currentTime+when,o=this.ctx.createOscillator(),g=this.ctx.createGain();o.type=type;o.frequency.setValueAtTime(f,t);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(volume,t+.02);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.connect(g);g.connect(this.master);o.start(t);o.stop(t+d+.01)},play(name){if(!settings.sound)return;this.init();let patterns={voice:[370,440,330,490],hit:[120,75],spell:[330,495,660],heal:[440,554,660],loot:[520,660,880],victory:[392,494,587,784]};(patterns[name]||[]).forEach((f,i)=>this.tone(f,name==='voice'?.07:.18,name==='hit'?'sawtooth':name==='voice'?'triangle':'sine',.14,i*(name==='voice'?.075:.09)))},music(){if(!settings.music||!this.ctx||this.ctx.state!=='running')return;const now=this.ctx.currentTime;if(now<this.next)return;let melody=[196,247,294,330,294,247,220,196,175,220,262,294,262,220,196,175];let f=melody[this.step%melody.length];this.tone(f,.8,'triangle',.045);if(this.step%4===0){this.tone(f/2,1.8,'sine',.055);this.tone(f*1.5,1.4,'sine',.018)}this.step++;this.next=now+.48}};
+const ui={update(s){$('portraits').innerHTML=s.party.map((p,i)=>`<div class="portrait"><span class="role">${i===s.active?'● Active':p.role}</span><div class="name">${p.name}</div><div class="bar"><i style="width:${100*p.hp/p.maxHp}%"></i></div><div class="tiny">${Math.ceil(p.hp)} / ${p.maxHp} health · ${Math.floor(p.energy)} focus</div></div>`).join('');$('quest-text').textContent=s.objective;$('quest-title').textContent=s.finished?'A promise kept':'The Bell Below';$('prompt').textContent=s.prompt?'✕ / E  '+s.prompt:'';$('prompt').classList.toggle('hidden',!s.prompt);world?.setFocus?.(s.party[s.active].id);$('potion-count').textContent='Remedy ×'+s.potions;const active=s.party[s.active],near=s.enemies.filter(e=>e.hp>0&&Math.hypot(e.x-active.x,e.z-active.z)<7).sort((a,b)=>Math.hypot(a.x-active.x,a.z-active.z)-Math.hypot(b.x-active.x,b.z-active.z))[0];$('enemy-info').classList.toggle('hidden',!near);if(near)$('enemy-info').textContent=near.name+' · '+Math.ceil(near.hp)+' / '+near.maxHp},dialogue(d){$('speaker').textContent=d.speaker;$('dialogue-text').textContent=d.text;$('choices').innerHTML=d.choices.map((c,i)=>`<button class="btn" data-choice="${i}"><span>${i+1}. ${escapeHTML(c)}</span><small>✕</small></button>`).join('');dialog.classList.remove('hidden');dialogueIndex=0;markSelection()},closeDialogue(){dialog.classList.add('hidden')},notice(t){$('notice').textContent=t;$('notice').classList.remove('hidden');clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>$('notice').classList.add('hidden'),2600)},ending(d){localStorage.setItem('copper-save',game.save());showModal(`<div class="eyebrow">A chapter complete</div><h2>${escapeHTML(d.title)}</h2><p class="sub">${escapeHTML(d.text)}</p><div class="rule"></div><p class="sub">Rowan and Moth have many roads left to travel. Thank you for sharing this one.</p><div class="rule"></div><div class="buttonlist"><button class="btn" data-do="new">Begin again <small>✕</small></button><button class="btn" data-do="title">Return to title <small>○</small></button></div>`);hubResult()}};
+function escapeHTML(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function showModal(html){$('modal-panel').innerHTML=html;modal.classList.remove('hidden');selected=0;markSelection()}
+function hideModal(){modal.classList.add('hidden');selected=0;markSelection()}
+function settingsScreen(){showModal(`<div class="eyebrow">Make the road your own</div><h2>Settings</h2><div class="rule"></div>${[['invertX','Invert horizontal axis'],['invertY','Invert vertical axis'],['music','Music'],['sound','Sound & voices']].map(([k,label])=>`<div class="settings-line"><span>${label}</span><button class="btn" data-toggle="${k}">${settings[k]?'On':'Off'}</button></div>`).join('')}<p class="tiny" style="margin:18px 0">Movement uses the left stick. Right shoulder switches party member. Options pauses. Keyboard: WASD / arrows, E interact, J strike, K ability, Q potion, Tab switch, Space tactical pause, Esc menu.</p><div class="buttonlist"><button class="btn" data-do="back">Back <small>○</small></button></div>`)}
+function aboutScreen(){showModal(`<div class="eyebrow">About & credits</div><h2>The Copper Gate</h2><div class="rule"></div><div class="about"><p><strong>Source information.</strong> 2026-10-29 09:13 · Inspired by Baldur's Gate. Original world, story, characters and procedural artwork.</p><p><strong>Technology.</strong> Three.js r180 with WebGPU, Rapier 0.19.3 physics, JavaScript, Web Audio, Gamepad API, PeerJS and ai-hub session integration. WebGPU and an internet connection for dependencies are required.</p><p><strong>Art & animation.</strong> Cel-shaded, low-poly fantasy; procedural articulated animation. <strong>Audio.</strong> Code-generated music, effects, and gibberish voices.</p><p><strong>Online.</strong> Two-player shared story and combat over peer-to-peer rooms; ai-hub supports parallel sessions. Standalone rooms use PeerJS signalling. <strong>Testing.</strong> Lightweight syntax, simulation, and headless browser checks; full controller and cross-device testing unknown.</p><p><strong>Environment.</strong> Codex CLI (headless); Linux; browser unknown. <strong>Model.</strong> OpenAI, gpt-6.1-terra, reasoning effort ultra. <strong>Usage.</strong> Unknown.</p><p><strong>Engine feedback.</strong> Three.js offers a flexible scene graph; WebGPU setup and browser support need care. The quest, UI, art and audio were built for this game. Integration was the hardest part. Better WebGPU diagnostics would help; the implicit WebGL fallback deserves an explicit opt-out.</p><p><strong>Prompt feedback.</strong> The controller-first direction and attract mode were useful constraints. Multiplayer deployment details were the least clear. The hardest task was making a cohesive slice in one file. A real-controller, multi-device multiplayer playtest would be valuable.</p><p><strong>Testing feedback.</strong> Eight issues were observed: two game-breaking startup errors, a missing co-op ending broadcast, incorrect hub metadata, blank headless GPU output, and three hub conformance failures. The most helpful test was the ai-hub conformance harness; the least helpful was the headless screenshot, which could not verify the scene.</p></div><div class="rule"></div><button class="btn" data-do="back">Back <small>○</small></button>`)}
+function pauseScreen(){showModal(`<div class="eyebrow">The road waits</div><h2>Journey paused</h2><p class="sub">Your progress is saved on this device.</p><div class="rule"></div><div class="buttonlist"><button class="btn" data-do="resume">Resume <small>✕</small></button><button class="btn" data-do="settings">Settings <small>⚙</small></button><button class="btn" data-do="about">About & credits <small>✧</small></button><button class="btn" data-do="title">Return to title <small>○</small></button></div>`)}
+function title(){if(started&&!attracting&&!game.state.finished)localStorage.setItem('copper-save',game.save());started=false;attracting=false;dialog.classList.add('hidden');modal.classList.add('hidden');hud.classList.add('hidden');$('attract').classList.add('hidden');menu.classList.remove('hidden');lastInput=performance.now();selected=0;markSelection()}
+function begin(load=false, demo=false){audio.init();game.start();if(load){if(!game.load(localStorage.getItem('copper-save')||''))ui.notice('No saved journey yet. A new journey begins.')}started=true;attracting=demo;attractStep=0;attractTimer=0;attractAction=0;menu.classList.add('hidden');modal.classList.add('hidden');hud.classList.remove('hidden');$('attract').classList.toggle('hidden',!demo);if(!demo)ui.notice('Speak to Keeper Sable. Follow the road east.');if(window.AIHub?.active)AIHub.ready()}
+function markSelection(){let scope=!dialog.classList.contains('hidden')?$('choices'):!modal.classList.contains('hidden')?$('modal-panel'):menu;let b=[...scope.querySelectorAll('button')];b.forEach((x,i)=>x.classList.toggle('selected',i===(!dialog.classList.contains('hidden')?dialogueIndex:selected)));}
+function buttons(){let scope=!dialog.classList.contains('hidden')?$('choices'):!modal.classList.contains('hidden')?$('modal-panel'):!menu.classList.contains('hidden')?menu:null;return scope?[...scope.querySelectorAll('button')]:[]}
+function navigate(dir){let b=buttons();if(!b.length)return;if(!dialog.classList.contains('hidden'))dialogueIndex=(dialogueIndex+dir+b.length)%b.length;else selected=(selected+dir+b.length)%b.length;markSelection();let i=!dialog.classList.contains('hidden')?dialogueIndex:selected;b[i]?.scrollIntoView({block:'nearest'});}
+function activate(){let b=buttons();if(b.length)b[!dialog.classList.contains('hidden')?dialogueIndex:selected]?.click();else if(started)game.action('interact')}
+function onlineScreen(){showModal(`<div class="eyebrow">A companion on the road</div><h2>Travel together</h2><p class="sub">Share a room code with a friend. Play the same journey together: the host guides Rowan and the guest guides Moth. The host owns the shared story and battle.</p><div class="rule"></div><div id="net-status" class="tiny">${escapeHTML(online?.status||'Ready to connect.')}</div><div class="row" style="margin:16px 0"><button class="btn" data-do="host">Create room</button><input id="room-code" placeholder="Room code" maxlength="32" aria-label="Room code"><button class="btn" data-do="join">Join room</button></div><div class="buttonlist"><button class="btn" data-do="disconnect">Disconnect</button><button class="btn" data-do="back">Back <small>○</small></button></div>`)}
+function netUpdate(){if($('net-status'))$('net-status').textContent=(online?.status||'Ready')+(online?.code?' · Room code: '+online.code:'')}
+document.addEventListener('click',e=>{const btn=e.target.closest('button');if(!btn)return;lastInput=performance.now();audio.init();if(attracting){title();return}if(btn.dataset.choice!==undefined){game.choose(+btn.dataset.choice);return}if(btn.dataset.toggle){settings[btn.dataset.toggle]=!settings[btn.dataset.toggle];saveSettings();settingsScreen();return}switch(btn.dataset.do){case'new':if(game)begin();break;case'continue':if(game)begin(true);break;case'settings':settingsScreen();break;case'about':aboutScreen();break;case'online':onlineScreen();break;case'host':online?.host().then(netUpdate).catch(err=>{ui.notice(err.message);netUpdate()});break;case'join':online?.join($('room-code').value.trim()).then(()=>{game.setNetwork('guest',m=>online.send(m));netUpdate()}).catch(err=>{ui.notice(err.message);netUpdate()});break;case'disconnect':online?.close();netUpdate();break;case'back':if(started)pauseScreen();else hideModal();break;case'resume':hideModal();break;case'title':title();break}});
+let keys={};function inputEvent(){lastInput=performance.now();if(attracting){title();return true}return false}
+window.addEventListener('keydown',e=>{if(e.repeat)return;if(inputEvent())return;audio.init();const k=e.key.toLowerCase();keys[k]=true;if(['arrowup','arrowdown','arrowleft','arrowright',' ','tab'].includes(k))e.preventDefault();if(k==='escape'){if(!dialog.classList.contains('hidden'))return;if(!modal.classList.contains('hidden')){if(started)hideModal();else hideModal()}else if(started){if(window.AIHub?.active)settingsScreen();else pauseScreen()}return}if(buttons().length){if(k==='arrowdown'||k==='s')navigate(1);else if(k==='arrowup'||k==='w')navigate(-1);else if(k==='enter'||k==='e'||k===' ')activate();else if(/^[1-9]$/.test(k)&&!dialog.classList.contains('hidden'))game.choose(+k-1);return}if(!started)return;if(k==='e'||k==='enter')game.action('interact');if(k==='j')game.action('attack');if(k==='k')game.action('skill');if(k==='q')game.action('potion');if(k==='tab')game.action('switch');if(k===' ')game.action('pause')});window.addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);window.addEventListener('pointerdown',()=>{if(attracting)title();else lastInput=performance.now()});
+function padInput(now){let p=[...navigator.getGamepads?.()||[]].find(Boolean);if(!p)return {x:0,z:0};let pressed=p.buttons.map(b=>b.pressed);let edge=i=>pressed[i]&&!lastButtons[i];let ax=p.axes[0]||0,ay=p.axes[1]||0;if(Math.abs(ax)<.2)ax=0;if(Math.abs(ay)<.2)ay=0;let any=pressed.some((v,i)=>v&&!lastButtons[i])||Math.abs(ax)>.3||Math.abs(ay)>.3;if(any){if(inputEvent()){lastButtons=pressed;return{x:0,z:0}}audio.init()}
+ if(buttons().length){let n=(edge(13)?1:0)-(edge(12)?1:0);if(Math.abs(ay)>.6&&now-lastNav>250){n=ay>0?1:-1;lastNav=now}if(n)navigate(n);if(edge(0))activate();if(edge(1)){if(!dialog.classList.contains('hidden')){}else if(started)hideModal();else hideModal()}}else if(started){if(edge(0))game.action('interact');if(edge(2))game.action('attack');if(edge(3))game.action('skill');if(edge(1))game.action('potion');if(edge(5))game.action('switch');if(edge(4))game.action('pause');if(edge(9))pauseScreen()}lastButtons=pressed;return{x:ax,z:ay}}
+function demoInput(dt){const s=game.state,p=s.party[s.active];attractTimer+=dt;if(s.dialogue){if(attractTimer>1.2){game.choose(0);attractTimer=0}return{x:0,z:0}}if(s.finished){if(attractTimer>5)begin(false,true);return{x:0,z:0}}let target;if(!s.talked)target={x:-12,z:1,act:'interact'};else if(!s.chest)target={x:-8,z:-4,act:'interact'};else if(!s.ward)target={x:0,z:-2,act:'interact'};else {const enemies=s.enemies.filter(e=>e.id!=='guardian'&&e.hp>0);if(enemies.length){target={x:enemies[0].x,z:enemies[0].z,combat:true}}else if(!s.guardianPeace&&s.enemies[3].hp>0)target={x:s.enemies[3].x,z:s.enemies[3].z,act:'interact'};else target={x:18,z:0,act:'interact'}}let dx=target.x-p.x,dz=target.z-p.z,d=Math.hypot(dx,dz);if(target.combat&&d<5){attractAction+=dt;if(attractAction>.7){game.action('skill');game.action('attack');attractAction=0}if(p.hp<50)game.action('potion');if(d<2)return{x:0,z:0}}if(target.act&&d<2.3){game.action(target.act);attractTimer=0;return{x:0,z:0}}return{x:dx/Math.max(d,1),z:dz/Math.max(d,1)}}
+async function boot(){try{if(!navigator.gpu||!await navigator.gpu.requestAdapter())throw new Error('WebGPU is unavailable. Open this game in a WebGPU-enabled browser.');await RAPIER.init();world=await createWorld(THREE,$('game'));game=createGameplay({world,ui,audio,RAPIER});game.start();online=new CopperOnline();online.onStatus=()=>{netUpdate();if(online.isHost&&online.connections.size>0)game.setNetwork('host',m=>online.send(m));else if(!online.peer)game.setNetwork('offline')};online.onState=(id,data)=>game.receiveNetwork(data);online.onLeave=()=>{game.setNetwork('offline');ui.notice('Companion disconnected. The journey continues.');};initHub();requestAnimationFrame(frame)}catch(err){console.error(err);window.AIHub?.fail(err.message);showModal(`<div class="eyebrow">Unable to start</div><h2>The gate is closed</h2><p class="sub error">${escapeHTML(err.message||String(err))}</p><p class="sub">This game requires WebGPU and network access to its libraries.</p><div class="rule"></div><button class="btn" data-do="settings">Settings</button>`)}}
+let probeInput={x:0,y:0};let hubEnded=false,hubReported=false;function hubScore(){return game.state.xp+(game.state.ward?50:0)+(game.state.finished?200:0)}function hubProgress(){if(window.AIHub?.active)AIHub.progress({score:hubScore(),label:game.state.objective})}function hubResult(){if(window.AIHub?.active&&!hubReported){hubReported=true;AIHub.result({score:hubScore()})}}async function initHub(){if(!window.AIHub)return;AIHub.probe(()=>({scene:started?'play':'menu',menu:!modal.classList.contains('hidden'),world:game?game.state.elapsed:0,input:{x:probeInput.x,y:probeInput.y,fire:!!keys.j||!!lastButtons[2]}}));AIHub.on('time-up',hubResult);AIHub.on('end',()=>{hubEnded=true;showModal('<div class="eyebrow">Session complete</div><h2>The road rests</h2><p class="sub">This round has ended.</p>')});let info=await AIHub.connect({mode:'parallel',seats:[1,4]});if(info){begin();AIHub.ready()}}
+let previous=performance.now();function frame(now){let dt=Math.min(.05,(now-previous)/1000);previous=now;clock+=dt;let pad=padInput(now);audio.music();if(!started&&modal.classList.contains('hidden')&&now-lastInput>10000&&!touchOnly&&!online?.peer)begin(false,true);if(started){let x=(keys.d||keys.arrowright?1:0)-(keys.a||keys.arrowleft?1:0),z=(keys.s||keys.arrowdown?1:0)-(keys.w||keys.arrowup?1:0);if(Math.abs(pad.x)>Math.abs(x))x=pad.x;if(Math.abs(pad.z)>Math.abs(z))z=pad.z;if(settings.invertX)x=-x;if(settings.invertY)z=-z;let input=attracting?demoInput(dt):{x,z};if(!modal.classList.contains('hidden')&&!attracting)input={x:0,z:0};probeInput={x:input.x,y:input.z};if((modal.classList.contains('hidden')||attracting)&&(!window.AIHub?.active||AIHub.time()>=0)&&!hubEnded)game.update(dt,input);saveTimer+=dt;networkTimer+=dt;if(!attracting&&saveTimer>5){localStorage.setItem('copper-save',game.save());saveTimer=0}if(networkTimer>.15){let p=game.state.party[game.state.active];hubProgress();networkTimer=0}}world.update(dt,clock);requestAnimationFrame(frame)}
+markSelection();boot();
+
+</script></body></html>

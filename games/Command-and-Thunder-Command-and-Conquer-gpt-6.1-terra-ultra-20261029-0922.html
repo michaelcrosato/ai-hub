@@ -1,0 +1,1022 @@
+<!--
+Source Information
+Date: 2026-10-29 09:22
+Source: Command & Conquer
+Tech: Three.js r180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio, PeerJS 1.5.5, AI Hub session 1.3.0.
+Art Direction: cel-shaded low-poly battlefield.
+Animation: procedural transforms and physics simulation.
+Audio: code-generated music, sound effects, and gibberish radio voices.
+Online: AI Hub parallel score race and standalone WebRTC rooms.
+Testing: lightweight headless browser, simulation, and network checks; browser/GPU dependent.
+Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort ultra.
+Usage: unknown.
+Testing Feedback
+Four issues were caught in testing and review: hub input and menu state probes, a stray cursor marker, and HUD mouse interception. Critical/game-breaking: zero. Most helpful: the AI Hub harness, which passed 20/20 with two and three players after fixes. Least helpful: syntax checking alone. Gamepad emulation was unavailable in the harness run.
+Engine Feedback
+Three.js made procedural scenes and WebGPU approachable. An initial headless GPU setup produced a black frame; Vulkan with SwiftShader fixed the test environment. WebGPU availability and module loading required care. The RTS simulation, AI and controller interface were built for this game. Coordinating physics, rendering and browser lifecycle was hardest. WebGPU initialization and diagnostics could use clearer compatibility reporting; that is the part to overhaul.
+Prompt Feedback
+The controller-first direction and complete playable slice were strong. The broad feature scope and multiplayer requirements were hardest to reconcile in a single file. A full real-device controller and multiplayer session would be the most valuable additional test. Confusing: none.
+-->
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script><meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="4"><meta name="hub:session-goal" content="Highest command score before time runs out"><meta name="hub:session-howto" content="Left stick cursor; Cross select; Circle order; Triangle command"><meta name="hub:webgpu" content="required"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#111b19"><title>Command & Thunder</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "@dimforge/rapier3d-compat": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=IBM+Plex+Mono:wght@400;600;700&display=swap');
+:root{font-family:'Barlow Condensed',Arial,sans-serif;color:#f2f2dc;background:#0b1413;font-size:16px}*{box-sizing:border-box}body{margin:0;overflow:hidden;user-select:none}button,input{font:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible{outline:3px solid #fff5a4;outline-offset:3px}#world{position:absolute;width:100%;height:100%;inset:0}#shade{pointer-events:none;position:absolute;inset:0;background:linear-gradient(90deg,rgba(8,15,14,.26),transparent 45%),linear-gradient(0deg,rgba(7,13,12,.42),transparent 30%)}#app{position:absolute;inset:0;pointer-events:none}#app>*{pointer-events:auto}.hidden{display:none!important}.menu{position:absolute;inset:0;background:linear-gradient(90deg,rgba(7,15,14,.98) 0%,rgba(7,15,14,.91) 32%,rgba(7,15,14,.25) 75%),linear-gradient(0deg,rgba(7,15,14,.45),transparent 60%);display:flex;align-items:center;padding:5vh 7vw}.menu-content{width:min(570px,70vw)}.eyebrow{font:700 14px 'IBM Plex Mono',monospace;letter-spacing:.22em;color:#efc45c;text-transform:uppercase}.rule{height:3px;background:#eec458;width:68px;margin:18px 0}.title{font-size:clamp(58px,8vw,120px);line-height:.82;letter-spacing:-.035em;text-transform:uppercase;font-weight:900;margin:0 0 20px;text-shadow:3px 4px #0c1715}.title span{color:#efc45c}.lead{font-size:clamp(19px,1.8vw,26px);line-height:1.2;max-width:520px;color:#c5d0bf;margin:0 0 28px}.menu-buttons{display:grid;gap:8px;width:min(380px,100%)}.btn{border:1px solid #667a6d;background:#1b302b;color:#f2f2dc;text-align:left;text-transform:uppercase;font-weight:800;letter-spacing:.045em;padding:11px 16px;font-size:21px;min-height:48px}.btn:hover,.btn:focus-visible,.btn.active{background:#e8bf55;color:#17221c;border-color:#ffe59a}.btn.primary{background:#e8bf55;color:#14221c;border-color:#ffe29a}.btn.primary:hover{background:#ffe396}.micro{font:600 12px 'IBM Plex Mono',monospace;color:#9aab9b;line-height:1.5;letter-spacing:.03em}.menu .micro{margin-top:24px}.panel{position:absolute;inset:5vh 7vw;background:rgba(12,23,21,.97);border:1px solid #799283;padding:clamp(20px,3vw,42px);overflow:auto;box-shadow:0 20px 80px #000b}.panel h2{font-size:clamp(38px,5vw,64px);line-height:1;margin:0 0 16px;text-transform:uppercase}.panel h3{color:#efc45c;font-size:22px;margin:22px 0 8px;text-transform:uppercase}.panel p,.panel li{font-size:19px;line-height:1.35;color:#d2dacb}.panel .btn{margin:4px}.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.settings-row{display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid #3d5147;padding:10px 0;font-size:22px}.settings-row button{min-width:115px;text-align:center}.close{float:right}#app>.hud{pointer-events:none}.hud{position:absolute;inset:0;pointer-events:none}.topbar{position:absolute;top:18px;left:24px;right:24px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.badge{background:rgba(12,27,23,.93);border-left:4px solid #e8bf55;padding:10px 16px;box-shadow:0 4px 18px #0006}.badge small,.stat small{display:block;font:700 11px 'IBM Plex Mono',monospace;letter-spacing:.13em;color:#9eaf9f;text-transform:uppercase}.badge strong{font-size:24px;text-transform:uppercase}.stat{background:rgba(12,27,23,.93);padding:10px 18px;border-bottom:3px solid #e8bf55;text-align:right;min-width:120px}.stat strong{font-size:28px;color:#f4d775}.orders{position:absolute;bottom:20px;left:24px;right:24px;display:flex;align-items:flex-end;gap:12px}.selection{background:rgba(12,27,23,.94);border-left:4px solid #67c8ae;padding:12px 16px;min-width:205px;max-width:260px}.selection strong{font-size:23px;display:block}.selection span{font:600 12px 'IBM Plex Mono',monospace;color:#abc3b4}.actions{display:flex;gap:6px;flex:1;overflow:hidden}.action{pointer-events:auto;flex:1;min-width:90px;max-width:170px;text-align:left;background:rgba(17,37,31,.95);border:1px solid #718f7d;color:#edf1d9;padding:9px 10px;min-height:72px}.action b{display:block;text-transform:uppercase;font-size:17px}.action small{display:block;color:#eac866;font:600 11px 'IBM Plex Mono',monospace;margin-top:4px}.action.active,.action:hover{background:#e9c15d;color:#14211a}.action.active small,.action:hover small{color:#303a25}.guide{position:absolute;right:24px;top:100px;width:260px;background:rgba(12,27,23,.88);padding:14px;border-top:3px solid #e8bf55}.guide b{font-size:19px;text-transform:uppercase;display:block}.guide p{font-size:16px;line-height:1.2;margin:5px 0;color:#cad5c4}.guide .micro{font-size:10px}.toast{position:absolute;top:25%;left:50%;transform:translateX(-50%);background:#e8bf55;color:#14211a;font-size:22px;font-weight:800;text-transform:uppercase;padding:10px 20px;box-shadow:0 6px 25px #0008;white-space:nowrap}.cross{position:absolute;width:24px;height:24px;border:2px solid #f5e5a4;border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 5px #000;pointer-events:none}.cross:before,.cross:after{content:'';position:absolute;background:#f5e5a4}.cross:before{width:2px;height:32px;left:9px;top:-6px}.cross:after{height:2px;width:32px;top:9px;left:-6px}.hint{position:absolute;bottom:103px;left:50%;transform:translateX(-50%);background:#10221ddc;padding:7px 14px;font:600 12px 'IBM Plex Mono',monospace;color:#d6e5d5;white-space:nowrap}.input{background:#12231e;color:white;border:1px solid #708b7b;font:700 22px 'IBM Plex Mono',monospace;padding:10px;text-transform:uppercase;width:180px}.attract-label{position:absolute;top:35px;left:50%;transform:translateX(-50%);background:#e8bf55;color:#102019;font-weight:900;font-size:20px;padding:8px 20px;letter-spacing:.1em}.failure{position:absolute;inset:0;background:#101c18;display:grid;place-items:center;text-align:center;padding:30px}.failure h2{font-size:48px;margin:0}.failure p{font-size:22px;max-width:650px}.touch{position:absolute;right:24px;bottom:24px}.footerkeys{position:absolute;bottom:20px;right:24px;color:#d1d9c9;font:600 12px 'IBM Plex Mono',monospace}.loading{position:absolute;inset:0;display:grid;place-items:center;background:#101c18;font-size:24px;font-weight:800;letter-spacing:.2em}
+@media(max-width:800px){.guide{display:none}.selection{min-width:140px}.orders{left:10px;right:10px;bottom:10px}.action{min-width:70px;font-size:14px}.action b{font-size:14px}.topbar{left:10px;right:10px;top:10px}.two{grid-template-columns:1fr}.panel{inset:2vh 3vw}.title{font-size:58px}.menu-content{width:90vw}}
+</style></head><body><canvas id="world"></canvas><div id="shade"></div><div id="app">
+<div id="loading" class="loading">ESTABLISHING BATTLEFIELD / / /</div>
+<div id="menu" class="menu hidden"><div class="menu-content"><div class="eyebrow">A tactical warfare transmission · 01</div><div class="rule"></div><h1 class="title">Command <span>&</span><br>Thunder</h1><p class="lead">The storm has a price. Take the field, build an army, and make the other side pay it.</p><div class="menu-buttons"><button class="btn primary" data-menu="solo">Deploy · Solo operation</button><button class="btn" data-menu="online">Multiplayer · Score race</button><button class="btn" data-menu="briefing">Field manual</button><button class="btn" data-menu="settings">Settings</button><button class="btn" data-menu="about">About / credits</button></div><div class="micro">CONTROLLER RECOMMENDED &nbsp; • &nbsp; KEYBOARD + MOUSE SUPPORTED<br>WEBGPU REQUIRED &nbsp; / &nbsp; SINGLE MISSION VERTICAL SLICE</div></div><div class="footerkeys">A / ENTER &nbsp; SELECT &nbsp; · &nbsp; ↑↓ &nbsp; NAVIGATE</div></div>
+<div id="panel" class="panel hidden"></div>
+<div id="hud" class="hud hidden"><div class="topbar"><div class="badge"><small>Operation / Glass Frontier</small><strong id="objective">Secure the field</strong></div><div class="stat"><small>Credits</small><strong id="credits">0</strong></div></div><div class="guide"><b>Commander's brief</b><p id="guide">Harvest crystal. Build your force. Destroy the enemy command center.</p><div id="netstatus" class="micro"></div></div><div class="hint" id="hint"></div><div class="orders"><div class="selection"><strong id="selname">No selection</strong><span id="seldetail">A / ENTER TO SELECT</span></div><div id="actions" class="actions"></div></div><div id="toast" class="toast hidden"></div></div>
+<div id="attract" class="attract-label hidden">DEMONSTRATION · PRESS ANY BUTTON</div><div id="touch" class="failure hidden"><div><h2>Controller or keyboard required</h2><p>Connect a controller or use a keyboard to command the battlefield.</p><button class="btn" data-menu="settings">Settings</button></div></div><div id="failure" class="failure hidden"><div><h2>WebGPU unavailable</h2><p>Command & Thunder requires a browser and device with WebGPU enabled. No alternate renderer is included.</p><button class="btn" data-menu="settings">Settings</button></div></div>
+</div><script type="module">
+import * as THREE from 'three/webgpu';
+import * as RAPIER from '@dimforge/rapier3d-compat';
+
+// A deliberately toy-like battlefield: low polygon silhouettes, ink edges and
+// hard colour blocks keep individual orders legible from a sofa.
+async function createRenderer({canvas}) {
+  if (!navigator.gpu || !(await navigator.gpu.requestAdapter())) throw new Error('WebGPU is required. Enable WebGPU in a compatible browser.');
+  const renderer = new THREE.WebGPURenderer({canvas, antialias:true, alpha:false});
+  // Three's WebGPURenderer otherwise silently falls back to WebGL2.
+  renderer._getFallback = null;
+  await renderer.init();
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.setClearColor(0x97b8bd);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x91adb0);
+  scene.fog = new THREE.Fog(0x91adb0, 105, 210);
+  const camera = new THREE.OrthographicCamera(-35,35,25,-25,0.1,300);
+  const focus = new THREE.Vector3(0,0,0);
+  let viewSize = 56;
+  function positionCamera(){ camera.position.set(focus.x+32, 47, focus.z+39); camera.lookAt(focus); camera.updateMatrixWorld(); }
+  positionCamera();
+  scene.add(new THREE.HemisphereLight(0xffe9c3, 0x4e6872, 2.0));
+  const sun = new THREE.DirectionalLight(0xffe1ab, 3.0); sun.position.set(-30,70,25); sun.castShadow = true;
+  sun.shadow.mapSize.set(2048,2048); Object.assign(sun.shadow.camera,{left:-75,right:75,top:75,bottom:-75,near:1,far:180});
+  sun.shadow.bias=-0.00025; sun.shadow.normalBias=.06; scene.add(sun);
+  const mats = {};
+  function mat(color){ let key=color.toString(); return mats[key] ||= new THREE.MeshToonMaterial({color}); }
+  const ink = new THREE.LineBasicMaterial({color:0x273231, transparent:true, opacity:.68});
+  function mesh(geometry, color, x=0,y=0,z=0, outlined=false) {
+    const m = new THREE.Mesh(geometry, mat(color)); m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true;
+    if(outlined){const lines=new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 28),ink);m.add(lines);}
+    return m;
+  }
+  function box(w,h,d,color,x=0,y=0,z=0,outline=true){return mesh(new THREE.BoxGeometry(w,h,d),color,x,y,z,outline);}
+  function cylinder(rt,rb,h,n,color,x=0,y=0,z=0){return mesh(new THREE.CylinderGeometry(rt,rb,h,n),color,x,y,z,true);}
+  function addBox(g,w,h,d,c,x,y,z,outline=true){const m=box(w,h,d,c,x,y,z,outline);g.add(m);return m;}
+  // Land mass and a network of bleached roads establish the playable limits.
+  const ground=box(94,1,94,0xb39b6d,0,-.58,0,false); ground.receiveShadow=true; scene.add(ground);
+  scene.add(box(100,1,100,0x607a75,0,-1.45,0,false));
+  for(let i=-4;i<=4;i++){
+    const road=box(1.1,.025,90,0xc4ad7c,i*10,.005,0,false); road.receiveShadow=true; scene.add(road);
+    const cross=box(90,.025,1.1,0xc4ad7c,0,.008,i*10,false); cross.receiveShadow=true;scene.add(cross);
+  }
+  let seed=8342; function rand(){seed=(seed*1664525+1013904223)>>>0;return seed/4294967296;}
+  // Sparse terrain decorations do not obstruct unit silhouettes.
+  for(let i=0;i<95;i++){
+    const x=(rand()-.5)*88,z=(rand()-.5)*88;
+    if((x < -19 && z > 14)||(x>19 && z < -14)||Math.abs(x-z)<5)continue;
+    const stone=mesh(new THREE.DodecahedronGeometry(.35+rand()*.9,0),rand()>.5?0x8d8065:0x9c8966,x,.15,z);
+    stone.rotation.set(rand(),rand()*6,rand());stone.scale.y=.5;scene.add(stone);
+  }
+  for(let i=0;i<21;i++){
+    const x=(rand()-.5)*90,z=(rand()-.5)*90;
+    if((x < -18 && z > 10)||(x>18 && z < -10))continue;
+    const shrub=new THREE.Group();shrub.position.set(x,0,z);
+    shrub.add(cylinder(.13,.18,1.4,6,0x5d765a,0,.7,0));
+    shrub.add(mesh(new THREE.IcosahedronGeometry(.65,0),0x647c58,0,1.45,0));scene.add(shrub);
+  }
+  // Compass corner markers reinforce the tactical-map presentation.
+  for(const x of [-46,46])for(const z of [-46,46]){
+    scene.add(box(3,.14,.22,0xf2d9a3,x,.05,z,false));scene.add(box(.22,.14,3,0xf2d9a3,x,.05,z,false));
+  }
+  const resourceGroup=new THREE.Group();scene.add(resourceGroup);
+  const resourceMeshes=[];
+  function makeResource(r){
+    const group=new THREE.Group();group.position.set(r.x,.1,r.z);
+    group.add(cylinder(2.1,2.5,.16,8,0x806f50,0,0,0));
+    for(let i=0;i<8;i++){
+      const a=i*2.4,rad=(i%3)*.55+.2;
+      const crystal=mesh(new THREE.ConeGeometry(.38+(i%3)*.13,1.2+(i%4)*.3,5),i%2?0x5cdd88:0xa3f3a0,Math.cos(a)*rad,.7,Math.sin(a)*rad,true);
+      crystal.rotation.z=(i%2?-.12:.12);group.add(crystal);
+    }
+    resourceGroup.add(group);return group;
+  }
+  const objects=new Map();
+  const teams=[{main:0x5caac1,light:0x8ce1e5,dark:0x315b6a},{main:0xb04e42,light:0xf48660,dark:0x70372f}];
+  function unitVisual(e){
+    const g=new THREE.Group(), t=teams[e.team]||teams[0];
+    const dark=0x344346, black=0x202b2c, sand=0xddd0a7;
+    let animated=null;
+    if(e.type==='infantry'){
+      g.add(cylinder(.24,.30,.22,6,black,0,.14,0));
+      addBox(g,.5,.62,.36,t.main,0,.65,0); g.add(mesh(new THREE.IcosahedronGeometry(.26,1),sand,0,1.12,0,true));
+      addBox(g,.16,.14,.58,dark,.32,.75,-.15);addBox(g,.18,.38,.2,dark,-.16,.23,0);addBox(g,.18,.38,.2,dark,.16,.23,0);
+    } else if(e.type==='tank'){
+      addBox(g,1.8,.42,2.5,black,0,.35,0);addBox(g,2,.30,.42,dark,0,.33,-1.05);addBox(g,2,.30,.42,dark,0,.33,1.05);
+      addBox(g,1.7,.55,2.1,t.main,0,.68,0);const turret=new THREE.Group();turret.position.y=1.08;g.add(turret);
+      addBox(turret,1.15,.42,1.05,t.light,0,0,.08);addBox(turret,.23,.22,1.6,dark,0,.06,-.8);animated=turret;
+    } else if(e.type==='harvester'){
+      addBox(g,2,.45,2.8,black,0,.3,0);addBox(g,1.9,.8,2.4,t.main,0,.85,0);
+      addBox(g,1.5,.5,1.3,0xd4ae56,0,1.45,.38);addBox(g,1.5,.35,.6,t.light,0,1.25,-.9);
+      for(let i=-1;i<=1;i++)addBox(g,.2,.25,1.1,0x6f8954,i*.45,1.75,.38);
+    } else {
+      const base=addBox(g,e.type==='hq'?5.4:4.4,.5,e.type==='hq'?5.4:4.4,0x4a5150,0,.25,0);
+      if(e.type==='hq'){
+        addBox(g,4.4,2.4,3.8,t.main,0,1.65,.2);addBox(g,3.1,.5,3,t.light,0,3,.2);
+        addBox(g,1.3,1.4,1.3,t.dark,0,3.9,.2);addBox(g,.14,1.5,.14,dark,0,5.25,.2);
+        const flag=addBox(g,1,.55,.08,t.light,.48,5.7,.2); animated=flag;
+        addBox(g,1.4,.9,.08,0xd5e5da,0,1.6,-1.75);
+      } else if(e.type==='refinery'){
+        addBox(g,3.6,1.4,3.5,t.main,0,1.2,0);addBox(g,2.3,1.1,2.1,0xc5ad6e,.2,2.1,0);
+        for(let x of [-1.25,1.25]){g.add(cylinder(.34,.4,2.7,8,dark,x,2,-1));g.add(cylinder(.48,.48,.25,8,t.light,x,3.4,-1));}
+        addBox(g,1.6,.2,1.4,0x7da866,0,.6,1.7);
+      } else if(e.type==='barracks'){
+        addBox(g,3.7,1.7,3.4,t.main,0,1.35,0);addBox(g,4,.3,3.7,t.light,0,2.35,0);
+        addBox(g,1.3,1.15,.12,dark,0,1.1,-1.75);addBox(g,.5,.4,.13,0xe4c965,1.1,1.75,-1.77);
+      } else if(e.type==='factory'){
+        addBox(g,3.8,2.1,3.6,t.main,0,1.55,0);addBox(g,4,.3,3.8,t.light,0,2.7,0);
+        addBox(g,2,1.3,.15,dark,0,1.2,-1.85);addBox(g,.9,.4,.18,0xe4c965,0,2.3,-1.9);
+        g.add(cylinder(.23,.23,1.4,6,dark,1.3,3.4,.8));
+      } else if(e.type==='power'){
+        addBox(g,3.3,1.25,3.3,t.main,0,1.1,0);g.add(cylinder(.95,1.15,1.4,8,0xd6c48d,0,2.35,0));
+        g.add(cylinder(.65,.9,.65,8,t.light,0,3.35,0));
+      } else if(e.type==='turret'){
+        addBox(g,2.8,.65,2.8,t.dark,0,.75,0);g.add(cylinder(.7,1,1,8,t.main,0,1.55,0));
+        const turret=new THREE.Group();turret.position.y=2.1;g.add(turret);addBox(turret,1,.5,1,t.light,0,0,0);addBox(turret,.28,.28,1.6,dark,0,0,-.9);animated=turret;
+      }
+    }
+    const ring=new THREE.Mesh(new THREE.RingGeometry(Math.max(.7,e.radius||1)+.15,Math.max(.7,e.radius||1)+.30,32),new THREE.MeshBasicMaterial({color:e.team?0xff8060:0xa3fff0,side:THREE.DoubleSide}));
+    ring.rotation.x=-Math.PI/2;ring.position.y=.08;ring.visible=false;g.add(ring);
+    // Health meters face the camera and are visible only for damaged/selected objects.
+    const meter=new THREE.Group();meter.position.y=e.type==='hq'?6.2: (['refinery','factory','power','barracks','turret'].includes(e.type)?4.3:2.2);
+    const width=e.type==='hq'?3:2;
+    const bg=new THREE.Mesh(new THREE.PlaneGeometry(width,.22),new THREE.MeshBasicMaterial({color:0x182326,side:THREE.DoubleSide}));meter.add(bg);
+    const fill=new THREE.Mesh(new THREE.PlaneGeometry(width-.08,.12),new THREE.MeshBasicMaterial({color:0x88e6ab,side:THREE.DoubleSide}));fill.position.z=.02;meter.add(fill);g.add(meter);
+    scene.add(g);return {g,ring,meter,fill,animated};
+  }
+  const effectsGroup=new THREE.Group();scene.add(effectsGroup);
+  const cursorGroup=new THREE.Group();scene.add(cursorGroup);
+  const cursorRing=new THREE.Mesh(new THREE.RingGeometry(.8,.95,40),new THREE.MeshBasicMaterial({color:0xffee9a,side:THREE.DoubleSide}));cursorRing.rotation.x=-Math.PI/2;cursorRing.position.y=.12;cursorGroup.add(cursorRing);
+  for(let i=0;i<4;i++){const tick=box(.1,.08,.55,0xfff1ac,0,.16,1.25,false);tick.rotation.y=i*Math.PI/2;tick.position.set(Math.sin(i*Math.PI/2)*1.25,.16,Math.cos(i*Math.PI/2)*1.25);cursorGroup.add(tick);}
+  let time=0;
+  function update(sim,cursor,dt=0){
+    time+=dt;
+    if(!sim)return;
+    const live=new Set();
+    for(const e of sim.entities||[]){
+      if(e.dead)continue;live.add(e.id);
+      let o=objects.get(e.id);if(!o){o=unitVisual(e);objects.set(e.id,o);}
+      o.g.position.set(e.x,0,e.z);o.g.rotation.y=Number.isFinite(e.angle)?e.angle:0;
+      o.ring.visible=!!e.selected;
+      const ratio=THREE.MathUtils.clamp(e.hp/(e.maxHp||1),0,1);o.meter.visible=ratio<.99||!!e.selected;
+      o.meter.quaternion.copy(camera.quaternion);o.meter.rotateY(-o.g.rotation.y);
+      o.fill.scale.x=Math.max(.001,ratio);o.fill.position.x=-(1-ratio)*(e.type==='hq'?2.92:1.92)/2;
+      o.fill.material.color.setHex(ratio>.5?0x88e6ab:ratio>.25?0xffcc62:0xff705e);
+      if(o.animated&&e.type==='hq')o.animated.rotation.y=Math.sin(time*2)*.12;
+    }
+    for(const [id,o] of objects)if(!live.has(id)){scene.remove(o.g);objects.delete(id);}
+    (sim.resources||[]).forEach((r,i)=>{if(!resourceMeshes[i])resourceMeshes[i]=makeResource(r);resourceMeshes[i].visible=r.amount>0;resourceMeshes[i].scale.y=.5+.5*Math.max(0,r.amount/(r.maxAmount||r.amount||1));});
+    while(effectsGroup.children.length) { const c=effectsGroup.children[0];effectsGroup.remove(c);c.geometry?.dispose();c.material?.dispose(); }
+    for(const f of sim.effects||[]){
+      const p=1-(f.life/(f.maxLife||1));
+      if(f.type==='shot'){
+        const dx=(f.tx??f.x)-f.x,dz=(f.tz??f.z)-f.z,len=Math.sqrt(dx*dx+dz*dz);
+        const tracer=new THREE.Mesh(new THREE.CylinderGeometry(.06,.06,Math.max(.1,len),5),new THREE.MeshBasicMaterial({color:f.team?0xff8063:0xffee9d,transparent:true,opacity:Math.max(0,1-p)}));
+        tracer.position.set(f.x+dx/2,1.1,f.z+dz/2);tracer.rotation.z=Math.PI/2;tracer.rotation.y=-Math.atan2(dz,dx);effectsGroup.add(tracer);
+      }else{
+        const boom=new THREE.Mesh(new THREE.IcosahedronGeometry(f.type==='harvest'?.5:1.4,0),new THREE.MeshBasicMaterial({color:f.type==='harvest'?0x9dffad:0xffaa55,transparent:true,opacity:Math.max(0,.8*(1-p))}));
+        boom.position.set(f.x,.8+p*1.5,f.z);boom.scale.setScalar(.4+p);effectsGroup.add(boom);
+      }
+    }
+    cursorGroup.visible=!!cursor&&cursor.visible!==false;
+    if(cursor){cursorGroup.position.set(cursor.x,0,cursor.z);cursorRing.material.color.setHex(cursor.color||0xffee9a);}
+  }
+  function resize(){const w=canvas.clientWidth||innerWidth,h=canvas.clientHeight||innerHeight;renderer.setSize(w,h,false);const aspect=w/h;camera.left=-viewSize*aspect/2;camera.right=viewSize*aspect/2;camera.top=viewSize/2;camera.bottom=-viewSize/2;camera.updateProjectionMatrix();}
+  function pan(dx,dz){focus.x=THREE.MathUtils.clamp(focus.x+dx,-42,42);focus.z=THREE.MathUtils.clamp(focus.z+dz,-42,42);positionCamera();}
+  function center(x,z){focus.x=THREE.MathUtils.clamp(x,-42,42);focus.z=THREE.MathUtils.clamp(z,-42,42);positionCamera();}
+  function zoom(delta){viewSize=THREE.MathUtils.clamp(viewSize+delta,30,85);resize();}
+  const raycaster=new THREE.Raycaster(),plane=new THREE.Plane(new THREE.Vector3(0,1,0),0),hit=new THREE.Vector3();
+  function worldAt(x,y){const rect=canvas.getBoundingClientRect();raycaster.setFromCamera({x:(x-rect.left)/rect.width*2-1,y:-((y-rect.top)/rect.height)*2+1},camera);return raycaster.ray.intersectPlane(plane,hit)?{x:THREE.MathUtils.clamp(hit.x,-44,44),z:THREE.MathUtils.clamp(hit.z,-44,44)}:null;}
+  resize();
+  return {renderer,scene,camera,update,render:()=>renderer.render(scene,camera),resize,pan,center,zoom,worldAt,focus};
+}
+
+// Data-driven rules for the Ashfall operation. Coordinates are world-space x/z.
+const DATA = {
+  hq:{name:'Command Core',cost:0,hp:1800,radius:3.5,structure:true,power:8},
+  refinery:{name:'Refinery',cost:500,hp:1000,radius:2.7,structure:true,power:-3,time:10},
+  barracks:{name:'Barracks',cost:350,hp:850,radius:2.4,structure:true,power:-2,time:8},
+  factory:{name:'War Factory',cost:650,hp:1100,radius:3,structure:true,power:-4,time:13,requires:'barracks'},
+  power:{name:'Power Plant',cost:300,hp:750,radius:2.3,structure:true,power:10,time:7},
+  turret:{name:'Sentry',cost:400,hp:800,radius:1.6,structure:true,power:-3,time:9,range:12,damage:27,rate:1.05,requires:'barracks'},
+  infantry:{name:'Rifle Squad',cost:100,hp:150,radius:.65,speed:4,range:7,damage:12,rate:.8,time:5,producer:'barracks'},
+  tank:{name:'Thunder Tank',cost:350,hp:430,radius:1.15,speed:3.6,range:10,damage:45,rate:1.5,time:10,producer:'factory'},
+  harvester:{name:'Harvester',cost:300,hp:400,radius:1.2,speed:3.3,time:9,producer:'refinery'}
+};
+const STRUCTURES=['refinery','barracks','factory','power','turret'];
+const UNITS=['infantry','tank','harvester'];
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z);
+
+function createSimulation({RAPIER,onEvent=()=>{},onEnd=()=>{},attract=false, multiplayer=false}={}) {
+  let nextId=1, aiClock=0, aiWave=0, elapsed=0, ended=false, lastAttractAction=-1;
+  const world=RAPIER ? new RAPIER.World({x:0,y:0,z:0}) : null;
+  const sim={entities:[],resources:[],effects:[],credits:[1600,1600],kills:0,queues:[[],[]],selected:[],world,elapsed:0,status:'active',attract,multiplayer,DATA};
+  function event(type,text,extra={}) { onEvent({type,text,...extra}); }
+  function fx(type,x,z,tx=x,tz=z,team=0) { const life=type==='explosion'?.75:type==='harvest'?.45:.22; sim.effects.push({type,x,z,tx,tz,team,life,maxLife:life}); }
+  function spawn(type,team,x,z,building=false) {
+    const d=DATA[type];
+    const e={id:nextId++,type,team,x,z,hp:building?d.hp*.2:d.hp,maxHp:d.hp,angle:team?Math.PI:0,selected:false,radius:d.radius,build:building?0:1,cooldown:Math.random(),order:null,cargo:0,harvestTimer:0};
+    if(world){
+      const desc=d.structure?RAPIER.RigidBodyDesc.fixed():RAPIER.RigidBodyDesc.dynamic().lockRotations().setLinearDamping(1);
+      e.body=world.createRigidBody(desc.setTranslation(x,0,z));
+      const cd=RAPIER.ColliderDesc.ball(d.radius).setRestitution(0).setFriction(.4);
+      world.createCollider(cd,e.body);
+    }
+    sim.entities.push(e); return e;
+  }
+  const alive=(team,type)=>sim.entities.filter(e=>e.team===team && e.hp>0 && (!type||e.type===type));
+  const ready=(team,type)=>alive(team,type).some(e=>e.build>=1);
+  const power=team=>{let supply=0,demand=0;for(const e of alive(team)) if(e.build>=1){const p=DATA[e.type].power||0;if(p>0)supply+=p;else demand-=p;}return {supply,demand,low:supply<demand};};
+  sim.power=power;
+  // The opposing outpost is visible from the outset; deposits are shared territorial objectives.
+  [[-18,9],[-8,-2],[8,1],[18,-9],[-2,22],[1,-23]].forEach(([x,z],i)=>sim.resources.push({x,z,amount:2600,maxAmount:2600,id:i}));
+  spawn('hq',0,-30,25);spawn('refinery',0,-22,25);spawn('barracks',0,-30,17);spawn('power',0,-37,24);
+  spawn('harvester',0,-20,19);spawn('infantry',0,-25,14);spawn('infantry',0,-22,13);spawn('tank',0,-19,15);
+  spawn('hq',1,30,-25);spawn('refinery',1,22,-25);spawn('barracks',1,30,-17);spawn('power',1,37,-24);
+  spawn('harvester',1,20,-19);spawn('infantry',1,25,-14);spawn('infantry',1,22,-13);spawn('tank',1,19,-15);spawn('turret',1,25,-7);
+  function nearest(x,z,filter=()=>true,max=Infinity){let best=null,bd=max;for(const e of sim.entities){if(e.hp<=0||!filter(e))continue;const d=Math.hypot(e.x-x,e.z-z)-e.radius;if(d<bd){best=e;bd=d;}}return best;}
+  sim.nearest=nearest;
+  sim.clearSelection=()=>{for(const e of sim.entities)e.selected=false;sim.selected=[];};
+  sim.selectAt=(x,z,add=false,team=0)=>{const e=nearest(x,z,u=>u.team===team,2.2);if(!add)sim.clearSelection();if(e){e.selected=add?!e.selected:true;sim.selected=sim.entities.filter(u=>u.selected).map(u=>u.id);event('select',`${DATA[e.type].name} selected`);}return e;};
+  sim.selectAll=(team=0)=>{sim.clearSelection();for(const e of alive(team))if(!DATA[e.type].structure&&e.type!=='harvester')e.selected=true;sim.selected=sim.entities.filter(e=>e.selected).map(e=>e.id);event('select',`${sim.selected.length} combat units selected`);};
+  sim.order=(x,z,team=0,ids=sim.selected)=>{const units=sim.entities.filter(e=>ids.includes(e.id)&&e.team===team&&!DATA[e.type].structure&&e.hp>0);const target=nearest(x,z,e=>e.team!==team,2.3);const patch=sim.resources.find(p=>Math.hypot(p.x-x,p.z-z)<3&&p.amount>0);units.forEach((e,i)=>{if(target)e.order={type:'attack',target:target.id};else if(e.type==='harvester'&&patch)e.order={type:'harvest',patch:patch.id};else e.order={type:'move',x:clamp(x+(i%3-1)*1.8,-43,43),z:clamp(z+Math.floor(i/3)*1.8,-43,43)};});if(units.length){event('order',target?'Attack order acknowledged':patch?'Harvest order acknowledged':'Move order acknowledged',{team,x,z});}return units.length>0;};
+  sim.stop=(team=0)=>{for(const e of sim.entities)if(e.selected&&e.team===team)e.order=null;event('order','Units holding position');};
+  sim.build=(type,x,z,team=0)=>{
+    const d=DATA[type];if(!d||!STRUCTURES.includes(type))return false;
+    const fail=message=>{if(team===0)event('error',message,{team});return false;};
+    if(d.requires&&!ready(team,d.requires))return fail(`Requires ${DATA[d.requires].name}`);
+    if(sim.credits[team]<d.cost)return fail('Insufficient credits');
+    if(Math.abs(x)>42||Math.abs(z)>42)return fail('Outside the operation area');
+    if(!alive(team).some(e=>DATA[e.type].structure&&e.build>=1&&Math.hypot(e.x-x,e.z-z)<15))return fail('Build closer to a friendly structure');
+    if(sim.entities.some(e=>e.hp>0&&Math.hypot(e.x-x,e.z-z)<e.radius+d.radius+1)||sim.resources.some(p=>Math.hypot(p.x-x,p.z-z)<d.radius+3))return fail('Site obstructed');
+    sim.credits[team]-=d.cost;spawn(type,team,x,z,true);event('build',`${d.name} construction started`,{team});return true;
+  };
+  sim.produce=(type,team=0)=>{const d=DATA[type];if(!d||!UNITS.includes(type))return false;if(!ready(team,d.producer)){if(team===0)event('error',`Requires ${DATA[d.producer].name}`,{team});return false;}if(sim.credits[team]<d.cost){if(team===0)event('error','Insufficient credits',{team});return false;}if(sim.queues[team].length>=6){if(team===0)event('error','Production queue is full',{team});return false;}sim.credits[team]-=d.cost;sim.queues[team].push({type,progress:0});event('queue',`${d.name} queued`,{team});return true;};
+  sim.repair=(team=0)=>{let n=0;for(const e of sim.entities.filter(e=>e.selected&&e.team===team&&e.hp<e.maxHp)){const hp=Math.min(e.maxHp-e.hp,250,sim.credits[team]*2);if(hp>0){e.hp+=hp;sim.credits[team]-=Math.ceil(hp/2);n++;}}event(n?'build':'error',n?'Field repairs complete':'Select a damaged unit or structure');return n>0;};
+  function damage(e,amount,attacker){e.hp-=amount;if(e.hp<=0){e.hp=0;if(attacker.team===0&&e.team===1)sim.kills++;fx('explosion',e.x,e.z,e.x,e.z,e.team);event('destroy',`${DATA[e.type].name} destroyed`,{team:e.team,x:e.x,z:e.z});if(e.type==='hq'&&!ended){ended=true;sim.status=e.team===0?'defeat':'victory';event('end',sim.status);onEnd(sim.status);}}}
+  function weapon(e,target,dt){const d=DATA[e.type];if(!d.damage||e.build<1)return;e.cooldown-=dt;if(e.cooldown<=0){e.cooldown=d.rate*(power(e.team).low&&e.type==='turret'?2:1);fx('shot',e.x,e.z,target.x,target.z,e.team);damage(target,d.damage,e);if(Math.random()<.22)event('fire','',{team:e.team,x:e.x,z:e.z});}}
+  function move(e,goal,dt,stop=0.5){
+    let dx=goal.x-e.x,dz=goal.z-e.z,dd=Math.hypot(dx,dz);if(dd<stop){if(e.body)e.body.setLinvel({x:0,y:0,z:0},true);return true;}
+    dx/=dd;dz/=dd;
+    // Steer around static structures while Rapier resolves the actual contacts.
+    let sx=dx,sz=dz;for(const o of sim.entities){if(o===e||o.hp<=0||!DATA[o.type].structure)continue;const ox=e.x-o.x,oz=e.z-o.z,od=Math.hypot(ox,oz),r=o.radius+e.radius+2;if(od<r&&od>0){const ahead=dx*(-ox/od)+dz*(-oz/od);if(ahead>0){const side=(dx*oz-dz*ox)>=0?1:-1;sx+=(-oz/od)*side*(r-od)/r*2;sz+=(ox/od)*side*(r-od)/r*2;}}}
+    const l=Math.hypot(sx,sz)||1;sx/=l;sz/=l;e.angle=Math.atan2(-sx,-sz);const speed=DATA[e.type].speed;
+    if(e.body)e.body.setLinvel({x:sx*speed,y:0,z:sz*speed},true);else{e.x=clamp(e.x+sx*speed*dt,-44,44);e.z=clamp(e.z+sz*speed*dt,-44,44);}return false;
+  }
+  function updateHarvester(e,dt){
+    const ref=alive(e.team,'refinery').filter(a=>a.build>=1).sort((a,b)=>dist(e,a)-dist(e,b))[0];
+    let patch=e.order?.type==='harvest'?sim.resources.find(p=>p.id===e.order.patch&&p.amount>0):null;
+    if(!patch)patch=sim.resources.filter(p=>p.amount>0).sort((a,b)=>dist(e,a)-dist(e,b))[0];
+    if(e.cargo>=300&&ref){if(move(e,ref,dt,ref.radius+e.radius+1.3)){sim.credits[e.team]+=e.cargo;e.cargo=0;event('harvest','Ore delivered',{team:e.team});}return;}
+    if(!patch){if(e.body)e.body.setLinvel({x:0,y:0,z:0},true);return;}
+    if(move(e,patch,dt,2)){e.harvestTimer+=dt;if(e.harvestTimer>=.5){e.harvestTimer=0;const n=Math.min(50,patch.amount,300-e.cargo);patch.amount-=n;e.cargo+=n;fx('harvest',patch.x,patch.z,e.x,e.z,e.team);}}
+  }
+  function updateUnit(e,dt){
+    if(e.type==='harvester'&&(!e.order||e.order.type==='harvest')){updateHarvester(e,dt);return;}
+    const d=DATA[e.type];if(d.structure&&!d.damage)return;
+    let target=e.order?.type==='attack'?sim.entities.find(t=>t.id===e.order.target&&t.hp>0):null;
+    if(!target&&d.range)target=nearest(e.x,e.z,u=>u.team!==e.team,d.range+2);
+    if(target&&d.damage){const delta=dist(e,target);e.angle=Math.atan2(e.x-target.x,e.z-target.z);if(delta<=d.range+target.radius){if(e.body&&!d.structure)e.body.setLinvel({x:0,y:0,z:0},true);weapon(e,target,dt);}else if(!d.structure&&e.order?.type==='attack')move(e,target,dt,d.range*.8);return;}
+    if(e.order?.type==='attack')e.order=null;
+    if(!d.structure&&e.order?.type==='move'){if(move(e,e.order,dt,1)){e.order=null;}}else if(e.body&&!d.structure)e.body.setLinvel({x:0,y:0,z:0},true);
+  }
+  function ai(dt,team=1){aiClock+=dt;aiWave+=dt;if(aiClock>8){aiClock=0;
+    if(!ready(team,'factory')){const base=alive(team,'hq')[0];if(base){for(const [dx,dz] of [[-8,0],[0,8],[8,0],[0,-8],[-10,6]])if(sim.build('factory',base.x+dx,base.z+dz,team))break;}}
+    if(power(team).low){const base=alive(team,'hq')[0];if(base)for(const [dx,dz] of [[7,7],[-7,-7],[7,-7],[-7,7]])if(sim.build('power',base.x+dx,base.z+dz,team))break;}
+    if(sim.queues[team].length<3){if(ready(team,'factory')&&sim.credits[team]>=350)sim.produce('tank',team);else if(sim.credits[team]>=100)sim.produce('infantry',team);}
+  }
+  if(aiWave>42){aiWave=0;const target=alive(1-team,'hq')[0];const army=alive(team).filter(e=>e.type==='tank'||e.type==='infantry');if(target&&army.length)sim.order(target.x,target.z,team,army.map(e=>e.id));}}
+  sim.update=dt=>{if(ended)return;dt=Math.min(.05,Math.max(0,dt));elapsed+=dt;sim.elapsed=elapsed;
+    for(const e of [...sim.entities]){if(e.hp<=0)continue;if(e.build<1){e.build=Math.min(1,e.build+dt/(DATA[e.type].time||1));e.hp=Math.min(e.maxHp,e.hp+e.maxHp*.8*dt/(DATA[e.type].time||1));if(e.build>=1)event('complete',`${DATA[e.type].name} online`,{team:e.team});}else updateUnit(e,dt);}
+    for(let team=0;team<2;team++){const q=sim.queues[team][0];if(q){const prod=alive(team,DATA[q.type].producer).find(e=>e.build>=1);if(prod){q.progress+=dt/(DATA[q.type].time*(power(team).low?2:1));if(q.progress>=1){let a=team?Math.PI:0;let x=clamp(prod.x+Math.sin(a)*4,-42,42),z=clamp(prod.z-Math.cos(a)*4,-42,42);spawn(q.type,team,x,z);sim.queues[team].shift();event('complete',`${DATA[q.type].name} ready`,{team});}}}}
+    ai(dt);if(attract){
+      sim.credits[0]=Math.max(sim.credits[0],4000);
+      const beat=Math.floor(elapsed/8);
+      if(beat!==lastAttractAction){lastAttractAction=beat;
+        if(beat===0)sim.build('factory',-37,14,0);
+        else if(beat===1)sim.build('turret',-26,7,0);
+        else if(beat%4===2){const target=alive(1,'hq')[0];const ids=alive(0).filter(e=>e.type==='infantry'||e.type==='tank').map(e=>e.id);if(target)sim.order(target.x,target.z,0,ids);}
+        else sim.produce(ready(0,'factory')?'tank':'infantry',0);
+      }
+    }
+    if(world){world.timestep=dt;world.step();for(const e of sim.entities)if(e.body&&!DATA[e.type].structure){const p=e.body.translation();e.x=clamp(p.x,-44,44);e.z=clamp(p.z,-44,44);if(e.x!==p.x||e.z!==p.z)e.body.setTranslation({x:e.x,y:0,z:e.z},true);}}
+    for(const e of sim.entities.filter(e=>e.hp<=0)){if(e.body&&world){world.removeRigidBody(e.body);e.body=null;}}
+    sim.entities=sim.entities.filter(e=>e.hp>0);sim.selected=sim.selected.filter(id=>sim.entities.some(e=>e.id===id));for(const f of sim.effects)f.life-=dt;sim.effects=sim.effects.filter(f=>f.life>0);
+  };
+  sim.dispose=()=>{if(world)world.free();};
+  return sim;
+}
+
+/* Multiplayer: AI Hub's parallel-session protocol, plus standalone WebRTC score races. */
+function createNetwork(callbacks = {}) {
+  const emit = (name, ...args) => callbacks[name]?.(...args);
+  let peer = null, links = [], upstream = null, host = false, room = '', seat = 0;
+  let scores = {}, sentAt = 0, finished = false, startingAt = 0, ended = false;
+  const hub = window.AIHub;
+  let hubActive = false;
+  function status(s) { emit('onStatus', s); }
+  function refresh() { emit('onScores', { ...scores }); }
+  function send(link, data) { if (link?.open) link.send(data); }
+  function broadcast(data, except = null) { for (const link of links) if (link !== except) send(link, data); }
+  function cleanup() {
+    for (const link of links) link.close();
+    links = []; upstream = null;
+    if (peer) peer.destroy();
+    peer = null; room = ''; host = false; seat = 0; scores = {}; startingAt = 0;
+  }
+  function importPeer() {
+    if (window.Peer) return Promise.resolve(window.Peer);
+    return new Promise((resolve, reject) => {
+      let script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
+      script.onload = () => window.Peer ? resolve(window.Peer) : reject(new Error('PeerJS unavailable'));
+      script.onerror = () => reject(new Error('Could not load the multiplayer service'));
+      document.head.appendChild(script);
+    });
+  }
+  function handle(link, msg) {
+    if (!msg || typeof msg !== 'object' || typeof msg.t !== 'string') return;
+    if (msg.t === 'welcome' && !host && Number.isInteger(msg.seat)) {
+      seat = msg.seat; scores = msg.scores || {}; refresh(); status('CONNECTED · PLAYER ' + (seat + 1));
+    } else if (msg.t === 'score' && host && Number.isFinite(msg.score)) {
+      const player = link._seat;
+      if (!Number.isInteger(player)) return;
+      scores[player] = { score: Math.max(0, Math.min(99999999, Math.floor(msg.score))), label: String(msg.label || '').slice(0, 24) };
+      refresh(); broadcast({t:'scores', scores});
+    } else if (msg.t === 'scores' && !host && msg.scores && typeof msg.scores === 'object') {
+      scores = msg.scores; refresh();
+    } else if (msg.t === 'start' && !host && Number.isFinite(msg.delay)) {
+      startingAt = performance.now() + Math.max(0, Math.min(5000, msg.delay));
+      finished = false; ended = false; emit('onStart', startingAt);
+    } else if (msg.t === 'finished' && host) {
+      scores[link._seat] = { ...(scores[link._seat] || {}), done: true };
+      refresh(); broadcast({t:'scores', scores});
+    }
+  }
+  function wire(link) {
+    link.on('data', msg => handle(link, msg));
+    link.on('close', () => {
+      links = links.filter(l => l !== link);
+      if (host && Number.isInteger(link._seat)) {
+        delete scores[link._seat]; refresh(); broadcast({t:'scores', scores});
+        status('A COMMANDER LEFT THE ROOM');
+      } else if (!host) { upstream = null; status('CONNECTION TO HOST LOST'); emit('onEnd', 'disconnected'); }
+    });
+    link.on('error', () => status('CONNECTION INTERRUPTED'));
+  }
+  function openPeer(id) {
+    return importPeer().then(Peer => new Promise((resolve, reject) => {
+      const p = new Peer(id, {debug: 0});
+      let settled = false;
+      p.once('open', () => { settled = true; peer = p; resolve(p); });
+      p.on('error', err => { if (!settled) { p.destroy(); reject(err); } else status('NETWORK ERROR · ' + (err.type || 'connection')); });
+    }));
+  }
+  return {
+    get active() { return hubActive || !!peer; },
+    get isHub() { return hubActive; },
+    get isHost() { return host; },
+    get room() { return room; },
+    get seat() { return seat; },
+    get players() { return Object.keys(scores).length; },
+    async hubConnect() {
+      if (!hub?.active) return false;
+      const info = await hub.connect({mode:'parallel', seats:[1,4]});
+      if (!info) return false;
+      hubActive = true; finished = false; ended = false;
+      hub.on('time-up', () => emit('onTimeUp'));
+      hub.on('end', data => { ended = true; emit('onEnd', data); });
+      return true;
+    },
+    ready() { if (hubActive) hub.ready(); },
+    canStep() { return !ended && (hubActive ? hub.time() >= 0 : !startingAt || performance.now() >= startingAt); },
+    progress(score, label='') {
+      if (!Number.isFinite(score)) return;
+      if (hubActive) { hub.progress({score, label: String(label).slice(0,24)}); return; }
+      if (!peer || performance.now() - sentAt < 800) return;
+      sentAt = performance.now();
+      if (host) { scores[0] = {score: Math.floor(score), label: String(label).slice(0,24)}; refresh(); broadcast({t:'scores', scores}); }
+      else send(upstream, {t:'score', score:Math.floor(score), label:String(label).slice(0,24)});
+    },
+    finish(score) {
+      if (finished) return;
+      finished = true;
+      if (hubActive) hub.result({score: Number.isFinite(score) ? Math.floor(score) : 0});
+      else if (host) { scores[0] = { ...(scores[0] || {}), done:true }; refresh(); broadcast({t:'scores', scores}); }
+      else send(upstream, {t:'finished'});
+    },
+    async hostRoom() {
+      cleanup(); finished = false; ended = false;
+      // Cryptographic randomness avoids predictable/conflicting public room IDs.
+      const bytes = new Uint8Array(6); crypto.getRandomValues(bytes);
+      room = Array.from(bytes, b => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b % 32]).join('');
+      const p = await openPeer('cat-' + room.toLowerCase());
+      host = true; seat = 0; scores = {0:{score:0,label:'Ready'}}; refresh();
+      p.on('connection', link => {
+        const used = new Set(links.map(l => l._seat));
+        let n = [1,2,3].find(x => !used.has(x));
+        if (n == null || startingAt) { link.on('open', () => link.close()); return; }
+        link._seat = n; links.push(link); wire(link);
+        link.on('open', () => { scores[n] = {score:0,label:'Ready'}; send(link,{t:'welcome',seat:n,scores}); broadcast({t:'scores',scores}); refresh(); status('COMMANDER JOINED · ' + Object.keys(scores).length + '/4'); });
+      });
+      status('ROOM ' + room + ' · SHARE CODE'); return room;
+    },
+    async joinRoom(code) {
+      cleanup(); finished = false; ended = false;
+      room = String(code || '').toUpperCase().replace(/[^A-Z2-9]/g,'').slice(0,6);
+      if (room.length !== 6) throw new Error('Enter the six-character room code');
+      const p = await openPeer();
+      return new Promise((resolve, reject) => {
+        const link = p.connect('cat-' + room.toLowerCase(), {reliable:true});
+        upstream = link; links = [link]; wire(link);
+        let settled = false;
+        const timer = setTimeout(() => { if (!settled) { settled = true; cleanup(); reject(new Error('Room not found or unavailable')); } }, 12000);
+        link.on('open', () => { if (!settled) { settled = true; clearTimeout(timer); status('CONNECTED · WAITING FOR HOST'); resolve(); } });
+        link.on('error', () => { if (!settled) { settled = true; clearTimeout(timer); cleanup(); reject(new Error('Unable to join room')); } });
+      });
+    },
+    startRoom() {
+      if (!host || !peer) return false;
+      startingAt = performance.now() + 3000; finished = false; ended = false;
+      broadcast({t:'start', delay:3000}); emit('onStart', startingAt); return true;
+    },
+    close: cleanup
+  };
+}
+
+
+
+
+
+const $=id=>document.getElementById(id), show=(id,on=true)=>$(id).classList.toggle('hidden',!on);
+const state={mode:'loading',sim:null,cursor:{x:-24,z:14,visible:true,color:0xf6e6a4},action:0,placing:null,settings:{invertX:false,invertY:false,music:true,sfx:true},lastInput:performance.now(),lastFrame:performance.now(),toastUntil:0,score:0,netText:'',scores:{},attractStart:0};
+const actions=[['infantry','Rifle squad'],['tank','Thunder tank'],['harvester','Harvester'],['refinery','Refinery'],['barracks','Barracks'],['factory','War factory'],['power','Power plant'],['turret','Sentry'],['repair','Repair'],['stop','Hold']];
+let renderer, network, audio, lastMusic=0, beat=0, keys={}, padPrev=[], panelReturn='menu', roomCode='', blockScreen='', inputState={x:0,y:0,fire:false};
+try {Object.assign(state.settings,JSON.parse(localStorage.getItem('ct-settings')||'{}'));} catch {}
+function save(){try{localStorage.setItem('ct-settings',JSON.stringify(state.settings));}catch{}}
+function sound(type='select'){
+ if(!state.settings.sfx)return; try{audio ||= new AudioContext(); if(audio.state==='suspended')audio.resume();const t=audio.currentTime;const o=audio.createOscillator(),g=audio.createGain();o.type=type==='fire'?'sawtooth':type==='voice'?'square':'triangle';o.frequency.setValueAtTime(type==='error'?145:type==='fire'?95:type==='voice'?310:480,t);o.frequency.exponentialRampToValueAtTime(type==='error'?90:type==='fire'?45:type==='voice'?190:660,t+.12);g.gain.setValueAtTime(.045,t);g.gain.exponentialRampToValueAtTime(.001,t+.14);o.connect(g).connect(audio.destination);o.start(t);o.stop(t+.15);if(type==='voice'){for(let i=1;i<3;i++){const v=audio.createOscillator(),a=audio.createGain();v.type='square';v.frequency.value=210+Math.random()*260;a.gain.setValueAtTime(.025,t+i*.09);a.gain.exponentialRampToValueAtTime(.001,t+i*.09+.08);v.connect(a).connect(audio.destination);v.start(t+i*.09);v.stop(t+i*.09+.09);}}}catch{}
+}
+function music(now){if(!state.settings.music||!audio||audio.state!=='running'||now-lastMusic<300)return;lastMusic=now;const notes=[55,55,82.41,55,65.41,55,98,82.41,55,55,82.41,110,65.41,73.42,82.41,49];const t=audio.currentTime,o=audio.createOscillator(),g=audio.createGain(),filter=audio.createBiquadFilter();o.type=beat%4===0?'sawtooth':'triangle';o.frequency.value=notes[beat++%notes.length];filter.type='lowpass';filter.frequency.value=350;g.gain.setValueAtTime(.035,t);g.gain.exponentialRampToValueAtTime(.001,t+.26);o.connect(filter).connect(g).connect(audio.destination);o.start(t);o.stop(t+.27);}
+function toast(msg){if(!msg)return;$('toast').textContent=msg;show('toast');state.toastUntil=performance.now()+1800;}
+function score(){if(!state.sim)return 0;const s=state.sim;return Math.max(0,Math.floor((s.credits[0]||0)+s.entities.filter(e=>e.team===0).reduce((n,e)=>n+(DATA[e.type].cost||0)*.5,0)+(s.kills||0)*200+(s.status==='victory'?2000:0)));}
+function event(e){if(e.team===1)return;if(['select','order'].includes(e.type))sound('voice');else if(e.type==='fire')sound('fire');else if(e.type==='error')sound('error');else if(['complete','destroy','build','queue'].includes(e.type))sound('select');if(e.text&&e.type!=='fire'&&e.type!=='harvest'&&state.mode==='game')toast(e.text);}
+function dispose(){if(state.sim){state.sim.dispose();state.sim=null;}}
+function menu(){dispose();state.mode='menu';state.lastInput=performance.now();state.placing=null;show('menu');show('panel',false);show('hud',false);show('attract',false);$('menu').querySelector('button').focus();}
+function begin(attract=false, multi=false){dispose();state.mode=attract?'attract':'game';state.placing=null;state.action=0;state.cursor={x:-24,z:14,visible:!attract,color:0xf6e6a4};state.sim=createSimulation({RAPIER,onEvent:event,onEnd:result=>endGame(result),attract,multiplayer:multi});renderer.center(-20,16);show('menu',false);show('panel',false);show('hud',!attract);show('attract',attract);state.attractStart=performance.now();refreshActions();if(multi)network.ready();}
+function endGame(result){if(state.mode==='attract'){requestAnimationFrame(()=>begin(true));return;}if(state.mode!=='game'&&state.mode!=='paused')return;const n=score();network?.finish(n);state.mode='result';panelReturn='menu';show('hud',false);showPanel(`<div class="eyebrow">Operation / Glass Frontier</div><h2>${result==='victory'?'Victory secured':result==='defeat'?'Command lost':'Time expired'}</h2><p>${result==='victory'?'Enemy command has fallen. The frontier belongs to us.':'The field remains contested. Rebuild, adapt, and return.'}</p><h3>Command score · ${n.toLocaleString()}</h3><p>${scoreText()}</p>${network.isHub?'':`<button class="btn primary" data-do="again">Deploy again</button><button class="btn" data-do="menu">Main menu</button>`}`);}
+function showPanel(html){$('panel').innerHTML=html;show('panel');show('menu',false);setTimeout(()=>$('panel').querySelector('button,input')?.focus(),0);}
+function openPanel(name){show('touch',false);show('failure',false);if(state.mode!=='paused')panelReturn=state.mode==='game'?'game':'menu';if(state.mode==='game')state.mode='paused';show('hud',false);if(name==='settings'){showPanel(`<div class="eyebrow">Systems / Preferences</div><h2>Settings</h2><p>Adjust the controls to suit your controller. Changes are saved on this device.</p>${[['invertX','Invert horizontal axis'],['invertY','Invert vertical axis'],['music','Music'],['sfx','Sound & voices']].map(([key,label])=>`<div class="settings-row"><span>${label}</span><button class="btn" data-toggle="${key}">${state.settings[key]?'On':'Off'}</button></div>`).join('')}<p class="micro">AXIS INVERSION APPLIES TO BOTH STICKS.</p><button class="btn primary" data-do="back">Back</button>`);}
+else if(name==='briefing'){showPanel(`<div class="eyebrow">Intelligence / Read before deployment</div><h2>Field manual</h2><div class="two"><div><h3>The mission</h3><p>Destroy the red command core before the enemy destroys yours. Crystal deposits fund your war; harvesters work automatically and return cargo to a refinery.</p><h3>Build the machine</h3><p>Cycle commands with L1 / R1, then press Triangle to queue a unit or choose a structure. Move the cursor and press Cross to place it near your base. A barracks unlocks the factory and sentry. Power shortages slow production and sentries.</p></div><div><h3>Take command</h3><p>Left stick moves the targeting cursor; right stick pans the camera. Cross selects a friendly unit or building. Circle sends selected units to move, attack an enemy, or direct a harvester to crystal. Square selects all combat units. Options pauses.</p><h3>Keyboard & mouse</h3><p>WASD moves cursor, arrows pan, Enter selects, Backspace orders, X selects army, Q/E cycles commands, Space activates, Esc pauses. Mouse: left click selects or places, right click orders. Wheel zooms.</p></div></div><button class="btn primary" data-do="back">Back</button>`);}
+else if(name==='about'){showPanel(`<div class="eyebrow">Archive / Credits</div><h2>About this operation</h2><p>Command & Thunder is an original real-time strategy vertical slice inspired by Command & Conquer. Created for this prompt with procedural geometry, animation, music and voices.</p><h3>Source information</h3><p>Date: 2026-10-29 09:22 · Source: Command & Conquer<br>Tech: Three.js r180 WebGPU; Rapier 0.19.3; Gamepad API; Web Audio; PeerJS 1.5.5; AI Hub session 1.3.0.<br>Art: cel-shaded low-poly battlefield. Animation: procedural transforms and simulation. Audio: code-generated music, effects and gibberish radio voices.<br>Online: AI Hub parallel score race and standalone WebRTC rooms. Testing: lightweight headless checks; browser and GPU availability dependent.<br>Environment: Codex CLI (headless); Linux; browser unknown. Model: OpenAI, gpt-6.1-terra, reasoning effort ultra. Usage: unknown.</p><h3>Testing feedback</h3><p id="testingFeedback">Testing and review caught four issues: two hub state-probe errors, a stray cursor marker, and HUD mouse interception. None was game-breaking. Most helpful: the two-player AI Hub harness. Least helpful: syntax checking alone. The hub harness passed 20/20 checks with two and three players after fixes; its gamepad emulation was unavailable in this run. A live WebRTC room, WebGPU rendering, a 120-second physics simulation, and attract mode were also checked.</p><h3>Engine feedback</h3><p>Three.js offers expressive procedural scenes and a direct WebGPU renderer. The initial headless GPU setup produced a black frame; Vulkan with SwiftShader resolved the test environment. WebGPU availability and module loading required care. The strategy simulation, AI and controller interface were built for this game. The hardest part was coordinating physics, rendering and the browser lifecycle. WebGPU initialization and diagnostics would benefit from clearer compatibility reporting.</p><h3>Prompt feedback</h3><p>The strongest part was the clear controller-first direction and the request for a complete playable slice. The broad feature scope and multiplayer requirements were the hardest to reconcile in a single file. A full real-device controller and multiplayer session would be the most valuable additional test. Confusing: none.</p><button class="btn primary" data-do="back">Back</button>`);}
+else if(name==='online'){showPanel(`<div class="eyebrow">Communications / Parallel operation</div><h2>Score race</h2><p>Up to four commanders fight their own matching battlefield for four minutes. Build, survive and destroy the enemy core; highest command score wins. Score is credits plus half the value of your surviving force, 200 per enemy destroyed, and 2,000 for destroying the enemy core. Share a room code to meet online.</p><div class="two"><div><button class="btn primary" data-do="host">Host room</button><p id="roomStatus" class="micro">${state.netText||'CREATE A ROOM OR JOIN A COMMANDER'}</p><button class="btn" data-do="startroom">Start race · host</button></div><div><label for="roomInput" class="micro">SIX-CHARACTER ROOM CODE</label><br><input id="roomInput" class="input" maxlength="6" value="${roomCode}" aria-label="Room code"><button class="btn" data-do="join">Join room</button></div></div><p class="micro">Requires internet access and a WebRTC-capable browser. AI Hub sessions connect automatically.</p><button class="btn" data-do="back">Back</button>`);}}
+function back(){show('panel',false);if(panelReturn==='game'){state.mode='game';show('hud');}else if(blockScreen){show(blockScreen);state.mode='blocked';}else menu();}
+function scoreText(){return Object.entries(state.scores).map(([id,v])=>`P${Number(id)+1}: ${Number(v.score||0).toLocaleString()}${v.done?' ✓':''}`).join('  ·  ')||'Solo operation';}
+function refreshActions(){const container=$('actions');container.innerHTML='';const start=Math.max(0,Math.min(actions.length-5,state.action-2));actions.slice(start,start+5).forEach(([id,label],i)=>{const idx=start+i,b=document.createElement('button');b.className='action'+(idx===state.action?' active':'');b.innerHTML=`<b>${label}</b><small>${DATA[id]?`$${DATA[id].cost}`:id==='repair'?'$ / HEALTH':'STOP MOVEMENT'}</small>`;b.onclick=()=>{state.action=idx;activate();};container.appendChild(b);});}
+function activate(){const id=actions[state.action][0];sound();if(DATA[id]?.structure){state.placing=id;toast(`Place ${DATA[id].name} near your base`);}else if(DATA[id])state.sim.produce(id);else if(id==='repair')state.sim.repair();else state.sim.stop();refreshActions();}
+function select(){if(!state.sim)return;if(state.placing){if(state.sim.build(state.placing,state.cursor.x,state.cursor.z))state.placing=null;}else state.sim.selectAt(state.cursor.x,state.cursor.z);}
+function order(){if(state.placing){state.placing=null;toast('Placement cancelled');}else state.sim?.order(state.cursor.x,state.cursor.z);}
+function actionCycle(n){state.action=(state.action+n+actions.length)%actions.length;refreshActions();sound();}
+function input(){state.lastInput=performance.now();if(state.mode==='attract'){menu();return true;}return false;}
+function closestButtons(){return [...document.querySelectorAll('#panel:not(.hidden) button, #menu:not(.hidden) button')].filter(x=>!x.disabled);}
+function nav(n){const buttons=closestButtons();if(!buttons.length)return;let i=buttons.indexOf(document.activeElement);buttons[(i+n+buttons.length)%buttons.length].focus();sound();}
+document.addEventListener('click',async e=>{if(input())return;const b=e.target.closest('button');if(!b)return;if(b.dataset.menu){if(b.dataset.menu==='solo')begin();else openPanel(b.dataset.menu);return;}if(b.dataset.toggle){state.settings[b.dataset.toggle]=!state.settings[b.dataset.toggle];save();openPanel('settings');return;}switch(b.dataset.do){case 'back':back();break;case 'menu':network.close();menu();break;case 'again':network.close();begin();break;case 'host':try{$('roomStatus').textContent='OPENING ROOM…';roomCode=await network.hostRoom();$('roomStatus').textContent='ROOM '+roomCode+' · SHARE THIS CODE';}catch(err){$('roomStatus').textContent=err.message;}break;case 'join':try{roomCode=$('roomInput').value;$('roomStatus').textContent='CONNECTING…';await network.joinRoom(roomCode);}catch(err){$('roomStatus').textContent=err.message;}break;case 'startroom':if(!network.startRoom())$('roomStatus').textContent='HOST A ROOM FIRST';break;}});
+window.addEventListener('keydown',e=>{if(e.repeat)return;if(input())return;if(state.mode==='result'&&network.isHub)return;keys[e.code]=true;if(document.activeElement?.tagName==='INPUT')return;if(state.mode==='game'){if(['Enter','NumpadEnter'].includes(e.code))select();else if(e.code==='Backspace')order();else if(e.code==='KeyX')state.sim.selectAll();else if(e.code==='KeyQ')actionCycle(-1);else if(e.code==='KeyE')actionCycle(1);else if(e.code==='Space')activate();else if(e.code==='Escape')openPanel('settings');}else if(e.code==='Escape'&&!$('panel').classList.contains('hidden'))back();else if(e.code==='ArrowDown')nav(1);else if(e.code==='ArrowUp')nav(-1);if(['Space','Backspace','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault();});
+window.addEventListener('resize',()=>renderer?.resize());window.addEventListener('keyup',e=>keys[e.code]=false);window.addEventListener('blur',()=>keys={});
+document.addEventListener('pointermove',()=>{if(state.mode==='menu'||state.mode==='attract')input();});
+$('world').addEventListener('pointermove',e=>{if(state.mode!=='game')return;const p=renderer.worldAt(e.clientX,e.clientY);if(p){state.cursor.x=p.x;state.cursor.z=p.z;}state.lastInput=performance.now();});$('world').addEventListener('pointerdown',e=>{if(input()||state.mode!=='game')return;const p=renderer.worldAt(e.clientX,e.clientY);if(p){state.cursor.x=p.x;state.cursor.z=p.z;}if(e.button===2)order();else if(e.button===0)select();});window.addEventListener('contextmenu',e=>e.preventDefault());window.addEventListener('wheel',e=>{if(state.mode==='game')renderer.zoom(e.deltaY*.01);},{passive:true});
+function pollPad(dt){const pad=[...navigator.getGamepads()].find(Boolean);if(!pad){padPrev=[];return;}const ax=(i)=>Math.abs(pad.axes[i]||0)>.18?pad.axes[i]:0;let x=ax(0)*(state.settings.invertX?-1:1),y=ax(1)*(state.settings.invertY?-1:1),rx=ax(2)*(state.settings.invertX?-1:1),ry=ax(3)*(state.settings.invertY?-1:1);let pressed=pad.buttons.map(b=>b.pressed);inputState={x,y,fire:!!pressed[0]};const edge=i=>pressed[i]&&!padPrev[i];if(x||y||rx||ry||pressed.some((v,i)=>v&&!padPrev[i])){if(input()){padPrev=pressed;return;}}if(state.mode==='result'&&network.isHub){padPrev=pressed;return;}if(state.mode==='game'){state.cursor.x=Math.max(-44,Math.min(44,state.cursor.x+x*24*dt));state.cursor.z=Math.max(-44,Math.min(44,state.cursor.z+y*24*dt));renderer.pan(rx*25*dt,ry*25*dt);if(edge(0))select();if(edge(1))order();if(edge(2))state.sim.selectAll();if(edge(3))activate();if(edge(4))actionCycle(-1);if(edge(5))actionCycle(1);if(edge(9)&&!pressed[8])openPanel('settings');}else{if(edge(9)&&!pressed[8]&&state.mode==='paused'){back();}if(edge(12))nav(-1);if(edge(13))nav(1);if(edge(0))document.activeElement?.click();if(edge(1)&&!$('panel').classList.contains('hidden'))back();}padPrev=pressed;}
+function updateHud(){const s=state.sim;if(!s)return;$('credits').textContent=Math.floor(s.credits[0]).toLocaleString();const selected=s.entities.filter(e=>e.selected);$('selname').textContent=selected.length===0?'No selection':selected.length===1?DATA[selected[0].type].name:`${selected.length} units selected`;const p=s.power(0);$('seldetail').textContent=selected.length===1?`${Math.ceil(selected[0].hp)} / ${selected[0].maxHp} HP · POWER ${p.supply}/${p.demand}`:`POWER ${p.supply}/${p.demand}${p.low?' · LOW':''}`;$('objective').textContent=s.status==='active'?'Destroy enemy command core':s.status;$('guide').textContent=state.placing?`Place ${DATA[state.placing].name} within range of your base. Cross / Enter confirms; Circle / Backspace cancels.`:p.low?'Power low: production and sentry fire are slowed. Build a power plant.':s.queues[0].length?`Production: ${DATA[s.queues[0][0].type].name} ${Math.floor(s.queues[0][0].progress*100)}% · queue ${s.queues[0].length}/6`:'Harvest crystal, build your force, and destroy the enemy command core.';$('netstatus').textContent=network.active?'SCORE '+score().toLocaleString()+' · '+(network.isHub?'AI HUB':scoreText()):'';$('hint').textContent=state.placing?'CROSS / ENTER  PLACE   ·   CIRCLE / BACKSPACE  CANCEL':'CROSS  SELECT   ·   CIRCLE  ORDER   ·   SQUARE  ARMY   ·   L1 / R1  COMMAND   ·   TRIANGLE  ACTIVATE';}
+function frame(now){const dt=Math.min(.05,(now-state.lastFrame)/1000);state.lastFrame=now;inputState={x:0,y:0,fire:false};pollPad(dt);if(state.mode!=='result')music(now);if(state.mode==='menu'&&now-state.lastInput>10000)begin(true);if(state.mode==='attract'&&now-state.attractStart>60000)begin(true);if(state.mode==='game'){let x=(keys.KeyD?1:0)-(keys.KeyA?1:0),z=(keys.KeyS?1:0)-(keys.KeyW?1:0);if(x||z||keys.ArrowRight||keys.ArrowLeft||keys.ArrowUp||keys.ArrowDown||keys.Enter||keys.Space)inputState={x:x+(keys.ArrowRight?1:0)-(keys.ArrowLeft?1:0),y:z+(keys.ArrowDown?1:0)-(keys.ArrowUp?1:0),fire:!!(keys.Enter||keys.Space)};state.cursor.x=Math.max(-44,Math.min(44,state.cursor.x+x*22*dt*(state.settings.invertX?-1:1)));state.cursor.z=Math.max(-44,Math.min(44,state.cursor.z+z*22*dt*(state.settings.invertY?-1:1)));renderer.pan(((keys.ArrowRight?1:0)-(keys.ArrowLeft?1:0))*22*dt,((keys.ArrowDown?1:0)-(keys.ArrowUp?1:0))*22*dt);if(network.canStep())state.sim.update(dt);if(network.active&&!network.isHub&&state.sim.elapsed>=240){endGame('time');}network.progress(score(),'In battle');updateHud();}else if(state.mode==='attract'){state.sim.update(dt);const t=(now-state.attractStart)/1000;renderer.center(Math.sin(t*.13)*16,Math.cos(t*.13)*12);}if(state.sim)renderer.update(state.sim,state.cursor,dt);renderer.render();if(now>state.toastUntil)show('toast',false);requestAnimationFrame(frame);}
+async function boot(){network=createNetwork({onStatus:s=>{state.netText=s;const el=$('roomStatus');if(el)el.textContent=s;},onScores:s=>state.scores=s,onStart:()=>begin(false,true),onTimeUp:()=>endGame('time'),onEnd:()=>{if(state.mode==='game')endGame('time');}});window.AIHub?.probe(()=>({scene:({game:'play',paused:'play',result:'over',menu:'title'}[state.mode]||state.mode),menu:state.mode==='menu'||state.mode==='paused',world:state.sim?state.sim.elapsed:0,input:inputState}));try{await RAPIER.init();renderer=await createRenderer({canvas:$('world')});show('loading',false);menu();if(window.matchMedia('(pointer: coarse)').matches&&!window.matchMedia('(pointer: fine)').matches&&!navigator.getGamepads().some(Boolean)){blockScreen='touch';state.mode='blocked';show('touch');show('menu',false);}if(await network.hubConnect()){begin(false,true);}requestAnimationFrame(frame);}catch(err){console.error(err);show('loading',false);blockScreen='failure';state.mode='blocked';show('failure');}}
+boot();
+
+</script></body></html>

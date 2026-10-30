@@ -1,0 +1,911 @@
+<!doctype html>
+<!--
+Source Information
+Date: 2026-10-29 09:24
+Source: Waku Waku 7
+Tech: Three.js r180 WebGPU; Rapier 0.19.3; Web Audio API; Gamepad API; PeerJS 1.5.5; AI Hub Session Protocol 1.3.0.
+Art Direction: Original procedural cel-shaded carnival fighting game.
+Animation: Procedural articulated poses and effects.
+Audio: Code-synthesized music, sound effects, and gibberish vocal chirps.
+Online: PeerJS/WebRTC two-player rooms; AI Hub parallel score sessions.
+Testing: Lightweight headless browser and syntax checks; WebGPU hardware availability unknown.
+Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort ultra.
+Usage: unknown.
+Testing Feedback: 2 issues caught by browser testing: title overlap (fixed) and blank 3D canvas in headless software rendering (Chrome reported an uninitialized GPU shared image; game-breaking in that environment). Most helpful: browser screenshot and runtime smoke test; least helpful: syntax-only check. Live networking remains untested.
+Engine Feedback: Three.js makes procedural scenes approachable. WebGPU initialization and headless rendering were difficult; combat, input, animation, audio, and UI were built for this game. Overhaul suggestion: clearer WebGPU-only initialization and diagnostics. No other engine change identified.
+Prompt Feedback: The creative latitude and arcade focus were enjoyable. The breadth of the vertical slice and multiplayer expectations were challenging; no specific wording was unclear. A full controller and network playtest would be valuable.
+-->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><title>Waku Paku Panic!</title>
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="4"><meta name="hub:session-goal" content="Score the most points in carnival combat"><meta name="hub:session-howto" content="Move with stick, Cross jumps, Square attacks, Triangle specials"><meta name="hub:webgpu" content="required"><meta name="hub:players" content="1-2">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@700;800;900&family=Rubik+Mono+One&display=swap');
+:root{--cream:#fff5d2;--ink:#252044;--pink:#ff4d87;--yellow:#ffe05a;--blue:#49d6ed}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#25153c;color:var(--cream);font-family:Nunito,system-ui,sans-serif;font-weight:800}canvas{position:absolute;inset:0;width:100%;height:100%;display:block}button,input{font:inherit}button{cursor:pointer}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(31,17,58,.92),rgba(31,17,58,.63) 44%,rgba(31,17,58,.06) 80%),linear-gradient(0deg,rgba(30,16,60,.5),transparent 40%);pointer-events:none}.screen{position:absolute;inset:0;padding:4vh 5vw;display:flex;flex-direction:column;pointer-events:none}.screen>*{pointer-events:auto}.hidden{display:none!important}.eyebrow{color:var(--yellow);text-transform:uppercase;letter-spacing:.22em;font-size:clamp(12px,1.2vw,19px)}.brand{flex:none;font-family:'Rubik Mono One',system-ui;font-size:clamp(32px,min(6vw, 10vh),100px);line-height:1;letter-spacing:-.08em;color:var(--yellow);text-shadow:4px 5px 0 #f5538e,8px 9px 0 #422454;transform:rotate(-3deg);margin:1vh 0 3.5vh;max-width:650px}.brand small{display:block;color:#fff;font-size:.54em;line-height:1.1;letter-spacing:.02em;margin-top:.18em}.tagline{font-size:clamp(15px,1.5vw,24px);max-width:570px;line-height:1.3}.menu{display:grid;gap:.4vh;width:min(460px,44vw);margin-top:2vh}.menu button,.action{border:3px solid transparent;background:rgba(255,255,255,.12);color:white;text-align:left;border-radius:13px;padding:.55vh 1.3vw;font-size:clamp(16px,1.55vw,24px);font-weight:900;transition:.12s}.menu button.selected,.menu button:hover,.action:hover,.action:focus-visible{background:var(--yellow);color:var(--ink);border-color:#fff;transform:translateX(8px);box-shadow:0 5px 0 #e85b83}.menu button span{float:right;font-size:.65em;opacity:.7;padding-top:.3em}.footer{position:absolute;bottom:1vh;left:5vw;color:#fff;font-size:clamp(12px,1.1vw,17px);letter-spacing:.04em}.footer b,.key{color:var(--yellow)}.corner{position:absolute;right:4vw;bottom:3vh;text-align:right;text-shadow:0 2px 4px #341b53}.corner strong{display:block;color:var(--yellow);font-size:1.5em}.panel{margin:auto;width:min(850px,86vw);max-height:87vh;overflow:auto;background:#292044ee;border:4px solid #fff2ca;border-radius:24px;padding:3vh 3vw;box-shadow:0 12px 0 #a53770,0 20px 80px #190c32}.panel h2{font-family:'Rubik Mono One',system-ui;color:var(--yellow);font-size:clamp(26px,3.5vw,52px);margin:0 0 1vh;letter-spacing:-.06em}.panel p{font-size:clamp(15px,1.3vw,20px);line-height:1.4;margin:.6em 0}.panel .muted{opacity:.7}.rows{display:grid;gap:.8vh;margin:2vh 0}.row{display:flex;align-items:center;justify-content:space-between;gap:2vw;border-bottom:1px solid #ffffff2c;padding:.6vh 0;font-size:clamp(16px,1.45vw,22px)}.row span:last-child{color:var(--yellow);text-align:right}.actions{display:flex;gap:1vw;flex-wrap:wrap;margin-top:2vh}.action{background:#f45b91;box-shadow:0 4px 0 #ad326e;text-align:center;padding:1vh 1.4vw}.action.selected{background:var(--yellow);color:var(--ink)}input{background:#fff6d6;color:#252044;border:0;border-radius:10px;padding:10px;text-align:center;font-size:24px;width:150px;letter-spacing:.2em}.hud{position:absolute;top:2.5vh;left:3vw;right:3vw;display:grid;grid-template-columns:1fr auto 1fr;gap:1.5vw;align-items:start;pointer-events:none;text-shadow:2px 2px #33204f}.fighterhud:last-child{text-align:right}.name{font-family:'Rubik Mono One';font-size:clamp(15px,1.8vw,28px);letter-spacing:-.06em}.bar{height:clamp(15px,2.2vh,25px);background:#4b2a53;border:3px solid #fff3d3;border-radius:8px;overflow:hidden;box-shadow:0 4px #312044}.bar i{display:block;background:linear-gradient(90deg,#ffdb55,#ff648b);height:100%;width:100%;transition:width .12s}.fighterhud:last-child .bar i{margin-left:auto;background:linear-gradient(90deg,#55cce9,#8df6cf)}.meter{height:8px;background:#46375a;border-radius:9px;margin-top:6px;overflow:hidden}.meter i{display:block;background:#7df5fa;height:100%;width:50%}.timer{text-align:center;background:#34204e;border:3px solid #fff0c9;border-radius:15px;padding:.3vh 1vw;color:var(--yellow);font-family:'Rubik Mono One';font-size:clamp(24px,3vw,48px)}.rounds{font-size:15px;color:var(--yellow);margin-top:5px}.callout{position:absolute;top:35%;left:0;right:0;text-align:center;pointer-events:none;font-family:'Rubik Mono One';font-size:clamp(35px,6vw,90px);color:var(--yellow);text-shadow:4px 5px #f04681,8px 9px #372052;transform:rotate(-4deg)}.subcall{position:absolute;top:53%;left:0;right:0;text-align:center;font-size:clamp(17px,2vw,30px);text-shadow:2px 3px #382049;pointer-events:none}.fightfoot{position:absolute;bottom:2vh;left:3vw;right:3vw;display:flex;justify-content:space-between;font-size:clamp(11px,1vw,16px);text-shadow:2px 2px #392449}.badge{background:#f64f85;color:white;padding:.4em .8em;border-radius:8px}.fatal{position:absolute;inset:0;display:grid;place-items:center;background:#211834;text-align:center;padding:10vw;font-size:22px}.fatal h1{color:#ffe05a}.attract{position:absolute;top:16vh;right:3vw;font-size:clamp(15px,1.5vw,24px);color:#fff;background:#f34f87;padding:.5em 1em;border-radius:8px;animation:blink 1s infinite alternate}@keyframes blink{to{opacity:.5}}@media(max-width:700px){.screen{padding:4vh 5vw}.menu{width:80vw}.brand{font-size:42px}.corner{display:none}.panel{width:95vw;padding:3vh 5vw}.hud{gap:1vw}.name{font-size:14px}}
+</style></head><body>
+<div id="stage"></div><div id="shade" class="shade"></div>
+<div id="title" class="screen"><div class="eyebrow">✦ a pocket-sized fighting carnival ✦</div><h1 class="brand">WAKU<br>PAKU<small>PANIC!</small></h1><div class="tagline">Two wish-chasers. One lucky star.<br>Absolutely no sensible decisions.</div><div id="menu" class="menu"></div><div class="footer"><b>✕ / ENTER</b> SELECT &nbsp;&nbsp; <b>↑ ↓</b> CHOOSE &nbsp;&nbsp; <b>⚙</b> SETTINGS</div><div class="corner"><strong>READY, SET, SPARKLE!</strong>Original arcade fighting demo<br>Inspired by Waku Waku 7</div></div>
+<div id="overlay" class="screen hidden"><div class="panel" id="panel"></div></div>
+<div id="hud" class="hud hidden"><div class="fighterhud"><div class="name">★ MOCHI <span id="p1combo"></span></div><div class="bar"><i id="hp1"></i></div><div class="meter"><i id="mp1"></i></div><div class="rounds" id="round1">♡ ♡</div></div><div class="timer" id="timer">99</div><div class="fighterhud"><div class="name"><span id="p2combo"></span> NIBS ★</div><div class="bar"><i id="hp2"></i></div><div class="meter"><i id="mp2"></i></div><div class="rounds" id="round2">♡ ♡</div></div></div><div id="callout" class="callout hidden"></div><div id="subcall" class="subcall hidden"></div><div id="fightfoot" class="fightfoot hidden"><span>✕ JUMP &nbsp; □ LIGHT &nbsp; △ HEAVY &nbsp; ○ SPARK</span><span>L1 GUARD &nbsp; R1 DASH &nbsp; R2 PANIC!</span></div><div id="attract" class="attract hidden">DEMO PLAY · PRESS ANY BUTTON</div><div id="fatal" class="fatal hidden"></div>
+<script type="module">
+import * as THREE from 'three';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+/* Match simulation. World coordinates are metres; inputs are controller-shaped. */
+function createCombat(onEvent = () => {}) {
+  const MAX_HP = 1000, LIMIT = 5.25;
+  const moves = {
+    light:   {duration:.34, start:.07, end:.17, range:1.55, damage:58, stun:.22, push:2.4, meter:7},
+    heavy:   {duration:.58, start:.18, end:.31, range:1.85, damage:110, stun:.35, push:4.5, meter:11},
+    throw:   {duration:.65, start:.13, end:.24, range:1.05, damage:145, stun:.48, push:5.5, meter:13, unblockable:true},
+    special: {duration:.68, start:.22, end:.24, meter:0},
+    super:   {duration:1.75, start:1.25, end:1.27, meter:0}
+  };
+  const makeFighter = (x) => ({x,y:0,vx:0,vy:0,facing:x<0?1:-1,hp:MAX_HP,maxHp:MAX_HP,meter:0,action:'idle',actionTime:0,stun:0,blocking:false,combo:0,comboTimer:0,flash:0,grounded:true,hit:false,prev:{},dashTime:0});
+  const state = {fighters:[makeFighter(-2),makeFighter(2)], projectiles:[], timer:60, round:1, scores:[0,0], phase:'intro', phaseTime:1.6, winner:null, roundWinner:null};
+  const emit = (type,data={}) => onEvent(type,data);
+  function reset() {
+    Object.assign(state,{fighters:[makeFighter(-2),makeFighter(2)],projectiles:[],timer:60,round:1,scores:[0,0],phase:'intro',phaseTime:1.6,winner:null,roundWinner:null});
+    emit('round',{round:1});
+  }
+  function nextRound() {
+    state.round++;
+    state.fighters=[makeFighter(-2),makeFighter(2)];
+    state.projectiles=[]; state.timer=60; state.phase='intro'; state.phaseTime=1.6;
+    emit('round',{round:state.round});
+  }
+  function start(f, action, i) {
+    f.action=action; f.actionTime=0; f.hit=false; f.blocking=false;
+    emit(action==='super'?'super':action==='special'?'special':'attack',{fighter:i,action,x:f.x,y:f.y});
+  }
+  function hit(attacker, defender, move, index, source) {
+    if (defender.stun > 0 && defender.action === 'knockdown') return;
+    const blocked=defender.blocking && defender.action==='block' && defender.grounded && !move.unblockable;
+    if (blocked) {
+      defender.hp=Math.max(1, defender.hp-Math.max(1,Math.floor(move.damage*.08)));
+      defender.stun=.15; defender.action='block'; defender.actionTime=0;
+      defender.vx=attacker.facing*2; defender.flash=.09;
+      defender.meter=Math.min(100,defender.meter+4); attacker.meter=Math.min(100,attacker.meter+3);
+      emit('block',{attacker:index,defender:1-index,x:defender.x,y:defender.y+1,source});
+      return;
+    }
+    attacker.combo = attacker.comboTimer>0 ? attacker.combo+1 : 1;
+    attacker.comboTimer=1.25;
+    const damage=Math.max(20,Math.round(move.damage*Math.max(.55,1-(attacker.combo-1)*.10)));
+    defender.hp=Math.max(0,defender.hp-damage); defender.stun=move.stun; defender.flash=.18;
+    defender.action=move.launch?'knockdown':'hurt'; defender.actionTime=0; defender.vx=attacker.facing*move.push;
+    if (move.launch) {defender.vy=5; defender.grounded=false;}
+    attacker.meter=Math.min(100,attacker.meter+(move.meter||0)); defender.meter=Math.min(100,defender.meter+5);
+    emit('hit',{attacker:index,defender:1-index,x:defender.x,y:defender.y+1,damage,combo:attacker.combo,source});
+  }
+  function stepFighter(f, other, input, i, dt) {
+    input=input||{};
+    const pressed=(key)=>!!input[key]&&!f.prev[key];
+    f.flash=Math.max(0,f.flash-dt); f.comboTimer=Math.max(0,f.comboTimer-dt);
+    if (!f.comboTimer) f.combo=0;
+    f.facing=other.x>=f.x?1:-1;
+    f.grounded=f.y<=0 && f.vy<=0;
+    if (f.stun>0) {
+      f.stun=Math.max(0,f.stun-dt); f.actionTime+=dt;
+      if (!f.stun && f.action!=='knockdown') {f.action='idle';f.actionTime=0;}
+    } else {
+      const move=moves[f.action];
+      if (move) {
+        f.actionTime+=dt;
+        if (!f.hit && f.actionTime>=move.start) {
+          f.hit=true;
+          if (f.action==='special'||f.action==='super') {
+            const superMove=f.action==='super';
+            state.projectiles.push({x:f.x+f.facing*.85,y:f.y+1.1,dir:f.facing,owner:i,life:2.3,kind:superMove?'super':'special',hit:false});
+            emit('projectile',{fighter:i,kind:f.action,x:f.x,y:f.y+1});
+          } else if (Math.abs(other.x-f.x)<move.range && Math.abs((other.y+1)-(f.y+1))<1.45) {
+            hit(f,other,move,i,f.action);
+          }
+        }
+        if (f.actionTime>=move.duration) {f.action=f.grounded?'idle':'jump';f.actionTime=0;}
+      } else if (f.action==='dash' && f.dashTime>0) {
+        f.dashTime-=dt; f.actionTime+=dt;
+        if (f.dashTime<=0) f.action='idle';
+      } else {
+        if (f.action==='knockdown' && !f.grounded) {
+          f.actionTime+=dt;
+        } else {
+          const x=Math.abs(input.x||0)>.22?Math.max(-1,Math.min(1,input.x)):0;
+          f.blocking=!!input.guard && f.grounded;
+          if (pressed('super') && f.meter>=50) {f.meter-=50; start(f,'super',i);}
+          else if (pressed('special')) start(f,'special',i);
+          else if ((pressed('light')&&input.heavy)||(pressed('heavy')&&input.light)||pressed('throw')) start(f,'throw',i);
+          else if (pressed('heavy')) start(f,'heavy',i);
+          else if (pressed('light')) start(f,'light',i);
+          else if (pressed('dash') && f.grounded && !f.blocking) {f.action='dash';f.actionTime=0;f.dashTime=.23;f.vx=(x||f.facing)*10;emit('dash',{fighter:i,x:f.x});}
+          else if (pressed('jump') && f.grounded && !f.blocking) {f.vy=8.4;f.grounded=false;f.action='jump';f.actionTime=0;emit('jump',{fighter:i,x:f.x});}
+          else {f.action=f.grounded?(f.blocking?'block':x?'walk':'idle'):'jump';f.actionTime+=dt;}
+          if (f.action!=='dash') f.vx=x*(f.blocking?1.15:f.grounded?4.2:3.6);
+        }
+      }
+    }
+    f.prev={...input};
+    f.vy-=19*dt; f.x=Math.max(-LIMIT,Math.min(LIMIT,f.x+f.vx*dt)); f.y+=f.vy*dt;
+    if (f.y<=0) {f.y=0;f.vy=0;f.grounded=true;if(f.action==='knockdown' && f.stun<=0){f.action='idle';f.actionTime=0;}}
+    if (f.stun>0 || moves[f.action]) f.vx*=Math.pow(.03,dt);
+  }
+  function update(dt,input1={},input2={}) {
+    dt=Math.min(.05,Math.max(0,dt));
+    if (state.phase==='intro') {state.phaseTime-=dt;if(state.phaseTime<=0){state.phase='fight';emit('fight',{round:state.round});}return;}
+    if (state.phase==='roundOver') {state.phaseTime-=dt;if(state.phaseTime<=0){if(state.winner!==null){state.phase='finished';emit('match',{winner:state.winner});}else nextRound();}return;}
+    if (state.phase!=='fight') return;
+    state.timer=Math.max(0,state.timer-dt);
+    const [a,b]=state.fighters;
+    stepFighter(a,b,input1,0,dt); stepFighter(b,a,input2,1,dt);
+    const overlap=0.65-Math.abs(a.x-b.x);
+    if(overlap>0 && Math.abs(a.y-b.y)<1){const sign=a.x<=b.x?-1:1;a.x=Math.max(-LIMIT,Math.min(LIMIT,a.x+sign*overlap/2));b.x=Math.max(-LIMIT,Math.min(LIMIT,b.x-sign*overlap/2));}
+    for (const p of state.projectiles) {
+      p.x+=p.dir*(p.kind==='super'?8:6)*dt;p.life-=dt;
+      const target=state.fighters[1-p.owner], owner=state.fighters[p.owner];
+      if (Math.abs(p.x-target.x)<.65 && Math.abs(p.y-(target.y+1))<1.1) {
+        hit(owner,target,p.kind==='super'?{damage:240,stun:.5,push:6,meter:0,launch:true,unblockable:true}:{damage:90,stun:.32,push:3.5,meter:8},p.owner,p.kind);
+        p.life=0;
+      }
+    }
+    state.projectiles=state.projectiles.filter(p=>p.life>0 && Math.abs(p.x)<7);
+    if (a.hp<=0||b.hp<=0||state.timer<=0) {
+      let w=a.hp===b.hp?null:(a.hp>b.hp?0:1);
+      state.roundWinner=w;
+      if(w!==null) state.scores[w]++;
+      state.phase='roundOver';state.phaseTime=2.5;state.projectiles=[];
+      if(w!==null && state.scores[w]>=2) state.winner=w;
+      if(w!==null){state.fighters[w].action='win';state.fighters[w].actionTime=0;}
+      emit('ko',{winner:w,timeout:state.timer<=0});
+    }
+  }
+  const brains=[{think:0,input:{},hold:0},{think:0,input:{},hold:0}];
+  function ai(index,dt) {
+    const brain=brains[index], f=state.fighters[index], other=state.fighters[1-index];
+    brain.think-=dt;
+    if(brain.think<=0){
+      const dist=Math.abs(other.x-f.x), toward=Math.sign(other.x-f.x), r=Math.random();
+      brain.think=.12+Math.random()*.24;
+      const input={x:0};
+      if(dist>2.3) input.x=toward; else if(dist<.9 && r<.16) input.x=-toward;
+      if(other.action==='heavy' && dist<2 && r<.6) input.guard=true;
+      else if(f.meter>=50 && r<.13) input.super=true;
+      else if(dist>2 && r<.22) input.special=true;
+      else if(dist<1.7 && r<.37) input.light=true;
+      else if(dist<1.9 && r<.62) input.heavy=true;
+      else if(dist<1 && r<.68) input.throw=true;
+      else if(r<.75) input.jump=true;
+      else if(dist>3 && r<.83) {input.dash=true;input.x=toward;}
+      brain.input=input;
+    }
+    return brain.input;
+  }
+  return {state,update,reset,ai};
+}
+
+// Procedural carnival stage and pose-driven fighters.
+function createVisuals(THREE, scene) {
+  const T = THREE;
+  const palette = { ink: 0x252442, pink: 0xff6c98, cream: 0xffefca, yellow: 0xffd34e, blue: 0x59cfe3, navy: 0x293b78, red: 0xf65058, white: 0xfff8e5, purple: 0x8d72dd, green: 0xa3e877 };
+  const gradient = new T.DataTexture(new Uint8Array([65,65,65,255, 155,155,155,255, 215,215,215,255, 255,255,255,255]), 4, 1, T.RGBAFormat);
+  gradient.minFilter = T.NearestFilter; gradient.magFilter = T.NearestFilter; gradient.needsUpdate = true;
+  const mats = {};
+  for (const [name, color] of Object.entries(palette)) mats[name] = new T.MeshToonMaterial({color, gradientMap:gradient});
+  const material = c => typeof c === 'string' ? mats[c] : new T.MeshToonMaterial({color:c, gradientMap:gradient});
+  const geo = { sphere:new T.SphereGeometry(1, 20, 12), box:new T.BoxGeometry(1,1,1), cylinder:new T.CylinderGeometry(1,1,1,20), cone:new T.ConeGeometry(1,1,16), torus:new T.TorusGeometry(1,.1,8,32) };
+  const ink = new T.MeshBasicMaterial({color: palette.ink, side:T.BackSide});
+  function mesh(parent, shape, color, pos, scale, outline=false) {
+    const g = geo[shape] || shape; const o = new T.Mesh(g, material(color));
+    o.position.set(...pos); o.scale.set(...scale); o.castShadow=true; o.receiveShadow=true; parent.add(o);
+    if(outline) { const line = new T.Mesh(g, ink); line.scale.setScalar(1.055); o.add(line); }
+    return o;
+  }
+  function group(parent,x=0,y=0,z=0){const g=new T.Group();g.position.set(x,y,z);parent.add(g);return g;}
+  function text(label, color='#26304c', bg='transparent', w=512,h=128) {
+    const c=document.createElement('canvas'); c.width=w;c.height=h;const ctx=c.getContext('2d');
+    if(bg!=='transparent'){ctx.fillStyle=bg;ctx.fillRect(0,0,w,h)}
+    ctx.textAlign='center';ctx.textBaseline='middle';ctx.lineJoin='round';ctx.font='900 76px system-ui, sans-serif';ctx.strokeStyle='#fff3d1';ctx.lineWidth=12;ctx.strokeText(label,w/2,h/2);ctx.fillStyle=color;ctx.fillText(label,w/2,h/2);
+    const tx=new T.CanvasTexture(c);tx.colorSpace=T.SRGBColorSpace;return tx;
+  }
+  function sign(parent,label,x,y,z,w,h, color='#26304c') { const m=new T.Mesh(new T.PlaneGeometry(w,h),new T.MeshBasicMaterial({map:text(label,color),transparent:true,side:T.DoubleSide}));m.position.set(x,y,z);parent.add(m);return m; }
+  scene.background = new T.Color(0xa7e8ed);
+  scene.fog = new T.Fog(0xa7e8ed, 28, 60);
+  scene.add(new T.HemisphereLight(0xfff9db,0x6088b8,2.2));
+  const sun=new T.DirectionalLight(0xffeed1, 2.6);sun.position.set(-5,10,9);sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);sun.shadow.camera.left=-13;sun.shadow.camera.right=13;sun.shadow.camera.top=12;sun.shadow.camera.bottom=-8;scene.add(sun);
+  const stage=group(scene);
+  mesh(stage,'cylinder','pink',[0,-.45,0],[8.5,.7,4.1]);
+  mesh(stage,'cylinder','cream',[0,-.09,0],[8.2,.18,3.9]);
+  // Bright alternating floor tiles are inset into the top of the stage.
+  for(let x=-7;x<=7;x++) for(let z=-2;z<=2;z++) {const tile=mesh(stage,'box',(x+z)%2?'yellow':'white',[x*.95,.012,z*.83],[.92,.024,.8]); tile.receiveShadow=true;}
+  for(let i=0;i<18;i++){const a=i*Math.PI*2/18;mesh(stage,'sphere',i%2?'yellow':'white',[Math.cos(a)*8.25,-.42,Math.sin(a)*3.95],[.11,.11,.11]);}
+  // Big happy carnival facade in the distance.
+  mesh(stage,'box','purple',[0,4.4,-5.7],[16,.45,.4]);
+  mesh(stage,'box','pink',[0,4.9,-5.8],[13,.6,.45]);
+  sign(stage,'DREAM PARADE',0,5,-5.48,7.6,1.3,'#e7446b');
+  for(const side of [-1,1]) {
+    mesh(stage,'box','blue',[side*7.25,2.2,-5.7],[.7,4.6,.65]);
+    mesh(stage,'sphere','yellow',[side*7.25,4.8,-5.7],[.52,.52,.52]);
+    for(let n=0;n<5;n++)mesh(stage,'sphere',n%2?'pink':'white',[side*7.25,.65+n*.7,-5.3],[.15,.15,.15]);
+    const tower=group(stage,side*9,0,-9);
+    mesh(tower,'box',side<0?'pink':'blue',[0,2.2,0],[2.8,4.4,2]);
+    mesh(tower,'cone','yellow',[0,5.3,0],[2.1,2.2,1.5]);
+    for(let j=-1;j<=1;j++) for(let k=0;k<3;k++)mesh(tower,'box','cream',[j*.72,.9+k*.85,1.02],[.38,.48,.04]);
+    const lollipop=group(stage,side*6.4,.05,-4.4);
+    mesh(lollipop,'cylinder','white',[0,2.1,0],[.12,4.2,.12]);
+    mesh(lollipop,'sphere',side<0?'red':'blue',[0,4.1,0],[.65,.65,.22]);
+    const spiral=mesh(lollipop,'torus','white',[0,4.1,.24],[.36,.36,.36]);
+  }
+  // Soft cloud cutouts and rainbow bands.
+  for(let i=0;i<9;i++) { const x=-13+i*3.3; const y=7.1+(i%3)*.45; const cl=group(stage,x,y,-12);for(let j=0;j<4;j++)mesh(cl,'sphere','white',[(j-1.5)*.55,(j%2)*.2,0],[.58,.42,.22]); }
+  for(let i=0;i<7;i++){ const x=-6+i*2;mesh(stage,'sphere',i%2?'pink':'yellow',[x,5.15,-5.37],[.13,.13,.13]); }
+  const crowd=group(stage,0,0,-5.2);
+  for(let i=0;i<22;i++) {const x=-7.7+i*.72; const y=.55+(i%3)*.08;const person=group(crowd,x,y,0);mesh(person,'sphere',['pink','blue','yellow','purple','green'][i%5],[0,.32,0],[.3,.38,.22]);mesh(person,'sphere','cream',[0,.84,0],[.25,.28,.2]);mesh(person,'sphere','ink',[-.07,.88,.19],[.035,.05,.025]);mesh(person,'sphere','ink',[.07,.88,.19],[.035,.05,.025]);person.userData.phase=i*1.7;}
+  function limb(parent,color,x,y,z,w,h,depth){const pivot=group(parent,x,y,z);mesh(pivot,'sphere',color,[0,-h*.4,0],[w,h*.55,depth],true);return pivot;}
+  function fighter(which) {
+    const root=group(scene); const body=group(root); const hero=which===0;
+    const main=hero?'pink':'blue', secondary=hero?'cream':'navy', accent=hero?'yellow':'red';
+    const shadow=new T.Mesh(new T.CircleGeometry(.75,32),new T.MeshBasicMaterial({color:0x44374c,transparent:true,opacity:.22,depthWrite:false}));shadow.rotation.x=-Math.PI/2;shadow.position.y=.03;root.add(shadow);
+    const legL=limb(body,secondary,-.34,.91,0,.23,.78,.26);const legR=limb(body,secondary,.34,.91,0,.23,.78,.26);
+    mesh(legL,'sphere',accent,[.04,-.75,.1],[.34,.19,.4],true);mesh(legR,'sphere',accent,[.04,-.75,.1],[.34,.19,.4],true);
+    mesh(body,'sphere',main,[0,1.42,0],[.67,.76,.43],true);
+    mesh(body,'sphere',secondary,[0,1.32,.38],[.43,.47,.12]);
+    if(hero){mesh(body,'sphere','yellow',[0,1.36,.49],[.17,.17,.07]);}else {mesh(body,'box','red',[0,1.4,.48],[.4,.22,.07]);}
+    const armL=limb(body,main,-.63,1.85,0,.22,.72,.24);const armR=limb(body,main,.63,1.85,0,.22,.72,.24);
+    mesh(armL,'sphere',accent,[0,-.68,.04],[.3,.28,.3],true);mesh(armR,'sphere',accent,[0,-.68,.04],[.3,.28,.3],true);
+    const head=group(body,0,2.26,0);mesh(head,'sphere',secondary,[0,.38,0],[.69,.67,.51],true);
+    if(hero){
+      const ear1=mesh(head,'sphere','pink',[-.4,1.05,0],[.2,.66,.16],true);ear1.rotation.z=.32;
+      const ear2=mesh(head,'sphere','pink',[.36,1.07,0],[.2,.68,.16],true);ear2.rotation.z=-.25;
+      mesh(head,'sphere','red',[-.4,1.08,.14],[.09,.4,.045]);mesh(head,'sphere','red',[.36,1.1,.14],[.09,.4,.045]);
+      mesh(head,'sphere','pink',[-.44,.36,.43],[.16,.11,.06]);mesh(head,'sphere','pink',[.44,.36,.43],[.16,.11,.06]);
+      mesh(head,'sphere','ink',[0,.27,.49],[.09,.07,.05]);
+    } else {
+      mesh(head,'sphere','blue',[0,.43,-.01],[.72,.67,.51],true);
+      mesh(head,'box','navy',[0,.42,.47],[.93,.35,.1]);
+      mesh(head,'sphere','yellow',[-.26,.42,.55],[.1,.09,.04]);mesh(head,'sphere','yellow',[.26,.42,.55],[.1,.09,.04]);
+      mesh(head,'sphere','red',[-.72,.43,0],[.2,.27,.23],true);mesh(head,'sphere','red',[.72,.43,0],[.2,.27,.23],true);
+      mesh(head,'cylinder','navy',[0,1.1,0],[.08,.35,.08]);mesh(head,'sphere','yellow',[0,1.3,0],[.13,.13,.13]);
+      mesh(head,'box','cream',[0,.03,.48],[.4,.1,.08]);
+    }
+    if(hero){mesh(head,'sphere','ink',[-.25,.48,.47],[.07,.12,.05]);mesh(head,'sphere','ink',[.25,.48,.47],[.07,.12,.05]);}
+    return {root,body,head,armL,armR,legL,legR,shadow};
+  }
+  const fighters=[fighter(0),fighter(1)];
+  const projectileMeshes=[];const particles=[];let time=0;
+  function effect(x,y,color=0xffe850,count=12){for(let i=0;i<count;i++){const m=mesh(scene,'sphere',color,[x,y,.8],[.11,.11,.11]);const angle=Math.random()*Math.PI*2;particles.push({m,vx:Math.cos(angle)*(1+Math.random()*3),vy:Math.sin(angle)*(1+Math.random()*3),vz:(Math.random()-.5)*2,life:.35+Math.random()*.3,max:.65});}}
+  function update(state,dt) {
+    time+=dt; crowd.children.forEach((c,i)=>{c.position.y=.55+(i%3)*.08+Math.sin(time*3+c.userData.phase)*.1;c.rotation.z=Math.sin(time*2+c.userData.phase)*.12;});
+    const fs=state?.fighters||[];
+    fighters.forEach((v,i)=>{const f=fs[i];if(!f)return;const moving=Math.abs(f.vx||0)>.4;const phase=time*13;const action=f.action||'idle';const t=f.actionTime||0;const active=['light','heavy','special','super','throw'].includes(action);
+      v.root.position.set(f.x||0,f.y||0,0);v.root.scale.x=f.facing<0?-1:1;v.shadow.scale.setScalar(Math.max(.5,1-(f.y||0)*.15));v.shadow.position.y=.03-(f.y||0);
+      v.body.position.y= Math.sin(time*5+i)*.035 + (moving?Math.abs(Math.sin(phase))*.07:0);v.body.rotation.z= action==='knockdown'?-1.1: action==='hurt'?-.25:action==='dash'?.25:0;
+      v.head.rotation.z=Math.sin(time*4+i)*.04+(action==='hurt'?-.18:0);
+      v.armL.rotation.z= moving?Math.sin(phase)*.5:-.25;v.armR.rotation.z=moving?-Math.sin(phase)*.5:.25;
+      v.legL.rotation.z=moving?-Math.sin(phase)*.45:0;v.legR.rotation.z=moving?Math.sin(phase)*.45:0;
+      if(action==='jump'){v.legL.rotation.z=-.5;v.legR.rotation.z=.5;v.armL.rotation.z=-.7;v.armR.rotation.z=.7;}
+      if(f.blocking||action==='block'){v.armR.rotation.z=1.6;v.armL.rotation.z=.9;}
+      if(active){const swing=Math.sin(Math.min(1,t/.35)*Math.PI);v.armR.rotation.z=1.65+swing*.4;v.armL.rotation.z=-.5;v.body.rotation.z=-.1+swing*.13;if(action==='heavy'){v.legR.rotation.z=1.2*swing;}if(action==='super'){v.armL.rotation.z=-2;v.armR.rotation.z=2;}}
+      if(action==='win'){v.armL.rotation.z=-2.5;v.armR.rotation.z=2.5;v.body.position.y+=Math.abs(Math.sin(time*5))*.2;}
+      v.body.visible= !(f.flash>0 && Math.floor(time*30)%2===0);
+    });
+    const ps=state?.projectiles||[];while(projectileMeshes.length<ps.length){const p=group(scene);mesh(p,'sphere','yellow',[0,0,0],[.38,.38,.38]);mesh(p,'torus','pink',[0,0,.04],[.55,.55,.55]);projectileMeshes.push(p);}
+    projectileMeshes.forEach((m,i)=>{m.visible=i<ps.length;if(i<ps.length){m.position.set(ps[i].x,ps[i].y,.2);m.rotation.z+=dt*5;}});
+    for(let i=particles.length-1;i>=0;i--){const p=particles[i];p.life-=dt;p.m.position.x+=p.vx*dt;p.m.position.y+=p.vy*dt;p.m.position.z+=p.vz*dt;p.vy-=4*dt;p.m.scale.multiplyScalar(Math.max(.8,1-dt*2));if(p.life<=0){scene.remove(p.m);particles.splice(i,1);}}
+  }
+  return {update,effect,fighters};
+}
+
+/* Standalone two-player transport. AI Hub sessions use AIHub directly and never start this broker. */
+function createPeerNetwork({onStatus = () => {}, onMessage = () => {}, onLeave = () => {}} = {}) {
+  let peer = null, connection = null, generation = 0;
+  const prefix = 'waku-party-v1-';
+  function code() {
+    const value = new Uint32Array(1); crypto.getRandomValues(value);
+    return String(value[0] % 10000).padStart(4, '0');
+  }
+  function close() {
+    generation++;
+    if (connection) { connection.close(); connection = null; }
+    if (peer) { peer.destroy(); peer = null; }
+  }
+  function bind(conn, role) {
+    if (connection && connection.open) { conn.close(); return; }
+    connection = conn;
+    conn.on('open', () => onStatus('connected', role));
+    conn.on('data', data => { if (data && typeof data === 'object') onMessage(data); });
+    conn.on('close', () => { if (connection === conn) { connection = null; onLeave(); onStatus('disconnected', role); } });
+    conn.on('error', error => onStatus('error', error.message || String(error)));
+  }
+  async function load() {
+    const module = await import('https://esm.sh/peerjs@1.5.5');
+    return module.default || module.Peer;
+  }
+  return {
+    async host() {
+      close(); const current = generation;
+      onStatus('connecting');
+      const Peer = await load(); if (current !== generation) throw new Error('Cancelled');
+      const room = code(); peer = new Peer(prefix + room);
+      return new Promise((resolve, reject) => {
+        let opened = false;
+        peer.on('open', () => { opened = true; onStatus('waiting', room); resolve(room); });
+        peer.on('connection', conn => bind(conn, 'host'));
+        peer.on('error', err => { onStatus('error', err.message || String(err)); if (!opened) reject(err); });
+        peer.on('disconnected', () => onStatus('disconnected'));
+      });
+    },
+    async join(room) {
+      room = String(room || '').trim().toUpperCase();
+      if (!/^[0-9]{4}$/.test(room)) throw new Error('Enter a four-digit room code.');
+      close(); const current = generation;
+      onStatus('connecting');
+      const Peer = await load(); if (current !== generation) throw new Error('Cancelled');
+      peer = new Peer();
+      return new Promise((resolve, reject) => {
+        let opened = false;
+        const timeout = setTimeout(() => {
+          if (!opened) { close(); reject(new Error('Connection timed out. Check the room code.')); }
+        }, 15000);
+        peer.on('open', () => {
+          const conn = peer.connect(prefix + room, {reliable: true});
+          bind(conn, 'guest');
+          conn.on('open', () => { opened = true; clearTimeout(timeout); resolve(); });
+          conn.on('error', err => { if (!opened) { clearTimeout(timeout); reject(err); } });
+        });
+        peer.on('error', err => { onStatus('error', err.message || String(err)); if (!opened) { clearTimeout(timeout); reject(err); } });
+      });
+    },
+    send(data) { if (connection && connection.open) { connection.send(data); return true; } return false; },
+    close,
+    get connected() { return !!(connection && connection.open); }
+  };
+}
+
+const $=id=>document.getElementById(id);const title=$('title'),overlay=$('overlay'),panel=$('panel'),hud=$('hud');
+let renderer,scene,camera,visuals,combat,world,physicsBalls=[],touchGate=false;let mode='title',playMode='arcade',menuIndex=0,lastInput=performance.now(),paused=false,attract=false,settings={invertX:false,invertY:false,music:true,sfx:true};let selected=0,modalButtons=[],prevPad=[],keys={},lastFrame=performance.now(),callTime=0,score=0,hubInfo=null,hubDone=false,hubNeedsReady=false,netRole='',remoteInput={},remoteState=null,sendClock=0;
+try{settings={...settings,...JSON.parse(localStorage.getItem('waku-settings')||'{}')}}catch(e){}
+const menus=['ARCADE','LOCAL VERSUS','ONLINE VERSUS','HOW TO PLAY','SETTINGS','ABOUT / CREDITS'];
+function save(){try{localStorage.setItem('waku-settings',JSON.stringify(settings))}catch(e){}}
+function renderMenu(){ $('menu').innerHTML=menus.map((m,i)=>`<button class="${i===menuIndex?'selected':''}" data-menu="${i}">${m}<span>${['ONE PLAYER','TWO PLAYERS','PLAY WITH A FRIEND','THE BASICS','MAKE IT YOURS','THE FINE PRINT'][i]}</span></button>`).join('');document.querySelectorAll('[data-menu]').forEach(b=>b.onclick=()=>{menuIndex=+b.dataset.menu;activateMenu()}) }
+function audioInit(){if(!audio.ctx){try{audio.ctx=new AudioContext();audio.master=audio.ctx.createGain();audio.master.gain.value=.18;audio.master.connect(audio.ctx.destination)}catch(e){}}if(audio.ctx?.state==='suspended')audio.ctx.resume()}
+const audio={ctx:null,master:null,step:0,next:0};
+function tone(freq,dur=.1,type='square',vol=.15,slide=1){if(!audio.ctx||!settings.sfx)return;const c=audio.ctx,o=c.createOscillator(),g=c.createGain();o.type=type;o.frequency.setValueAtTime(freq,c.currentTime);o.frequency.exponentialRampToValueAtTime(Math.max(30,freq*slide),c.currentTime+dur);g.gain.setValueAtTime(vol,c.currentTime);g.gain.exponentialRampToValueAtTime(.001,c.currentTime+dur);o.connect(g);g.connect(audio.master);o.start();o.stop(c.currentTime+dur)}
+function music(){if(!audio.ctx||!settings.music||paused)return;const c=audio.ctx;if(audio.next<c.currentTime-.2)audio.next=c.currentTime;while(audio.next<c.currentTime+.12){let s=audio.step++, notes=[261.63,329.63,392,523.25,392,329.63,293.66,349.23,440,587.33,440,349.23,246.94,329.63,392,493.88];for(const [f,v,t] of [[notes[s%16],.045,'triangle'],[notes[(s*2)%16]/2,.035,'square']]){let o=c.createOscillator(),g=c.createGain();o.type=t;o.frequency.value=f;g.gain.setValueAtTime(v,audio.next);g.gain.exponentialRampToValueAtTime(.001,audio.next+.13);o.connect(g);g.connect(audio.master);o.start(audio.next);o.stop(audio.next+.14)}audio.next+=.16}}
+function chirp(){tone(510+Math.random()*260,.12,'sawtooth',.09,1.6);setTimeout(()=>tone(350+Math.random()*300,.1,'triangle',.1,.7),90)}
+function call(text,sub='',seconds=1.1){$('callout').textContent=text;$('subcall').textContent=sub;$('callout').classList.remove('hidden');$('subcall').classList.toggle('hidden',!sub);callTime=seconds}
+function event(type,data={}){if(type==='hit'){tone(110,.14,'sawtooth',.3,.35);tone(600,.07,'square',.18,.4);if(data.attacker===0)score+=100;visuals?.effect?.(data.x,data.y);spawnConfetti(data.x,data.y)}else if(type==='block')tone(440,.08,'triangle',.15,.7);else if(type==='jump')tone(330,.12,'square',.08,1.8);else if(type==='special'||type==='super'){chirp();tone(180,.4,'sawtooth',.15,3);if(type==='super')call('PANIC TIME!','A VERY BIG IDEA IS COMING',1.3)}else if(type==='ko'){call('K.O.!','WHAT A COMMOTION!',2);tone(180,.5,'sawtooth',.2,.3);if(data.winner===0)score+=1000}else if(type==='round')call('ROUND '+(combat?.state.round||1),'READY? GO!',1.5);else if(type==='attack')tone(230,.06,'triangle',.06,1.5)}
+function showPanel(html, buttons){mode='panel';title.classList.add('hidden');overlay.classList.remove('hidden');$('shade').classList.remove('hidden');panel.innerHTML=html;modalButtons=buttons||[];selected=0;wirePanel()}
+function wirePanel(){panel.querySelectorAll('[data-action]').forEach(el=>el.onclick=()=>{selected=+el.dataset.action;modalButtons[selected]?.()});updatePanelFocus()}
+function updatePanelFocus(){panel.querySelectorAll('[data-action]').forEach(el=>el.classList.toggle('selected',+el.dataset.action===selected))}
+function btn(label,i){return `<button class="action" data-action="${i}">${label}</button>`}
+function toTitle(){if(touchGate){overlay.classList.add('hidden');$('fatal').classList.remove('hidden');return}net?.close();netRole='';remoteState=null;attract=false;paused=false;mode='title';title.classList.remove('hidden');overlay.classList.add('hidden');hud.classList.add('hidden');$('fightfoot').classList.add('hidden');$('attract').classList.add('hidden');$('callout').classList.add('hidden');$('subcall').classList.add('hidden');$('shade').classList.remove('hidden');lastInput=performance.now();renderMenu()}
+function how(){showPanel(`<div class="eyebrow">THE CARNIVAL FIELD GUIDE</div><h2>LET'S FIGHT!</h2><p>Win two rounds to claim the wishing star. Move close, make mischief, and watch your rival's wind-up!</p><div class="rows"><div class="row"><span>Move / jump</span><span>Stick or D-pad / ✕</span></div><div class="row"><span>Light / heavy</span><span>□ / △</span></div><div class="row"><span>Spark projectile</span><span>○</span></div><div class="row"><span>Guard / dash</span><span>L1 / R1</span></div><div class="row"><span>PANIC attack</span><span>R2 · costs half meter</span></div></div><p>PANIC is unblockable, but its long wind-up can be interrupted. Land hits and take damage to build meter. Jump over sparks, guard attacks, and press light + heavy together to throw!</p><p class="muted">Keyboard P1: A/D move, W jump, J light, K heavy, L spark, U guard, I dash, O panic. P2: arrows, numpad 1/2/3, 4 guard, 5 dash, 6 panic. Esc pauses.</p><div class="actions">${btn('GOT IT!',0)}</div>`,[toTitle])}
+function settingScreen(){showPanel(`<div class="eyebrow">YOUR CABINET, YOUR RULES</div><h2>SETTINGS</h2><p>Choose an option to toggle it. Axis inversion affects controllers.</p><div class="actions" style="display:grid">${btn('HORIZONTAL AXIS: '+(settings.invertX?'INVERTED':'NORMAL'),0)}${btn('VERTICAL AXIS: '+(settings.invertY?'INVERTED':'NORMAL'),1)}${btn('MUSIC: '+(settings.music?'ON':'OFF'),2)}${btn('SOUND & VOICES: '+(settings.sfx?'ON':'OFF'),3)}${btn('BACK',4)}</div>`,[()=>{settings.invertX=!settings.invertX;save();settingScreen()},()=>{settings.invertY=!settings.invertY;save();settingScreen()},()=>{settings.music=!settings.music;save();settingScreen()},()=>{settings.sfx=!settings.sfx;save();settingScreen()},toTitle])}
+function about(){showPanel(`<div class="eyebrow">A LITTLE PRINT FOR A BIG ADVENTURE</div><h2>ABOUT</h2><p><b>Waku Paku Panic!</b> is an original fighting demo inspired by the playful spirit of <i>Waku Waku 7</i> (Sunsoft, 1996). All characters and artwork here are original.</p><p><b>Source information:</b> 2026-10-29 09:24 · Three.js r180 WebGPU · Rapier 0.19.3 · PeerJS 1.5.5 · AI Hub Session Protocol 1.3.0 · Gamepad and Web Audio APIs. Procedural cel-shaded art, articulated animation, synthesized music, effects and gibberish voices. Online: peer rooms and hub parallel scoring. Testing: lightweight browser and syntax checks. Environment: Codex CLI headless, Linux, browser unknown. Model: OpenAI gpt-6.1-terra, ultra. Usage: unknown.</p><p><b>Testing feedback:</b> 2 browser-test issues: title overlap fixed; a blank 3D canvas remains game-breaking in headless software rendering; Chrome reported an uninitialized GPU shared image. Most helpful: browser screenshot and runtime smoke test. Least helpful: static syntax alone. Live networking was not tested.</p><p><b>Engine feedback:</b> Three.js makes procedural scenes approachable. WebGPU setup and diagnostics are the trickiest parts; combat, controls, audio and animation are custom. A more direct WebGPU-only initialization path and clearer diagnostics would help; no other engine overhaul was identified.</p><p><b>Prompt feedback:</b> The arcade focus and creative freedom were delightful. The breadth of the vertical slice and multiplayer contract were challenging; no specific wording was unclear. A full controller and network playtest would be valuable.</p><div class="actions">${btn('BACK',0)}</div>`,[toTitle])}
+function online(){showPanel(`<div class="eyebrow">TWO CABINETS, ONE CARNIVAL</div><h2>ONLINE VERSUS</h2><p>Host a room and share its four-digit code, or enter your friend's code. The host runs the match.</p><p id="netstatus">Ready to connect.</p><div class="row"><span>ROOM CODE</span><input id="room" maxlength="4" value="0000" inputmode="numeric" aria-label="Room code"></div><p class="muted">Controller: use left/right to choose a digit, up/down to change it, and L1/R1 to choose an action. The free public PeerJS broker and a working WebRTC connection are required.</p><div class="actions">${btn('HOST ROOM',0)}${btn('JOIN ROOM',1)}${btn('BACK',2)}</div>`,[async()=>{try{await net.host()}catch(e){$('netstatus').textContent=e.message}},async()=>{try{await net.join($('room').value)}catch(e){$('netstatus').textContent=e.message}},toTitle])}
+let roomDigit=0;
+const net=createPeerNetwork({onStatus:(status,detail)=>{if($('netstatus'))$('netstatus').textContent=({connecting:'Connecting…',waiting:'ROOM '+detail+' · waiting for a challenger',connected:'Challenger connected!',disconnected:'Disconnected.',error:'Connection error: '+detail})[status]||status;if(status==='connected'){netRole=detail;playMode='online';if(detail==='host'){startFight('online');net.send({t:'start'})}}},onMessage:d=>{if(d.t==='start'&&netRole==='guest')startFight('online');if(d.t==='input')remoteInput=d.input;if(d.t==='state')remoteState=d.state},onLeave:()=>{if(playMode==='online'&&mode==='fight')showPanel(`<h2>CONNECTION LOST</h2><p>Your challenger left the carnival.</p><div class="actions">${btn('BACK TO TITLE',0)}</div>`,[toTitle])}});
+function activateMenu(){audioInit();tone(500,.08,'square',.1,1.4);if(menuIndex===0)startFight('arcade');if(menuIndex===1)startFight('local');if(menuIndex===2)online();if(menuIndex===3)how();if(menuIndex===4)settingScreen();if(menuIndex===5)about()}
+function startFight(which){playMode=which;attract=which==='attract';mode='fight';paused=false;score=0;combat.reset();title.classList.add('hidden');overlay.classList.add('hidden');$('shade').classList.add('hidden');hud.classList.remove('hidden');$('fightfoot').classList.remove('hidden');$('attract').classList.toggle('hidden',!attract);call(attract?'DEMO PLAY':'ROUND 1','READY? GO!',1.6);chirp()}
+function pause(){if(attract){toTitle();return}paused=true;showPanel(`<div class="eyebrow">TAKE A BREATHER</div><h2>PAUSED</h2><p>The star can wait. Probably.</p><div class="actions">${btn('RESUME',0)}${btn('HOW TO PLAY',1)}${btn('QUIT TO TITLE',2)}</div>`,[()=>{paused=false;mode='fight';overlay.classList.add('hidden');$('shade').classList.add('hidden')},how,toTitle])}
+function result(){if(mode!=='fight'||attract)return;if(hubInfo){if(!hubDone){AIHub.result({score});hubDone=true}return}let win=combat.state.winner;showPanel(`<div class="eyebrow">THE STAR HAS SPOKEN</div><h2>${win===0?'MOCHI WINS!':win===1?'NIBS WINS!':'A TIE?!'}</h2><p>${win===0?'“My wish? More wishes! ...Is that allowed?”':'“Behold! I am the champion of snacks!”'}</p><p>Score: ${score} · Thanks for visiting the carnival!</p><div class="actions">${playMode==='online'&&netRole==='guest'?btn('TITLE',0):btn('REMATCH',0)+btn('TITLE',1)}</div>`,playMode==='online'&&netRole==='guest'?[toTitle]:[()=>{if(playMode==='online'&&netRole==='host')net.send({t:'start'});startFight(playMode)},toTitle])}
+function spawnConfetti(x,y){if(!world||!scene)return;for(let i=0;i<5;i++){const body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,y+.4,0).setLinvel((Math.random()-.5)*5,2+Math.random()*4,(Math.random()-.5)*3));world.createCollider(RAPIER.ColliderDesc.cuboid(.09,.09,.09).setRestitution(.6),body);const mesh=new THREE.Mesh(new THREE.BoxGeometry(.18,.18,.18),new THREE.MeshToonMaterial({color:[0xffdd55,0xff538d,0x51d8ec][i%3]}));scene.add(mesh);physicsBalls.push({body,mesh,life:2})}}
+function blank(){return {x:0,jump:false,light:false,heavy:false,special:false,super:false,guard:false,dash:false}}
+function keyboard(n){let k=keys;return n===0?{x:(+!!k.KeyD)-(+!!k.KeyA),jump:!!k.KeyW,light:!!k.KeyJ,heavy:!!k.KeyK,special:!!k.KeyL,super:!!k.KeyO,guard:!!k.KeyU,dash:!!k.KeyI}:{x:(+!!k.ArrowRight)-(+!!k.ArrowLeft),jump:!!k.ArrowUp,light:!!k.Numpad1,heavy:!!k.Numpad2,special:!!k.Numpad3,super:!!k.Numpad6,guard:!!k.Numpad4,dash:!!k.Numpad5}}
+function padInput(p){if(!p)return blank();let a=p.axes||[],b=p.buttons||[],x=(Math.abs(a[0]||0)>.25?a[0]:0)*(settings.invertX?-1:1),y=(Math.abs(a[1]||0)>.4?a[1]:0)*(settings.invertY?-1:1);return {x:Math.max(-1,Math.min(1,x+(b[15]?.pressed?1:0)-(b[14]?.pressed?1:0))),jump:!!b[0]?.pressed||y<-.5||!!b[12]?.pressed,light:!!b[2]?.pressed,heavy:!!b[3]?.pressed,special:!!b[1]?.pressed,super:!!b[7]?.pressed,guard:!!b[4]?.pressed,dash:!!b[5]?.pressed}}
+function combined(n,p){let a=keyboard(n),b=padInput(p);return Object.fromEntries(Object.keys(a).map(k=>[k,k==='x'?(Math.abs(b.x)>.1?b.x:a.x):a[k]||b[k]]))}
+function nav(dir){if(mode==='title'){menuIndex=(menuIndex+dir+menus.length)%menus.length;renderMenu()}else if(mode==='panel'){selected=(selected+dir+modalButtons.length)%modalButtons.length;updatePanelFocus()}tone(380,.04,'triangle',.06,1.3)}
+function accept(){audioInit();if(attract){toTitle();return}if(mode==='title')activateMenu();else if(mode==='panel')modalButtons[selected]?.()}
+function activity(){lastInput=performance.now();if(hubNeedsReady){hubNeedsReady=false;mode='fight';overlay.classList.add('hidden');$('shade').classList.add('hidden');audioInit();AIHub.ready();return true}if(attract){toTitle();return true}return false}
+window.addEventListener('keydown',e=>{if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code))e.preventDefault();if(e.repeat){keys[e.code]=true;return}keys[e.code]=true;if(activity())return;audioInit();if(mode==='title'||mode==='panel'){if(e.code==='ArrowDown'||e.code==='KeyS')nav(1);else if(e.code==='ArrowUp'||e.code==='KeyW')nav(-1);else if(e.code==='Enter'||e.code==='Space')accept();else if(e.code==='Escape')toTitle()}else if(mode==='fight'&&e.code==='Escape')pause()});window.addEventListener('keyup',e=>keys[e.code]=false);window.addEventListener('pointerdown',()=>{activity();audioInit()});
+function pollPads(){let pads=Array.from(navigator.getGamepads?.()||[]).filter(Boolean);let p=pads[0];if(!p){prevPad=[];return pads}let raw=[p.buttons[0]?.pressed,p.buttons[1]?.pressed,p.buttons[9]?.pressed,(p.axes[1]||0)*(settings.invertY?-1:1)<-.6||p.buttons[12]?.pressed,(p.axes[1]||0)*(settings.invertY?-1:1)>.6||p.buttons[13]?.pressed,(p.axes[0]||0)*(settings.invertX?-1:1)<-.6||p.buttons[14]?.pressed,(p.axes[0]||0)*(settings.invertX?-1:1)>.6||p.buttons[15]?.pressed,p.buttons[4]?.pressed,p.buttons[5]?.pressed];let edge=raw.map((v,i)=>v&&!prevPad[i]);prevPad=raw;if(edge.some(Boolean)){if(activity())return pads;if(mode==='title'||mode==='panel'){if(!$('room')){if(edge[3])nav(-1);if(edge[4])nav(1);}if(edge[0])accept();if(edge[1])toTitle();if($('room')){if(edge[7])nav(-1);if(edge[8])nav(1);if(edge[5])roomDigit=(roomDigit+3)%4;if(edge[6])roomDigit=(roomDigit+1)%4;if(edge[3]||edge[4]){let chars=$('room').value.padStart(4,'0').split('');chars[roomDigit]=String((+chars[roomDigit]+(edge[3]?1:9))%10);$('room').value=chars.join('')}}}else if(mode==='fight'&&edge[2])pause()}return pads}
+function updateHud(s){for(let i=0;i<2;i++){let f=s.fighters[i];$('hp'+(i+1)).style.width=Math.max(0,100*f.hp/f.maxHp)+'%';$('mp'+(i+1)).style.width=Math.max(0,Math.min(100,f.meter))+'%';$('p'+(i+1)+'combo').textContent=f.combo>1?f.combo+' HIT!':'';$('round'+(i+1)).textContent=Array.from({length:2},(_,j)=>j<(s.scores?.[i]||0)?'★':'☆').join(' ')}$('timer').textContent=Math.ceil(s.timer)}
+async function init(){renderMenu();if(('ontouchstart' in window||navigator.maxTouchPoints>0)&&!matchMedia('(pointer:fine)').matches){touchGate=true;$('fatal').classList.remove('hidden');$('fatal').innerHTML='<div><h1>CONTROLLER OR KEYBOARD REQUIRED</h1><p>Connect a controller or keyboard to play.</p><button class="action" id="touchSettings">SETTINGS</button></div>';$('touchSettings').onclick=()=>{$('fatal').classList.add('hidden');settingScreen()};return}if(!navigator.gpu||!await navigator.gpu.requestAdapter()){throw Error('WebGPU is unavailable. Use a browser and device with WebGPU enabled.')}await RAPIER.init();world=new RAPIER.World({x:0,y:-9.8,z:0});world.createCollider(RAPIER.ColliderDesc.cuboid(15,.2,5).setTranslation(0,-.2,0));scene=new THREE.Scene();camera=new THREE.PerspectiveCamera(35,innerWidth/innerHeight,.1,100);camera.position.set(0,5.8,19);camera.lookAt(0,2,0);renderer=new THREE.WebGPURenderer({antialias:true});renderer.setSize(innerWidth,innerHeight);renderer.setPixelRatio(Math.min(devicePixelRatio,2));await renderer.init();if(!renderer.backend?.isWebGPUBackend)throw Error('WebGPU initialization failed. This game requires WebGPU.');$('stage').appendChild(renderer.domElement);visuals=createVisuals(THREE,scene);combat=createCombat(event);window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});AIHub.probe(()=>({scene:mode,menu:mode==='title'?menus[menuIndex]:null,world:combat?.state,input:{x:keyboard(0).x,y:keyboard(0).jump?-1:0,fire:keyboard(0).light}}));if(AIHub.active){hubInfo=await AIHub.connect({mode:'parallel',seats:[1,4]});if(hubInfo){AIHub.on('time-up',()=>{if(!hubDone){AIHub.result({score});hubDone=true}});AIHub.on('end',()=>{paused=true});AIHub.on('start',()=>audioInit());startFight('hub');if(hubInfo.splash)AIHub.ready();else{hubNeedsReady=true;mode='panel';overlay.classList.remove('hidden');$('shade').classList.remove('hidden');panel.innerHTML='<h2>READY TO RUMBLE?</h2><p>Press any key or controller button when you are ready.</p>'}}}renderer.setAnimationLoop(loop)}
+function loop(now){let dt=Math.min(.033,(now-lastFrame)/1000);lastFrame=now;let pads=pollPads();music();if(mode==='title'&&now-lastInput>10000)startFight('attract');if(mode==='fight'&&!paused&&(!hubInfo||AIHub.time()>=0)){let p1=combined(0,pads[0]),p2=combined(1,pads[1]);if(attract){p1=combat.ai(0,dt);p2=combat.ai(1,dt)}else if(playMode==='arcade'||playMode==='hub')p2=combat.ai(1,dt);else if(playMode==='online'){if(netRole==='guest'){net.send({t:'input',input:p1});if(remoteState)Object.assign(combat.state,remoteState)}else p2=remoteInput}if(!(playMode==='online'&&netRole==='guest'))combat.update(dt,p1,p2);if(playMode==='online'&&netRole==='host'&&(sendClock+=dt)>.05){sendClock=0;net.send({t:'state',state:combat.state})}if(hubInfo)AIHub.progress({score,label:'Carnival points'});updateHud(combat.state);if(combat.state.phase==='finished'){if(attract){combat.reset()}else result()}}if(callTime>0&&(callTime-=dt)<=0){$('callout').classList.add('hidden');$('subcall').classList.add('hidden')}if(world){world.timestep=dt;world.step();for(let i=physicsBalls.length-1;i>=0;i--){const p=physicsBalls[i],v=p.body.translation(),q=p.body.rotation();p.mesh.position.set(v.x,v.y,v.z);p.mesh.quaternion.set(q.x,q.y,q.z,q.w);if((p.life-=dt)<=0){scene.remove(p.mesh);world.removeRigidBody(p.body);physicsBalls.splice(i,1)}}}visuals?.update(combat.state,dt);renderer.render(scene,camera)}
+init().catch(e=>{$('fatal').classList.remove('hidden');$('fatal').innerHTML='<div><h1>THE CARNIVAL NEEDS WEBGPU</h1><p>'+String(e.message).replace(/[<>]/g,'')+'</p><p>Try a current WebGPU-capable browser with hardware acceleration enabled.</p></div>';console.error(e)});
+</script></body></html>

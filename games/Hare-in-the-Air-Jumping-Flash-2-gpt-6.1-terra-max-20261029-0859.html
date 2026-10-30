@@ -1,0 +1,2747 @@
+<!--
+SOURCE INFORMATION
+Date: 2026-10-29 08:59
+Source: Jumping Flash! 2
+Tech: Three.js R180 WebGPU; Rapier 0.19.3; Web Audio API; Gamepad API; PeerJS 1.5.5; AI Hub Session Protocol 1.3.0.
+Art Direction: Original procedural cel-shaded 3D toy-like islands and characters.
+Animation: Procedural transform animation and Rapier kinematic physics.
+Audio: Original code-synthesized music, sound effects, and gibberish voices.
+Online: AI Hub side-by-side score sessions and standalone PeerJS/WebRTC score rooms, up to four players.
+Testing: Lightweight headless Chrome 154 software-WebGPU checks, assisted gameplay, a simulated gamepad and two-player sessions.
+Environment: Codex CLI (headless); Linux; deployment browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort max.
+Usage: estimated cost unknown; total tokens unknown; session time approximately 20 minutes.
+TESTING FEEDBACK
+Seven issues caught: camera roll, title-footer overlap, missing favicon, slow host-disconnect detection, duplicate Enter activation after a mouse click, pointer lock remaining active in settings, and missed short controller presses during slow rendering. Critical/game-breaking: zero. Most helpful test: live two-client room and score propagation. Least helpful test: syntax-only checking, which cannot reveal runtime behavior.
+ENGINE FEEDBACK
+Three.js's scene graph made the world quick to build. Initial camera orientation retained roll from the title view and needed a fix. The most important custom work was the first-person controller and game systems. Verifying WebGPU initialization was hardest. Overhaul the automatic fallback and add an explicit WebGPU-only option with clearer diagnostics.
+PROMPT FEEDBACK
+The joyful jumping and controller-first goal were the best parts. The scope of a complete engine in one HTML file was broad; combining it with networking and lightweight testing was hardest. The most valuable additional test would be a full playthrough with physical controllers, four players, different WebGPU devices and real networks.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<script type="importmap">
+{
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+
+<meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="5">
+<meta name="hub:session-goal" content="Rescue residents and earn the most points">
+<meta name="hub:session-howto" content="Move left stick, look right stick, Cross jump, R2 fire">
+<meta name="hub:webgpu" content="required">
+<title>Hare in the Air</title>
+<link rel="icon" href="data:,">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&family=Nunito:wght@600;700;800;900&display=swap');
+:root{--ink:#182d50;--cream:#fff8e7;--yellow:#ffdf62;--pink:#ff7e83;--blue:#87dce9;--dark:#172d4c;--outline:#294269}
+*{box-sizing:border-box} html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#87dce9;color:var(--ink);font-family:Nunito,system-ui,sans-serif;font-weight:800} button{font:inherit;color:inherit;cursor:pointer;border:0} button:focus-visible{outline:4px solid white;outline-offset:3px} canvas{display:block} #world{position:absolute;inset:0} #world canvas{width:100%;height:100%} .hidden{display:none!important} .overlay{position:absolute;inset:0;pointer-events:none} .overlay button,.overlay .interactive{pointer-events:auto}
+#title{background:linear-gradient(90deg,rgba(255,250,227,.98) 0%,rgba(255,250,227,.94) 30%,rgba(255,250,227,.4) 49%,transparent 65%)}
+.brandline{position:absolute;left:4.5%;top:5%;display:flex;gap:12px;align-items:center;font-size:clamp(11px,1vw,15px);letter-spacing:.16em;text-transform:uppercase}.brandline .badge{background:var(--ink);color:#fff;border-radius:6px;padding:7px 10px;letter-spacing:.1em}.brandline .round{color:#e86868}
+.titlecontent{position:absolute;left:6.2%;top:15%;width:min(44%,590px)} .eyebrow{display:flex;align-items:center;gap:10px;color:#d75c5b;text-transform:uppercase;letter-spacing:.19em;font-size:clamp(11px,1vw,15px)} .eyebrow:before{content:'';width:30px;height:3px;background:#ee7772}
+h1,h2,h3,p{margin:0} h1{font-family:'Baloo 2',system-ui,sans-serif;font-weight:800;font-size:clamp(58px,7.3vw,116px);letter-spacing:-.065em;line-height:.77;margin:22px 0 20px;text-transform:uppercase;text-shadow:0 4px 0 #fff} h1 .line{display:block} h1 .air{color:#f16f70}.titlecopy{font-size:clamp(15px,1.36vw,21px);line-height:1.38;max-width:450px;color:#435876;margin:0 0 25px}.titlecopy b{color:#e36562}
+.menu-list{display:flex;flex-direction:column;align-items:flex-start;gap:8px;max-width:350px}.menu-btn{position:relative;min-height:46px;min-width:245px;text-align:left;padding:10px 18px;border:2px solid transparent;border-radius:12px;background:rgba(255,255,255,.64);font-size:clamp(16px,1.25vw,20px);transition:transform .12s,background .12s,box-shadow .12s}.menu-btn .arr{float:right;opacity:.45}.menu-btn.primary{color:white;background:var(--ink);box-shadow:0 5px 0 #0d203b}.menu-btn:hover,.menu-btn.selected{transform:translateX(7px);border-color:#f1a447;background:#fff;box-shadow:0 4px 0 #e1bd80}.menu-btn.primary:hover,.menu-btn.primary.selected{background:#ec7371;border-color:#fff;box-shadow:0 5px 0 #c74e56}.menu-btn small{font-size:.75em;opacity:.7}
+.title-footer{position:absolute;bottom:4%;left:4.5%;font-size:clamp(10px,.9vw,14px);letter-spacing:.08em;color:#60718b;text-transform:uppercase}.title-footer b{display:inline-grid;place-items:center;width:24px;height:24px;border:2px solid #60718b;border-radius:50%;margin-right:6px}.scene-label{position:absolute;right:4.5%;bottom:5%;color:white;text-shadow:0 2px 5px #247b93;text-align:right;font-size:clamp(11px,1vw,15px);text-transform:uppercase;letter-spacing:.18em}.scene-label strong{display:block;font-family:'Baloo 2',sans-serif;font-size:clamp(25px,2.8vw,42px);letter-spacing:0;line-height:1.1}
+#loading,#fatal{position:absolute;inset:0;background:#a4e4e8;display:grid;place-items:center;z-index:15;text-align:center}.load-card{padding:30px;max-width:540px}.load-card h2{font-family:'Baloo 2',sans-serif;font-size:45px}.load-card p{line-height:1.5}.spinner{width:50px;height:50px;border:7px solid #fff7;border-top-color:#f57375;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 20px}@keyframes spin{to{transform:rotate(360deg)}}
+#panel{position:absolute;inset:0;background:rgba(14,35,59,.58);backdrop-filter:blur(5px);display:grid;place-items:center;z-index:6;pointer-events:auto}.panel-card{background:var(--cream);border:4px solid white;box-shadow:0 12px 0 rgba(21,43,68,.25);border-radius:26px;width:min(680px,90vw);max-height:88vh;padding:30px 38px;overflow:auto}.panel-top{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:16px}.panel-kicker{color:#e77573;font-size:12px;letter-spacing:.16em;text-transform:uppercase}.panel-card h2{font-family:'Baloo 2',sans-serif;font-size:clamp(32px,4vw,50px);line-height:1}.panel-card p{font-size:16px;line-height:1.45;color:#52627a;margin:10px 0}.panel-card .menu-list{max-width:none;align-items:stretch}.panel-card .menu-btn{width:100%;min-height:45px;background:#e9f3f0}.panel-card .menu-btn.selected,.panel-card .menu-btn:hover{background:#ffdf80}.panel-card .menu-btn.primary{background:#273d62;color:white}.panel-card .menu-btn.primary.selected,.panel-card .menu-btn.primary:hover{background:#ed7775}.panel-hint{font-size:12px!important;letter-spacing:.04em;text-transform:uppercase;margin-top:18px!important}.controls-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:20px 0}.control{background:#e9f3f0;border-radius:12px;padding:11px 13px;font-size:15px;line-height:1.2}.control strong{display:block;color:#df716d;font-size:12px;text-transform:uppercase;letter-spacing:.09em;margin-bottom:5px}.credits-text{max-height:48vh;overflow:auto;font-size:15px;line-height:1.45;color:#516078}.credits-text h3{color:#203553;font-size:17px;margin:13px 0 2px}.credits-text p{font-size:15px;margin:3px 0}.room-code{font-family:'Baloo 2',sans-serif;font-size:56px;letter-spacing:.18em;color:#ed7775;text-align:center}.code-entry{display:flex;gap:8px;justify-content:center;margin:12px}.digit{width:64px;height:70px;background:#d9eeec;border-radius:12px;font-family:'Baloo 2',sans-serif;font-size:36px}.digit.selected{background:#ffdf80;outline:3px solid #ea8e66}.network-status{min-height:30px;text-align:center;font-weight:800}.roster{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;margin:10px 0}.roster span{background:#e3f0ed;border-radius:20px;padding:7px 12px;font-size:13px}
+#hud{z-index:2;color:#fff;text-shadow:0 2px 0 #294269,1px 1px 4px #294269}.hud-top{position:absolute;top:3.5%;left:3.5%;right:3.5%;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}.hud-block{background:rgba(24,45,80,.78);border:2px solid rgba(255,255,255,.6);border-radius:16px;padding:10px 15px;box-shadow:0 4px 0 rgba(19,43,70,.25)}.hud-label{font-size:clamp(12px,1vw,15px);letter-spacing:.13em;text-transform:uppercase;opacity:.8}.rescue-row{display:flex;gap:6px;align-items:center}.pip{width:22px;height:22px;border-radius:50%;background:#4e6078;border:2px solid #d9edf0}.pip.on{background:#ffdf62;border-color:white;box-shadow:0 0 12px #ffe776}.score{text-align:right;font-size:19px;font-family:'Baloo 2',sans-serif;line-height:1}.timer{font-size:13px;opacity:.9;margin-top:4px}.crosshair{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:25px;height:25px;border:2px solid #fff;border-radius:50%;box-shadow:0 1px 4px #16314d}.crosshair:after{content:'';position:absolute;left:9px;top:9px;width:3px;height:3px;background:white;border-radius:50%}.hud-bottom{position:absolute;left:3.5%;right:3.5%;bottom:4%;display:flex;justify-content:space-between;align-items:flex-end}.health{font-size:23px;letter-spacing:2px;color:#ff8683}.jump-dots{display:flex;gap:6px;margin-top:5px}.jump-dots i{display:block;width:30px;height:9px;border-radius:8px;background:#7c8b97}.jump-dots i.on{background:#ffe263;box-shadow:0 0 8px #ffe263}.objective{position:absolute;top:3.5%;left:50%;transform:translateX(-50%);text-align:center;background:#fff8e8;color:#273d60;text-shadow:none;padding:9px 19px;border-radius:14px;border:2px solid white;box-shadow:0 4px 0 #24466555;min-width:240px}.objective strong{display:block;font-size:13px;text-transform:uppercase;letter-spacing:.1em}.objective span{font-size:14px;color:#e1686b}.message{position:absolute;left:50%;bottom:14%;transform:translateX(-50%);background:rgba(24,45,80,.88);border:2px solid #fff;border-radius:15px;padding:11px 20px;max-width:min(620px,80%);text-align:center;font-size:16px;box-shadow:0 4px 0 #172d4c66}.message b{color:#ffe16f}.boss-bar{position:absolute;top:13%;left:50%;transform:translateX(-50%);width:min(400px,40%);text-align:center;font-size:12px;letter-spacing:.13em}.boss-track{height:11px;background:#273b58;border:2px solid white;border-radius:8px;margin-top:4px;overflow:hidden}.boss-fill{height:100%;background:#ff777a}.demo-ribbon{position:absolute;top:18%;right:4%;background:#ffdf62;color:#273d60;text-shadow:none;padding:8px 14px;border-radius:10px;font-size:13px;letter-spacing:.1em}.mission-name{font-family:'Baloo 2',sans-serif;font-size:17px}.hud-side{text-align:right}.hud-tip{font-size:12px;opacity:.88}.leaderboard{position:absolute;right:3.5%;top:21%;font-size:12px;text-align:right}.leaderboard div{background:#1b3155bb;border-radius:7px;padding:4px 8px;margin:4px}.hitflash{position:absolute;inset:0;border:10px solid #ff6767;opacity:0;transition:opacity .1s;pointer-events:none}
+#touchNotice{position:absolute;z-index:8;bottom:4%;right:4%;background:#fff8e9;border:3px solid white;border-radius:15px;padding:14px 18px;box-shadow:0 5px 0 #3453;color:#243c5e;max-width:300px}.touch-only #titleMenu{display:none}#touchNotice button{background:#263e60;color:white;border-radius:8px;padding:8px 14px;margin-top:8px}
+@media(max-height:700px){.titlecontent{top:14%}h1{font-size:clamp(50px,7vw,85px);margin:14px 0}.titlecopy{margin-bottom:14px}.menu-list{gap:4px}.menu-btn{min-height:39px;padding:7px 14px}.panel-card{padding:20px 28px}}
+@media(max-width:760px){.titlecontent{width:64%;left:5%}h1{font-size:clamp(47px,10vw,72px)}.titlecopy{font-size:14px}.title-footer{font-size:9px}.scene-label{display:none}.objective{top:15%;min-width:0}.hud-top{top:2%}.controls-grid{grid-template-columns:1fr}.panel-card{max-height:90vh}}
+</style>
+</head>
+<body>
+<div id="world"></div>
+<div id="title" class="overlay hidden">
+ <div class="brandline"><span class="badge">SKY POST</span><span>Field report <span class="round">●</span> 01</span></div>
+ <div class="titlecontent"><div class="eyebrow">A very high-stakes rescue</div><h1><span class="line">Hare in</span><span class="line">the <span class="air">Air!</span></span></h1><p class="titlecopy">Four skyfolk need saving. Our best pilot is a <b>rabbit.</b> What could possibly go wrong?</p><div class="menu-list" id="titleMenu"><button class="menu-btn primary" data-action="play">Start adventure <span class="arr">➜</span></button><button class="menu-btn" data-action="online">Play with friends <span class="arr">➜</span></button><button class="menu-btn" data-action="how">How to play <span class="arr">➜</span></button><button class="menu-btn" data-action="settings">Settings <span class="arr">➜</span></button><button class="menu-btn" data-action="about">About & credits <span class="arr">➜</span></button></div></div>
+ <div class="title-footer"><b>✕</b> Select &nbsp;&nbsp; <b>☰</b> Settings &nbsp;&nbsp; Controller recommended</div><div class="scene-label">Destination 01<strong>Sunny Side Isles</strong>Watch your step up there!</div>
+</div>
+<div id="hud" class="overlay hidden"><div class="hud-top"><div class="hud-block"><div class="hud-label">Little locals rescued</div><div class="rescue-row" id="rescues"></div></div><div class="hud-block score"><div class="hud-label">Score</div><div id="score">000000</div><div class="timer" id="timer">06:00</div></div></div><div class="objective"><strong id="objectiveTitle">THE RESCUE IS ON</strong><span id="objectiveText">Find the four skyfolk</span></div><div class="boss-bar hidden" id="bossbar">CAPTAIN CRUMPET <div class="boss-track"><div class="boss-fill" id="bossfill"></div></div></div><div class="crosshair"></div><div id="message" class="message hidden"></div><div id="demoRibbon" class="demo-ribbon hidden">DEMO PLAYING · PRESS ANY BUTTON</div><div id="leaderboard" class="leaderboard"></div><div class="hud-bottom"><div class="hud-block"><div class="hud-label">Hull integrity</div><div id="health" class="health">♥ ♥ ♥ ♥ ♥</div></div><div class="hud-block hud-side"><div class="hud-label">Air hops</div><div id="jumps" class="jump-dots"></div><div class="hud-tip">✕ JUMP &nbsp; R2 ZAP</div></div></div><div id="hitflash" class="hitflash"></div></div>
+<div id="panel" class="hidden"><div class="panel-card" id="panelCard"></div></div>
+<div id="touchNotice" class="hidden">Controller or keyboard required<br><button id="touchSettings">Settings</button></div>
+<div id="loading"><div class="load-card"><div class="spinner"></div><h2>Warming up the whiskers...</h2><p>Preparing Sunny Side Isles</p></div></div>
+<div id="fatal" class="hidden"><div class="load-card"><h2>Whoops-a-daisy!</h2><p id="fatalText"></p><button class="menu-btn primary" id="fatalSettings">Settings</button></div></div>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const ui = {
+	title: $("title"),
+	hud: $("hud"),
+	panel: $("panel"),
+	card: $("panelCard"),
+	loading: $("loading"),
+	fatal: $("fatal"),
+};
+let THREE,
+	R,
+	renderer,
+	scene,
+	camera,
+	scenery,
+	fxGroup,
+	world,
+	controller,
+	body,
+	collider,
+	gun,
+	landingMarker;
+let islands = [],
+	cages = [],
+	enemies = [],
+	coins = [],
+	shots = [],
+	hostile = [],
+	particles = [],
+	pads = [],
+	windmills = [],
+	portal,
+	boss;
+let state = "loading",
+	panelName = "",
+	panelBefore = "",
+	menuIndex = 0,
+	menuButtons = [],
+	worldSeconds = 0,
+	lastInput = performance.now(),
+	demoTime = 0;
+let score = 0,
+	rescued = 0,
+	health = 5,
+	jumpCount = 0,
+	velocityY = 0,
+	grounded = false,
+	yaw = 0,
+	pitch = 0,
+	autoPitch = 0,
+	fireCooldown = 0,
+	invuln = 0,
+	damageFlash = 0,
+	elapsed = 0,
+	messageUntil = 0,
+	bossStarted = false,
+	ended = false;
+let checkpoint = { x: 0, y: 1.2, z: 10 },
+	lastSafe = checkpoint,
+	initialInfo = null,
+	stopped = false,
+	readyGesture = false;
+let network = {
+	peer: null,
+	host: false,
+	conns: [],
+	code: "",
+	digits: [0, 0, 0, 0],
+	cursor: 0,
+	status: "",
+	roster: [],
+	entries: {},
+	started: false,
+	startAt: 0,
+	lastUpdate: 0,
+	lastHostSeen: 0,
+	rejected: false,
+};
+let heartbeatTimer = null;
+const held = new Set(),
+	pressed = new Set(),
+	padPrev = [],
+	probeInput = { x: 0, y: 0, fire: false };
+let lastStickMenu = 0,
+	mouseFire = false,
+	settings;
+const defaults = {
+	invertX: false,
+	invertY: false,
+	autoLook: true,
+	volume: 70,
+	sensitivity: 100,
+};
+try {
+	settings = {
+		...defaults,
+		...JSON.parse(localStorage.getItem("hare.settings") || "{}"),
+	};
+} catch {
+	settings = { ...defaults };
+}
+const saveSettings = () => {
+	try {
+		localStorage.setItem("hare.settings", JSON.stringify(settings));
+	} catch {}
+};
+const touchOnly = () =>
+	matchMedia("(pointer:coarse)").matches &&
+	!matchMedia("(pointer:fine)").matches &&
+	!Array.from(navigator.getGamepads?.() || []).some(Boolean);
+function updateTouch() {
+	const only = touchOnly();
+	$("touchNotice").classList.toggle("hidden", !only);
+	document.body.classList.toggle("touch-only", only);
+}
+window.addEventListener("gamepadconnected", updateTouch);
+updateTouch();
+function fatal(msg) {
+	ui.loading.classList.add("hidden");
+	ui.fatal.classList.remove("hidden");
+	$("fatalText").textContent = msg;
+	AIHub.fail(msg);
+	state = "fatal";
+}
+function wake() {
+	lastInput = performance.now();
+	if (audio.ctx?.state === "suspended") audio.ctx.resume().catch(() => {});
+	if (state === "demo") {
+		returnToTitle();
+		return true;
+	}
+	return false;
+}
+
+// Small, synthesized score and a toy-box full of synthesized noises.
+const audio = {
+	ctx: null,
+	master: null,
+	next: 0,
+	beat: 0,
+	muted: false,
+	init() {
+		if (!this.ctx) {
+			this.ctx = new AudioContext();
+			this.master = this.ctx.createGain();
+			this.master.connect(this.ctx.destination);
+			this.next = this.ctx.currentTime + 0.05;
+		}
+		this.master.gain.value = this.muted ? 0 : (settings.volume / 100) * 0.23;
+		if (this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
+	},
+	tone(
+		freq,
+		duration = 0.12,
+		type = "square",
+		volume = 0.12,
+		when = 0,
+		endFreq = freq,
+	) {
+		if (!this.ctx || this.ctx.state !== "running") return;
+		const t = when || this.ctx.currentTime,
+			o = this.ctx.createOscillator(),
+			g = this.ctx.createGain();
+		o.type = type;
+		o.frequency.setValueAtTime(Math.max(40, freq), t);
+		o.frequency.exponentialRampToValueAtTime(
+			Math.max(40, endFreq),
+			t + duration,
+		);
+		g.gain.setValueAtTime(0.0001, t);
+		g.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), t + 0.012);
+		g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+		o.connect(g);
+		g.connect(this.master);
+		o.start(t);
+		o.stop(t + duration + 0.01);
+	},
+	sound(kind) {
+		const map = {
+			jump: [320, 0.18, "sine", 0.25, 690],
+			zap: [620, 0.1, "square", 0.1, 260],
+			hit: [170, 0.2, "sawtooth", 0.14, 65],
+			coin: [720, 0.18, "sine", 0.18, 1100],
+			rescue: [440, 0.32, "triangle", 0.2, 850],
+			hurt: [180, 0.3, "sawtooth", 0.15, 72],
+			slam: [170, 0.35, "triangle", 0.23, 50],
+			select: [480, 0.08, "sine", 0.13, 650],
+			win: [480, 0.4, "triangle", 0.2, 960],
+		};
+		const a = map[kind];
+		if (a) this.tone(a[0], a[1], a[2], a[3], 0, a[4]);
+	},
+	voice() {
+		if (!this.ctx || this.ctx.state !== "running") return;
+		const t = this.ctx.currentTime;
+		const vowels = [
+			[540, 1500, 2500],
+			[380, 1950, 2800],
+			[650, 1150, 2450],
+			[450, 1750, 2700],
+		];
+		for (let i = 0; i < 5; i++) {
+			const at = t + i * 0.095,
+				o = this.ctx.createOscillator(),
+				env = this.ctx.createGain();
+			o.type = "sawtooth";
+			o.frequency.setValueAtTime(180 + Math.random() * 100, at);
+			o.frequency.exponentialRampToValueAtTime(
+				210 + Math.random() * 140,
+				at + 0.075,
+			);
+			env.gain.setValueAtTime(0.0001, at);
+			env.gain.exponentialRampToValueAtTime(0.045, at + 0.012);
+			env.gain.exponentialRampToValueAtTime(0.0001, at + 0.085);
+			const formants = vowels[Math.floor(Math.random() * vowels.length)];
+			for (let j = 0; j < formants.length; j++) {
+				const f = this.ctx.createBiquadFilter(),
+					g = this.ctx.createGain();
+				f.type = "bandpass";
+				f.frequency.value = formants[j];
+				f.Q.value = 2.1;
+				g.gain.value = [1, 0.55, 0.2][j];
+				o.connect(f);
+				f.connect(g);
+				g.connect(env);
+			}
+			env.connect(this.master);
+			o.start(at);
+			o.stop(at + 0.09);
+		}
+	},
+	tick() {
+		if (!this.ctx || this.ctx.state !== "running" || this.muted || stopped)
+			return;
+		const t = this.ctx.currentTime;
+		if (this.next < t - 0.5) this.next = t;
+		const notes = bossStarted
+			? [0, 3, 7, 10, 7, 3, 5, 7]
+			: [0, 4, 7, 11, 7, 4, 9, 7, 2, 5, 9, 12, 9, 5, 7, 5];
+		while (this.next < t + 0.12) {
+			const n = notes[this.beat % notes.length],
+				base = bossStarted ? 196 : 220;
+			this.tone(base * 2 ** (n / 12), 0.13, "triangle", 0.055, this.next);
+			if (this.beat % 4 === 0)
+				this.tone(
+					(base / 2) * 2 ** ((this.beat % 16 < 8 ? 0 : 5) / 12),
+					0.25,
+					"sine",
+					0.07,
+					this.next,
+				);
+			if (this.beat % 2 === 0)
+				this.tone(105, 0.045, "square", 0.025, this.next, 65);
+			this.next += 0.185;
+			this.beat++;
+		}
+	},
+};
+
+function focusButtons() {
+	menuButtons = Array.from(
+		(panelName ? ui.card : $("titleMenu")).querySelectorAll(
+			"button[data-action]:not(:disabled)",
+		),
+	);
+	menuIndex = Math.min(menuIndex, Math.max(0, menuButtons.length - 1));
+	menuButtons.forEach((b, i) => {
+		b.classList.toggle("selected", i === menuIndex);
+	});
+}
+function panel(html, name) {
+	if (document.pointerLockElement) document.exitPointerLock();
+	panelName = name;
+	menuIndex = 0;
+	ui.card.innerHTML = html;
+	ui.panel.classList.remove("hidden");
+	focusButtons();
+}
+const hint =
+	'<p class="panel-hint">D-pad / arrows to choose &nbsp; · &nbsp; ✕ / Enter select &nbsp; · &nbsp; ○ / Esc back</p>';
+function setPanel(name) {
+	panelBefore = state;
+	if (name === "settings") return settingsPanel();
+	if (name === "how")
+		return panel(
+			`<div class="panel-top"><div><div class="panel-kicker">Pilot training</div><h2>How to play</h2></div><span>✦ 01 / 01</span></div><p>Captain Crumpet has bottled the skyfolk! Spring across the islands, zap their cages, then send his flying teapot packing.</p><div class="controls-grid"><div class="control"><strong>Get around</strong>Left stick / WASD to move<br>Right stick / mouse to look</div><div class="control"><strong>Go sky-high</strong>✕ / Space jumps up to 3 times. The view tips down in the air.</div><div class="control"><strong>Zap things</strong>R2 / F / click fires. Hold to keep shooting; aim near a target.</div><div class="control"><strong>Ground pound</strong>○ / C slams downward. Spring pads launch you upwards.</div></div><p>Find 4 skyfolk, defeat the captain, then hop into the glowing exit. Coins and baddies add points. Falling costs a heart; each rescue restores a heart and makes a checkpoint.</p><div class="menu-list"><button class="menu-btn primary" data-action="back">Got it!</button></div>${hint}`,
+			"how",
+		);
+	if (name === "about") return aboutPanel();
+	if (name === "online")
+		return panel(
+			`<div class="panel-top"><div><div class="panel-kicker">The more the hare-ier</div><h2>Play with friends</h2></div></div><p>Up to four pilots play their own island at the same time. Share a room code, then compare scores as you rescue. The host starts the round.</p><div class="menu-list"><button class="menu-btn primary" data-action="host">Host a room <span class="arr">➜</span></button><button class="menu-btn" data-action="join">Join a room <span class="arr">➜</span></button><button class="menu-btn" data-action="back">Back</button></div><p class="panel-hint">Internet connection required · scores only, no chat</p>${hint}`,
+			"online",
+		);
+}
+function settingsPanel() {
+	panel(
+		`<div class="panel-top"><div><div class="panel-kicker">Make yourself at home</div><h2>Settings</h2></div></div><div class="menu-list"><button class="menu-btn" data-action="invertX">Invert horizontal axes <span class="arr">${settings.invertX ? "ON" : "OFF"}</span></button><button class="menu-btn" data-action="invertY">Invert vertical axes <span class="arr">${settings.invertY ? "ON" : "OFF"}</span></button><button class="menu-btn" data-action="autoLook">Look down in the air <span class="arr">${settings.autoLook ? "ON" : "OFF"}</span></button><button class="menu-btn" data-action="sensitivity">Look sensitivity <span class="arr">${settings.sensitivity}%</span></button><button class="menu-btn" data-action="volume">Sound & music <span class="arr">${settings.volume}%</span></button><button class="menu-btn" data-action="fullscreen">Fullscreen <span class="arr">↗</span></button><button class="menu-btn primary" data-action="back">Done <span class="arr">✓</span></button></div>${hint}`,
+		"settings",
+	);
+}
+function aboutPanel() {
+	panel(
+		`<div class="panel-top"><div><div class="panel-kicker">A tiny game with a big jump</div><h2>About & credits</h2></div></div><div class="credits-text"><h3>Source information</h3><p>Date: 2026-10-29 08:59. Source: Jumping Flash! 2. Tech: Three.js R180 WebGPU, Rapier 0.19.3, Web Audio, Gamepad API and PeerJS 1.5.5. Art: original procedural, cel-shaded 3D. Animation: procedural transforms and physics. Audio: synthesized music and sound effects, with synthesized gibberish voices. Online: AI Hub Session Protocol 1.3.0 side-by-side; standalone PeerJS/WebRTC score rooms, up to four players. Testing: lightweight headless Chrome 154/WebGPU checks, including assisted gameplay, a simulated gamepad and two-player sessions. Environment: Codex CLI (headless); Linux; deployment browser unknown. Model: OpenAI, gpt-6.1-terra, reasoning effort max. Usage: cost and token count unknown; session time approximately 20 minutes.</p><h3>Testing feedback</h3><p id="aboutTesting">Seven issues were caught: camera roll, title-footer overlap, a missing favicon, slow host-disconnect detection, duplicate Enter activation after a mouse click, pointer lock remaining active in settings, and missed short controller presses during slow rendering. None were game-breaking. Most helpful: the two-client room and score test. Least helpful: the syntax-only check, which cannot reveal runtime behavior.</p><h3>Engine feedback</h3><p>Three.js's scene graph made the toy-like world quick to build. I initially carried camera roll over from the title view and fixed it. The most important custom work was the first-person character controller and game systems; the hardest engine work was verifying WebGPU initialization. I would overhaul the automatic fallback and add an explicit WebGPU-only option with clearer diagnostics.</p><h3>Prompt feedback</h3><p>The joyful jumping and controller-first goal were the best parts. The scope of a complete engine in a single HTML file was broad; combining networking with lightweight testing was hardest. The most valuable extra test would be a full playthrough with physical controllers, four players, different WebGPU devices and real networks.</p></div><div class="menu-list"><button class="menu-btn primary" data-action="back">Back</button></div><p class="panel-hint">Right stick / Page Up &amp; Down scroll &nbsp; · &nbsp; ✕ / Enter back</p>`,
+		"about",
+	);
+}
+function closePanel() {
+	if (!panelName) return;
+	const old = panelName;
+	panelName = "";
+	ui.panel.classList.add("hidden");
+	ui.card.innerHTML = "";
+	if (old === "room" || old === "joincode") {
+		cleanupNetwork();
+		setPanel("online");
+	} else focusButtons();
+}
+function doAction(action) {
+	audio.init();
+	audio.sound("select");
+	wake();
+	if (action === "play") {
+		closePanel();
+		startRun(false);
+	} else if (
+		action === "settings" ||
+		action === "how" ||
+		action === "about" ||
+		action === "online"
+	)
+		setPanel(action);
+	else if (action === "back") closePanel();
+	else if (["invertX", "invertY", "autoLook"].includes(action)) {
+		settings[action] = !settings[action];
+		saveSettings();
+		const i = menuIndex;
+		settingsPanel();
+		menuIndex = i;
+		focusButtons();
+	} else if (action === "volume" || action === "sensitivity") {
+		settings[action] =
+			action === "volume"
+				? (settings.volume + 25) % 125
+				: settings.sensitivity >= 150
+					? 50
+					: settings.sensitivity + 25;
+		saveSettings();
+		audio.init();
+		const i = menuIndex;
+		settingsPanel();
+		menuIndex = i;
+		focusButtons();
+	} else if (action === "fullscreen") {
+		if (document.fullscreenElement) document.exitFullscreen?.();
+		else document.documentElement.requestFullscreen?.().catch(() => {});
+	} else if (action === "host") hostRoom();
+	else if (action === "join") joinCode();
+	else if (action === "connect") connectRoom();
+	else if (action === "startroom") startRoom();
+	else if (action === "leave") {
+		cleanupNetwork();
+		panelName = "";
+		ui.panel.classList.add("hidden");
+		setPanel("online");
+	} else if (action === "again") {
+		closePanel();
+		returnToTitle();
+	} else if (action === "digit") {
+		network.cursor = (network.cursor + 1) % 4;
+		renderJoin();
+	}
+}
+document.addEventListener("click", (e) => {
+	const b = e.target.closest("button");
+	if (!b) return;
+	wake();
+	if (b.dataset.action) {
+		if (b.dataset.index !== undefined) {
+			network.cursor = +b.dataset.index;
+			network.digits[network.cursor] =
+				(network.digits[network.cursor] + 1) % 10;
+			renderJoin();
+		} else doAction(b.dataset.action);
+	}
+});
+$("touchSettings").onclick = () => setPanel("settings");
+$("fatalSettings").onclick = () => setPanel("settings");
+function navigate(n) {
+	if (!menuButtons.length) return;
+	menuIndex = (menuIndex + n + menuButtons.length) % menuButtons.length;
+	focusButtons();
+	audio.sound("select");
+}
+function confirm() {
+	const b = menuButtons[menuIndex];
+	if (!b) return;
+	if (b.dataset.index !== undefined) {
+		network.cursor = +b.dataset.index;
+		network.digits[network.cursor] = (network.digits[network.cursor] + 1) % 10;
+		renderJoin();
+	} else doAction(b.dataset.action);
+}
+function back() {
+	if (panelName) {
+		closePanel();
+		return;
+	}
+	if (state === "play") setPanel("settings");
+	else if (state === "over" && !AIHub.active) returnToTitle();
+	else if (state === "title") setPanel("settings");
+}
+
+// Standalone friends use a signaling service only outside an AI Hub session.
+function cleanupNetwork() {
+	if (network.host && network.peer) broadcast({ t: "host-left" });
+	if (heartbeatTimer) {
+		clearInterval(heartbeatTimer);
+		heartbeatTimer = null;
+	}
+	if (network.peer) network.peer.destroy();
+	network = {
+		peer: null,
+		host: false,
+		conns: [],
+		code: "",
+		digits: [0, 0, 0, 0],
+		cursor: 0,
+		status: "",
+		roster: [],
+		entries: {},
+		started: false,
+		startAt: 0,
+		lastUpdate: 0,
+		lastHostSeen: 0,
+		rejected: false,
+	};
+}
+function hostGone() {
+	if (!network.peer || network.host) return;
+	if (network.started) {
+		cleanupNetwork();
+		$("leaderboard").innerHTML = "";
+		showMessage("The host disconnected. Your adventure continues solo.", 5);
+	} else {
+		if (heartbeatTimer) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = null;
+		}
+		netStatus("The host disconnected. Leave to try another room.");
+	}
+}
+function beginHeartbeat() {
+	if (heartbeatTimer) clearInterval(heartbeatTimer);
+	network.lastHostSeen = performance.now();
+	heartbeatTimer = setInterval(() => {
+		if (!network.peer) return;
+		if (!network.host && performance.now() - network.lastHostSeen > 8000) {
+			hostGone();
+			return;
+		}
+		broadcast({ t: "beat" });
+	}, 1000);
+}
+window.addEventListener("pagehide", () => {
+	if (network.host) broadcast({ t: "host-left" });
+});
+async function loadPeer() {
+	if (window.Peer) return;
+	await new Promise((resolve, reject) => {
+		const s = document.createElement("script");
+		s.src = "https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js";
+		s.onload = resolve;
+		s.onerror = () => reject(Error("Could not load the room service."));
+		document.head.appendChild(s);
+	});
+}
+function roomPanel() {
+	const host = network.host;
+	const count = host
+		? network.conns.filter((c) => c.open).length + 1
+		: network.roster.length || 1;
+	panel(
+		`<div class="panel-top"><div><div class="panel-kicker">Sky post party line</div><h2>${host ? "Your room" : "Joining room"}</h2></div></div><p>Everyone plays their own island. Highest score wins!</p><div class="room-code">${network.code}</div><div class="network-status">${network.status}</div><div class="roster">${Array.from({ length: count }, (_, i) => `<span>● Pilot ${i + 1}${i === 0 ? " · host" : ""}</span>`).join("")}</div><div class="menu-list">${host ? '<button class="menu-btn primary" data-action="startroom">Start the adventure <span class="arr">➜</span></button>' : ""}<button class="menu-btn" data-action="leave">Leave room</button></div>${hint}`,
+		"room",
+	);
+}
+function renderJoin() {
+	panel(
+		`<div class="panel-top"><div><div class="panel-kicker">Sky post party line</div><h2>Enter room code</h2></div></div><p>Choose a digit, then press ✕ to change it. The host has the four-digit code.</p><div class="code-entry">${network.digits.map((n, i) => `<button class="digit ${i === network.cursor ? "selected" : ""}" data-action="digit" data-index="${i}">${n}</button>`).join("")}</div><div class="menu-list"><button class="menu-btn primary" data-action="connect">Join this room <span class="arr">➜</span></button><button class="menu-btn" data-action="leave">Back</button></div>${hint}`,
+		"joincode",
+	);
+	menuIndex = network.cursor;
+	focusButtons();
+}
+function netStatus(s) {
+	network.status = s;
+	if (panelName === "room") roomPanel();
+}
+function wireConn(conn) {
+	network.conns.push(conn);
+	conn.on("open", () => {
+		if (network.host) {
+			if (network.started || network.conns.filter((c) => c.open).length > 3) {
+				conn.send({ t: network.started ? "started" : "full" });
+				setTimeout(() => conn.close(), 500);
+				return;
+			}
+			netStatus("Pilots are ready to join.");
+			broadcastRoster();
+		} else {
+			netStatus("Connected! Waiting for the host.");
+			beginHeartbeat();
+			conn.send({ t: "hello" });
+		}
+	});
+	conn.on("data", (m) => netMessage(conn, m));
+	conn.on("close", () => {
+		network.conns = network.conns.filter((c) => c !== conn);
+		if (network.host) {
+			broadcastRoster();
+			netStatus("A pilot left the room.");
+		} else if (network.peer && !network.rejected) hostGone();
+	});
+	conn.on("error", () => netStatus("Connection failed. Please try again."));
+}
+function broadcast(m) {
+	for (const c of network.conns) if (c.open) c.send(m);
+}
+function broadcastRoster() {
+	if (!network.host) return;
+	network.roster = [
+		"host",
+		...network.conns.filter((c) => c.open).map((c) => c.peer),
+	];
+	broadcast({ t: "roster", roster: network.roster });
+	if (panelName === "room") roomPanel();
+}
+function netMessage(conn, m) {
+	if (!m || typeof m !== "object") return;
+	if (!network.host) network.lastHostSeen = performance.now();
+	if (m.t === "host-left" && !network.host) {
+		hostGone();
+		return;
+	}
+	if (m.t === "roster") {
+		network.roster = m.roster || [];
+		if (panelName === "room") roomPanel();
+	} else if (m.t === "start" && !network.host) {
+		network.started = true;
+		network.startAt =
+			performance.now() + Math.max(0, Math.min(5000, Number(m.delay) || 1500));
+		beginHeartbeat();
+		panelName = "";
+		ui.panel.classList.add("hidden");
+		startRun(false, true);
+	} else if (m.t === "score") {
+		if (network.host) {
+			network.entries[conn.peer] = {
+				score: Number(m.score) || 0,
+				rescued: Number(m.rescued) || 0,
+			};
+			broadcast({ t: "board", entries: network.entries });
+		}
+	} else if (m.t === "board" && !network.host) {
+		network.entries = m.entries || {};
+	} else if (m.t === "full" || m.t === "started") {
+		network.rejected = true;
+		if (heartbeatTimer) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = null;
+		}
+		netStatus(
+			m.t === "full" ? "That room is full." : "That round has already started.",
+		);
+		conn.close();
+	}
+}
+async function hostRoom() {
+	cleanupNetwork();
+	network.host = true;
+	const bytes = new Uint32Array(1);
+	crypto.getRandomValues(bytes);
+	network.code = String(bytes[0] % 10000).padStart(4, "0");
+	network.status = "Opening the room...";
+	roomPanel();
+	const ticket = network;
+	try {
+		await loadPeer();
+		if (network !== ticket) return;
+		network.peer = new Peer("hareair-" + network.code);
+		network.peer.on("open", () => {
+			beginHeartbeat();
+			netStatus("Share this code with your friends.");
+		});
+		network.peer.on("connection", wireConn);
+		network.peer.on("error", (e) =>
+			netStatus(
+				e.type === "unavailable-id"
+					? "Code in use. Leave and host again."
+					: "Room service unavailable. Try again.",
+			),
+		);
+	} catch (e) {
+		netStatus(e.message);
+	}
+}
+function joinCode() {
+	cleanupNetwork();
+	renderJoin();
+}
+async function connectRoom() {
+	network.code = network.digits.join("");
+	network.host = false;
+	network.status = "Connecting...";
+	roomPanel();
+	const ticket = network;
+	try {
+		await loadPeer();
+		if (network !== ticket) return;
+		network.peer = new Peer();
+		network.peer.on("open", () =>
+			wireConn(
+				network.peer.connect("hareair-" + network.code, { reliable: true }),
+			),
+		);
+		network.peer.on("error", (e) =>
+			netStatus(
+				e.type === "peer-unavailable"
+					? "Room not found. Check the code."
+					: "Connection failed. Try again.",
+			),
+		);
+	} catch (e) {
+		netStatus(e.message);
+	}
+}
+function startRoom() {
+	if (!network.peer || network.peer.destroyed || network.peer.disconnected) {
+		netStatus("Room is still connecting.");
+		return;
+	}
+	network.started = true;
+	network.startAt = performance.now() + 1800;
+	broadcast({ t: "start", delay: 1800 });
+	beginHeartbeat();
+	panelName = "";
+	ui.panel.classList.add("hidden");
+	startRun(false, true);
+}
+function updateNetwork() {
+	if (!network.started || performance.now() - network.lastUpdate < 1000) return;
+	network.lastUpdate = performance.now();
+	if (network.host) {
+		network.entries.host = { score, rescued };
+		broadcast({ t: "board", entries: network.entries });
+	} else broadcast({ t: "score", score, rescued });
+	const entries = Object.entries(network.entries).sort(
+		(a, b) => b[1].score - a[1].score,
+	);
+	const myId = network.host ? "host" : network.peer?.id;
+	$("leaderboard").innerHTML =
+		entries.length > 1
+			? entries
+					.slice(0, 4)
+					.map(([id, p], i) => {
+						const seat = Math.max(0, network.roster.indexOf(id));
+						return `<div>${i + 1}. ${id === myId ? "YOU" : seat === 0 ? "HOST" : "PILOT " + (seat + 1)} &nbsp; ${Math.floor(p.score).toString().padStart(6, "0")}</div>`;
+					})
+					.join("")
+			: "";
+}
+
+// The island layout is data: add, move, or re-theme pieces here without touching the simulation.
+const LEVEL = {
+	platforms: [
+		[0, 0, 30, 27, 0, 0x8fd6a4],
+		[-22, -8, 10, 10, 2, 0xa2d9a2],
+		[-33, -13, 15, 15, 4, 0x8ccfc0],
+		[22, -8, 10, 10, 2, 0xf1d59c],
+		[33, -13, 15, 15, 4, 0xf2cb8f],
+		[0, -21, 10, 10, 3, 0x9cd9bc],
+		[0, -34, 16, 14, 7, 0xb6d5a0],
+		[-20, -28, 8, 8, 6, 0x9acfe1],
+		[20, -28, 8, 8, 6, 0xecc1ab],
+		[0, 14, 9, 6, 0, 0x8fd6a4],
+	],
+	cages: [
+		[-8, 0, -6, 0],
+		[33, 4, -11, 1],
+		[-33, 4, -11, 2],
+		[0, 7, -34, 3],
+	],
+	pads: [
+		[11, 0, -4],
+		[-11, 0, -4],
+		[0, 0, -10],
+		[0, 3, -21],
+	],
+	enemies: [
+		[3, 3, -5, 0],
+		[-24, 5, -10, 0],
+		[27, 7, -13, 1],
+		[-2, 10, -29, 0],
+		[-36, 8, -19, 1],
+		[9, 4, 3, 0],
+	],
+	coins: [
+		[-4, 1, -2],
+		[0, 1, -3],
+		[4, 1, -3],
+		[18, 3, -8],
+		[22, 3, -8],
+		[28, 5, -11],
+		[-18, 3, -8],
+		[-22, 3, -8],
+		[-28, 5, -11],
+		[0, 4, -20],
+		[0, 8, -29],
+		[-4, 8, -34],
+		[4, 8, -34],
+		[20, 7, -28],
+		[-20, 7, -28],
+	],
+};
+
+let mats = {},
+	toonRamp;
+function material(color, opts = {}) {
+	const key = JSON.stringify([color, opts]);
+	if (!mats[key])
+		mats[key] = new THREE.MeshToonMaterial({
+			color,
+			gradientMap: toonRamp,
+			...opts,
+		});
+	return mats[key];
+}
+function mesh(geo, color, parent, x = 0, y = 0, z = 0, opts) {
+	const m = new THREE.Mesh(
+		geo,
+		typeof color === "string" || typeof color === "number"
+			? material(color, opts)
+			: color,
+	);
+	m.position.set(x, y, z);
+	parent.add(m);
+	return m;
+}
+function box(w, h, d, c, parent, x = 0, y = 0, z = 0) {
+	return mesh(new THREE.BoxGeometry(w, h, d), c, parent, x, y, z);
+}
+function sphere(r, c, parent, x = 0, y = 0, z = 0) {
+	return mesh(new THREE.SphereGeometry(r, 16, 10), c, parent, x, y, z);
+}
+function cylinder(rt, rb, h, c, parent, x = 0, y = 0, z = 0, seg = 12) {
+	return mesh(new THREE.CylinderGeometry(rt, rb, h, seg), c, parent, x, y, z);
+}
+function torus(r, t, c, parent, x = 0, y = 0, z = 0) {
+	return mesh(new THREE.TorusGeometry(r, t, 8, 24), c, parent, x, y, z);
+}
+function outline(obj, color = 0x355376) {
+	const edge = new THREE.LineSegments(
+		new THREE.EdgesGeometry(obj.geometry, 25),
+		new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.35 }),
+	);
+	obj.add(edge);
+}
+function platform(x, z, w, d, top, grass = 0x8dd7a6) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, 0, z);
+	const base = box(w, 2.8, d, 0xeecf95, g, 0, top - 1.45, 0);
+	outline(base, 0xb57e65);
+	const turf = box(w + 0.12, 0.4, d + 0.12, grass, g, 0, top - 0.15, 0);
+	outline(turf, 0x5ca78d);
+	const under = mesh(
+		new THREE.ConeGeometry(Math.min(w, d) * 0.46, 5, 4),
+		0xc4a77d,
+		g,
+		0,
+		top - 5.1,
+		0,
+	);
+	under.rotation.y = Math.PI / 4;
+	const fixed = world.createRigidBody(
+		R.RigidBodyDesc.fixed().setTranslation(x, top - 1.4, z),
+	);
+	world.createCollider(R.ColliderDesc.cuboid(w / 2, 1.4, d / 2), fixed);
+	islands.push({ x, z, w, d, top });
+	return g;
+}
+function tree(x, y, z, scale = 1, accent = 0x69cbb0) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	g.scale.setScalar(scale);
+	cylinder(0.22, 0.32, 2.3, 0x8f6d5c, g, 0, 1.1, 0);
+	sphere(1.05, accent, g, 0, 2.35, 0);
+	sphere(0.76, accent, g, 0.7, 2.1, 0.18);
+	sphere(0.76, accent, g, -0.65, 2.2, 0.1);
+	for (let i = 0; i < 3; i++)
+		sphere(
+			0.17,
+			0xffdb81,
+			g,
+			Math.cos(i * 2.1) * 0.8,
+			2.6,
+			Math.sin(i * 2.1) * 0.8,
+		);
+}
+function flower(x, y, z, color = 0xffec84, s = 1) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	g.scale.setScalar(s);
+	cylinder(0.035, 0.04, 0.7, 0x5aa989, g, 0, 0.35, 0, 6);
+	for (let i = 0; i < 5; i++) {
+		const a = (i * Math.PI * 2) / 5;
+		sphere(0.16, color, g, Math.cos(a) * 0.2, 0.74, Math.sin(a) * 0.2);
+	}
+	sphere(0.13, 0xffaa5c, g, 0, 0.76, 0);
+}
+function cloud(x, y, z, s = 1) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	g.scale.setScalar(s);
+	sphere(1, 0xfff7e6, g, 0, 0, 0);
+	sphere(0.8, 0xfff7e6, g, -1, 0, 0);
+	sphere(0.8, 0xfff7e6, g, 1, 0, 0);
+	sphere(0.65, 0xfff7e6, g, 0.1, 0.5, 0);
+}
+function house(x, y, z, s = 1, color = 0xffc4a7) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	g.scale.setScalar(s);
+	const b = box(3.4, 2.8, 3.2, color, g, 0, 1.4, 0);
+	outline(b);
+	const roof = mesh(new THREE.ConeGeometry(3, 1.8, 4), 0xff8483, g, 0, 3.6, 0);
+	roof.rotation.y = Math.PI / 4;
+	box(0.95, 1.5, 0.08, 0x7287a8, g, 0, 0.75, 1.64);
+	sphere(0.1, 0xffdc77, g, 0.25, 0.8, 1.7);
+	for (const xx of [-1, 1]) {
+		box(0.65, 0.65, 0.1, 0xb6f0ef, g, xx, 1.8, 1.66);
+		box(0.75, 0.1, 0.12, 0xfff9dd, g, xx, 1.8, 1.7);
+	}
+	return g;
+}
+function beacon(x, y, z) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	cylinder(0.6, 0.85, 0.35, 0x324c6e, g, 0, 0.18, 0);
+	cylinder(0.1, 0.1, 2.1, 0x638e9a, g, 0, 1.3, 0);
+	sphere(0.35, 0xffdc72, g, 0, 2.45, 0);
+	return g;
+}
+function makeBunny(parent, x, y, z, scale = 1) {
+	const g = new THREE.Group();
+	parent.add(g);
+	g.position.set(x, y, z);
+	g.scale.setScalar(scale);
+	const body = sphere(1, 0xfff6e1, g, 0, 1.25, 0);
+	body.scale.set(0.8, 1, 0.65);
+	const head = sphere(0.82, 0xfff9ee, g, 0, 2.65, 0.05);
+	head.scale.set(1, 0.9, 0.85);
+	for (const s of [-1, 1]) {
+		const ear = sphere(0.26, 0xfff9ee, g, s * 0.45, 3.62, 0);
+		ear.scale.set(0.75, 2.7, 0.55);
+		ear.rotation.z = -s * 0.15;
+		const inner = sphere(0.13, 0xff9e9a, g, s * 0.45, 3.63, 0.15);
+		inner.scale.set(0.7, 4, 0.4);
+		inner.rotation.z = -s * 0.15;
+		sphere(0.11, 0x283f5e, g, s * 0.27, 2.7, 0.71);
+		sphere(0.08, 0xff9b95, g, s * 0.38, 2.48, 0.7);
+		const foot = sphere(0.4, 0x84dce1, g, s * 0.5, 0.35, 0.27);
+		foot.scale.set(1, 0.5, 1.2);
+		const arm = sphere(0.35, 0xfff6e1, g, s * 0.78, 1.35, 0.1);
+		arm.scale.set(0.7, 1.3, 0.7);
+	}
+	sphere(0.13, 0xff897f, g, 0, 2.45, 0.79);
+	const pack = box(1.1, 1.2, 0.45, 0xe8a66f, g, 0, 1.3, -0.7);
+	outline(pack);
+	return g;
+}
+function windmill(x, y, z) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	cylinder(1.3, 1.7, 6, 0xffefc5, g, 0, 3, 0);
+	const roof = mesh(
+		new THREE.ConeGeometry(1.8, 1.6, 10),
+		0xf78279,
+		g,
+		0,
+		6.75,
+		0,
+	);
+	const blades = new THREE.Group();
+	g.add(blades);
+	blades.position.set(0, 4.5, 1.35);
+	for (let i = 0; i < 4; i++) {
+		const b = box(0.62, 3.3, 0.15, 0xfff6e0, blades, 0, 1.65, 0);
+		const pivot = new THREE.Group();
+		blades.remove(b);
+		pivot.add(b);
+		pivot.rotation.z = (i * Math.PI) / 2;
+		blades.add(pivot);
+	}
+	sphere(0.38, 0xffb965, blades, 0, 0, 0.2);
+	windmills.push(blades);
+	return g;
+}
+function makeCage(x, top, z, id) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, top, z);
+	cylinder(1.25, 1.45, 0.35, 0x54789b, g, 0, 0.18, 0);
+	const ring = torus(1.03, 0.09, 0xf4d86a, g, 0, 1.2, 0);
+	ring.rotation.x = Math.PI / 2;
+	const glass = mesh(
+		new THREE.SphereGeometry(1.0, 16, 12),
+		material(0xa0ebf5, { transparent: true, opacity: 0.28, depthWrite: false }),
+		g,
+		0,
+		1.28,
+		0,
+	);
+	glass.scale.set(1, 1.2, 1);
+	for (let i = 0; i < 4; i++) {
+		const a = (i * Math.PI) / 2;
+		cylinder(
+			0.055,
+			0.055,
+			1.9,
+			0xffd869,
+			g,
+			Math.cos(a) * 0.95,
+			1.25,
+			Math.sin(a) * 0.95,
+			6,
+		);
+	}
+	cylinder(1.0, 1, 0.18, 0xffd869, g, 0, 2.2, 0);
+	const flag = cylinder(0.035, 0.035, 2.7, 0xffe9bb, g, 0, 3.5, 0, 6);
+	const f = box(1, 0.45, 0.05, 0xf77774, g, 0.48, 4.65, 0);
+	outline(f);
+	const buddy = new THREE.Group();
+	g.add(buddy);
+	buddy.position.set(0, 0.42, 0);
+	sphere(0.5, 0xfff7e8, buddy, 0, 0.55, 0);
+	for (const s of [-1, 1]) {
+		sphere(0.07, 0x233e5d, buddy, s * 0.18, 0.58, 0.44);
+		const foot = sphere(0.18, 0xf6a5a6, buddy, s * 0.32, 0.1, 0.08);
+		foot.scale.y = 0.5;
+	}
+	const leaf = sphere(0.26, 0x72cba4, buddy, 0, 1.18, 0);
+	leaf.scale.set(0.6, 1.4, 0.5);
+	leaf.rotation.z = 0.5;
+	cages.push({
+		id,
+		g,
+		buddy,
+		glass,
+		x,
+		y: top + 1.3,
+		z,
+		hp: 3,
+		freed: false,
+		flag: f,
+	});
+}
+function makeEnemy(x, y, z, type = 0) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	const disc = cylinder(
+		1.1,
+		0.85,
+		0.38,
+		type ? 0xb590db : 0xff9d76,
+		g,
+		0,
+		0,
+		0,
+	);
+	outline(disc);
+	sphere(0.65, type ? 0xd1b5f2 : 0xffe29d, g, 0, 0.4, 0);
+	for (const s of [-1, 1]) {
+		sphere(0.12, 0x294269, g, s * 0.25, 0.45, 0.57);
+	}
+	const prop = box(1.8, 0.08, 0.18, 0x6586a3, g, 0, 1.15, 0);
+	cylinder(0.08, 0.08, 0.4, 0x6586a3, g, 0, 0.95, 0);
+	enemies.push({
+		g,
+		prop,
+		x,
+		y,
+		z,
+		hp: type ? 5 : 3,
+		type,
+		phase: Math.random() * 6,
+		shot: 2 + Math.random() * 3,
+		dead: false,
+	});
+}
+function makeCoin(x, y, z) {
+	const g = torus(0.38, 0.13, 0xffdd60, scenery, x, y, z);
+	coins.push({ g, x, y, z, taken: false });
+}
+function makePad(x, y, z) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	cylinder(1.3, 1.3, 0.25, 0x345578, g, 0, 0.13, 0);
+	cylinder(1.03, 1.03, 0.2, 0xffca65, g, 0, 0.32, 0);
+	const a = torus(0.66, 0.11, 0xfff5d9, g, 0, 0.44, 0);
+	a.rotation.x = Math.PI / 2;
+	pads.push({ x, y, z, g, cool: 0 });
+}
+function makePortal(x, y, z) {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(x, y, z);
+	cylinder(2, 2, 0.4, 0x425e88, g, 0, 0.2, 0);
+	cylinder(1.65, 1.65, 0.14, 0x98b9bc, g, 0, 0.45, 0);
+	const ring = torus(1.48, 0.15, 0x6be2d4, g, 0, 0.58, 0);
+	ring.rotation.x = Math.PI / 2;
+	portal = { g, ring, x, y, z, active: false };
+}
+function makeBoss() {
+	const g = new THREE.Group();
+	scenery.add(g);
+	g.position.set(0, 9, -2);
+	const pot = sphere(2.2, 0xff9b83, g, 0, 0, 0);
+	pot.scale.set(1.25, 0.8, 1);
+	outline(pot, 0x8c5969);
+	cylinder(1.25, 1.45, 0.3, 0xffe0a0, g, 0, 1.7, 0);
+	sphere(0.35, 0xffe0a0, g, 0, 2, 0);
+	const spout = cylinder(0.35, 0.65, 2, 0xf6a08b, g, 2.55, 0.2, 0);
+	spout.rotation.z = -1.2;
+	const handle = torus(0.95, 0.25, 0xffe0a0, g, -2.5, 0.25, 0);
+	for (const s of [-1, 1]) {
+		sphere(0.2, 0x243c5d, g, s * 0.55, 0.25, 1.9);
+	}
+	const brow = box(1.9, 0.13, 0.12, 0x7d4f60, g, 0, 0.75, 2);
+	brow.rotation.z = 0.08;
+	const crown = mesh(
+		new THREE.ConeGeometry(0.8, 1.5, 5),
+		0xffdf67,
+		g,
+		0,
+		2.75,
+		0,
+	);
+	boss = { g, hp: 25, max: 25, shot: 1.5, dead: false, phase: 0 };
+}
+function buildWorld() {
+	if (scenery) {
+		scene.remove(scenery);
+		scenery.traverse((o) => {
+			if (o.geometry) o.geometry.dispose();
+			if (o.isLineSegments) o.material.dispose();
+		});
+	}
+	if (fxGroup) {
+		scene.remove(fxGroup);
+		fxGroup.traverse((o) => {
+			if (o.geometry) o.geometry.dispose();
+		});
+	}
+	if (world) world.free();
+	scenery = new THREE.Group();
+	fxGroup = new THREE.Group();
+	scene.add(scenery, fxGroup);
+	islands = [];
+	cages = [];
+	enemies = [];
+	coins = [];
+	shots = [];
+	hostile = [];
+	particles = [];
+	pads = [];
+	windmills = [];
+	boss = null;
+	portal = null;
+	world = new R.World({ x: 0, y: -18, z: 0 });
+	world.timestep = 1 / 60;
+	controller = world.createCharacterController(0.05);
+	controller.enableSnapToGround(0.15);
+	for (const p of LEVEL.platforms) platform(...p);
+	// Distant islands, clouds and paper-cut mountains fill the horizon.
+	for (let i = 0; i < 9; i++) {
+		const a = (i * 2 * Math.PI) / 9,
+			rr = 75 + (i % 2) * 16,
+			x = Math.cos(a) * rr,
+			z = Math.sin(a) * rr;
+		const g = new THREE.Group();
+		scenery.add(g);
+		g.position.set(x, -7, z);
+		cylinder(5, 3, 3, [0xa8d8ba, 0xffd2ac, 0xc2d6f1][i % 3], g, 0, 0, 0, 6);
+		mesh(new THREE.ConeGeometry(3.5, 5, 5), 0xc9bb93, g, 0, -3.7, 0);
+		tree(x, -5, z, 1);
+	}
+	for (let i = 0; i < 16; i++) {
+		const a = i * 2.4;
+		cloud(
+			Math.cos(a) * (95 + i * 3),
+			16 + (i % 4) * 4,
+			Math.sin(a) * (95 + i * 3),
+			1.2 + (i % 3) * 0.4,
+		);
+	}
+	// The plaza is deliberately open so jumps and lines of sight stay readable.
+	house(-11, 0, 6, 0.85, 0xffc5a4);
+	house(10, 0, -7, 0.8, 0xffdba6);
+	windmill(36, 4, -17);
+	house(-35, 4, -17, 0.95, 0xe7b8d6);
+	house(3, 7, -38, 0.8, 0xffcbaa);
+	for (const [x, y, z, s] of [
+		[-13, 0, -10, 1],
+		[12, 0, 9, 1],
+		[8, 0, 11, 0.7],
+		[-28, 4, -9, 1.2],
+		[29, 4, -8, 0.85],
+		[-5, 7, -35, 1],
+		[5, 7, -31, 0.8],
+		[-20, 6, -28, 0.7],
+		[20, 6, -28, 0.7],
+	])
+		tree(x, y, z, s);
+	for (let i = 0; i < 24; i++) {
+		const x = -13 + ((i * 7) % 26),
+			z = -12 + ((i * 11) % 23);
+		flower(x, 0, z, [0xfff1a2, 0xffaaa5, 0xf8f8ed][i % 3], 0.7);
+	}
+	for (let i = 0; i < 10; i++) {
+		flower(-39 + i * 1.4, 4, -10, [0xf7eef0, 0xffd079][i % 2], 0.65);
+		flower(27 + i * 1.3, 4, -10, 0xfff2d7, 0.65);
+	}
+	beacon(-12, 0, -12);
+	beacon(12, 0, -12);
+	for (const c of LEVEL.cages) makeCage(...c);
+	for (const p of LEVEL.pads) makePad(...p);
+	makePortal(0, 0, 6);
+	for (const e of LEVEL.enemies) makeEnemy(...e);
+	for (const c of LEVEL.coins) makeCoin(...c);
+	landingMarker = mesh(
+		new THREE.CircleGeometry(0.85, 24),
+		new THREE.MeshBasicMaterial({
+			color: 0x294269,
+			transparent: true,
+			opacity: 0.28,
+			depthWrite: false,
+		}),
+		scenery,
+	);
+	landingMarker.rotation.x = -Math.PI / 2;
+	landingMarker.visible = false;
+	body = world.createRigidBody(
+		R.RigidBodyDesc.kinematicPositionBased().setTranslation(0, 1.05, 12),
+	);
+	collider = world.createCollider(R.ColliderDesc.capsule(0.53, 0.48), body);
+	world.step();
+}
+let titleBunny = null;
+function setupScene() {
+	scene = new THREE.Scene();
+	scene.background = new THREE.Color(0x8edeea);
+	scene.fog = new THREE.Fog(0x9bdeeb, 95, 200);
+	camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.08, 500);
+	scene.add(camera);
+	const hemi = new THREE.HemisphereLight(0xfff6d5, 0x81bac5, 2.2);
+	scene.add(hemi);
+	const sun = new THREE.DirectionalLight(0xffffff, 2.1);
+	sun.position.set(-30, 60, 25);
+	scene.add(sun);
+	const ramp = new Uint8Array([
+		45, 45, 45, 255, 125, 125, 125, 255, 205, 205, 205, 255, 255, 255, 255, 255,
+	]);
+	toonRamp = new THREE.DataTexture(ramp, 4, 1, THREE.RGBAFormat);
+	toonRamp.magFilter = THREE.NearestFilter;
+	toonRamp.minFilter = THREE.NearestFilter;
+	toonRamp.needsUpdate = true;
+	buildWorld();
+	titleBunny = makeBunny(scenery, 7, 0, 2, 2.1);
+	titleBunny.rotation.y = -0.28;
+	gun = new THREE.Group();
+	camera.add(gun);
+	gun.position.set(0.6, -0.6, -1.05);
+	gun.scale.setScalar(0.19);
+	sphere(0.7, 0xfff6e6, gun, 0, 0, 0).scale.set(1, 0.8, 0.8);
+	box(0.9, 0.42, 1.2, 0x64d2d6, gun, 0, 0.13, -0.35);
+	const barrel = cylinder(0.31, 0.38, 0.7, 0xffcb75, gun, 0, 0.14, -1.0);
+	barrel.rotation.x = Math.PI / 2;
+	const muzzle = cylinder(0.21, 0.21, 0.05, 0x314960, gun, 0, 0.14, -1.37);
+	muzzle.rotation.x = Math.PI / 2;
+	box(0.42, 0.12, 0.5, 0xfff7e8, gun, 0, 0.43, -0.3);
+	gun.visible = false;
+	window.addEventListener("resize", () => {
+		camera.aspect = innerWidth / innerHeight;
+		camera.updateProjectionMatrix();
+		renderer.setSize(innerWidth, innerHeight);
+	});
+}
+function showMessage(text, seconds = 4) {
+	$("message").innerHTML = text;
+	$("message").classList.remove("hidden");
+	messageUntil = worldSeconds + seconds;
+	audio.voice();
+}
+function updateHud() {
+	$("score").textContent = String(Math.floor(score)).padStart(6, "0");
+	$("health").textContent = Array.from({ length: 5 }, (_, i) =>
+		i < health ? "♥" : "♡",
+	).join(" ");
+	$("rescues").innerHTML = Array.from(
+		{ length: 4 },
+		(_, i) => `<i class="pip ${i < rescued ? "on" : ""}"></i>`,
+	).join("");
+	$("jumps").innerHTML = Array.from(
+		{ length: 3 },
+		(_, i) => `<i class="${i < Math.max(0, 3 - jumpCount) ? "on" : ""}"></i>`,
+	).join("");
+	const remain = Math.max(0, 360 - elapsed),
+		m = Math.floor(remain / 60),
+		s = Math.floor(remain % 60);
+	$("timer").textContent =
+		`${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+	const objective = bossStarted
+		? boss && !boss.dead
+			? "CAPTAIN ON DECK"
+			: "EXIT IS OPEN"
+		: "THE RESCUE IS ON";
+	$("objectiveTitle").textContent = objective;
+	const pos = body?.translation();
+	const target = !bossStarted
+		? cages
+				.filter((c) => !c.freed)
+				.sort(
+					(a, b) =>
+						Math.hypot(a.x - pos.x, a.z - pos.z) -
+						Math.hypot(b.x - pos.x, b.z - pos.z),
+				)[0]
+		: boss && !boss.dead
+			? { x: boss.g.position.x, z: boss.g.position.z }
+			: { x: portal.x, z: portal.z };
+	if (target && pos) {
+		const dist = Math.round(Math.hypot(target.x - pos.x, target.z - pos.z)),
+			angle = Math.atan2(target.x - pos.x, -(target.z - pos.z)) + yaw;
+		const dirs = ["↑", "↗", "→", "↘", "↓", "↙", "←", "↖"];
+		const idx = ((Math.round(angle / (Math.PI / 4)) % 8) + 8) % 8;
+		$("objectiveText").textContent =
+			`${dirs[idx]} ${bossStarted ? (boss && !boss.dead ? "Zap the captain" : "Reach the exit") : "Find the skyfolk"} · ${dist} m`;
+	}
+	$("bossbar").classList.toggle("hidden", !boss || boss.dead);
+	if (boss)
+		$("bossfill").style.width = `${Math.max(0, (boss.hp / boss.max) * 100)}%`;
+}
+function markScore(points) {
+	score += points;
+	if (AIHub.active) AIHub.progress({ score, label: `${rescued}/4 rescued` });
+}
+function startRun(demo = false, room = false) {
+	state = demo ? "demo" : AIHub.active || room ? "ready" : "play";
+	stopped = false;
+	ended = false;
+	score = 0;
+	rescued = 0;
+	health = 5;
+	jumpCount = 0;
+	velocityY = 0;
+	grounded = false;
+	yaw = 0;
+	pitch = 0;
+	autoPitch = 0;
+	fireCooldown = 0;
+	invuln = 0;
+	elapsed = 0;
+	worldSeconds = 0;
+	bossStarted = false;
+	checkpoint = { x: 0, y: 1.1, z: 12 };
+	lastSafe = checkpoint;
+	demoTime = 0;
+	buildWorld();
+	titleBunny = null;
+	gun.visible = true;
+	ui.title.classList.add("hidden");
+	ui.hud.classList.remove("hidden");
+	$("demoRibbon").classList.toggle("hidden", !demo);
+	$("leaderboard").innerHTML = "";
+	$("message").classList.add("hidden");
+	$("bossbar").classList.add("hidden");
+	if (!demo)
+		showMessage(
+			"<b>WIDGET:</b> Four skyfolk in a pickle! Zap their cages, pilot.",
+		);
+	updateHud();
+	if (AIHub.active) AIHub.progress({ score, label: "0/4 rescued" });
+}
+function returnToTitle() {
+	if (AIHub.active) return;
+	cleanupNetwork();
+	state = "title";
+	ended = false;
+	stopped = false;
+	ui.hud.classList.add("hidden");
+	ui.title.classList.remove("hidden");
+	ui.panel.classList.add("hidden");
+	panelName = "";
+	lastInput = performance.now();
+	gun.visible = false;
+	buildWorld();
+	titleBunny = makeBunny(scenery, 7, 0, 2, 2.1);
+	titleBunny.rotation.y = -0.28;
+	menuIndex = 0;
+	focusButtons();
+}
+function endRun(victory, reason = "") {
+	if (ended) return;
+	ended = true;
+	state = "over";
+	if (victory) {
+		markScore(Math.max(0, Math.floor((360 - elapsed) * 5)));
+		audio.sound("win");
+	}
+	if (AIHub.active)
+		AIHub.result({ score, stats: { rescued, completed: victory } });
+	if (network.started) {
+		network.lastUpdate = 0;
+		updateNetwork();
+	}
+	const finalReason = victory
+		? "Captain Crumpet is toast! The skyfolk are safe and the kettle is on."
+		: reason ||
+			"Your brave little bunny needs a tune-up. The skyfolk will be cheering for your next flight.";
+	panel(
+		`<div class="panel-top"><div><div class="panel-kicker">${victory ? "Mission accomplished" : "Flight report"}</div><h2>${victory ? "Hare-raising work!" : "A bumpy landing!"}</h2></div></div><p>${finalReason}</p><div class="controls-grid"><div class="control"><strong>Skyfolk rescued</strong>${rescued} / 4</div><div class="control"><strong>Final score</strong>${Math.floor(score).toString().padStart(6, "0")}</div></div>${AIHub.active ? "<p>Waiting for the hub to finish the round.</p>" : '<div class="menu-list"><button class="menu-btn primary" data-action="again">Back to title <span class="arr">➜</span></button></div>'}${hint}`,
+		"result",
+	);
+}
+function rescue(c) {
+	if (c.freed) return;
+	health = Math.min(5, health + 1);
+	c.freed = true;
+	c.glass.visible = false;
+	for (const child of c.g.children) {
+		if (child !== c.buddy && child !== c.flag) child.visible = false;
+	}
+	c.buddy.position.y = 1;
+	c.buddy.scale.setScalar(1.3);
+	rescued++;
+	markScore(1500);
+	audio.sound("rescue");
+	checkpoint = { x: c.x + 2, y: c.y + 0.1, z: c.z + 2 };
+	showMessage(
+		[
+			"<b>SKYFOLK:</b> Bwee! My hero has excellent ears!",
+			"<b>SKYFOLK:</b> Freedom! And I didn’t even wrinkle.",
+			"<b>WIDGET:</b> Another happy customer. No refunds!",
+			"<b>WIDGET:</b> All four! Oh crumbs... incoming teapot!",
+		][rescued - 1],
+		4,
+	);
+	if (rescued === 4) {
+		bossStarted = true;
+		makeBoss();
+	}
+}
+function harm(amount = 1) {
+	if (invuln > 0 || state === "demo") return;
+	health -= amount;
+	invuln = 1.4;
+	damageFlash = 0.5;
+	audio.sound("hurt");
+	if (health <= 0) endRun(false);
+}
+function respawn() {
+	if (state === "demo") return;
+	harm();
+	body.setTranslation(checkpoint, true);
+	body.setNextKinematicTranslation(checkpoint);
+	velocityY = 0;
+	jumpCount = 0;
+	showMessage(
+		"<b>WIDGET:</b> Bottomless sky! Good thing we packed a spare.",
+		3,
+	);
+}
+function burst(x, y, z, color = 0xffdf76, count = 12) {
+	for (let i = 0; i < count; i++) {
+		const o = sphere(0.12 + Math.random() * 0.08, color, fxGroup, x, y, z);
+		particles.push({
+			g: o,
+			v: new THREE.Vector3(
+				(Math.random() - 0.5) * 8,
+				2 + Math.random() * 6,
+				(Math.random() - 0.5) * 8,
+			),
+			life: 0.5 + Math.random() * 0.5,
+		});
+	}
+}
+function beam(a, b, color = 0xfff295) {
+	const delta = new THREE.Vector3().subVectors(b, a),
+		g = cylinder(0.045, 0.045, delta.length(), color, fxGroup);
+	g.position.copy(a).add(b).multiplyScalar(0.5);
+	g.quaternion.setFromUnitVectors(
+		new THREE.Vector3(0, 1, 0),
+		delta.normalize(),
+	);
+	particles.push({ g, v: new THREE.Vector3(), life: 0.09, beam: true });
+}
+function fire() {
+	if (fireCooldown > 0) return;
+	fireCooldown = 0.19;
+	audio.sound("zap");
+	const origin = new THREE.Vector3();
+	camera.getWorldPosition(origin);
+	const dir = new THREE.Vector3(0, 0, -1)
+		.applyQuaternion(camera.quaternion)
+		.normalize();
+	const candidates = [];
+	for (const c of cages)
+		if (!c.freed)
+			candidates.push({
+				kind: "cage",
+				obj: c,
+				pos: new THREE.Vector3(c.x, c.y, c.z),
+				radius: 1.2,
+			});
+	for (const e of enemies)
+		if (!e.dead)
+			candidates.push({
+				kind: "enemy",
+				obj: e,
+				pos: e.g.position.clone(),
+				radius: 1.1,
+			});
+	if (boss && !boss.dead)
+		candidates.push({
+			kind: "boss",
+			obj: boss,
+			pos: boss.g.position.clone(),
+			radius: 2.8,
+		});
+	let chosen = null,
+		best = Infinity;
+	for (const c of candidates) {
+		const rel = c.pos.clone().sub(origin),
+			dist = rel.length(),
+			along = rel.dot(dir),
+			perp = Math.sqrt(Math.max(0, dist * dist - along * along));
+		if (
+			along > 0 &&
+			dist < 80 &&
+			perp < c.radius + dist * 0.09 &&
+			along < best
+		) {
+			chosen = c;
+			best = along;
+		}
+	}
+	const target = chosen ? chosen.pos : origin.clone().addScaledVector(dir, 35);
+	beam(origin.clone().add(new THREE.Vector3(0.22, -0.18, 0)), target);
+	if (chosen) {
+		const o = chosen.obj;
+		burst(target.x, target.y, target.z, 0xffe98b, 4);
+		if (chosen.kind === "cage") {
+			o.hp--;
+			if (o.hp <= 0) rescue(o);
+			else audio.sound("hit");
+		} else if (chosen.kind === "enemy") {
+			o.hp--;
+			if (o.hp <= 0) {
+				o.dead = true;
+				o.g.visible = false;
+				markScore(300);
+				audio.sound("hit");
+				burst(o.g.position.x, o.g.position.y, o.g.position.z, 0xffa073, 12);
+			}
+		} else {
+			boss.hp--;
+			audio.sound("hit");
+			if (boss.hp <= 0) {
+				boss.dead = true;
+				boss.g.visible = false;
+				portal.active = true;
+				markScore(5000);
+				burst(
+					boss.g.position.x,
+					boss.g.position.y,
+					boss.g.position.z,
+					0xffd974,
+					24,
+				);
+				showMessage(
+					"<b>CAPTAIN CRUMPET:</b> My tea! My beautiful tea! Exit is open!",
+					5,
+				);
+			}
+		}
+	}
+}
+function slamImpact(p) {
+	audio.sound("slam");
+	burst(p.x, p.y - 0.8, p.z, 0xffe98b, 14);
+	for (const e of enemies) {
+		if (
+			!e.dead &&
+			Math.hypot(e.g.position.x - p.x, e.g.position.z - p.z) < 4 &&
+			Math.abs(e.g.position.y - p.y) < 5
+		) {
+			e.hp -= 3;
+			if (e.hp <= 0) {
+				e.dead = true;
+				e.g.visible = false;
+				markScore(300);
+			}
+		}
+	}
+}
+function enemyShot(origin, target, speed = 8) {
+	const g = sphere(0.24, 0xff856f, fxGroup, origin.x, origin.y, origin.z);
+	const v = new THREE.Vector3()
+		.subVectors(target, origin)
+		.normalize()
+		.multiplyScalar(speed);
+	hostile.push({ g, v, life: 5 });
+}
+let slamming = false,
+	keyJump = false,
+	padJump = false,
+	padSlam = false,
+	currentPad = null;
+function advanceWorld(dt) {
+	worldSeconds += dt;
+	for (const w of windmills) w.rotation.z += dt * 0.9;
+	for (const c of cages) {
+		if (c.freed) {
+			c.buddy.rotation.y += dt * 2;
+			c.buddy.position.y = 1 + Math.sin(worldSeconds * 5 + c.id) * 0.18;
+		} else c.buddy.rotation.y = Math.sin(worldSeconds * 2 + c.id) * 0.25;
+	}
+	for (const c of coins)
+		if (!c.taken) {
+			c.g.rotation.y += dt * 2.5;
+			c.g.position.y = c.y + Math.sin(worldSeconds * 3 + c.x) * 0.18;
+		}
+	if (portal) {
+		portal.ring.rotation.z += dt;
+		portal.ring.material = material(portal.active ? 0x71f9d6 : 0x7da5a3);
+	}
+	const p = body.translation(),
+		target = new THREE.Vector3(p.x, p.y, p.z);
+	const below = islands
+		.filter(
+			(i) =>
+				Math.abs(p.x - i.x) <= i.w / 2 &&
+				Math.abs(p.z - i.z) <= i.d / 2 &&
+				i.top < p.y,
+		)
+		.sort((a, b) => b.top - a.top)[0];
+	landingMarker.visible =
+		!!below && (state === "play" || state === "demo") && p.y - below.top > 2;
+	if (below) landingMarker.position.set(p.x, below.top + 0.035, p.z);
+	for (const e of enemies) {
+		if (e.dead) continue;
+		e.phase += dt;
+		e.g.position.set(
+			e.x + Math.sin(e.phase * 0.9) * 1.5,
+			e.y + Math.sin(e.phase * 2) * 0.5,
+			e.z + Math.cos(e.phase * 0.7) * 1.2,
+		);
+		e.g.rotation.y = Math.atan2(p.x - e.g.position.x, p.z - e.g.position.z);
+		e.prop.rotation.y += dt * 8;
+		e.shot -= dt;
+		if (e.shot <= 0) {
+			e.shot = e.type ? 2.0 : 3.4;
+			if (target.distanceTo(e.g.position) < 30)
+				enemyShot(e.g.position.clone(), target, e.type ? 11 : 8);
+		}
+	}
+	if (boss && !boss.dead) {
+		boss.phase += dt;
+		boss.g.position.set(
+			Math.sin(boss.phase * 0.7) * 7,
+			9 + Math.sin(boss.phase * 1.4) * 1.3,
+			-2 + Math.cos(boss.phase * 0.7) * 4,
+		);
+		boss.g.rotation.y = Math.sin(boss.phase * 0.5) * 0.25;
+		boss.shot -= dt;
+		if (boss.shot <= 0) {
+			boss.shot = 1.1;
+			enemyShot(boss.g.position.clone(), target, 10);
+		}
+	}
+	for (let i = hostile.length - 1; i >= 0; i--) {
+		const a = hostile[i];
+		a.life -= dt;
+		a.g.position.addScaledVector(a.v, dt);
+		if (state !== "demo" && a.g.position.distanceTo(target) < 1.1) {
+			harm();
+			a.life = 0;
+		}
+		if (a.life <= 0) {
+			fxGroup.remove(a.g);
+			a.g.geometry.dispose();
+			hostile.splice(i, 1);
+		}
+	}
+	for (let i = particles.length - 1; i >= 0; i--) {
+		const a = particles[i];
+		a.life -= dt;
+		a.g.position.addScaledVector(a.v, dt);
+		a.v.y -= 12 * dt;
+		if (!a.beam) a.g.scale.multiplyScalar(Math.max(0.9, 1 - dt));
+		if (a.life <= 0) {
+			fxGroup.remove(a.g);
+			a.g.geometry.dispose();
+			particles.splice(i, 1);
+		}
+	}
+	if (worldSeconds > messageUntil) $("message").classList.add("hidden");
+	if (damageFlash > 0) {
+		damageFlash -= dt;
+		$("hitflash").style.opacity = String(Math.max(0, damageFlash) * 1.2);
+	} else $("hitflash").style.opacity = "0";
+}
+function getInput() {
+	const pad = currentPad;
+	const dz = (v) => (Math.abs(v || 0) > 0.16 ? v || 0 : 0);
+	let x =
+		(held.has("KeyD") ? 1 : 0) - (held.has("KeyA") ? 1 : 0) + dz(pad?.axes[0]);
+	let y =
+		(held.has("KeyS") ? 1 : 0) - (held.has("KeyW") ? 1 : 0) + dz(pad?.axes[1]);
+	if (settings.invertX) x = -x;
+	if (settings.invertY) y = -y;
+	const fire =
+		held.has("KeyF") ||
+		mouseFire ||
+		!!pad?.buttons[7]?.pressed ||
+		!!pad?.buttons[2]?.pressed;
+	probeInput.x = Math.max(-1, Math.min(1, x));
+	probeInput.y = Math.max(-1, Math.min(1, y));
+	probeInput.fire = fire;
+	probeInput.jump = held.has("Space") || !!pad?.buttons[0]?.pressed;
+	return {
+		x: probeInput.x,
+		y: probeInput.y,
+		fire,
+		lx: dz(pad?.axes[2]),
+		ly: dz(pad?.axes[3]),
+	};
+}
+function simulate(dt) {
+	const input = getInput();
+	const invX = settings.invertX ? -1 : 1,
+		invY = settings.invertY ? -1 : 1;
+	const sensitivity = settings.sensitivity / 100;
+	yaw -=
+		(input.lx +
+			(held.has("ArrowRight") ? 1 : 0) -
+			(held.has("ArrowLeft") ? 1 : 0)) *
+		invX *
+		dt *
+		2.1 *
+		sensitivity;
+	pitch -=
+		(input.ly +
+			(held.has("ArrowDown") ? 1 : 0) -
+			(held.has("ArrowUp") ? 1 : 0)) *
+		invY *
+		dt *
+		1.65 *
+		sensitivity;
+	pitch = THREE.MathUtils.clamp(pitch, -1.15, 1.1);
+	const moving = new THREE.Vector3(
+		Math.cos(yaw) * input.x + Math.sin(yaw) * input.y,
+		0,
+		-Math.sin(yaw) * input.x + Math.cos(yaw) * input.y,
+	);
+	if (moving.length() > 1) moving.normalize();
+	if ((keyJump || padJump) && jumpCount < 3) {
+		velocityY = jumpCount === 0 ? 15.5 : 14.5;
+		jumpCount++;
+		grounded = false;
+		slamming = false;
+		audio.sound("jump");
+	}
+	if ((pressed.has("KeyC") || padSlam) && !grounded) {
+		velocityY = -28;
+		slamming = true;
+		audio.sound("slam");
+	}
+	keyJump = false;
+	padJump = false;
+	padSlam = false;
+	velocityY = Math.max(-32, velocityY - 18 * dt);
+	const translation = {
+		x: moving.x * 9.2 * dt,
+		y: velocityY * dt,
+		z: moving.z * 9.2 * dt,
+	};
+	controller.computeColliderMovement(collider, translation);
+	let move = controller.computedMovement(),
+		p = body.translation();
+	const next = { x: p.x + move.x, y: p.y + move.y, z: p.z + move.z };
+	const wasGrounded = grounded;
+	grounded = controller.computedGrounded() && velocityY <= 0;
+	if (grounded) {
+		if (!wasGrounded && slamming) slamImpact(next);
+		slamming = false;
+		velocityY = -0.6;
+		jumpCount = 0;
+		lastSafe = { ...next };
+	} else if (velocityY > 0 && move.y < translation.y - 0.02) velocityY = 0;
+	body.setNextKinematicTranslation(next);
+	world.timestep = dt;
+	world.step();
+	p = body.translation();
+	for (const pad of pads) {
+		pad.cool = Math.max(0, pad.cool - dt);
+		if (
+			grounded &&
+			pad.cool <= 0 &&
+			Math.hypot(p.x - pad.x, p.z - pad.z) < 1.35 &&
+			Math.abs(p.y - 1.0 - pad.y) < 0.7
+		) {
+			velocityY = 20;
+			jumpCount = 1;
+			grounded = false;
+			pad.cool = 1.4;
+			audio.sound("jump");
+			burst(pad.x, pad.y + 0.5, pad.z, 0xffe17a, 8);
+		}
+	}
+	if (p.y < -18) respawn();
+	for (const c of coins) {
+		if (!c.taken && Math.hypot(c.x - p.x, c.y - p.y, c.z - p.z) < 1.5) {
+			c.taken = true;
+			c.g.visible = false;
+			markScore(100);
+			audio.sound("coin");
+		}
+	}
+	if (
+		portal.active &&
+		Math.hypot(p.x - portal.x, p.z - portal.z) < 1.6 &&
+		Math.abs(p.y - portal.y) < 3
+	)
+		endRun(true);
+	autoPitch = THREE.MathUtils.lerp(
+		autoPitch,
+		settings.autoLook && jumpCount >= 2 ? -0.55 : 0,
+		Math.min(1, dt * 3),
+	);
+	camera.rotation.set(
+		THREE.MathUtils.clamp(pitch + autoPitch, -1.35, 1.1),
+		yaw,
+		0,
+		"YXZ",
+	);
+	camera.position.set(p.x, p.y + 0.55, p.z);
+	gun.position.y =
+		-0.6 +
+		Math.sin(worldSeconds * 11) * Math.min(0.025, moving.length() * 0.02);
+	gun.rotation.x = slamming ? -0.25 : 0;
+	fireCooldown -= dt;
+	if (input.fire) fire();
+	invuln -= dt;
+	elapsed = AIHub.active
+		? Math.max(0, AIHub.time() / 1000)
+		: network.started
+			? Math.max(0, (performance.now() - network.startAt) / 1000)
+			: elapsed + dt;
+	if (elapsed >= 360)
+		endRun(
+			false,
+			"Time is up! The skyfolk send their thanks for your brave effort.",
+		);
+	advanceWorld(dt);
+	updateHud();
+	updateNetwork();
+}
+function demoStep(dt) {
+	demoTime += dt;
+	const t = demoTime;
+	const sequence = [
+		{ a: [0, 3, 10], b: [-5, 5, 1], target: 0, start: 0, end: 7 },
+		{ a: [-5, 5, 1], b: [29, 9, -4], target: 1, start: 7, end: 14 },
+		{ a: [29, 9, -4], b: [-29, 10, -4], target: 2, start: 14, end: 21 },
+		{ a: [-29, 10, -4], b: [0, 13, -25], target: 3, start: 21, end: 28 },
+		{ a: [0, 13, -25], b: [0, 12, 6], target: "boss", start: 28, end: 36 },
+		{ a: [0, 12, 6], b: [0, 4, 12], target: "exit", start: 36, end: 41 },
+	];
+	const s = sequence.find((q) => t >= q.start && t < q.end);
+	if (!s) {
+		startRun(true);
+		return;
+	}
+	const q = Math.max(0, Math.min(1, (t - s.start) / (s.end - s.start)));
+	const ease = q * q * (3 - 2 * q);
+	const a = new THREE.Vector3(...s.a),
+		b = new THREE.Vector3(...s.b),
+		pos = a.lerp(b, ease);
+	pos.y += Math.sin(q * Math.PI) * 5;
+	camera.position.copy(pos);
+	body.setTranslation({ x: pos.x, y: pos.y - 0.5, z: pos.z }, true);
+	const tgt =
+		s.target === "boss" && boss
+			? boss.g.position
+			: s.target === "exit"
+				? new THREE.Vector3(0, 0, 8)
+				: s.target === "boss"
+					? new THREE.Vector3(0, 9, 0)
+					: new THREE.Vector3(
+							cages[s.target].x,
+							cages[s.target].y,
+							cages[s.target].z,
+						);
+	camera.lookAt(tgt);
+	if (typeof s.target === "number" && q > 0.68 && !cages[s.target].freed) {
+		burst(tgt.x, tgt.y, tgt.z, 0xffdf76);
+		rescue(cages[s.target]);
+	}
+	if (s.target === "boss" && boss && !boss.dead) {
+		fireCooldown -= dt;
+		if (q > 0.15 && fireCooldown <= 0) fire();
+		if (q > 0.85 && !boss.dead) {
+			boss.hp = 0;
+			boss.dead = true;
+			boss.g.visible = false;
+			portal.active = true;
+			markScore(5000);
+			showMessage("<b>WIDGET:</b> Nice shooting! Exit is open!", 3);
+		}
+	}
+	if (s.target === "exit" && q > 0.4 && !ended) {
+		ended = true;
+		showMessage("<b>WIDGET:</b> Another splendid sky-saving adventure!", 4);
+	}
+	elapsed += dt;
+	advanceWorld(dt);
+	updateHud();
+}
+function titleCamera(t) {
+	camera.position.set(
+		30 + Math.sin(t * 0.12) * 2,
+		22 + Math.sin(t * 0.14) * 1.2,
+		38 + Math.cos(t * 0.12) * 2,
+	);
+	camera.lookAt(2, 2, -6);
+	if (titleBunny) {
+		titleBunny.rotation.y = -0.28 + Math.sin(t * 0.8) * 0.1;
+		titleBunny.position.y = Math.sin(t * 2) * 0.08;
+	}
+	for (const w of windmills) w.rotation.z += 0.008;
+}
+
+function handlePad(dt) {
+	if (stopped && AIHub.active) return;
+	const padsNow = Array.from(navigator.getGamepads?.() || []),
+		pad = padsNow.find(Boolean);
+	currentPad = pad;
+	if (!pad) return;
+	const edges = pad.buttons.map((b, i) => !!b.pressed && !padPrev[i]);
+	const moved = pad.axes.some((a) => Math.abs(a) > 0.3);
+	if (edges.some(Boolean) || moved) {
+		if (!audio.ctx) audio.init();
+		if (wake()) {
+			for (let i = 0; i < pad.buttons.length; i++)
+				padPrev[i] = !!pad.buttons[i].pressed;
+			return;
+		}
+		updateTouch();
+		if (readyGesture) {
+			readyGesture = false;
+			AIHub.ready();
+		}
+	}
+	if (panelName === "about") {
+		const credits = ui.card.querySelector(".credits-text");
+		if (credits) credits.scrollTop += (pad.axes[3] || 0) * 350 * dt;
+	}
+	const hasCreate = !!pad.buttons[8]?.pressed;
+	if (edges[9] && !hasCreate) back();
+	if (panelName || state === "title") {
+		const now = performance.now();
+		let up = edges[12],
+			down = edges[13];
+		if (now - lastStickMenu > 240) {
+			const stickY = (pad.axes[1] || 0) * (settings.invertY ? -1 : 1);
+			const stickX = (pad.axes[0] || 0) * (settings.invertX ? -1 : 1);
+			if (stickY < -0.6 || stickX < -0.6) {
+				up = true;
+				lastStickMenu = now;
+			} else if (stickY > 0.6 || stickX > 0.6) {
+				down = true;
+				lastStickMenu = now;
+			}
+		}
+		if (panelName === "about") {
+			if (up) ui.card.querySelector(".credits-text")?.scrollBy(0, -80);
+			if (down) ui.card.querySelector(".credits-text")?.scrollBy(0, 80);
+		} else {
+			if (up) navigate(-1);
+			if (down) navigate(1);
+		}
+		if (edges[14]) navigate(-1);
+		if (edges[15]) navigate(1);
+		if (edges[0]) confirm();
+		if (edges[1] && panelName) closePanel();
+	} else if (state === "play") {
+		if (edges[0]) padJump = true;
+		if (edges[1]) padSlam = true;
+	}
+	for (let i = 0; i < pad.buttons.length; i++)
+		padPrev[i] = !!pad.buttons[i].pressed;
+}
+function onKeyDown(e) {
+	if (stopped && AIHub.active) return;
+	if (
+		["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(
+			e.code,
+		)
+	)
+		e.preventDefault();
+	const exited = wake();
+	document.body.classList.remove("touch-only");
+	$("touchNotice").classList.add("hidden");
+	audio.init();
+	if (readyGesture) {
+		readyGesture = false;
+		AIHub.ready();
+	}
+	if (exited) return;
+	if (e.repeat) return;
+	pressed.add(e.code);
+	held.add(e.code);
+	if (e.code === "Escape") {
+		back();
+		return;
+	}
+	if (panelName || state === "title") {
+		if (e.code === "Enter") e.preventDefault();
+		if (
+			panelName === "about" &&
+			["ArrowDown", "ArrowUp", "PageDown", "PageUp"].includes(e.code)
+		) {
+			ui.card
+				.querySelector(".credits-text")
+				?.scrollBy(
+					0,
+					e.code === "ArrowDown" || e.code === "PageDown" ? 100 : -100,
+				);
+			return;
+		}
+		if (e.code === "ArrowDown" || e.code === "KeyS") navigate(1);
+		else if (e.code === "ArrowUp" || e.code === "KeyW") navigate(-1);
+		else if (e.code === "ArrowLeft") navigate(-1);
+		else if (e.code === "ArrowRight") navigate(1);
+		else if (e.code === "Enter" || e.code === "Space") confirm();
+		return;
+	}
+	if (state === "play" && e.code === "Space") keyJump = true;
+}
+window.addEventListener("keydown", onKeyDown);
+window.addEventListener("keyup", (e) => {
+	held.delete(e.code);
+	pressed.delete(e.code);
+});
+window.addEventListener("blur", () => {
+	held.clear();
+	pressed.clear();
+	mouseFire = false;
+});
+window.addEventListener("pointerdown", (e) => {
+	if (wake()) return;
+	if (readyGesture) {
+		readyGesture = false;
+		AIHub.ready();
+	}
+	if (state === "play" && !panelName && e.target.tagName === "CANVAS") {
+		audio.init();
+		mouseFire = true;
+		if (document.pointerLockElement !== renderer.domElement)
+			renderer.domElement.requestPointerLock?.();
+	}
+});
+window.addEventListener("pointerup", () => {
+	mouseFire = false;
+});
+window.addEventListener("mousemove", (e) => {
+	if (state === "demo" && Math.abs(e.movementX) + Math.abs(e.movementY) > 1) {
+		returnToTitle();
+		return;
+	}
+	if (state === "title") lastInput = performance.now();
+	if (
+		state === "play" &&
+		!panelName &&
+		document.pointerLockElement === renderer.domElement
+	) {
+		yaw -=
+			((e.movementX * 0.0022 * settings.sensitivity) / 100) *
+			(settings.invertX ? -1 : 1);
+		pitch -=
+			((e.movementY * 0.0022 * settings.sensitivity) / 100) *
+			(settings.invertY ? -1 : 1);
+		pitch = THREE.MathUtils.clamp(pitch, -1.15, 1.1);
+	}
+});
+AIHub.probe(() => ({
+	scene: state === "demo" ? "play" : state === "fatal" ? "over" : state,
+	menu: panelName === "settings",
+	world: worldSeconds,
+	input: { ...probeInput },
+}));
+let previous = performance.now();
+function frame(now) {
+	const dt = Math.min(0.04, Math.max(0, (now - previous) / 1000));
+	previous = now;
+	audio.tick();
+	if (state === "title") {
+		titleCamera(now / 1000);
+		if (panelName !== "room" && now - lastInput >= 10000) {
+			panelName = "";
+			ui.panel.classList.add("hidden");
+			startRun(true);
+		}
+	} else if (state === "ready") {
+		const canStart = AIHub.active ? AIHub.time() >= 0 : now >= network.startAt;
+		if (canStart) {
+			state = "play";
+			showMessage(
+				"<b>WIDGET:</b> Four skyfolk in a pickle! Zap their cages, pilot.",
+				4,
+			);
+		} else {
+			const secs = AIHub.active
+				? Math.ceil(-AIHub.time() / 1000)
+				: Math.ceil((network.startAt - now) / 1000);
+			if (Number.isFinite(secs)) {
+				$("objectiveText").textContent =
+					secs > 0 ? `Ready in ${secs}...` : "Ready!";
+			}
+		}
+	} else if (state === "play" && !stopped && !panelName) simulate(dt);
+	else if (state === "demo") demoStep(dt);
+	if (scene && renderer) renderer.render(scene, camera);
+	requestAnimationFrame(frame);
+}
+async function init() {
+	try {
+		if (!navigator.gpu)
+			throw Error(
+				"This game needs a browser with WebGPU enabled. Try a recent desktop browser, then open Settings to adjust controls.",
+			);
+		const adapter = await navigator.gpu.requestAdapter();
+		if (!adapter)
+			throw Error(
+				"No WebGPU adapter was available. Enable WebGPU in your browser or try another device.",
+			);
+		const [three, rapier] = await Promise.all([
+			import(
+				"/lib/vendor/three/0.180.0/build/three.webgpu.js"
+			),
+			import(
+				"/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs"
+			),
+		]);
+		THREE = three;
+		R = rapier.default;
+		await R.init();
+		renderer = new THREE.WebGPURenderer({ antialias: true });
+		renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+		renderer.setSize(innerWidth, innerHeight);
+		await renderer.init();
+		if (!renderer.backend.isWebGPUBackend)
+			throw Error("WebGPU initialization failed. This game requires WebGPU.");
+		$("world").append(renderer.domElement);
+		setupScene();
+		ui.loading.classList.add("hidden");
+		if (AIHub.active) {
+			AIHub.on("time-up", () => {
+				if (!ended)
+					endRun(false, "Time is up! Your score has been sent to the hub.");
+			});
+			AIHub.on("end", () => {
+				if (!ended) endRun(false, "The hub has ended this round.");
+				stopped = true;
+				audio.muted = true;
+				if (audio.master) audio.master.gain.value = 0;
+			});
+			const info = await AIHub.connect({ mode: "parallel", seats: [1, 4] });
+			if (info) {
+				initialInfo = info;
+				startRun(false);
+				if (info.splash) AIHub.ready();
+				else {
+					readyGesture = true;
+					showMessage("<b>WIDGET:</b> Press a button when you are ready!", 30);
+				}
+			} else returnToTitle();
+		} else returnToTitle();
+		requestAnimationFrame(frame);
+	} catch (err) {
+		console.error(err);
+		fatal(err.message || "Could not start the game.");
+	}
+}
+if (new URLSearchParams(location.search).has("test"))
+	window.__hareTest = {
+		snapshot: () => ({
+			state,
+			score,
+			rescued,
+			health,
+			jumpCount,
+			grounded,
+			elapsed,
+			position: body?.translation(),
+			cages: cages.map((c) => ({
+				hp: c.hp,
+				freed: c.freed,
+				x: c.x,
+				y: c.y,
+				z: c.z,
+			})),
+			boss: boss ? { hp: boss.hp, dead: boss.dead } : null,
+			portal: portal?.active,
+		}),
+		aimCage: (id) => {
+			const c = cages[id];
+			if (!c) return;
+			const p = { x: c.x, y: c.y - 0.25, z: c.z + 4 };
+			body.setTranslation(p, true);
+			body.setNextKinematicTranslation(p);
+			velocityY = 0;
+			jumpCount = 0;
+			grounded = false;
+			yaw = 0;
+			pitch = Math.atan2(c.y - (p.y + 0.55), 4);
+			autoPitch = 0;
+			camera.position.set(p.x, p.y + 0.55, p.z);
+			camera.rotation.set(pitch, yaw, 0, "YXZ");
+		},
+		aimBoss: () => {
+			if (!boss) return;
+			const b = boss.g.position;
+			const p = { x: b.x, y: b.y, z: b.z + 9 };
+			body.setTranslation(p, true);
+			body.setNextKinematicTranslation(p);
+			velocityY = 0;
+			yaw = 0;
+			pitch = Math.atan2(-0.55, 9);
+			autoPitch = 0;
+			camera.position.set(p.x, p.y + 0.55, p.z);
+			camera.rotation.set(pitch, yaw, 0, "YXZ");
+		},
+		primeBoss: () => {
+			if (boss) boss.hp = 1;
+		},
+		atExit: () => {
+			const p = { x: portal.x, y: portal.y + 1.05, z: portal.z };
+			body.setTranslation(p, true);
+			body.setNextKinematicTranslation(p);
+			velocityY = 0;
+		},
+	};
+setInterval(() => handlePad(0.02), 20);
+init();
+
+</script>
+</body>
+</html>

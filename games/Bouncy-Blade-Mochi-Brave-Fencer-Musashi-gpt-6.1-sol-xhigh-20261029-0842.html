@@ -1,0 +1,794 @@
+<!doctype html>
+<!--
+Source Information
+Date: 2026-10-29 09:30
+Source: Brave Fencer Musashi
+Game: Bouncy Blade Mochi — The Stolen Morning
+Tech: Three.js r180 (0.180.0), WebGPU only (fallback disabled), Rapier 0.19.3, Gamepad API, Web Audio API, vanilla JavaScript / HTML / CSS.
+Art Direction: procedural cel-shaded 3D storybook dioramas, ink hull outlines, faceted geometry.
+Animation: procedural hierarchical character rigs, blended locomotion, combat poses, squash and stretch, particles.
+Audio: original code-written adaptive synthesized music, synthesized effects and gibberish voice acting; no recorded audio.
+Online: AI Hub Session Protocol v1, client 1.3.0, 1–4 parallel score sessions. Standalone two-player couch co-op. CDN libraries and Google Fonts require internet on first load.
+Testing: efficient, lightweight browser smoke tests and AI Hub automatic harness; results below.
+Environment: Codex CLI (headless); Linux (Ubuntu / WSL2); browser: Google Chrome 154 headless for testing, end-user browser unknown.
+Model: OpenAI, gpt-6.1-sol, reasoning effort xhigh.
+Usage: estimated API cost unknown; token total unknown; session time approximately 48 minutes.
+Testing Feedback
+Issues caught by browser testing: 3; critical/game-breaking: 2. Corrected the Rapier browser module path, preserved shared Sprite geometry during scene cleanup, and separated input polling from rendering.
+Most helpful: GPU-labelled scene-transition regression; complete chapter mechanics route; official AI Hub harness at 1 player, 2 players and player departure.
+Least helpful: initial screenshots under incorrect headless Vulkan flags.
+Testing allowed: efficient and lightweight. Chrome 154 on Linux with a virtual display and software Vulkan WebGPU, emulated DualSense controllers, mechanics assertions, syntax checks and screenshots. No FPS or optimization benchmark. Physical controllers, a blind human playthrough and a real remote hub session remain untested.
+
+Engine Feedback
+Liked most: Three.js's scene graph and TSL support a cohesive procedural cel-shaded world; Rapier supplies character collision and dynamic props.
+Stuck or guessed wrong: used an outdated Rapier module filename and initially disposed Three.js's shared sprite quad. WebGPURenderer's implicit fallback also required explicit disabling.
+Most important custom system: the adventure layer—combat, power borrowing, quests, rescues, boss phases, party revival, checkpoint persistence, controller menus and attract playback.
+Hardest part: coordinating physics, readable combat telegraphs, hierarchical animation, camera-relative controls and GPU resource ownership.
+Remove or overhaul one thing: implicit renderer backend fallback; make it an explicit policy.
+Change one thing: expose resource ownership metadata to identify shared geometry and textures safely.
+
+Prompt Feedback
+Liked most: the specific spiritual reference, controller-first direction, procedural audio and single-file sharing requirement.
+Confusing: feature-complete demo/game-engine scope and standalone multiplayer topology were open-ended. Interpreted as a complete three-area chapter, two-player couch co-op and AI Hub 1–4 parallel score sessions.
+Hardest: making adventure systems, original procedural art/audio and multiplayer form a coherent complete chapter.
+One additional test: a blind two-person couch playthrough with physical DualSense controllers on a WebGPU-capable television, checking readability, reconnect behavior, puzzle comprehension and boss timing.
+-->
+<html lang="en"><head><meta charset="UTF-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="8"><meta name="hub:session-goal" content="Rescue the town and beat the Kiln King; most points wins"><meta name="hub:session-howto" content="WASD / stick move; J / Square slash; E / R1 absorb; F / Triangle cast"><meta name="hub:webgpu" content="required">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><rect width=%2264%22 height=%2264%22 rx=%2212%22 fill=%22%23173d3e%22/><text x=%2232%22 y=%2248%22 text-anchor=%22middle%22 font-size=%2248%22 fill=%22%23f5bf57%22>✦</text></svg>"><meta name="theme-color" content="#173d3e"><meta name="description" content="A cel-shaded pocket epic: two blades, borrowed powers, and a very overdue breakfast. 1–2 player couch co-op and AI Hub sessions."><title>Bouncy Blade Mochi · The Stolen Morning</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "rapier": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700;9..144,800&display=swap');
+:root{--ink:#17383c;--cream:#fff4d9;--gold:#f5bf57;--green:#246d64;--muted:#adc1ac;--red:#d75d44;font-family:'DM Sans',sans-serif;color:var(--cream);font-size:clamp(16px,1.65vw,25px)}*{box-sizing:border-box}body{margin:0;overflow:hidden;background:#abd4c9}button{font:inherit;cursor:pointer}canvas#game{position:fixed;inset:0;width:100%;height:100%;outline:none}.hide{display:none!important}#vignette{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at 52% 40%,transparent 40%,#152e302c 100%)}#ui{position:fixed;inset:0;pointer-events:none}button,.interactive{pointer-events:auto}#title{position:absolute;inset:0;background:linear-gradient(90deg,#102f38f2 0%,#153b41db 30%,#173b4160 53%,transparent 72%);display:flex;flex-direction:column;justify-content:center;padding:5vh 6vw}.eyebrow{font-size:.57rem;font-weight:700;letter-spacing:.24em;text-transform:uppercase;color:var(--gold);display:flex;align-items:center;gap:.7em}.eyebrow:before{content:'';height:2px;width:2.1em;background:currentColor}.logo{font-family:Fraunces,Georgia,serif;font-size:clamp(58px,7.2vw,116px);line-height:.89;letter-spacing:-.055em;margin:.25em 0 .23em;max-width:7em;text-shadow:0 5px 0 #0d2b3280}.logo span{color:var(--gold);display:block}.tagline{font-size:.83rem;line-height:1.6;color:#d4e2d2;margin:.2em 0 1.4em;max-width:22em}.menu-stack{width:min(24rem,32vw);display:grid;gap:.45rem}.menu-btn{position:relative;display:flex;justify-content:space-between;align-items:center;min-height:2.65rem;padding:.6rem 1rem;border:1px solid #f6eccc40;background:#113b3f86;color:var(--cream);text-align:left;border-radius:4px;font-size:.82rem;transition:background .15s,transform .15s}.menu-btn small{color:#cfdfca9c;font-size:.61rem}.menu-btn.selected,.menu-btn:focus-visible{outline:0;border-color:var(--gold);background:var(--gold);color:var(--ink);transform:translateX(5px);box-shadow:0 6px 22px #0d282544}.menu-btn.selected small{color:#294a45}.menu-btn .arrow{font-size:1rem}#title-foot{position:absolute;bottom:3.8vh;left:6vw;font-size:.56rem;color:#a6c9be;letter-spacing:.04em}#edition{position:absolute;right:3vw;bottom:4vh;text-align:right;font-size:.5rem;letter-spacing:.2em;color:#254c45;line-height:1.9}#edition b{font-size:.67rem;letter-spacing:.06em}#load{position:absolute;inset:0;display:grid;place-content:center;text-align:center;background:#143b3e;z-index:30;padding:10vw}#load .sigil{font:5rem Fraunces;color:var(--gold);animation:float 1.5s infinite ease-in-out}#load p{font-size:.75rem;color:#b9d1bc}#load h1{font:2rem Fraunces;margin:.2em}#hud{position:absolute;inset:0;padding:3vh 3vw}#hero-panel{display:flex;gap:.6rem;align-items:center;width:15rem}.portrait{width:3.6rem;height:3.6rem;border:3px solid var(--cream);border-radius:50%;background:#f5bf57;box-shadow:0 4px 0 #183b3b44;position:relative;overflow:hidden;flex-shrink:0}.portrait svg{width:100%;height:100%}.vitals{flex:1}.hero-name{font-size:.68rem;font-weight:700;letter-spacing:.1em;margin-bottom:.3rem}.bar{height:.55rem;background:#193f45aa;border:1px solid #fff7df83;overflow:hidden;border-radius:10px;margin:.22rem 0}.bar i{display:block;height:100%;width:100%;background:#ef7854;transition:width .15s}.bar.spirit{height:.35rem}.bar.spirit i{background:#80e0ca}.values{font-size:.48rem;display:flex;justify-content:space-between;letter-spacing:.07em}.p2-panel{position:absolute;left:3vw;top:12.8vh;display:flex;align-items:center;gap:.5rem;background:#173b3b99;padding:.3rem .7rem;border-radius:6px;font-size:.6rem}.location{position:absolute;left:50%;top:3.2vh;transform:translateX(-50%);text-align:center;color:#183f3a;text-shadow:0 1px #f8f3cc;font-family:Fraunces;font-size:1.1rem}.location small{display:block;font-family:'DM Sans';font-size:.43rem;letter-spacing:.23em;text-transform:uppercase;margin-top:.3rem}#quest{position:absolute;right:3vw;top:3.2vh;max-width:15rem;background:#143b3edb;border-left:3px solid var(--gold);padding:.65rem .85rem;border-radius:0 4px 4px 0}.quest-label{font-size:.44rem;color:var(--gold);letter-spacing:.18em;margin-bottom:.3em}#quest-title{font-family:Fraunces;font-size:.85rem}#quest-sub{font-size:.55rem;line-height:1.5;color:#c6dac7;margin-top:.25rem}#map-wrap{position:absolute;right:3vw;bottom:15vh;width:7.2rem;height:7.2rem;border:2px solid #fff0ca70;background:#133e3ce8;border-radius:50%;overflow:hidden;box-shadow:0 5px 14px #10323044}#map{width:100%;height:100%}#purse{position:absolute;left:3.2vw;top:13vh;font-size:.75rem;display:flex;gap:1.1rem;text-shadow:0 2px 4px #153f35}#purse b{color:var(--gold)}#ability{position:absolute;left:3vw;bottom:13vh;display:flex;align-items:center;gap:.6rem;background:#123b3bdc;padding:.65rem .9rem;border:1px solid #fff2cf55;border-radius:6px;min-width:12rem}#ability .rune{font-size:1.7rem;color:var(--gold)}#ability strong{display:block;font-family:Fraunces;font-size:.88rem}#ability small{display:block;font-size:.47rem;color:#bed6c8;margin-top:.15rem}#controls{position:absolute;bottom:3vh;left:3vw;right:3vw;display:flex;align-items:center;justify-content:center;gap:1.15rem;background:#153d3ed9;padding:.65rem 1rem;border:1px solid #fff3d32b;border-radius:6px;font-size:.53rem;box-shadow:0 4px 20px #12352822}.key{display:inline-flex;min-width:1.5em;height:1.5em;align-items:center;justify-content:center;border:1px solid #b9d3c4;border-radius:50%;font-family:'DM Sans';font-size:.85em;font-weight:700;padding:.08em .28em;margin-right:.28em;color:#ffe7ac}.key.wide{border-radius:4px}#prompt{position:absolute;bottom:16vh;left:50%;transform:translateX(-50%);background:var(--cream);border:2px solid var(--ink);color:var(--ink);border-radius:5px;box-shadow:0 4px 0 #163b3b66;padding:.6rem 1rem;font-size:.7rem;text-align:center;white-space:nowrap}#toast{position:absolute;top:20vh;left:50%;transform:translateX(-50%);background:#173d3de8;border:1px solid var(--gold);border-radius:4px;padding:.65rem 1.3rem;text-align:center;max-width:28rem;font-family:Fraunces;font-size:.85rem;box-shadow:0 6px 25px #17382d44}#area-banner{position:absolute;top:28vh;left:50%;transform:translateX(-50%);text-align:center;pointer-events:none;text-shadow:0 2px 8px #123b35}#area-banner strong{display:block;font:2.5rem Fraunces}#area-banner small{font-size:.55rem;letter-spacing:.25em;text-transform:uppercase;color:var(--gold)}#dialogue{position:absolute;bottom:3vh;left:15vw;right:15vw;background:#fff3dcef;color:var(--ink);border:3px solid var(--ink);border-radius:7px;padding:1rem 1.5rem;box-shadow:0 8px 0 #163c3c77;pointer-events:auto}#speaker{font-size:.54rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:#aa593f;margin-bottom:.4rem}#speech{font-family:Fraunces;font-size:1.12rem;line-height:1.45;min-height:2.8em}#dialogue-foot{text-align:right;font-size:.55rem;margin-top:.5rem;color:#416459}#overlay{position:absolute;inset:0;background:#123338d9;backdrop-filter:blur(9px);display:grid;place-items:center;padding:3vh 7vw;pointer-events:auto;z-index:10}#panel{width:min(42rem,90vw);max-height:92vh;overflow:hidden;display:flex;flex-direction:column}#panel h1{font:2.5rem Fraunces;margin:.1em 0 .35em;letter-spacing:-.04em}#panel .lead{font-size:.72rem;line-height:1.6;color:#c4d8c6;margin:0 0 1rem}#panel-body{overflow:auto;scrollbar-width:thin;padding:5px 10px 5px 0}.panel-menu{display:grid;gap:.4rem}.panel-menu .menu-btn{width:100%}.panel-footer{font-size:.53rem;color:#b5d0bf;margin-top:1rem;display:flex;justify-content:space-between}.tabs{display:flex;gap:1rem;font-size:.65rem;letter-spacing:.05em;margin-bottom:1rem}.tabs b{color:var(--gold)}.guide-grid{display:grid;grid-template-columns:1fr 1fr;gap:.7rem}.guide-card{background:#062f344f;padding:.8rem;border:1px solid #cfdfbd33;border-radius:5px}.guide-card h3{font:1rem Fraunces;color:var(--gold);margin:0 0 .35rem}.guide-card p{font-size:.63rem;color:#d6e3cd;line-height:1.65;margin:0}.guide-card.wide{grid-column:1/-1}.credit-copy{font-size:.61rem;line-height:1.7;max-height:56vh;overflow:auto;padding-right:1rem}.credit-copy h3{font-family:Fraunces;font-size:1rem;color:var(--gold);margin:.8rem 0 .2rem}.credit-copy p{margin:.3rem 0 .7rem}.badge{display:inline-block;border:1px solid #91b3a2;padding:.1em .5em;font-size:.48rem;border-radius:3px;margin-right:.35rem}#boss-hud{position:absolute;left:25%;right:25%;top:3vh;text-align:center}.boss-title{font-family:Fraunces;font-size:1rem;text-shadow:0 2px #173c3b}#boss-hud small{display:block;font-size:.44rem;letter-spacing:.13em;color:#ffdead;margin:.2rem}.boss-bar{height:.6rem;border:2px solid var(--cream);background:#17373ce0;border-radius:2px}.boss-bar i{display:block;background:#ee8248;height:100%;transition:width .2s}#boss-cue{font-size:.58rem;margin-top:.35rem;color:#fff1c8;text-shadow:0 1px 3px #000}#attract{position:absolute;inset:0;pointer-events:none;border:14px solid #123d3c99;display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:4vh}.attract-tag{background:var(--cream);color:var(--ink);font-size:.58rem;font-weight:700;letter-spacing:.18em;padding:.55rem 1rem;border-radius:3px}.attract-caption{text-align:center;text-shadow:0 3px 8px #133b3d;background:#123b3cbb;padding:1rem 2rem;border-radius:6px}.attract-caption strong{font:1.8rem Fraunces;display:block}.attract-caption small{font-size:.65rem;color:#cbdcc2}.float-text{position:absolute;transform:translate(-50%,-50%);font-family:Fraunces;font-weight:800;font-size:1.2rem;color:#fff2bf;text-shadow:2px 2px 0 #18393b,-1px -1px #18393b;pointer-events:none;white-space:nowrap}.enemy-label{position:absolute;transform:translate(-50%,-50%);width:3rem;height:.23rem;background:#153a3dcc;border:1px solid #fff0ca;pointer-events:none}.enemy-label i{display:block;height:100%;background:#ed9967}.enemy-label.weak{border-color:#ffd75b;box-shadow:0 0 8px #ffda76}.touch-note{position:absolute;bottom:12vh;left:50%;transform:translateX(-50%);background:#143b3de8;padding:.7rem 1rem;border:1px solid var(--cream);font-size:.7rem;text-align:center;pointer-events:auto;z-index:12}.touch-note button{display:block;margin:.6rem auto 0;border:1px solid var(--gold);color:var(--cream);background:#29685d;padding:.4rem .8rem;border-radius:4px}#fade{position:absolute;inset:0;background:#153a3c;pointer-events:none;opacity:0;transition:opacity .35s;z-index:25}#fade.on{opacity:1}#damage-flash{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 100px #de634900;transition:box-shadow .1s}#damage-flash.on{box-shadow:inset 0 0 100px #de63499c}#save-indicator{position:absolute;right:3vw;top:18vh;font-size:.48rem;color:#e4edce;background:#173b3c99;padding:.3rem .5rem;border-radius:4px}#menu-corner{position:absolute;right:2vw;bottom:2vh;pointer-events:auto;background:#153d3dde;color:var(--cream);border:1px solid #d4e2c66b;border-radius:4px;font-size:.6rem;padding:.5rem .8rem;z-index:3}#hud #menu-corner{display:none}.score-line{display:flex;gap:1.5rem;margin:.6rem 0 1.2rem}.score-line div{background:#10313588;padding:.7rem 1rem;border:1px solid #c6d7b633;flex:1}.score-line strong{font:1.5rem Fraunces;color:var(--gold);display:block}.score-line small{font-size:.5rem;color:#c7d9c3}#absorb-meter{position:absolute;left:50%;top:60%;transform:translateX(-50%);width:12rem;text-align:center;font-size:.6rem;color:#ffe49a}.absorb-bar{height:.35rem;border:1px solid var(--cream);background:#123b3c;margin-top:.35rem}.absorb-bar i{display:block;height:100%;background:var(--gold);width:0}#countdown{position:absolute;inset:0;display:grid;place-content:center;text-align:center;background:#173a3b66;font:3rem Fraunces}#countdown small{font:.7rem 'DM Sans';margin-top:1rem;color:#fff3d6}@keyframes float{50%{transform:translateY(-8px)}}@media(max-width:850px){.menu-stack{width:40vw}.logo{font-size:8vw}#title{padding-left:5vw}.tagline{font-size:.73rem;width:40vw}#controls{gap:.6rem;font-size:.46rem}#quest{max-width:12rem}#dialogue{left:8vw;right:8vw}#map-wrap{width:6rem;height:6rem}#hero-panel{width:12rem}.location{font-size:.9rem}.guide-grid{gap:.5rem}#panel h1{font-size:2rem}}@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+#hero-panel{background:#153d3cbd;border:1px solid #f8e9c233;border-radius:6px;padding:.4rem .6rem;width:16.6rem;box-shadow:0 4px 18px #12372b20}#purse{padding:.25rem .5rem;background:#153d3cb3;border-radius:4px}#controls{font-size:.63rem;gap:.95rem}.credit-copy{font-size:.7rem;max-height:none;overflow:visible}.guide-card p{font-size:.69rem}#edition{background:#fff0c9df;padding:.6rem .8rem;border-radius:4px;right:3vw;bottom:9vh}.values{font-size:.52rem}#hero-panel .hero-name{font-size:.66rem}
+
+#boss-hud{left:30%;right:30%}#panel-body{scroll-behavior:smooth}
+</style></head><body><canvas id="game" tabindex="-1" aria-label="Bouncy Blade Mochi game world"></canvas><div id="vignette"></div>
+<div id="ui">
+<div id="load"><div class="sigil">✦</div><h1>A little adventure is rising.</h1><p id="load-text">Warming the kiln · WebGPU required</p></div>
+<section id="title" class="hide"><div class="eyebrow">A pocket-sized epic</div><h1 class="logo">Bouncy Blade<span>Mochi</span></h1><p class="tagline">Borrow a power. Ring in the dawn.<br>Try not to miss breakfast.</p><div class="menu-stack" id="title-buttons"></div><div id="title-foot">✦ &nbsp; 1–2 PLAYERS &nbsp; · &nbsp; CONTROLLER RECOMMENDED</div><div id="edition"><b>THE STOLEN MORNING</b><br>A COMPLETE PLAYABLE CHAPTER<br>WEBGPU EDITION &nbsp; / &nbsp; 01</div></section>
+<div id="hud" class="hide"><div id="hero-panel"><div class="portrait"><svg viewBox="0 0 80 80"><path fill="#204b50" d="M5 80q0-26 34-26t36 26"/><path fill="#f6c48b" d="M19 27h43v23q-5 21-22 19-21-2-21-22"/><path fill="#173c46" d="m12 37 2-20 8 5L33 5l7 13L58 8l1 15 11 2-7 18-8-12-13 6-9-8-11 15Z"/><path fill="#f5844c" d="M13 29q29-11 52 2l-1 6q-29-9-49 0Z"/><path stroke="#173c46" stroke-width="3" d="M29 46v6m22-6v6m-18 9q6 4 13-1"/><path fill="#ed8050" d="m14 60 18 10-5 10-18-16Z"/></svg></div><div class="vitals"><div class="hero-name">MOCHI <span style="font-size:.45rem;opacity:.7">· BELLBEARER</span></div><div class="bar"><i id="hp-fill"></i></div><div class="bar spirit"><i id="sp-fill"></i></div><div class="values"><span id="hp-value">100 / 100</span><span id="sp-value">SPIRIT 100</span></div></div></div><div id="p2" class="p2-panel hide"></div><div class="location"><span id="region">Bellwether</span><small id="time-day">The morning that never was</small></div><div id="quest"><div class="quest-label">THE STOLEN MORNING</div><div id="quest-title">A bell out of order</div><div id="quest-sub">Talk to Mayor Crumb by the fountain.</div></div><div id="purse"><span>◈ <b id="coins">0</b></span><span>✧ <b id="rescue-count">0 / 2</b></span></div><div id="ability"><span class="rune" id="ability-icon">◇</span><div><strong id="ability-name">An empty echo</strong><small id="ability-help">Weaken a foe, then hold R1 / E</small></div></div><div id="map-wrap"><canvas id="map" width="240" height="240"></canvas></div><div id="controls"></div><div id="boss-hud" class="hide"><div class="boss-title">The Kiln King</div><small>HIS ROYAL CRUSTINESS</small><div class="boss-bar"><i id="boss-fill"></i></div><div id="boss-cue"></div></div><div id="prompt" class="hide"></div><div id="save-indicator" class="hide">✦ Chapter saved</div><div id="absorb-meter" class="hide">BORROWING SOMETHING…<div class="absorb-bar"><i id="absorb-fill"></i></div></div></div>
+<div id="labels"></div><div id="floats"></div><div id="toast" class="hide"></div><div id="area-banner" class="hide"></div><div id="dialogue" class="hide"><div id="speaker"></div><div id="speech"></div><div id="dialogue-foot"></div></div><div id="overlay" class="hide"><div id="panel"><div class="eyebrow" id="panel-kicker">FIELD NOTES</div><h1 id="panel-title"></h1><p class="lead" id="panel-lead"></p><div id="panel-body"></div><div class="panel-footer"><span>↑ ↓ / Left stick · Choose &nbsp; ✕ / Enter · Confirm</span><span>○ / Esc · Back</span></div></div></div><div id="attract" class="hide"><div class="attract-tag">✦ &nbsp; A LITTLE ADVENTURE, IN MOTION &nbsp; ✦</div><div class="attract-caption"><strong id="attract-title"></strong><small id="attract-sub"></small><div style="margin-top:.5rem;font-size:.5rem;letter-spacing:.12em">PRESS ANY BUTTON TO PLAY</div></div></div><div id="countdown" class="hide"></div><div id="touch" class="touch-note hide">Controller or keyboard required<button id="touch-settings">Settings</button></div><button id="menu-corner">☷ &nbsp; Settings</button><div id="damage-flash"></div><div id="fade"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three/webgpu';
+import {color, normalWorld, vec3, float} from 'three/tsl';
+import RAPIER from 'rapier';
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const TAU=Math.PI*2, clamp=(x,a,b)=>Math.max(a,Math.min(b,x)), lerp=(a,b,t)=>a+(b-a)*t;
+const V=(x=0,y=0,z=0)=>new THREE.Vector3(x,y,z);
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z);
+const angleDiff=(a,b)=>Math.atan2(Math.sin(a-b),Math.cos(a-b));
+let scene,camera,renderer,world,root,player,players=[],enemies=[],npcs=[],interactables=[],breakables=[],pickups=[],effects=[],projectiles=[],rigs=[],decor=[],dynamics=[],level=0,boss=null;
+let mode='loading',menu=null,lastInputAt=performance.now(),elapsed=0,simTime=0,attractTime=0,attractStep=-1,transitioning=false,dialog=null,paused=false,hubEnded=false,hubResult=false,hubInfo=null;
+let input={x:0,y:0,fire:false}, keys={},pressedKeys=new Set(),padPrevious=[],pads=[],padMode=false,menuIndex=0,menuActions=[],menuReturn='pause',menuCooldown=0,frameNo=0;
+let cameraAngle=.12,cameraDistance=22,shake=0,zoneBanner=0,toastTimer=0,absorbTarget=null,absorbProgress=0,notice='',localJoined=false;
+const defaultSettings={volume:.65,music:.55,voices:true,invertX:false,invertY:false,shake:true,assist:true};
+let settings={...defaultSettings};try{settings={...settings,...JSON.parse(localStorage.getItem('mochi-settings')||'{}')}}catch{}
+const state={hp:100,maxHp:100,sp:100,coins:0,tonics:3,power:null,powers:[],sword:1,fatigue:0,score:0,rescued:[],flags:{},killed:[],opened:[],time:0,kills:0,parries:0,casts:0,absorbed:0,checkpoint:{level:0,x:0,z:11},won:false};
+const palette={ink:0x173b43,cream:0xffe7ac,gold:0xf2bd54,grass:0xb4c96e,darkgrass:0x719b68,stone:0x718b86,rock:0x546f72,teal:0x408e80,leaf:0x599c78,orange:0xe88b48,red:0xce6549,blue:0x487c92,skin:0xffce94};
+
+const ZONES=[
+ {name:'Bellwether',sub:'The town that overslept',color:0xb7dccc,grass:0xb8cb79,radius:25,spawn:[0,12],exit:[0,-17],music:0,quest:'A bell out of order'},
+ {name:'The Hushwood',sub:'Even the birds are whispering',color:0xb3d4bc,grass:0x8ab377,radius:30,spawn:[0,20],exit:[0,-26],music:1,quest:'A spark in the dark'},
+ {name:'The Crown Kiln',sub:'Please do not feed the monarch',color:0x9fbdbb,grass:0x6c8e87,radius:30,spawn:[0,19],exit:[0,-22],music:2,quest:'For whom the breakfast tolls'}
+];
+const POWERS={ember:{name:'Ember pop',icon:'✹',color:0xff9b4e,cost:16,help:'Throw fire · Light braziers',description:'A borrowed spark with delusions of grandeur. Ignites braziers and deals 28 fire damage.'},gust:{name:'Gale twirl',icon:'≋',color:0x8ae4c9,cost:22,help:'Wind burst · Air jump unlocked',description:'A spinning gust that staggers enemies, turns turbines, and grants a second jump.'},quake:{name:'Crumb quake',icon:'◆',color:0xf4c25d,cost:28,help:'Ground slam · Shatter armor',description:'The earth scroll. Shatters cracked stone and the Kiln King’s crusty shield.'}};
+const SPAWNS=[[],[
+ ['cinder',-5,12],['cinder',5,8],['moth',9,4],['cinder',-9,0],['moth',-4,-5],['knight',4,-8],['cinder',-6,-11],['moth',7,-14],['knight',0,-23]
+],[['knight',-5,12],['moth',5,8],['cinder',-8,1],['knight',7,-2],['moth',-4,-5]]];
+const TYPE={cinder:{name:'Cinderbun',hp:58,damage:9,speed:2.4,power:'ember',color:0xe98a47,score:100},moth:{name:'Draft moth',hp:52,damage:8,speed:2.8,power:'gust',color:0x79bbaa,score:120},knight:{name:'Crust guard',hp:90,damage:13,speed:1.9,power:null,color:0x718d97,score:160}};
+const DIALOGUES={
+ mayor:[['MAYOR CRUMB · Acting morning person','Our dawn bell is missing! Without it, the sun refuses to clock in. Frankly, I admire the boundaries.'],['MOCHI · Very small. Very armed.','So I ring the bell, save the town, and get breakfast?'],['MAYOR CRUMB','Exactly. The Kiln King took it north, through the Hushwood. Our baker Pip went after him. Bring them both back before my toast becomes a historical artifact.'],['FIELD NOTE','Strike a foe until its health glows gold. Hold R1 / E nearby to BORROW its power. You keep every power you learn. Now go make some questionable friends!']],
+ pip:[['PIP · Baker, temporarily packaged','Thank crumbs! I was starting to proof in there. The path is sealed by two cold braziers.'],['PIP','Borrow a Cinderbun’s EMBER and toast both braziers. Their sparks will rebuild the bridge. Draft moths lend GALE: useful for the old turbine and for jumping twice.'],['MOCHI','Borrowing fire. Toasting architecture. This rescue is getting expensive.'],['PIP','Come see me in town. First pastry is on the house. The roof is edible. Don’t ask.']],
+ shrine:[['THE EARTH SCROLL · A rather grounded personality','Small feet. Large purpose. Take CRUMB QUAKE, and break what should never have been built.'],['MOCHI','Does that include my reputation?'],['THE EARTH SCROLL','Mostly cracked stone. Also royal armor. Press Triangle / F with Quake selected, or use your heavy blade with R2 / K.']],
+ keeper:[['PEPPER · Keeper of the bell','The King wears a crust that turns aside quick cuts. Heavy strikes and CRUMB QUAKE break it. GALE can interrupt his windup.'],['PEPPER','Watch the floor. Jump the golden shockwaves. Dash through the fire. Guard just before a hit to parry it.'],['MOCHI','Anything else?'],['PEPPER','Yes. If he offers you a biscuit, decline.']],
+ boss:[['THE KILN KING · His royal crustiness','I stole morning so breakfast could last FOREVER! Behold my perfectly reasonable economic policy!'],['MOCHI','Your people are hungry, your bell is stolen, and you smell like burnt elbows.'],['THE KILN KING','INSOLENCE! I shall toast you on BOTH SIDES!']],
+ ending:[['THE KILN KING · Lightly humbled','Perhaps forever breakfast was… slightly overbaked.'],['MOCHI','Next time, try brunch.'],['PEPPER','The bell is home. Dawn can begin again. And Bellwether remembers its little bellbearer.'],['PIP','Hero! Your breakfast is ready!'],['MOCHI','Finally. A quest with sensible rewards.']],
+ inn:[['INNKEEPER NAPPA','A warm bed, a full spirit, and absolutely no prophetic dreams. On the house for bellbearers.'],['MOCHI','Wake me if the world ends. Otherwise, five more minutes.']],
+ tutorial:[['MOCHI','Two swords, one borrowed destiny, and no idea where breakfast went. Let’s fix at least one of those.']]
+};
+
+const Audio={ctx:null,master:null,musicGain:null,sfxGain:null,next:0,step:0,timer:null,zone:0,muted:false,
+ init(){if(this.ctx){this.ctx.resume();return}try{this.ctx=new (window.AudioContext||window.webkitAudioContext)();this.master=this.ctx.createGain();this.master.gain.value=settings.volume;this.master.connect(this.ctx.destination);this.musicGain=this.ctx.createGain();this.musicGain.gain.value=settings.music*.3;this.musicGain.connect(this.master);this.sfxGain=this.ctx.createGain();this.sfxGain.gain.value=.4;this.sfxGain.connect(this.master);this.next=this.ctx.currentTime+.1;this.timer=setInterval(()=>this.schedule(),100)}catch{}},
+ apply(){if(!this.ctx)return;this.master.gain.setTargetAtTime(this.muted?0:settings.volume,this.ctx.currentTime,.08);this.musicGain.gain.setTargetAtTime(settings.music*.3,this.ctx.currentTime,.1)},
+ tone(freq,duration=.13,type='triangle',gain=.12,at=null,slide=0,bus=null){if(!this.ctx||this.muted)return;const t=at??this.ctx.currentTime,o=this.ctx.createOscillator(),g=this.ctx.createGain();o.type=type;o.frequency.setValueAtTime(freq,t);if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(20,freq+slide),t+duration);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(gain,t+.008);g.gain.exponentialRampToValueAtTime(.0001,t+duration);o.connect(g);g.connect(bus||this.sfxGain);o.start(t);o.stop(t+duration+.02)},
+ noise(d=.13,gain=.2,cut=1500){if(!this.ctx||this.muted)return;const n=this.ctx.createBuffer(1,this.ctx.sampleRate*d,this.ctx.sampleRate),data=n.getChannelData(0);for(let i=0;i<data.length;i++)data[i]=(Math.random()*2-1)*(1-i/data.length);const s=this.ctx.createBufferSource(),f=this.ctx.createBiquadFilter(),g=this.ctx.createGain();s.buffer=n;f.type='lowpass';f.frequency.value=cut;g.gain.value=gain;s.connect(f);f.connect(g);g.connect(this.sfxGain);s.start()},
+ sfx(name){if(!this.ctx)return;const t=this.ctx.currentTime;switch(name){case'slash':this.noise(.12,.22,3500);this.tone(500,.13,'sawtooth',.07,t,-360);break;case'hit':this.tone(150,.16,'square',.13,t,-90);this.noise(.1,.2,900);break;case'jump':this.tone(250,.18,'sine',.18,t,450);break;case'dash':this.noise(.22,.13,2700);this.tone(280,.13,'triangle',.1,t,150);break;case'coin':this.tone(880,.08,'sine',.2);this.tone(1320,.18,'sine',.13,t+.06);break;case'parry':[587,880,1175].forEach((f,i)=>this.tone(f,.24,'triangle',.18,t+i*.035));break;case'power':[392,494,587,784].forEach((f,i)=>this.tone(f,.4,'triangle',.22,t+i*.1));break;case'ember':this.noise(.3,.2,3000);this.tone(220,.3,'sawtooth',.14,t,480);break;case'gust':this.noise(.5,.3,5000);break;case'quake':this.noise(.6,.35,220);this.tone(65,.55,'sine',.35,t,-35);break;case'menu':this.tone(587,.09,'triangle',.1);break;case'confirm':this.tone(784,.13,'triangle',.15);break;case'hurt':this.tone(240,.22,'sawtooth',.12,t,-160);break;case'bell':[392,784,1176,1568].forEach((f,i)=>this.tone(f,1.4-i*.13,'sine',.2/(i+1),t));break;case'victory':[392,494,587,784,659,784,1046].forEach((f,i)=>this.tone(f,.5,'triangle',.22,t+i*.16));break;default:this.tone(440,.1)}},
+ voice(text,speaker=''){if(!settings.voices||!this.ctx||this.muted)return;const seed=[...speaker].reduce((a,c)=>a+c.charCodeAt(0),0),base=170+(seed%180),count=Math.min(18,Math.ceil(text.length/5)),t=this.ctx.currentTime;for(let i=0;i<count;i++){const n=(text.charCodeAt((i*5)%text.length)%12);const at=t+i*.085,d=.075+(i%3)*.015,o=this.ctx.createOscillator(),g=this.ctx.createGain(),vowels=[[800,1150],[400,2000],[300,2400],[500,900],[350,700]],v=vowels[(n+i)%5];o.type='sawtooth';o.frequency.setValueAtTime(base*Math.pow(2,(n-5)/18),at);o.frequency.linearRampToValueAtTime(base*Math.pow(2,(n-3)/18),at+d);g.gain.setValueAtTime(.0001,at);g.gain.exponentialRampToValueAtTime(.16,at+.012);g.gain.exponentialRampToValueAtTime(.0001,at+d);o.connect(g);for(const f of v){const filter=this.ctx.createBiquadFilter();filter.type='bandpass';filter.frequency.value=f;filter.Q.value=3;g.connect(filter);filter.connect(this.sfxGain)}o.start(at);o.stop(at+d+.02)}},
+ schedule(){if(!this.ctx||this.muted||mode==='title'||mode==='loading'||hubEnded)return;const now=this.ctx.currentTime;if(this.next<now-.5)this.next=now+.05;const roots=this.zone===2?[146.83,130.81,164.81,110]:this.zone===1?[164.81,130.81,196,146.83]:[196,164.81,130.81,146.83];const melody=[0,7,12,4,7,14,12,7,4,9,12,16,14,7,4,2,0,4,7,12,9,7,4,2,0,7,11,14,12,7,4,2];while(this.next<now+.25){const s=this.step++,r=roots[Math.floor(s/16)%4],t=this.next,tempo=boss?.active&&!boss.dead?.185:.23;if(s%4===0){this.tone(r/2,.36,'triangle',.25,t,0,this.musicGain);this.tone(r,.4,'sine',.1,t,0,this.musicGain)}if(s%2===0){this.tone(r*Math.pow(2,melody[(s/2|0)%32]/12),.24,'triangle',.17,t,0,this.musicGain)}if(s%8===4){this.tone(r*1.5,.5,'sine',.1,t,0,this.musicGain)}if(s%4===2)this.tone(120,.06,'triangle',.09,t,-60,this.musicGain);this.next+=tempo}},
+ stop(){this.muted=true;this.apply()}
+};
+
+const materials=new Map(), geometries=new Map();
+function mat(c,unlit=false){const key=c+':'+unlit;if(materials.has(key))return materials.get(key);const m=new THREE.MeshBasicNodeMaterial();if(unlit)m.color=new THREE.Color(c);else m.colorNode=color(c).mul(normalWorld.dot(vec3(-.35,.85,.4)).mul(.5).add(.5).mul(4).floor().div(4).mul(.46).add(.59));materials.set(key,m);return m}
+const outlineMat=new THREE.MeshBasicMaterial({color:palette.ink,side:THREE.BackSide});
+function mesh(geo,c,parent=root,outline=false){const m=new THREE.Mesh(geo,mat(c));if(parent)parent.add(m);if(outline){const ink=new THREE.Mesh(geo,outlineMat);ink.scale.setScalar(1.045);m.add(ink)}return m}
+function box(w,h,d,c,x=0,y=0,z=0,parent=root,outline=false){const m=mesh(new THREE.BoxGeometry(w,h,d),c,parent,outline);m.position.set(x,y,z);return m}
+function ball(r,c,x=0,y=0,z=0,parent=root,detail=0,outline=false){const m=mesh(new THREE.IcosahedronGeometry(r,detail),c,parent,outline);m.position.set(x,y,z);return m}
+function cyl(rt,rb,h,c,x=0,y=0,z=0,parent=root,n=10,outline=false){const m=mesh(new THREE.CylinderGeometry(rt,rb,h,n),c,parent,outline);m.position.set(x,y,z);return m}
+function cone(r,h,c,x=0,y=0,z=0,parent=root,n=7){return cyl(0,r,h,c,x,y,z,parent,n,true)}
+function torus(r,t,c,x=0,y=0,z=0,parent=root){const m=mesh(new THREE.TorusGeometry(r,t,5,30),c,parent);m.position.set(x,y,z);return m}
+function disk(r,c,x,y,z,parent=root){const m=mesh(new THREE.CircleGeometry(r,32),c,parent);m.rotation.x=-Math.PI/2;m.position.set(x,y,z);return m}
+function shadow(x,z,r=1,parent=root){const m=disk(r,0x456b5944,x,.035,z,parent);m.material=new THREE.MeshBasicMaterial({color:0x173c3b,transparent:true,opacity:.18,depthWrite:false});m.scale.z=.65;return m}
+function fixedBox(x,y,z,w,h,d){const co=world.createCollider(RAPIER.ColliderDesc.cuboid(w/2,h/2,d/2).setTranslation(x,y,z));return co}
+function path(points,width=3,c=0xedda9b){const shape=new THREE.Shape(),left=[],right=[];for(let i=0;i<points.length;i++){const prev=points[Math.max(0,i-1)],next=points[Math.min(points.length-1,i+1)],dx=next[0]-prev[0],dz=next[1]-prev[1],len=Math.hypot(dx,dz)||1;left.push([points[i][0]-dz/len*width/2,-points[i][1]+dx/len*width/2]);right.push([points[i][0]+dz/len*width/2,-points[i][1]-dx/len*width/2])}shape.moveTo(...left[0]);left.slice(1).forEach(v=>shape.lineTo(...v));right.reverse().forEach(v=>shape.lineTo(...v));shape.closePath();const m=mesh(new THREE.ShapeGeometry(shape),c);m.rotation.x=-Math.PI/2;m.position.y=.025;return m}
+function textSprite(text,color='#fff3d5',scale=1.3,parent=root){const cv=document.createElement('canvas');cv.width=512;cv.height=128;const ctx=cv.getContext('2d');ctx.fillStyle='#163c3dd9';ctx.beginPath();ctx.roundRect(4,20,504,90,16);ctx.fill();ctx.strokeStyle='#ffe4a3';ctx.lineWidth=3;ctx.stroke();ctx.font='bold 40px sans-serif';ctx.fillStyle=color;ctx.textAlign='center';ctx.fillText(text,256,80);const tx=new THREE.CanvasTexture(cv);tx.colorSpace=THREE.SRGBColorSpace;const m=new THREE.Sprite(new THREE.SpriteMaterial({map:tx,depthTest:true}));m.scale.set(scale*4,scale,1);parent.add(m);return m}
+function tree(x,z,s=1,variant=0){const g=new THREE.Group();root.add(g);g.position.set(x,0,z);g.scale.setScalar(s);cyl(.23,.43,3.8,0x896c49,0,1.9,0,g,7,true);for(let k=0;k<3;k++){const a=k*2.1;const b=cyl(.12,.2,2.1,0x896c49,Math.sin(a)*.7,2.9,Math.cos(a)*.7,g,5);b.rotation.z=.55*Math.cos(a);b.rotation.x=.55*Math.sin(a)}const colors=variant===1?[0xe3b65b,0xefcc73,0xd49d4d]:[0x5e9f7b,0x83b482,0x9cc789];for(let i=0;i<5;i++){const a=i*2.4;const t=ball(1.7+(i%2)*.35,colors[i%3],Math.sin(a)*1.1,4.2+(i%2)*.85,Math.cos(a)*1.1,g,1);t.scale.y=.85;t.material=t.material.clone();t.material.transparent=true;decor.push({kind:'crown',obj:t,x,z,r:s*2.5})}shadow(x,z,2.3*s);fixedBox(x,1.6*s,z,.65*s,3.2*s,.65*s);return g}
+function rock(x,z,s=1,c=palette.rock){const m=ball(s,c,x,s*.35,z,root,0,true);m.scale.set(1,.65,.9);m.rotation.set(.2,Math.random()*6,.1);return m}
+function grassTuft(x,z,c=0xe7d58b,s=1){const g=new THREE.Group();g.position.set(x,.02,z);root.add(g);for(let i=0;i<3;i++){const blade=cone(.09*s,.5*s,c,(i-1)*.13,.25*s,0,g,3);blade.rotation.z=(i-1)*-.24}return g}
+function flower(x,z,c=0xffe7a6,s=.6){cyl(.025,.025,s*.7,0x628a58,x,s*.35,z);for(let i=0;i<4;i++){const a=i*TAU/4;ball(.13,c,x+Math.sin(a)*.14,s*.75,z+Math.cos(a)*.14)}ball(.1,0xe9aa4d,x,s*.78,z)}
+function fence(x,z,length=4,rot=0){const g=new THREE.Group();root.add(g);g.position.set(x,0,z);g.rotation.y=rot;for(let i=0;i<=length;i+=2){box(.16,1.1,.16,0xf4dda3,i-length/2,.55,0,g,true);cone(.16,.2,0xf4dda3,i-length/2,1.2,0,g,4)}box(length,.13,.12,0xd7bd84,0,.4,0,g);box(length,.13,.12,0xd7bd84,0,.82,0,g);return g}
+function bannerPole(x,z,color=0xe68d4e){cyl(.055,.09,4,palette.ink,x,2,z);ball(.14,palette.gold,x,4.1,z);const g=new THREE.Group();g.position.set(x,3.5,z);root.add(g);box(1.1,1.8,.045,color,.62,-.5,0,g);box(.75,.18,.065,0xffdca0,.62,-.15,.02,g);box(.18,.8,.065,0xffdca0,.62,-.4,.025,g);decor.push({kind:'banner',obj:g,seed:x});return g}
+function cottage(x,z,c=0xce6b4d,s=1,label=''){const g=new THREE.Group();root.add(g);g.position.set(x,0,z);g.scale.setScalar(s);shadow(x,z,3.3*s);cyl(2.2,2.4,3.2,0xffdc9d,0,1.6,0,g,8,true);cyl(2.6,3,1.5,c,0,3.65,0,g,8,true);cone(2.65,2.1,c,0,4.6,0,g,8);cyl(.45,.5,1.4,palette.rock,1.2,4.8,-.5,g,6,true);for(let i=0;i<3;i++){const smoke=ball(.3+i*.15,0xd6dfc4,1.2,5.8+i*.6,-.5,g,1);decor.push({kind:'smoke',obj:smoke,base:smoke.position.clone(),seed:i})}box(1.2,2,.18,0x5e7867,0,1.03,2.22,g,true);cyl(.6,.6,.1,0x5e7867,0,2.05,2.22,g,10).rotation.x=Math.PI/2;ball(.08,palette.gold,.35,1.1,2.35,g);for(const side of [-1,1]){const w=cyl(.47,.47,.1,0xffbd5c,side*1.45,1.85,1.75,g,12,true);w.rotation.x=Math.PI/2;box(.08,.8,.15,0x617e6a,side*1.45,1.85,1.85,g);box(.8,.08,.15,0x617e6a,side*1.45,1.85,1.85,g)}box(4.4,.17,.15,0x916d4c,0,2.9,2,g);if(label){const t=textSprite(label,'#ffefc6',.55,g);t.position.set(0,3.1,2.65)}fixedBox(x,1.5*s,z,4.1*s,3*s,4.1*s);return g}
+function lantern(x,z,y=1.5){const g=new THREE.Group();g.position.set(x,y,z);root.add(g);cyl(.28,.18,.65,0xffd680,0,0,0,g,6,true);cyl(.34,.34,.1,0x48695c,0,.35,0,g);cone(.4,.3,0x5e8070,0,.52,0,g,6);decor.push({kind:'lantern',obj:g,base:g.position.clone(),seed:x+z});return g}
+function arch(x,z,label,kind='exit'){const g=new THREE.Group();root.add(g);g.position.set(x,0,z);for(const s of [-1,1]){box(1,4,1.4,0x839787,s*2.5,2,0,g,true);box(1.4,.35,1.7,0xa4b296,s*2.5,4,0,g,true);ball(.35,palette.gold,s*2.5,4.5,0,g)}box(6,.75,1.5,0xb2bf9b,0,4.2,0,g,true);const t=textSprite(label,'#fff0c6',.7,g);t.position.set(0,4.4,1);const ring=torus(1.9,.06,0xf7cb69,0,2.1,0,g);decor.push({kind:'portal',obj:ring});disk(2,0xdbc78e,x,.04,z);return {g,kind,x,z}}
+function fountain(){const g=new THREE.Group();root.add(g);g.position.set(0,0,3);cyl(2.8,3,.5,0xc2b99a,0,.25,0,g,12,true);cyl(2.4,2.4,.08,0x74c8bc,0,.53,0,g,24);cyl(.75,1.1,1.8,0x7c9785,0,1.4,0,g,8,true);cyl(1.5,1.2,.3,0xe1cca0,0,2.3,0,g,12,true);cyl(.6,.7,1.1,0x7c9785,0,2.9,0,g,8);const ring=torus(.65,.08,palette.gold,0,3.8,0,g);decor.push({kind:'relic',obj:ring,base:ring.position.clone()});for(let i=0;i<8;i++){const a=i*TAU/8;const drop=ball(.1,0xa4e9d3,Math.sin(a)*1.2,1.2,Math.cos(a)*1.2,g);decor.push({kind:'water',obj:drop,seed:i,base:drop.position.clone()})}fixedBox(0,.5,3,4.8,1,4.8);return g}
+function windmill(x,z){const g=cottage(x,z,0x678f7f,1.1,'FLOUR POWER');const tower=cyl(1.25,2,6,0xe9d7a4,0,5,0,g,8,true);cone(1.8,1.8,0xc7764c,0,8.7,0,g,8);const hub=new THREE.Group();g.add(hub);hub.position.set(0,6.5,1.5);ball(.35,palette.ink,0,0,0,hub);for(let i=0;i<4;i++){const arm=new THREE.Group();hub.add(arm);arm.rotation.z=i*Math.PI/2;box(.16,3,.12,0x796a48,0,1.5,0,arm);box(.75,2,.15,0xf5dfac,.3,1.85,.04,arm,true);for(let j=0;j<3;j++)box(.8,.06,.18,0x9c8558,.3,1.1+j*.65,.05,arm)}decor.push({kind:'mill',obj:hub});return g}
+function crystalCage(x,z,id){const g=new THREE.Group();g.position.set(x,0,z);root.add(g);cyl(1.4,1.7,.3,0x778c80,0,.15,0,g,8,true);const cage=mesh(new THREE.IcosahedronGeometry(1.65,0),0xefa75a,g,true);cage.position.y=1.5;cage.scale.y=1.2;cage.material=new THREE.MeshBasicMaterial({color:0xf8bf59,transparent:true,opacity:.33,wireframe:false,depthWrite:false});for(let i=0;i<5;i++){const a=i*TAU/5;const b=box(.08,2.8,.08,palette.gold,Math.sin(a)*1.2,1.5,Math.cos(a)*1.2,g);b.rotation.z=Math.sin(a)*-.15}const npc=createRig(id==='pip'?'baker':'keeper');npc.group.position.set(0,.2,0);g.add(npc.group);npc.group.scale.setScalar(.8);const o={kind:'cage',id,x,z,y:0,obj:g,cage,rig:npc,hp:65};interactables.push(o);return o}
+function brazier(x,z,id){const g=new THREE.Group();root.add(g);g.position.set(x,0,z);cyl(.55,.8,.35,0x6c817b,0,.18,0,g,6,true);cyl(.25,.4,1.25,0x718d80,0,.9,0,g,6,true);cyl(.65,.35,.5,0x314e50,0,1.6,0,g,8,true);const flame=cone(.43,1.15,0xffb653,0,2.25,0,g,6);flame.visible=false;const o={kind:'brazier',id,x,z,obj:g,flame,lit:!!state.flags[id]};flame.visible=o.lit;interactables.push(o);decor.push({kind:'flame',obj:flame});return o}
+function turbine(x,z,id){const g=new THREE.Group();g.position.set(x,0,z);root.add(g);cyl(.45,.7,2.3,0x81968d,0,1.15,0,g,6,true);const hub=new THREE.Group();g.add(hub);hub.position.y=2.8;for(let i=0;i<5;i++){const b=box(.4,1.6,.15,0x89d8bf,0,1.1,0,hub,true);const pivot=new THREE.Group();hub.add(pivot);pivot.rotation.z=i*TAU/5;pivot.add(b)}ball(.3,palette.gold,0,0,.1,hub);const o={kind:'turbine',id,x,z,obj:g,hub,on:!!state.flags[id]};interactables.push(o);decor.push({kind:'turbine',obj:hub,data:o});return o}
+function chest(x,y,z,id){const g=new THREE.Group();root.add(g);g.position.set(x,y,z);box(1.35,.65,.9,0x875e40,0,.4,0,g,true);const lid=box(1.4,.35,.95,0xdbad50,0,.92,0,g,true);box(.18,.8,.97,0xf8d579,0,.62,0,g);box(1.4,.16,.15,0xe2b75a,0,.65,.49,g);const o={kind:'chest',id,x,y,z,obj:g,lid,opened:state.opened.includes(id)};if(o.opened)lid.rotation.x=-1.1;interactables.push(o);return o}
+function crate(x,z,id){if(state.opened.includes(id))return;const m=box(.95,.95,.95,0xb18b50,x,.7,z,root,true);box(.98,.12,1,0xe6bc70,0,-.25,0,m);box(.98,.12,1,0xe6bc70,0,.25,0,m);const brace=box(.12,1.1,1.01,0xd7ad66,0,0,0,m);brace.rotation.z=.65;const rb=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.7,z).setLinearDamping(2));world.createCollider(RAPIER.ColliderDesc.cuboid(.48,.48,.48).setMass(5).setFriction(.8),rb);const o={kind:'crate',id,obj:m,body:rb,hp:25};breakables.push(o);dynamics.push(o);return o}
+function createRig(kind='hero',c=0xe8784e){const g=new THREE.Group(),body=new THREE.Group(),head=new THREE.Group(),arms=[],legs=[];g.add(body);let s=1;const hero=kind==='hero'||kind==='friend',npc=['mayor','baker','keeper','inn','shop','smith'].includes(kind),cinder=kind==='cinder',moth=kind==='moth',knight=kind==='knight';
+ if(hero||npc||knight){const coat=hero?(kind==='friend'?0x508f98:0x3d777d):knight?0x698994:kind==='mayor'?0x765b7b:kind==='baker'?0xf3dbb1:0x78916b;const torso=box(.76,.8,.48,coat,0,1.15,0,body,true);box(.81,.17,.52,0xde9a52,0,.9,0,body);body.add(head);head.position.y=1.9;ball(.47,palette.skin,0,0,0,head,1,true);if(knight){box(.95,.65,.82,0x7c9ba4,0,.08,0,head,true);box(.68,.11,.09,palette.ink,0,.05,.44,head);cone(.14,.65,0xe9af4d,0,.66,0,head,4)}else{const hair=ball(.49,hero?0x244754:0x766040,0,.18,-.04,head,0);hair.scale.y=.65;for(let i=0;i<6;i++){const a=i*TAU/6;const spike=cone(.18,.45,hero?0x244754:0x766040,Math.sin(a)*.37,.38,Math.cos(a)*.37,head,4);spike.rotation.z=-Math.sin(a)*.8;spike.rotation.x=Math.cos(a)*.8}for(const side of [-1,1]){ball(.055,palette.ink,side*.17,.02,.425,head,1);ball(.065,0xf1a37b,side*.29,-.1,.37,head)}box(.15,.035,.045,0x9d5846,0,-.23,.44,head);if(hero){const band=cyl(.5,.5,.15,kind==='friend'?0x9edbc0:0xf18c4e,0,.19,0,head,9);const tail=box(.2,.7,.08,kind==='friend'?0x9edbc0:0xf18c4e,.44,-.15,-.24,head);tail.rotation.z=-.7}if(kind==='baker'){cyl(.5,.5,.16,0xffefd1,0,.47,0,head,8,true);ball(.47,0xffefd1,0,.73,0,head,1)}if(kind==='mayor'){cyl(.55,.55,.13,palette.ink,0,.5,0,head,10);cyl(.36,.4,.65,0x664f70,0,.8,0,head,8);box(.26,.1,.1,0xe9bb67,0,-.2,.49,head)}}
+ for(const side of [-1,1]){const arm=new THREE.Group();body.add(arm);arm.position.set(side*.51,1.48,0);ball(.2,coat,0,0,0,arm);box(.23,.55,.24,coat,0,-.27,0,arm,true);ball(.15,palette.skin,0,-.58,0,arm);arms.push(arm);const leg=new THREE.Group();g.add(leg);leg.position.set(side*.22,.8,0);box(.25,.6,.28,0x354f58,0,-.28,0,leg,true);box(.31,.2,.48,0x765d42,0,-.62,.08,leg,true);legs.push(leg)}
+ if(hero||knight){const sw=new THREE.Group();arms[1].add(sw);sw.position.set(0,-.56,.13);sw.rotation.x=-.4;box(.12,1.45,.18,0xd5e7dc,0,-.72,0,sw,true);cone(.16,.35,0xffeec2,0,-1.56,0,sw,4).rotation.z=Math.PI;box(.65,.13,.28,palette.gold,0,0,0,sw,true);box(.13,.35,.15,0x5c6356,0,.2,0,sw);if(hero){const big=box(.25,1.9,.17,0xd4c597,-.4,1.22,-.4,body,true);big.rotation.z=-.5;box(.7,.13,.25,0xa9aa75,-.8,2,-.4,body)}}
+ if(kind==='keeper'){torus(.5,.07,palette.gold,0,.4,0,head).rotation.x=Math.PI/2}
+ }else if(cinder){const blob=ball(.7,0xe9904c,0,.8,0,body,1,true);blob.scale.y=.85;cone(.45,.9,0xffcb65,0,1.55,0,body,6);for(const side of [-1,1]){ball(.1,palette.ink,side*.22,.9,.57,body);box(.18,.045,.08,0xfff2bc,side*.22,1.03,.6,body);ball(.2,0x805342,side*.4,.16,.17,body)}box(.26,.08,.1,palette.ink,0,.65,.68,body)}else if(moth){ball(.42,0x508b8c,0,1.2,0,body,1,true);for(const side of [-1,1]){const wing=ball(.7,0xa1dcc0,side*.65,1.4,0,body,0,true);wing.scale.set(1.1,1,.17);arms.push(wing);ball(.12,palette.cream,side*.18,1.5,.35,body);cyl(.035,.035,.7,palette.ink,side*.2,1.8,0,body,5).rotation.z=-side*.4}ball(.2,palette.gold,0,2,0,body)}
+ const sh=shadow(0,0,hero?.65:.75,g);const rig={group:g,body,head,arms,legs,kind,shadow:sh,phase:Math.random()*6,walk:0};rigs.push(rig);return rig}
+function makeBoss(x,z){const g=new THREE.Group();root.add(g);g.position.set(x,0,z);const body=new THREE.Group();g.add(body);const b=ball(2.6,0x597f84,0,3,0,body,1,true);b.scale.set(1,1.15,.8);cyl(1.6,2,.9,0xe7b766,0,5.6,0,body,10,true);for(let i=0;i<6;i++){const a=i*TAU/6;cone(.25,.85,0xe8bd62,Math.sin(a)*1.4,6.4,Math.cos(a)*1.4,body,4)}box(2.6,.8,.2,palette.ink,0,3.8,2.1,body,true);for(const s of [-1,1]){box(.45,.19,.24,0xffd56b,s*.7,3.9,2.25,body);cyl(.55,.7,1.6,0x3e5f69,s*1.2,.9,0,body,8,true);box(1.2,.6,1.8,0x365664,s*1.2,.35,.4,body,true);ball(.75,0xd3ac68,s*2.5,4,0,body,0,true);const arm=box(.8,2.3,.8,0x4a6c75,s*2.7,2.85,.2,body,true);arm.rotation.z=-s*.25}const hammer=new THREE.Group();hammer.position.set(3.4,1.5,.9);body.add(hammer);cyl(.12,.12,3,0x986b49,0,1.2,0,hammer,6);box(2.2,1.2,1.4,0xe5bc67,0,2.7,0,hammer,true);const belly=cyl(1.3,1.3,.2,0xb9a171,0,2.4,2,body,10,true);belly.rotation.x=Math.PI/2;box(.25,1.4,.12,0xe2d390,0,2.4,2.2,body);box(1.4,.25,.12,0xe2d390,0,2.4,2.2,body);shadow(x,z,3.5);return {obj:g,body,hammer,x,z,hp:460,maxHp:460,shield:80,maxShield:80,exposed:0,active:false,dead:false,timer:2.5,attack:0,windup:0,stun:0,phase:1,pulses:[],hit:0}}
+function buildEnvironment(zone){const zd=ZONES[zone];scene.background=new THREE.Color(zd.color);scene.fog=new THREE.Fog(zd.color,55,115);const base=cyl(zd.radius-1,zd.radius-4,4,zone===2?0x425f68:0x6e8e79,0,-2.6,0,root,14,true);base.scale.z=zone===0?.85:1.1;const top=cyl(zd.radius,zd.radius-1,1,zd.grass,0,-.5,0,root,14,true);top.scale.z=zone===0?.85:1.1;fixedBox(0,-.7,0,zone===0?49:59,1.4,zone===0?42:64);
+ for(let i=0;i<22;i++){const a=i*TAU/22,r=zd.radius+Math.random()*2;rock(Math.sin(a)*r,Math.cos(a)*r*(zone===0?.8:1),1.4+Math.random()*1.7,0x719180)}
+ for(let i=0;i<11;i++){const a=i*TAU/11;const r=42+Math.random()*22;const g=new THREE.Group();root.add(g);g.position.set(Math.sin(a)*r,-7-Math.random()*7,Math.cos(a)*r);cyl(4,0,9,0x719c96,0,0,0,g,5);cyl(4.1,3.8,.7,0x9abf98,0,4.7,0,g,5);for(let j=0;j<3;j++)ball(3.2,0xe5e5c6,j*2,7,-2,g,1)}
+ if(zone===0){path([[0,17],[0,8],[0,1],[0,-6],[0,-18]],3.5);path([[-15,10],[-8,8],[0,8],[8,7],[15,10]],3);path([[-12,-5],[-6,-3],[0,0],[9,-4]],2.6);disk(5.8,0xe7d59e,0,.03,3);fountain();cottage(-11,7,0xd87c53,1.2,'THE SNOOZING SPOON');cottage(11,8,0x4f8c83,1.1,'ODDS & SCONES');cottage(-10,-7,0xdba855,1,'PIP’S BAKERY');windmill(12,-8);arch(0,-17,'THE HUSHWOOD');for(const [x,z,s,v] of [[-19,0,1.2,1],[-17,15,1,0],[19,17,.9,1],[-18,-13,1.1,0],[20,-8,.9,0],[7,18,.8,0]])tree(x,z,s,v);for(const x of [-7,7])bannerPole(x,-11);for(let i=0;i<4;i++){fence(-15+i*3.8,-.5,3);fence(7+i*3.8,16,3)}for(const p of [[-3,11],[4,8],[-3,-8],[4,-13]])lantern(...p);const mayor=createRig('mayor');mayor.group.position.set(-4,0,5);root.add(mayor.group);npcs.push({kind:'npc',id:'mayor',name:'Mayor Crumb',x:-4,z:5,rig:mayor});const inn=createRig('inn');inn.group.position.set(-10,0,11);root.add(inn.group);npcs.push({kind:'npc',id:'inn',name:'Rest at the inn',x:-10,z:11,rig:inn});const shop=createRig('shop');shop.group.position.set(10,0,11.7);root.add(shop.group);npcs.push({kind:'npc',id:'shop',name:'Odds & Scones',x:10,z:11.7,rig:shop});const smith=createRig('smith');smith.group.position.set(7,0,-4);root.add(smith.group);box(2,.65,1.1,0x4d6970,8,.4,-4);npcs.push({kind:'npc',id:'smith',name:'Forge your blade',x:7,z:-4,rig:smith});if(state.rescued.includes('pip')){const pp=createRig('baker');pp.group.position.set(-10,0,-3);root.add(pp.group);npcs.push({kind:'npc',id:'baker',name:'Pip’s pastries',x:-10,z:-3,rig:pp})}chest(18,0,5,'town-chest');for(let i=0;i<6;i++)crate(5+i%3*1.2,14+Math.floor(i/3)*1.2,'tcrate'+i);}
+ if(zone===1){path([[0,24],[0,17],[-3,10],[-2,4],[3,-3],[0,-11],[0,-27]],3.6,0xd9d39b);path([[-3,7],[-10,4],[-11,-1]],2);path([[0,6],[8,7],[14,2]],2);for(let i=0;i<32;i++){const side=i%2?-1:1;const x=side*(14+Math.random()*11),z=-24+Math.random()*48;tree(x,z,.8+Math.random()*.65,i%5===0?1:0)}for(const p of [[-9,15,.9],[10,13,1],[-12,-11,1.1],[12,-19,1],[-8,-23,1]])tree(...p);const stream=box(54,.035,5.8,0x70bcb3,0,.05,-18);for(let i=0;i<18;i++){box(1.1,.02,.08,0xb4e7cd,-24+i*2.9,.08,-18+(i%3-1)*1.2)}for(let i=0;i<7;i++){const m=box(3.8,.22,.65,0xad965f,0,.3,-20.4+i*.8);m.visible=!!state.flags.bridge;decor.push({kind:'bridge',obj:m})}brazier(-3.8,-13,'fire1');brazier(3.8,-13,'fire2');arch(0,-26,'THE CROWN KILN');arch(0,24,'BELLWETHER');crystalCage(-10,2,'pip');if(state.rescued.includes('pip'))interactables.at(-1).obj.visible=false;turbine(10,2,'wind1');for(let i=0;i<3;i++){box(2.6,.7+i*.8,2.6,0x94ab82,12+i*3,.35+i*.4,2-(i%2)*2,root,true);fixedBox(12+i*3,.35+i*.4,2-(i%2)*2,2.6,.7+i*.8,2.6)}chest(18,2.3,2,'wind-chest');const seal=box(3.8,3.2,.5,0x4c6f68,0,1.6,-15.8,root,true);const sealCollider=fixedBox(0,1.6,-15.8,4,3.2,.5);interactables.push({kind:'gate',id:'forest-gate',x:0,z:-15.8,obj:seal,collider:sealCollider,open:false});if(state.flags.bridge){seal.visible=false;world.removeCollider(sealCollider,true);interactables.at(-1).open=true}for(let i=0;i<9;i++)crate(-5+i%3*1.3,17-Math.floor(i/3)*2,'fcrate'+i);for(const p of [[-4,21],[4,-23]])checkpoint(...p);}
+ if(zone===2){path([[0,22],[0,13],[0,3],[0,-8],[0,-25]],6,0xa3aa8e);for(let x=-18;x<=18;x+=6)for(let z=-24;z<=23;z+=6){const t=box(5.7,.1,5.7,(x+z)%12===0?0x80958a:0x899e8b,x,.02,z);box(4,.02,.12,0xaab79c,x,.08,z);box(.12,.02,4,0xaab79c,x,.08,z)}for(const s of [-1,1]){for(let i=0;i<6;i++){const z=17-i*7;box(1.9,.4,1.9,0x526d70,s*13,.25,z,root,true);cyl(.65,.9,5+(i%2),0x8b9e8b,s*13,2.8,z,root,7,true);box(2,.4,2,0xb9b797,s*13,5.5,z,root,true);if(i%2===0)bannerPole(s*12,z,0xba6c4c)}box(3,.1,53,0xeaa457,s*20,.03,0);for(let i=0;i<20;i++)cone(.5,1.1,0xf6bf65,s*20,.35,24-i*2.6,root,5)}arch(0,23,'THE HUSHWOOD');const altar=new THREE.Group();root.add(altar);altar.position.set(-6,0,5);cyl(1.6,2,.45,0xb1ad8a,0,.25,0,altar,8,true);cyl(.45,.7,1.6,0x587d78,0,1.1,0,altar,6,true);const scroll=box(.9,.18,.55,0xf8df94,0,2.1,0,altar,true);const rr=torus(.8,.06,palette.gold,0,2.3,0,altar);decor.push({kind:'relic',obj:rr,base:rr.position.clone()});interactables.push({kind:'shrine',x:-6,z:5,obj:altar});crystalCage(8,-1,'keeper');if(state.rescued.includes('keeper'))interactables.at(-1).obj.visible=false;const wall=box(2.8,3.5,2.8,0xbbaa7e,8,1.75,-1,root,true);box(.07,3.5,2.84,palette.ink,8,1.8,-1,root).rotation.z=.35;interactables.push({kind:'crack',x:8,z:-1,obj:wall,broken:!!state.flags.crack});wall.visible=!state.flags.crack;turbine(0,-7,'wind2');const door=box(7,4,.7,0x45696c,0,2,-10,root,true);for(let i=0;i<5;i++)box(.18,3.6,.8,0xd1ae67,(i-2)*1.3,0,0,door);const co=fixedBox(0,2,-10,7,4,.8);interactables.push({kind:'gate',id:'boss-gate',x:0,z:-10,obj:door,collider:co,open:false});if(state.flags.wind2){door.visible=false;world.removeCollider(co,true);interactables.at(-1).open=true}disk(9.3,0x647f7b,0,.09,-20);for(let i=0;i<16;i++){const a=i*TAU/16;const m=box(.5,.05,1.5,0xd0b776,Math.sin(a)*8.5,.13,-20+Math.cos(a)*8.5);m.rotation.y=a}boss=makeBoss(0,-22);if(state.won){boss.dead=true;boss.obj.visible=false}const bell=cyl(1.1,1.6,2,0xf4cb72,0,8,-24,root,12,true);cyl(1.6,1.6,.2,0xdba850,0,7,-24);torus(.35,.1,palette.gold,0,9.3,-24);decor.push({kind:'bell',obj:bell});checkpoint(-4,16);for(let i=0;i<6;i++)crate(-8+i%2*1.3,14-(i/2|0)*2,'kcrate'+i);chest(-9,0,-4,'kiln-chest');}
+ for(let i=0;i<95;i++){const x=(Math.random()-.5)*(zone===0?43:48),z=(Math.random()-.5)*(zone===0?33:51);if(Math.abs(x)<3)continue;if(zone===2){if(i%4===0)rock(x,z,.35+Math.random()*.5,0xa6aa88)}else{grassTuft(x,z,zone===1?0xc3dba3:0xe5d58e,.5+Math.random()*.8);if(i%3===0)flower(x+.3,z,zone===1?0xffe7c6:0xffe1a1,.4+Math.random()*.4)}}for(let i=0;i<28;i++){const b=ball(.045,zone===2?0xffc26b:0xfff1a8,(Math.random()-.5)*45,1+Math.random()*6,(Math.random()-.5)*45);decor.push({kind:'mote',obj:b,base:b.position.clone(),seed:i})}
+}
+function checkpoint(x,z){const g=new THREE.Group();root.add(g);g.position.set(x,0,z);cyl(.65,.8,.3,0x8b9e88,0,.15,0,g,8,true);cyl(.1,.1,2.8,0x5d7770,0,1.5,0,g,7);const bell=cyl(.4,.6,.75,0xf0c56c,0,2.25,0,g,8,true);torus(.2,.06,palette.gold,0,2.85,0,g);interactables.push({kind:'checkpoint',x,z,obj:g});decor.push({kind:'smallbell',obj:bell,seed:x})}
+function animateRig(r,dt,speed=0,attack=0,guard=false,air=false){r.phase+=dt*(speed>0?10:2);r.walk=lerp(r.walk,speed>0?1:0,Math.min(dt*10,1));const w=Math.sin(r.phase)*r.walk;r.body.position.y=Math.abs(Math.cos(r.phase))*r.walk*.08+Math.sin(elapsed*2+r.phase)*.025;r.body.rotation.z=guard?-.12:0;r.body.rotation.x=guard?.15:0;if(r.legs.length){r.legs[0].rotation.x=w*.75;r.legs[1].rotation.x=-w*.75;for(let i=0;i<r.arms.length;i++){r.arms[i].rotation.x=(i%2?-1:1)*w*.6;r.arms[i].rotation.z=(i%2?-.1:.1)}if(guard){r.arms[1].rotation.x=-1.2;r.arms[1].rotation.z=-1}if(attack>0){const t=1-attack/.34;r.arms[1].rotation.x=-1.4;r.arms[1].rotation.z=Math.sin(t*Math.PI)*-2.4;r.body.rotation.y=Math.sin(t*Math.PI)*-.6}else r.body.rotation.y=lerp(r.body.rotation.y,0,dt*15);if(air)r.legs.forEach((l,i)=>l.rotation.x=i?.6:-.5)}if(r.kind==='cinder'){r.body.scale.y=1+Math.sin(elapsed*5+r.phase)*.1;r.body.position.y=Math.abs(Math.sin(elapsed*3+r.phase))*.14}if(r.kind==='moth'){r.body.position.y=Math.sin(elapsed*4+r.phase)*.25;r.arms.forEach((w,i)=>w.rotation.y=(i?1:-1)*(.25+Math.sin(elapsed*18)*.5))}if(r.shadow)r.shadow.position.y=.035-r.group.position.y}
+function animateDecor(dt){for(const d of decor){const o=d.obj;switch(d.kind){case'crown':{const dx=d.x-(player?.x||0),dz=d.z-(player?.z||0),front=dx*Math.sin(cameraAngle)+dz*Math.cos(cameraAngle),side=dx*Math.cos(cameraAngle)-dz*Math.sin(cameraAngle),fade=mode==='play'&&front>0&&front<12&&Math.abs(side)<d.r;o.material.opacity=lerp(o.material.opacity,fade?.18:1,Math.min(1,dt*7));o.material.depthWrite=o.material.opacity>.9;o.children.forEach(c=>c.visible=o.material.opacity>.7);break}case'mill':o.rotation.z-=dt*.32;break;case'banner':o.rotation.y=Math.sin(elapsed*2+d.seed)*.15;break;case'lantern':o.position.y=d.base.y+Math.sin(elapsed*1.7+d.seed)*.14;o.rotation.z=Math.sin(elapsed+d.seed)*.05;break;case'mote':o.position.set(d.base.x+Math.sin(elapsed*.3+d.seed)*1.4,d.base.y+Math.sin(elapsed+d.seed)*.5,d.base.z+Math.cos(elapsed*.2+d.seed));break;case'relic':o.rotation.y+=dt*.65;o.position.y=d.base.y+Math.sin(elapsed*2)*.17;break;case'portal':o.rotation.z+=dt*.2;break;case'turbine':o.rotation.z-=dt*(d.data.on?4:.15);break;case'flame':o.scale.set(1+Math.sin(elapsed*14)*.1,1+Math.sin(elapsed*10)*.17,1);break;case'water':o.position.y=.75+(elapsed*1.5+d.seed*.2)%1.7;o.scale.setScalar(.7+Math.sin(elapsed*4+d.seed)*.3);break;case'smoke':o.position.y=d.base.y+(elapsed*.5+d.seed*.4)%2;o.scale.setScalar(.7+(elapsed*.3+d.seed*.3)%1);break;case'bell':o.rotation.z=Math.sin(elapsed*1.6)*.06;break;case'smallbell':o.rotation.z=Math.sin(elapsed*1.2+d.seed)*.04;break}}}
+
+function retireScene(obj){const geo=new Set(),tex=new Set();obj.traverse(o=>{if(o.geometry&&!o.isSprite)geo.add(o.geometry);if(o.material?.map)tex.add(o.material.map)});setTimeout(async()=>{try{await renderer.backend.device.queue.onSubmittedWorkDone()}catch{};geo.forEach(g=>g.dispose());tex.forEach(t=>t.dispose())},1500)}
+function releaseGeometry(g){if(!g)return;setTimeout(async()=>{try{await renderer.backend.device.queue.onSubmittedWorkDone()}catch{}g.dispose()},1000)}
+function resetState(){Object.assign(state,{hp:100,maxHp:100,sp:100,coins:0,tonics:3,power:null,powers:[],sword:1,fatigue:0,score:0,rescued:[],flags:{},killed:[],opened:[],time:0,kills:0,parries:0,casts:0,absorbed:0,checkpoint:{level:0,x:0,z:11},won:false})}
+function addScore(n,label='Bellbearer'){state.score+=n;if(AIHub.active&&!hubEnded)AIHub.progress({score:state.score,label});}
+function saveGame(){if(mode==='attract'||AIHub.active)return;state.hp=player.hp;try{localStorage.setItem('mochi-save',JSON.stringify({state,level}));$('#save-indicator').classList.remove('hide');setTimeout(()=>$('#save-indicator').classList.add('hide'),2200)}catch{}}
+function makePlayer(x,z,index=0){const rig=createRig(index?'friend':'hero');root.add(rig.group);const body=world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x,.87,z));const collider=world.createCollider(RAPIER.ColliderDesc.capsule(.43,.32).setFriction(0),body);const controller=world.createCharacterController(.025);controller.enableAutostep(.45,.2,true);controller.enableSnapToGround(.3);controller.setApplyImpulsesToDynamicBodies(true);const p={rig,body,collider,controller,x,z,y:0,vy:0,facing:Math.PI,hp:state.maxHp,inv:0,attack:0,attackCD:0,combo:0,comboTime:0,dash:0,dashCD:0,dx:0,dz:-1,guard:false,guardTime:0,grounded:true,jumps:0,castCD:0,index,lock:null,down:false,revive:0,move:0};rig.group.position.set(x,0,z);return p}
+function spawnEnemy(type,x,z,id){if(state.killed.includes(id)){const d=TYPE[type];if(d.power&&!state.powers.includes(d.power)){const essence=new THREE.Group();root.add(essence);essence.position.set(x,1.2,z);ball(.32,POWERS[d.power].color,0,0,0,essence,1,true);torus(.58,.045,palette.gold,0,0,0,essence);const echo={type,id,...d,maxHp:d.hp,hp:0,x,z,homeX:x,homeZ:z,dead:true,consumed:false,essence};enemies.push(echo);return echo}return null}const data=TYPE[type],rig=createRig(type);root.add(rig.group);rig.group.position.set(x,0,z);const body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.85,z).lockRotations().setLinearDamping(5));world.createCollider(RAPIER.ColliderDesc.capsule(.32,.4).setFriction(.1).setMass(2),body);const label=document.createElement('div');label.className='enemy-label';label.innerHTML='<i></i>';$('#labels').append(label);const e={type,id,...data,maxHp:data.hp,rig,body,x,z,y:0,homeX:x,homeZ:z,cd:1+Math.random(),windup:0,attackKind:0,hit:0,stun:0,dead:false,essence:null,consumed:false,label,knock:0};enemies.push(e);return e}
+function loadLevel(n,spawn=null){const oldSecond=players[1]?.hp||state.maxHp;if(root){scene.remove(root);retireScene(root)}if(world)world.free();world=new RAPIER.World({x:0,y:-24,z:0});world.timestep=1/60;root=new THREE.Group();scene.add(root);level=n;enemies=[];npcs=[];interactables=[];breakables=[];pickups=[];effects=[];projectiles=[];rigs=[];decor=[];dynamics=[];boss=null;$('#labels').innerHTML='';$('#floats').innerHTML='';buildEnvironment(n);SPAWNS[n].forEach(([t,x,z],i)=>spawnEnemy(t,x,z,n+'-'+i));const pos=spawn||ZONES[n].spawn;player=makePlayer(pos[0],pos[1]);player.hp=clamp(state.hp,1,state.maxHp);players=[player];if(localJoined&&!AIHub.active){const p2=makePlayer(pos[0]+2,pos[1]+1,1);p2.hp=oldSecond;players.push(p2)}Audio.zone=ZONES[n].music;absorbProgress=0;absorbTarget=null;cameraAngle=.12;cameraDistance=22;camera.position.set(player.x+5,19,player.z+23);camera.lookAt(player.x,0,player.z);$('#region').textContent=ZONES[n].name;$('#time-day').textContent=ZONES[n].sub;zoneBanner=3.5;$('#area-banner').innerHTML='<small>'+ZONES[n].sub+'</small><strong>'+ZONES[n].name+'</strong>';$('#area-banner').classList.remove('hide');updateQuest()}
+function transitionLevel(n,spawn){if(transitioning)return;transitioning=true;Audio.sfx('bell');$('#fade').classList.add('on');setTimeout(()=>{state.hp=player.hp;loadLevel(n,spawn);state.checkpoint={level:n,x:player.x,z:player.z};saveGame();$('#fade').classList.remove('on');transitioning=false},380)}
+function talk(id,onEnd=null){const lines=DIALOGUES[id];if(!lines)return;dialog={lines,index:0,onEnd};$('#dialogue').classList.remove('hide');showLine()}
+function showLine(){const l=dialog.lines[dialog.index];$('#speaker').textContent=l[0];$('#speech').textContent=l[1];$('#dialogue-foot').textContent=padMode?'✕  Continue  ·  ○  Skip':'Enter / Space  Continue  ·  Esc  Skip';Audio.voice(l[1],l[0])}
+function nextLine(skip=false){if(!dialog)return;dialog.index++;if(skip||dialog.index>=dialog.lines.length){const cb=dialog.onEnd;dialog=null;$('#dialogue').classList.add('hide');if(cb)cb()}else showLine()}
+function particles(x,y,z,c,count=12,force=3){for(let i=0;i<count;i++){const o=ball(.06+Math.random()*.09,c,x,y,z);effects.push({kind:'particle',obj:o,v:V((Math.random()-.5)*force,Math.random()*force+1,(Math.random()-.5)*force),life:.5+Math.random()*.5,max:1})}}
+function ring(x,z,c=palette.gold,r=1,life=.5,y=.1){const m=torus(r,.06,c,x,y,z);m.rotation.x=Math.PI/2;effects.push({kind:'ring',obj:m,life,max:life,expand:5});return m}
+function slashFX(p,heavy=false){const g=new THREE.TorusGeometry(heavy?2.3:1.6,heavy?.14:.08,4,24,Math.PI*1.3);const m=mesh(g,heavy?0xffbd64:0xfff2bb);m.rotation.set(Math.PI/2,0,-p.facing-2.5);m.position.set(p.x,.95,p.z);effects.push({kind:'slash',obj:m,life:.22,max:.22});particles(p.x,.8,p.z,heavy?0xffbd64:0xfff4ce,4,2)}
+function floatText(text,x,y,z,c='#fff0ba'){const el=document.createElement('div');el.className='float-text';el.textContent=text;el.style.color=c;$('#floats').append(el);effects.push({kind:'text',el,x,y,z,life:1.2,max:1.2})}
+function heal(p,amount){p.hp=clamp(p.hp+amount,0,state.maxHp);p.down=false;p.rig.group.rotation.z=0;ring(p.x,p.z,0xa6e1ba,.5,.6);particles(p.x,1,p.z,0xbbefb4,15);floatText('+'+amount,p.x,2,p.z,'#c5f4bd')}
+function hurt(p,amount,source){if(p.inv>0||p.down||mode==='attract')return;const dx=(source?.x??p.x)-p.x,dz=(source?.z??p.z+1)-p.z;const inFront=Math.abs(angleDiff(Math.atan2(dx,dz),p.facing))<1.55;if(p.guard&&inFront){if(p.guardTime<.24){state.sp=clamp(state.sp+24,0,100);state.parries++;p.inv=.45;addScore(30,'Perfect parry');ring(p.x,p.z,0xc9f6df,1,.4);particles(p.x,1,p.z,0xffdf8c,22,6);floatText('PERFECT!',p.x,2.5,p.z);Audio.sfx('parry');if(source){source.stun=2;if(source===boss){boss.exposed=3;boss.shield=Math.max(0,boss.shield-20)}}rumble(.3,80);return}else if(state.sp>6){amount=Math.ceil(amount*.2);state.sp=Math.max(0,state.sp-10);Audio.sfx('parry')}}p.hp=Math.max(0,p.hp-amount);p.inv=.8;shake=settings.shake?.25:0;floatText('-'+amount,p.x,2,p.z,'#ffb69a');Audio.sfx('hurt');rumble(.5,120);particles(p.x,1,p.z,0xf29062,9,4);$('#damage-flash').classList.add('on');setTimeout(()=>$('#damage-flash').classList.remove('on'),130);if(!p.hp){p.down=true;p.rig.group.rotation.z=Math.PI/2;p.rig.group.position.y=.3;if(players.every(a=>a.down))gameOver()}state.hp=player.hp}
+function gameOver(){if(mode==='attract')return;if(AIHub.active){finishHub();return}openMenu('defeat')}
+function enemyDamage(e,n,p,heavy=false){if(e.dead)return;e.hp-=n;e.hit=.16;e.stun=heavy?.75:.3;e.knock=.22;if(e.body){const d=V(e.x-p.x,0,e.z-p.z).normalize().multiplyScalar(heavy?8:4);e.body.setLinvel({x:d.x,y:heavy?3:1,z:d.z},true)}particles(e.x,1,e.z,0xffdfa2,heavy?18:10,5);floatText(n,e.x,2.2,e.z);Audio.sfx('hit');if(e.hp<=0)defeatEnemy(e)}
+function defeatEnemy(e,borrow=false){if(e.dead)return;e.dead=true;e.rig.group.visible=false;e.label.remove();world.removeRigidBody(e.body);e.body=null;state.killed.push(e.id);state.kills++;addScore(e.score,'Foes bested');for(let i=0;i<3;i++)dropPickup('coin',e.x+(Math.random()-.5)*1.5,e.z+(Math.random()-.5)*1.5,5);if(Math.random()<.32)dropPickup('heart',e.x+1,e.z,14);particles(e.x,1,e.z,e.color,20,4);if(e.power&&!borrow){e.essence=new THREE.Group();root.add(e.essence);e.essence.position.set(e.x,1.2,e.z);ball(.32,POWERS[e.power].color,0,0,0,e.essence,1,true);torus(.58,.045,palette.gold,0,0,0,e.essence);if(!state.powers.includes(e.power))toast('An echo remains. Hold R1 / E to borrow it.')}else e.consumed=true}
+function bossDamage(n,heavy=false){if(!boss||!boss.active||boss.dead)return;if(boss.shield>0&&boss.exposed<=0){const shieldDamage=heavy?n:Math.max(2,n*.12);boss.shield-=shieldDamage;floatText(heavy?'CRACK!':'GUARDED',boss.x,5,boss.z,heavy?'#ffe7a0':'#a9d6c8');particles(boss.x,3,boss.z,palette.gold,heavy?20:5,6);if(boss.shield<=0){boss.shield=0;boss.exposed=8;boss.stun=1.6;toast('CRUST BROKEN · Make it count!');Audio.sfx('quake');addScore(150,'Armor broken')}}else{boss.hp=Math.max(0,boss.hp-n);boss.hit=.2;floatText(n,boss.x,5,boss.z);particles(boss.x,3,boss.z,0xffc27b,14,6);Audio.sfx('hit');if(boss.hp<=0)winGame()}shake=settings.shake?.12:0}
+function targetFor(p,r=6){let best=null,bestD=r;for(const e of enemies){if(e.dead)continue;const d=dist(p,e);if(d<bestD){bestD=d;best=e}}if(boss?.active&&!boss.dead&&dist(p,boss)<bestD+2)best=boss;return best}
+function doAttack(p,heavy=false){if(p.attackCD>0||p.dash>0||p.down)return;const t=targetFor(p,heavy?5.3:3.6);if(t&&settings.assist)p.facing=Math.atan2(t.x-p.x,t.z-p.z);if(p.comboTime<=0)p.combo=0;else p.combo=(p.combo+1)%3;p.comboTime=.9;p.attack=.34;p.attackCD=heavy?.66:.31;p.guard=false;const damage=Math.round((heavy?36:[15,18,25][p.combo])*(1+(state.sword-1)*.25));slashFX(p,heavy);Audio.sfx('slash');rumble(.16,45);for(const e of enemies){if(e.dead||dist(p,e)>(heavy?3.6:2.9))continue;if(Math.abs(angleDiff(Math.atan2(e.x-p.x,e.z-p.z),p.facing))<2)enemyDamage(e,damage,p,heavy)}if(boss?.active&&!boss.dead&&dist(p,boss)<5.2)bossDamage(damage,heavy);for(const c of [...breakables]){const v=c.body.translation();if(Math.hypot(v.x-p.x,v.z-p.z)<(heavy?3.5:2.7)){c.hp-=damage;if(c.hp<=0)breakCrate(c);else c.body.applyImpulse({x:Math.sin(p.facing)*3,y:2,z:Math.cos(p.facing)*3},true)}}for(const o of interactables){if(o.kind==='cage'&&!state.rescued.includes(o.id)&&dist(p,o)<3.5){if(o.id==='keeper'&&!state.flags.crack){toast('Cracked stone · Use Quake or a heavy strike');if(heavy)breakCrack();continue}o.hp-=damage;particles(o.x,1,o.z,palette.gold,10);if(o.hp<=0)rescue(o)}if(o.kind==='crack'&&!o.broken&&heavy&&dist(p,o)<3.6)breakCrack()}}
+function breakCrate(c){const v=c.body.translation();particles(v.x,.7,v.z,0xe4bd74,14,5);for(let i=0;i<4;i++)dropPickup('coin',v.x+(Math.random()-.5),v.z+(Math.random()-.5),5);if(Math.random()<.18)dropPickup('tonic',v.x,v.z,1);state.opened.push(c.id);root.remove(c.obj);world.removeRigidBody(c.body);breakables.splice(breakables.indexOf(c),1);dynamics.splice(dynamics.indexOf(c),1);addScore(15,'Crates cracked');Audio.sfx('hit')}
+function dropPickup(kind,x,z,value){const c=kind==='coin'?palette.gold:kind==='heart'?0xe98769:0x86d9be;const obj=kind==='coin'?cyl(.17,.17,.08,c,x,.65,z,root,8,true):ball(.22,c,x,.65,z,root,1,true);if(kind==='coin')obj.rotation.z=Math.PI/2;pickups.push({kind,x,z,value,obj,phase:Math.random()*6})}
+function learnPower(id){if(!state.powers.includes(id)){state.powers.push(id);state.absorbed++;addScore(200,'Power borrowed');toast('POWER BORROWED · '+POWERS[id].name);Audio.sfx('power');particles(player.x,1.5,player.z,POWERS[id].color,35,5);floatText(POWERS[id].name,player.x,3,player.z);if(id==='gust')setTimeout(()=>toast('GALE GIFT · You can now jump twice.'),2600)}else{state.sp=100;toast('Echo refreshed · Spirit restored');Audio.sfx('coin')}state.power=id;updateQuest();saveGame()}
+function cyclePower(){if(!state.powers.length){toast('Weaken an enemy, then hold R1 / E');return}const i=state.powers.indexOf(state.power);state.power=state.powers[(i+1)%state.powers.length];Audio.sfx('menu')}
+function castPower(p){if(p.castCD>0||p.down)return;const power=POWERS[state.power];if(!power){toast('Borrow an echo first · Hold R1 / E near a weakened foe');return}if(state.sp<power.cost){toast('Spirit is low · Guard, parry, or take a breather');Audio.sfx('hurt');return}state.sp-=power.cost;state.casts++;p.castCD=.6;p.attack=.3;Audio.sfx(state.power);if(state.power==='ember'){let target=null,dd=13;for(const o of interactables){if(o.kind==='brazier'&&!o.lit){const d=dist(p,o);if(d<dd){dd=d;target=o}}}if(!target)target=targetFor(p,14);if(target)p.facing=Math.atan2(target.x-p.x,target.z-p.z);const dir=V(Math.sin(p.facing),0,Math.cos(p.facing)),obj=ball(.3,0xffc263,p.x+dir.x,1.1,p.z+dir.z,root,1,true);projectiles.push({kind:'ember',obj,x:obj.position.x,z:obj.position.z,y:1.1,vx:dir.x*18,vz:dir.z*18,life:1.2,owner:p,target,damage:29})}
+ if(state.power==='gust'){ring(p.x,p.z,0x9aead0,1,.65);particles(p.x,1,p.z,0xa7efcf,30,8);for(const e of enemies)if(!e.dead&&dist(p,e)<6)enemyDamage(e,24,p,true);for(const o of interactables)if(o.kind==='turbine'&&dist(p,o)<7)activateTurbine(o);if(boss?.active&&!boss.dead&&dist(p,boss)<8){boss.stun=2;boss.windup=0;boss.timer=2.4;bossDamage(18,false);toast('The King is winded!')}}
+ if(state.power==='quake'){ring(p.x,p.z,palette.gold,1,.8);ring(p.x,p.z,0xffe4a4,2,.6);particles(p.x,.2,p.z,palette.gold,40,7);shake=settings.shake?.4:0;for(const e of enemies)if(!e.dead&&dist(p,e)<7)enemyDamage(e,42,p,true);if(boss?.active&&!boss.dead&&dist(p,boss)<8)bossDamage(58,true);for(const o of interactables)if(o.kind==='crack'&&!o.broken&&dist(p,o)<7)breakCrack();for(const o of interactables)if(o.kind==='cage'&&!state.rescued.includes(o.id)&&dist(p,o)<7){o.hp-=50;if(o.hp<=0)rescue(o)}}}
+function lightBrazier(o){if(o.lit)return;o.lit=true;o.flame.visible=true;state.flags[o.id]=true;addScore(150,'Brazier lit');Audio.sfx('bell');particles(o.x,2,o.z,0xffc05e,24,4);toast('One warmer welcome.');if(interactables.filter(i=>i.kind==='brazier').every(i=>i.lit)){state.flags.bridge=true;for(const d of decor)if(d.kind==='bridge')d.obj.visible=true;const gate=interactables.find(i=>i.id==='forest-gate');if(gate&&!gate.open){gate.obj.visible=false;world.removeCollider(gate.collider,true);gate.open=true}toast('THE EMBER BRIDGE AWAKENS · North to the kiln');addScore(350,'Bridge awakened');saveGame()}updateQuest()}
+function activateTurbine(o){if(o.on)return;o.on=true;state.flags[o.id]=true;Audio.sfx('power');addScore(200,'Wind seal turned');particles(o.x,2,o.z,0xb8ead0,30,4);if(o.id==='wind2'){const gate=interactables.find(i=>i.id==='boss-gate');gate.obj.visible=false;if(!gate.open)world.removeCollider(gate.collider,true);gate.open=true;toast('The royal gate opens. A terrible breakfast awaits.')}else toast('A rising draft · Air-jump up to the old treasure');updateQuest();saveGame()}
+function breakCrack(){state.flags.crack=true;const o=interactables.find(o=>o.kind==='crack');if(o&&!o.broken){o.broken=true;o.obj.visible=false;particles(o.x,1.8,o.z,palette.gold,40,6);Audio.sfx('quake');addScore(100,'Stone shattered');toast('The stone is broken. Free the bellkeeper!')}}
+function rescue(o){if(state.rescued.includes(o.id))return;state.rescued.push(o.id);o.obj.visible=false;particles(o.x,1.5,o.z,palette.gold,45,5);heal(player,25);state.sp=100;state.coins+=30;addScore(500,'Townsfolk rescued');Audio.sfx('power');updateQuest();talk(o.id==='pip'?'pip':'keeper',()=>saveGame())}
+function nearestInteract(p){let best=null,d=3.2;for(const o of [...npcs,...interactables]){if(o.kind==='cage'||o.kind==='brazier'||o.kind==='gate'||o.kind==='crack'||o.kind==='turbine')continue;if(o.kind==='chest'&&Math.abs(p.y-(o.y||0))>1.4)continue;const di=dist(p,o);if(di<d){d=di;best=o}}const exit=ZONES[level].exit;if(level<2&&Math.hypot(p.x-exit[0],p.z-exit[1])<3.4)best={kind:'exit',x:exit[0],z:exit[1]};if(level>0&&Math.hypot(p.x,p.z-(level===1?24:23))<3.5)best={kind:'back',x:0,z:level===1?24:23};for(const other of players)if(other!==p&&other.down&&dist(p,other)<3)best={kind:'revive',player:other};if(level===2&&state.won&&Math.hypot(p.x,p.z+22)<5)best={kind:'finish'};return best}
+function interact(p){const o=nearestInteract(p);if(!o)return;if(o.kind==='npc'){switch(o.id){case'mayor':state.flags.mayor=true;talk('mayor',()=>{updateQuest();saveGame()});break;case'inn':talk('inn',()=>{players.forEach(p=>heal(p,state.maxHp));state.sp=100;state.fatigue=0;state.time+=90;saveGame();toast('Well rested · Health, spirit and pep restored')});break;case'shop':openMenu('shop');break;case'smith':openMenu('smith');break;case'baker':if(!state.flags.pastry){state.flags.pastry=true;state.maxHp+=20;heal(player,20);toast('PIP’S THANK-YOU PASTRY · Maximum health +20');Audio.sfx('power');saveGame()}else toast('Pip: “The secret ingredient is surviving.”');break;}}if(o.kind==='exit'){if(level===1&&!state.flags.bridge){toast('Light both braziers with Ember to awaken the bridge');return}transitionLevel(level+1)}if(o.kind==='back')transitionLevel(level-1,level===1?[0,-13]:[0,-23]);if(o.kind==='chest'){if(o.opened){toast('A thoroughly looted chest. Nice work.');return}if(o.id==='wind-chest'&&!state.flags.wind1){toast('A wind seal protects it · Gale the turbine below');return}o.opened=true;o.lid.rotation.x=-1.1;state.opened.push(o.id);state.coins+=50;state.tonics+=1;addScore(250,'Treasure found');Audio.sfx('power');particles(o.x,(o.y||0)+1,o.z,palette.gold,30,5);toast('TREASURE · 50 crowns + 1 tonic');saveGame()}if(o.kind==='checkpoint'){state.checkpoint={level,x:p.x,z:p.z+1};players.forEach(a=>{if(a.down){a.down=false;a.rig.group.rotation.z=0}heal(a,state.maxHp)});state.sp=100;state.fatigue=Math.max(0,state.fatigue-35);Audio.sfx('bell');saveGame();toast('Waybell rung · Party restored. Chapter saved.')}if(o.kind==='shrine'){if(state.powers.includes('quake')){toast('The earth scroll: “Stay grounded. Metaphorically.”');return}learnPower('quake');talk('shrine')}if(o.kind==='revive'){o.player.down=false;o.player.rig.group.rotation.z=0;heal(o.player,Math.round(state.maxHp*.5));toast('Back on your feet, bellbearer!')}if(o.kind==='finish')openMenu('victory')}
+function promptName(o){if(!o)return '';if(o.kind==='npc')return o.name;if(o.kind==='exit')return 'Travel to '+ZONES[level+1].name;if(o.kind==='back')return 'Return to '+ZONES[level-1].name;return {chest:o.opened?'Treasure claimed':'Open treasure',checkpoint:'Ring waybell · Rest & save',shrine:state.powers.includes('quake')?'Read the earth scroll':'Claim the earth scroll',revive:'Revive your friend',finish:'Ring in the dawn'}[o.kind]||''}
+function useTonic(p){if(p.down)return;if(!state.tonics){toast('No tonics · Visit Odds & Scones in Bellwether');return}if(p.hp>=state.maxHp&&state.sp>=95){toast('Already feeling heroic');return}state.tonics--;heal(p,55);state.sp=clamp(state.sp+35,0,100);Audio.sfx('coin')}
+function updatePlayer(p,c,dt){if(p.down){animateRig(p.rig,dt);return}p.inv=Math.max(0,p.inv-dt);p.attackCD=Math.max(0,p.attackCD-dt);p.attack=Math.max(0,p.attack-dt);p.dashCD=Math.max(0,p.dashCD-dt);p.castCD=Math.max(0,p.castCD-dt);p.comboTime-=dt;if(c.guard){if(!p.guard)p.guardTime=0;p.guardTime+=dt;p.guard=true}else{p.guard=false;p.guardTime=0}if(c.attack)doAttack(p);if(c.heavy)doAttack(p,true);if(c.cast)castPower(p);if(c.cycle)cyclePower();if(c.tonic)useTonic(p);if(c.interact)interact(p);if(c.lock){p.lock=p.lock?null:targetFor(p,18);Audio.sfx('menu')}if(p.lock&&(p.lock.dead||dist(p,p.lock)>22))p.lock=null;
+ let mx=c.x,mz=c.y,len=Math.hypot(mx,mz);if(len>1){mx/=len;mz/=len}const a=cameraAngle,dx=mx*Math.cos(a)+mz*Math.sin(a),dz=-mx*Math.sin(a)+mz*Math.cos(a);let speed=(p.guard?2.5:5.6)*(p.attack>.05?.35:1);p.move=Math.min(len,1);if(p.lock)p.facing=Math.atan2(p.lock.x-p.x,p.lock.z-p.z);else if(len>.12&&p.attack<=0)p.facing=Math.atan2(dx,dz);if(c.dash&&p.dashCD<=0&&state.sp>=8){state.sp-=8;p.dash=.26;p.dashCD=.72;p.inv=.4;const dir=len>.12?V(dx,0,dz).normalize():V(Math.sin(p.facing),0,Math.cos(p.facing));p.dx=dir.x;p.dz=dir.z;Audio.sfx('dash');ring(p.x,p.z,0xe8e0ad,.4,.3)}if(c.jump&&(p.grounded||(state.powers.includes('gust')&&p.jumps<2))){p.vy=8.8;p.jumps++;p.grounded=false;Audio.sfx('jump');particles(p.x,.15,p.z,0xf2e0a9,8,2)}p.vy-=24*dt;let vx=dx*speed,vz=dz*speed;if(p.dash>0){p.dash-=dt;vx=p.dx*17;vz=p.dz*17;if(frameNo%3===0)particles(p.x,.5,p.z,0xf8e6ac,2,1)}p.controller.computeColliderMovement(p.collider,{x:vx*dt,y:p.vy*dt,z:vz*dt});const m=p.controller.computedMovement(),pos=p.body.translation();p.body.setNextKinematicTranslation({x:clamp(pos.x+m.x,-23,23),y:pos.y+m.y,z:clamp(pos.z+m.z,level===0?-19:-28,level===0?19:27)});p.grounded=p.controller.computedGrounded();if(p.grounded){p.vy=-1;p.jumps=0}if(pos.y<-.5){p.body.setTranslation({x:state.checkpoint.x,y:2,z:state.checkpoint.z},true);p.vy=0;hurt(p,8)}if(level===1&&!state.flags.bridge&&p.z<-15.8&&p.z>-21.3){p.body.setNextKinematicTranslation({x:p.x,y:1,z:-14.6});p.vy=3;hurt(p,8);toast('The river is swift · Light both braziers first')}
+ const current=p.body.translation();p.x=current.x;p.z=current.z;p.y=current.y-.87;p.rig.group.position.set(p.x,p.y,p.z);p.rig.group.rotation.y=p.facing;p.rig.group.visible=!(p.inv>0&&Math.floor(elapsed*18)%2===0);animateRig(p.rig,dt,p.move,p.attack,p.guard,!p.grounded);if(p.index===0)state.hp=p.hp}
+function updateAbsorb(c,dt,p=player){if(!c.absorb||p.down){absorbProgress=0;absorbTarget=null;$('#absorb-meter').classList.add('hide');return}let target=null,d=6.5;for(const e of enemies){if(!e.power||e.consumed||(!e.dead&&e.hp>e.maxHp*.65))continue;const di=dist(p,e);if(di<d){d=di;target=e}}if(!target){$('#absorb-meter').classList.remove('hide');$('#absorb-meter').firstChild.textContent='WEAKEN A FOE OR FIND ITS ECHO';$('#absorb-fill').style.width='0';absorbProgress=0;return}if(absorbTarget!==target){absorbTarget=target;absorbProgress=0}target.stun=.3;p.facing=Math.atan2(target.x-p.x,target.z-p.z);absorbProgress+=dt;$('#absorb-meter').classList.remove('hide');$('#absorb-meter').firstChild.textContent='BORROWING '+POWERS[target.power].name.toUpperCase();$('#absorb-fill').style.width=(absorbProgress/1.05*100)+'%';if(frameNo%5===0){const o=ball(.07,POWERS[target.power].color,target.x,1.5,target.z);effects.push({kind:'seek',obj:o,target:p,life:.5,max:.5})}if(absorbProgress>=1.05){if(!target.dead)defeatEnemy(target,true);target.consumed=true;if(target.essence)root.remove(target.essence);learnPower(target.power);absorbProgress=0;$('#absorb-meter').classList.add('hide')}}
+function updateEnemies(dt){for(const e of enemies){if(e.dead){if(e.essence){e.essence.rotation.y+=dt;e.essence.position.y=1.2+Math.sin(elapsed*3+e.homeX)*.15}continue}const v=e.body.translation();e.x=v.x;e.z=v.z;e.y=v.y-.85;e.cd-=dt;e.hit=Math.max(0,e.hit-dt);e.stun=Math.max(0,e.stun-dt);e.knock=Math.max(0,e.knock-dt);const living=players.filter(p=>!p.down),t=living.sort((a,b)=>dist(e,a)-dist(e,b))[0];if(!t)continue;const d=dist(e,t),range=e.type==='cinder'?6.4:e.type==='moth'?4.8:2.5;let vx=0,vz=0;if(e.stun<=0&&e.knock<=0){if(e.windup>0){e.windup-=dt;if(e.windup<=0){if(e.type==='cinder'||e.type==='moth'){const dir=V(t.x-e.x,0,t.z-e.z).normalize(),o=ball(.2,e.type==='cinder'?0xffb662:0xadebd1,e.x,1.2,e.z);projectiles.push({kind:'enemy',obj:o,x:e.x,z:e.z,y:1.2,vx:dir.x*8,vz:dir.z*8,life:1.8,damage:e.damage,owner:e})}else if(d<3.4)hurt(t,e.damage,e);e.cd=e.type==='knight'?1.8:2.6;ring(e.x,e.z,0xe9a65d,.6,.22)}}else if(d<range&&e.cd<=0){e.windup=.72;e.rig.body.scale.y=1.15;ring(e.x,e.z,0xefac69,.7,.7);Audio.tone(260,.15,'triangle',.05)}else if(d<17&&d>range*.7){const dir=V(t.x-e.x,0,t.z-e.z).normalize();vx=dir.x*e.speed;vz=dir.z*e.speed}else if(d>=17){vx=Math.sin(elapsed*.6+e.homeZ)*.4;vz=Math.cos(elapsed*.5+e.homeX)*.4}if(e.windup<=0)e.body.setLinvel({x:vx,y:e.body.linvel().y,z:vz},true)}else if(e.knock<=0)e.body.setLinvel({x:0,y:e.body.linvel().y,z:0},true);e.rig.group.position.set(e.x,e.y,e.z);e.rig.group.rotation.y=Math.atan2(t.x-e.x,t.z-e.z);e.rig.body.scale.y=lerp(e.rig.body.scale.y,1,dt*8);e.rig.group.scale.setScalar(e.hit>0?1.08:1);animateRig(e.rig,dt,Math.hypot(vx,vz)>.2?.7:0,e.windup>0?.15:0);e.label.classList.toggle('weak',e.hp<=e.maxHp*.65);e.label.firstChild.style.width=(e.hp/e.maxHp*100)+'%';if(v.y<-.5){e.body.setTranslation({x:e.homeX,y:2,z:e.homeZ},true)}}}
+function updateProjectiles(dt){for(let i=projectiles.length-1;i>=0;i--){const p=projectiles[i];p.life-=dt;p.x+=p.vx*dt;p.z+=p.vz*dt;p.obj.position.set(p.x,p.y,p.z);p.obj.rotation.x+=dt*8;let hit=false;if(p.kind==='ember'){for(const o of interactables)if(o.kind==='brazier'&&!o.lit&&dist(p,o)<1.3){lightBrazier(o);hit=true}for(const e of enemies)if(!e.dead&&dist(p,e)<.95){enemyDamage(e,p.damage,p.owner);hit=true;break}if(boss?.active&&!boss.dead&&dist(p,boss)<2.8){bossDamage(p.damage,false);hit=true}if(frameNo%2===0)particles(p.x,p.y,p.z,0xffd573,1,1)}else for(const a of players)if(!a.down&&Math.abs(a.y)<1.5&&dist(p,a)<.7){hurt(a,p.damage,p.owner);hit=true}if(hit||p.life<=0){particles(p.x,p.y,p.z,p.kind==='ember'?0xffc564:0xb8dac0,8,2);root.remove(p.obj);releaseGeometry(p.obj.geometry);projectiles.splice(i,1)}}}
+function updateBoss(dt){if(!boss||boss.dead)return;const b=boss;if(!b.active){if(players.some(p=>p.z<-13.5)){b.active=true;b.timer=2.2;if(mode!=='attract')talk('boss');$('#boss-hud').classList.remove('hide');Audio.zone=2;toast('QUAKE OR HEAVY · Break the royal crust')}return}b.phase=b.hp<150?3:b.hp<310?2:1;b.stun=Math.max(0,b.stun-dt);b.hit=Math.max(0,b.hit-dt);if(b.exposed>0){b.exposed-=dt;if(b.exposed<=0){b.shield=b.maxShield;b.timer=2;toast('The royal crust reforms · Break it again')}}b.body.rotation.z=Math.sin(elapsed*1.8)*.035;b.body.position.y=Math.sin(elapsed*2)*.1;const target=players.filter(p=>!p.down).sort((a,c)=>dist(b,a)-dist(b,c))[0];if(!target)return;b.obj.rotation.y=lerp(b.obj.rotation.y,Math.atan2(target.x-b.x,target.z-b.z),dt*2);if(b.stun<=0){if(b.windup>0){b.windup-=dt;b.hammer.rotation.z=-Math.sin(b.windup*3)*.65;if(b.windup<=0){bossAttack(b,target);b.timer=b.phase===3?1.8:2.6;b.attack=(b.attack+1)%3}}else{b.timer-=dt;if(b.timer<=0){b.windup=b.phase===3?.72:1.05;const cue=['JUMP THE GOLDEN RING','DASH OR GUARD THE FIRE','GET CLEAR OF THE ROYAL SLAM'][b.attack];$('#boss-cue').textContent=cue;ring(b.x,b.z,0xef945b,b.attack===2?6:2,b.windup);Audio.tone(110,.4,'sawtooth',.12)}}}for(let i=b.pulses.length-1;i>=0;i--){const s=b.pulses[i];s.r+=dt*s.speed;s.obj.scale.setScalar(s.r/s.initial);for(const p of players)if(!s.hit.has(p.index)&&Math.abs(dist(p,b)-s.r)<.65&&p.y<.85){s.hit.add(p.index);hurt(p,14+b.phase*2,b)}if(s.r>22){root.remove(s.obj);b.pulses.splice(i,1)}}$('#boss-fill').style.width=b.hp/b.maxHp*100+'%';if(b.stun>0)$('#boss-cue').textContent='WINDED · STRIKE NOW';else if(b.exposed>0)$('#boss-cue').textContent='CRUST BROKEN · '+Math.ceil(b.exposed)+'s';else if(b.windup<=0)$('#boss-cue').textContent='ROYAL CRUST '+Math.ceil(b.shield)+' · HEAVY / QUAKE';if(b.phase===3&&frameNo%15===0)particles(b.x,3,b.z,0xffbe60,2,2)}
+function bossAttack(b,t){Audio.sfx('quake');shake=settings.shake?.35:0;if(b.attack===0){const o=torus(1,.13,0xffdc85,b.x,.22,b.z);o.rotation.x=Math.PI/2;b.pulses.push({obj:o,r:1,initial:1,speed:7+b.phase,hit:new Set()});if(b.phase>1)setTimeout(()=>{if(boss===b&&!b.dead){const q=torus(1,.12,0xffdc85,b.x,.22,b.z);q.rotation.x=Math.PI/2;b.pulses.push({obj:q,r:1,initial:1,speed:7+b.phase,hit:new Set()})}},550)}if(b.attack===1){const a=Math.atan2(t.x-b.x,t.z-b.z);for(let i=-(2+b.phase);i<=2+b.phase;i++){const angle=a+i*.22,o=ball(.24,0xffbb64,b.x,1.2,b.z);projectiles.push({kind:'enemy',obj:o,x:b.x,z:b.z,y:1.2,vx:Math.sin(angle)*10,vz:Math.cos(angle)*10,life:2.3,damage:15,owner:b})}}if(b.attack===2){ring(b.x,b.z,0xffce70,6,.5);particles(b.x,.4,b.z,palette.gold,50,12);for(const p of players)if(dist(p,b)<6.6&&p.y<1.4)hurt(p,24,b)}}
+function updateEffects(dt){for(let i=effects.length-1;i>=0;i--){const e=effects[i];e.life-=dt;const t=e.life/e.max;if(e.kind==='particle'){e.v.y-=8*dt;e.obj.position.addScaledVector(e.v,dt);e.obj.scale.setScalar(Math.max(.05,t))}if(e.kind==='ring'){e.obj.scale.multiplyScalar(1+dt*e.expand);e.obj.scale.z=1;e.obj.position.y+=dt*.1}if(e.kind==='slash'){e.obj.scale.setScalar(1+(1-t)*.25);e.obj.rotation.z-=dt*3}if(e.kind==='seek')e.obj.position.lerp(V(e.target.x,1.5,e.target.z),dt*7);if(e.kind==='text'){e.y+=dt*.7;projectLabel(e.el,e.x,e.y,e.z);e.el.style.opacity=Math.min(1,t*3)}if(e.life<=0){if(e.obj){root.remove(e.obj);releaseGeometry(e.obj.geometry)}if(e.el)e.el.remove();effects.splice(i,1)}}}
+function updatePickups(dt){for(let i=pickups.length-1;i>=0;i--){const o=pickups[i];o.phase+=dt*4;o.obj.position.y=.55+Math.sin(o.phase)*.1;o.obj.rotation.y+=dt*2;const p=players.filter(p=>!p.down).sort((a,b)=>dist(o,a)-dist(o,b))[0];if(!p)continue;const d=dist(o,p);if(d<3.6){o.x=lerp(o.x,p.x,dt*7);o.z=lerp(o.z,p.z,dt*7);o.obj.position.x=o.x;o.obj.position.z=o.z}if(d<.7){if(o.kind==='coin'){state.coins+=o.value;addScore(o.value,'Crowns collected')}if(o.kind==='heart')heal(p,o.value);if(o.kind==='tonic'){state.tonics++;toast('Tonic found')}Audio.sfx('coin');root.remove(o.obj);pickups.splice(i,1)}}}
+function simulate(dt,commands){if(transitioning||hubEnded)return;simTime+=dt;state.time+=dt;state.fatigue=Math.min(100,state.fatigue+dt*.027);state.sp=Math.min(100,state.sp+dt*(state.fatigue>75?4:7)*(player.guard?.4:1));for(let i=0;i<players.length;i++)updatePlayer(players[i],commands[i]||emptyCommand(),dt);if(dialog||menu)return;const borrower=commands.findIndex(c=>c.absorb);updateAbsorb(commands[borrower>=0?borrower:0],dt,players[borrower>=0?borrower:0]);updateEnemies(dt);updateBoss(dt);updateProjectiles(dt);world.step();for(const d of dynamics){const v=d.body.translation(),q=d.body.rotation();d.obj.position.copy(v);d.obj.quaternion.copy(q)}updatePickups(dt);for(const p of players.slice(1)){if(!p.down&&dist(p,player)>20){p.body.setTranslation({x:player.x+1.5,y:player.y+2,z:player.z+1},true);p.vy=0;toast('Bellbearers stay together')}}if(mode==='attract'){players.forEach(p=>p.hp=state.maxHp);state.sp=100}updateQuest()}
+function winGame(){if(!boss||boss.dead)return;boss.dead=true;boss.active=false;state.won=true;boss.obj.visible=false;boss.pulses.forEach(p=>root.remove(p.obj));boss.pulses=[];projectiles.forEach(p=>root.remove(p.obj));projectiles=[];particles(boss.x,3,boss.z,palette.gold,100,12);ring(boss.x,boss.z,palette.gold,3,1.5);addScore(2500,'Dawn restored');Audio.sfx('victory');$('#boss-hud').classList.add('hide');if(mode==='attract')return;talk('ending',()=>{saveGame();if(AIHub.active)finishHub();else openMenu('victory')})}
+function finishHub(){if(hubResult)return;hubResult=true;AIHub.result({score:state.score,stats:{rescues:state.rescued.length,powers:state.powers.length,foes:state.kills,parries:state.parries,bell:state.won?1:0}});dialog=null;$('#dialogue').classList.add('hide');openMenu('session-over')}
+function rumble(strength,duration){if(mode==='attract')return;const p=pads[0];try{p?.vibrationActuator?.playEffect('dual-rumble',{duration,strongMagnitude:strength,weakMagnitude:strength*.6}).catch(()=>{})}catch{}}
+
+const GUIDE=[
+ {title:'A small hero’s itinerary',lead:'An entire morning to put back together.',cards:[['01 · Bellwether','Speak to Mayor Crumb at the fountain. The inn restores health, spirit and fatigue. Spend crowns on tonics or a stronger blade. Pip’s thank-you pastry increases maximum health.'],['02 · The Hushwood','Break Pip’s amber prison. Borrow Ember from a Cinderbun, then light both braziers to restore the north bridge. Borrow Gale from a Draft moth for the turbine and air jump.'],['03 · The Crown Kiln','Claim Quake at the earth shrine. Shatter the stone around Pepper, then free the bellkeeper. Gale the north turbine. Break the King’s armor and reclaim the dawn bell.'],['A friend along the way','Two players share crowns, spirit, items and powers. Each has their own health. Approach a fallen friend and interact to revive. Waybells restore everyone. The camera keeps you together.']]},
+ {title:'Two blades. Plenty of options.',lead:'Read the windup. Choose your moment.',cards:[['Square / J · Quick blade','Three chained strikes: 15, 18 and 25 damage. Keep pressing to link a combo. Auto-facing helps the blade find a nearby foe; switch it in Settings. R3 / Tab locks a target.'],['R2 / K · Heavy blade','A slower, wide swing that staggers enemies and cracks armor. It also breaks cracked stone. The Kiln King’s royal crust strongly resists quick strikes.'],['L2 / Shift · Guard & parry','Guard toward an attacker to reduce damage at a spirit cost. Raise the guard within 0.24 seconds of impact for a perfect parry: stagger the foe and restore spirit.'],['Cross / Space · Jump','Leap over shockwaves and onto platforms. With Gale learned, press again in the air for a second jump. Circle / L dashes through danger, spending 8 spirit.'],['R1 / E · Borrow','Strike enemies below 65% health, then hold near them for a little over a second. Defeated foes leave permanent echoes. Borrowing restores spirit and keeps the power forever.'],['D-pad down / H · Tonic','Drink a tonic for 55 health and 35 spirit. Spirit also refills over time; fatigue slows regeneration. Ring a waybell to heal and save. Rest in town to clear fatigue.']]},
+ {title:'Echoes in your pocket',lead:'L1 / Q cycles learned powers. Triangle / F casts.',cards:[['✹ · Ember pop · 16 spirit','Borrow from orange Cinderbuns. Launch a firebolt for 29 damage. A nearby unlit brazier takes aim priority, so you can solve the bridge puzzle without precision aiming.'],['≋ · Gale twirl · 22 spirit','Borrow from green Draft moths. A wind burst damages and staggers foes, turns turbines, and interrupts the Kiln King. Learning it grants a permanent second jump.'],['◆ · Crumb quake · 28 spirit','Claim at the earth shrine in the Crown Kiln. The shockwave deals 42 damage to foes, shatters stone, and takes a big bite out of royal armor.'],['The royal recipe','Gold ring: jump over it. Fire fan: dash through a gap or guard. Royal slam: leave the circle. Break the crust with heavy attacks or Quake; strike fast while exposed. Gale creates an opening.']]},
+ {title:'Made for the couch',lead:'Every screen works with a controller.',cards:[['DualSense / Standard pad','Left stick moves. Right stick rotates the camera. Square slash · Cross jump · Circle dash · Triangle power. L1 cycle · R1 borrow · L2 guard · R2 heavy. D-pad up interact · down tonic · left journal. R3 lock · Options pause.'],['Keyboard · Player one','WASD move · J slash · K heavy · Space jump · L dash · F power · E borrow · Q cycle · Shift guard · R interact · H tonic · Tab lock · C journal · Esc pause. Arrow keys also move in solo.'],['Couch co-op · Player two','Choose Two-player adventure or press 2 during play. A second controller can join with Cross. Keyboard: arrows move; Numpad 1 slash · 2 heavy · 3 power · 0 jump · decimal dash · Enter interact; End borrow · Delete guard · Home tonic · PageDown cycle.'],['AI Hub · 1–4 players','Parallel eight-minute score adventure. Everyone begins with the same world and fresh progress. Rescues, powers, treasure and the boss award points. The hub supplies the room, clock and live standings. Solo and couch adventure saves stay separate from sessions.']]}
+];
+let guidePage=0,creditsPage=0;
+const feedbackData={"session": "approximately 48 minutes", "testing": "<h3>Parameters & results</h3><p>Efficient, lightweight checks: Google Chrome 154 on Linux, a virtual display and SwiftShader Vulkan WebGPU; emulated DualSense controllers; JavaScript syntax checks; browser screenshots; direct fixed-step mechanics checks; the official AI Hub automatic harness. 119 assertions passed across chapter mechanics, controller/graphics regressions and the three hub scenarios. The synthesized audio produced a live Web Audio signal, and all attract scenes and the loop boundary were checked. No FPS target or performance benchmark was used.</p><h3>How many issues did testing catch?</h3><p>Three game issues: an obsolete Rapier module filename, disposal of Three.js\u2019s shared sprite geometry during scene changes, and render-dependent controller/menu polling. All three were corrected. Additional code review tightened power persistence, treasure height checks, party healing, defeat/retry behavior, HUD overlap and foliage visibility.</p><h3>How many were critical?</h3><p>Two: the import blocked startup, and shared-geometry disposal invalidated subsequent GPU draws.</p><h3>Most helpful test?</h3><p>The WebGPU scene-transition regression, with GPU-buffer labels, identified the shared sprite quad. The complete chapter mechanics check verified every power, rescue, gate and the boss ending. AI Hub checks passed for one player, two players and player departure, including keyboard, emulated pad and settings.</p><h3>Least helpful test?</h3><p>Initial screenshots with incorrect headless Vulkan flags misrepresented the rendered scene. A virtual display and explicit software Vulkan configuration produced useful visual checks.</p><h3>Limits</h3><p>No physical DualSense, human blind playthrough, television readability session or real remote hub room was available. The hub tests used its official simulated session harness. The player\u2019s actual browser is unknown.</p>", "text": "Testing Feedback\nIssues caught by browser testing: 3; critical/game-breaking: 2. Corrected the Rapier browser module path, preserved shared Sprite geometry during scene cleanup, and separated input polling from rendering.\nMost helpful: GPU-labelled scene-transition regression; complete chapter mechanics route; official AI Hub harness at 1 player, 2 players and player departure.\nLeast helpful: initial screenshots under incorrect headless Vulkan flags.\nTesting allowed: efficient and lightweight. Chrome 154 on Linux with a virtual display and software Vulkan WebGPU, emulated DualSense controllers, mechanics assertions, syntax checks and screenshots. No FPS or optimization benchmark. Physical controllers, a blind human playthrough and a real remote hub session remain untested.\n\nEngine Feedback\nLiked most: Three.js's scene graph and TSL support a cohesive procedural cel-shaded world; Rapier supplies character collision and dynamic props.\nStuck or guessed wrong: used an outdated Rapier module filename and initially disposed Three.js's shared sprite quad. WebGPURenderer's implicit fallback also required explicit disabling.\nMost important custom system: the adventure layer\u2014combat, power borrowing, quests, rescues, boss phases, party revival, checkpoint persistence, controller menus and attract playback.\nHardest part: coordinating physics, readable combat telegraphs, hierarchical animation, camera-relative controls and GPU resource ownership.\nRemove or overhaul one thing: implicit renderer backend fallback; make it an explicit policy.\nChange one thing: expose resource ownership metadata to identify shared geometry and textures safely.\n\nPrompt Feedback\nLiked most: the specific spiritual reference, controller-first direction, procedural audio and single-file sharing requirement.\nConfusing: feature-complete demo/game-engine scope and standalone multiplayer topology were open-ended. Interpreted as a complete three-area chapter, two-player couch co-op and AI Hub 1\u20134 parallel score sessions.\nHardest: making adventure systems, original procedural art/audio and multiplayer form a coherent complete chapter.\nOne additional test: a blind two-person couch playthrough with physical DualSense controllers on a WebGPU-capable television, checking readability, reconnect behavior, puzzle comprehension and boss timing.", "assertions": 119, "issues": 3, "critical": 2};
+const creditPages=[
+ {title:'A little game, carefully made',kicker:'SOURCE INFORMATION',lead:'Bouncy Blade Mochi · The Stolen Morning',body:`<h3>Source & creation</h3><p>Date: 2026-10-29 09:30<br>Inspired by Brave Fencer Musashi. An original spiritual successor; no source game assets or audio are used.<br>Model: OpenAI, gpt-6.1-sol · reasoning effort xhigh.</p><h3>Technology</h3><p>Three.js r180 / 0.180.0 · WebGPU only, fallback disabled. Rapier 0.19.3 physics. Gamepad API, Web Audio API, vanilla JavaScript, HTML and CSS. AI Hub Session Protocol v1, client 1.3.0. Google Fonts: Fraunces and DM Sans.</p><h3>Art, animation & sound</h3><p>Original procedural cel-shaded 3D dioramas with faceted forms, stepped TSL lighting and ink hull outlines. Hierarchical rigs blend procedural walking, guarding, jumping and attack poses. Original code-written adaptive music, synthesized effects and synthesized gibberish voices; no recorded audio.</p><h3>Online & environment</h3><p>AI Hub: 1–4 parallel score sessions. Standalone: two-player couch co-op. CDN dependencies and fonts need internet on first load. Environment: Codex CLI (headless), Linux / WSL2. Test browser: Google Chrome 154 headless; end-user browser unknown.</p><h3>Usage</h3><p>Estimated API cost: unknown. Total tokens and breakdown: unknown. Session time: ${feedbackData.session||'unknown'}.</p>`},
+ {title:'What the checks found',kicker:'TESTING FEEDBACK',lead:'Efficient and lightweight validation.',body:feedbackData.testing},
+ {title:'Under the little hood',kicker:'ENGINE FEEDBACK',lead:'Three.js r180 + Rapier 0.19.3',body:`<h3>What worked best?</h3><p>The scene graph makes a cohesive diorama easy to construct, and TSL expresses stepped cel lighting directly. Rapier provides solid character movement and dynamic props.</p><h3>Stuck or guessed wrong?</h3><p>An outdated Rapier browser-module filename prevented startup. Scene cleanup also incorrectly disposed Three.js’s shared sprite quad. Browser testing caught both. The renderer’s automatic WebGL fallback needed explicitly disabling for this brief.</p><h3>Most important custom system?</h3><p>The adventure layer: persistent quests and rescues, power borrowing, combat state, party revival, checkpoint saves, controller menus and the boss encounter.</p><h3>Hardest part?</h3><p>Coordinating physics movement, readable combat telegraphs, camera-relative controls and procedural character poses while keeping the world visually consistent.</p><h3>What would you overhaul?</h3><p>Overhaul the implicit backend fallback into an explicit renderer policy option. A WebGPU-only game should be able to request that behavior directly.</p><h3>One engine change?</h3><p>Resource ownership metadata that makes shared geometry and textures easy to distinguish from resources owned by a scene.</p>`},
+ {title:'Notes on the brief',kicker:'PROMPT FEEDBACK',lead:'A clear source, a new little adventure.',body:`<h3>What did you like most?</h3><p>The mix of a specific spiritual reference, controller-first UX, procedural audio, and a single-file deliverable gives the game a strong identity and a useful sharing format.</p><h3>What was confusing?</h3><p>“Feature-complete demo / game engine” leaves the precise scope open. This build interprets it as one complete chapter with town services, combat, three powers, exploration puzzles, rescues, co-op, saves and a multi-phase boss. The hub supports parallel sessions, while standalone multiplayer uses couch co-op.</p><h3>Hardest thing to do?</h3><p>Making all the adventure systems teach one another inside a coherent chapter while also delivering original procedural art, audio, menus and networking integration.</p><h3>One further test?</h3><p>A full blind couch playthrough with two physical DualSense controllers on a WebGPU-capable television, checking readability, reconnect behavior, puzzle comprehension and the boss’s timing.</p>`}
+];
+function buttonHTML(label,sub='',i=0){return `<button class="menu-btn ${i===menuIndex?'selected':''}" data-index="${i}"><span>${label}${sub?'<small style="display:block;margin-top:.15rem">'+sub+'</small>':''}</span><span class="arrow">${i===menuIndex?'↗':'›'}</span></button>`}
+function bindButtons(container){[...container.querySelectorAll('[data-index]')].forEach(b=>{b.addEventListener('pointerenter',()=>{menuIndex=+b.dataset.index;highlightMenu()});b.addEventListener('click',()=>{menuIndex=+b.dataset.index;menuActions[menuIndex]?.();Audio.init()})})}
+function highlightMenu(scroll=false){const container=mode==='title'&&!menu?$('#title-buttons'):$('#panel-body');container.querySelectorAll('[data-index]').forEach(b=>{const active=+b.dataset.index===menuIndex;b.classList.toggle('selected',active);b.querySelector('.arrow').textContent=active?'↗':'›';if(active&&menu&&scroll)b.scrollIntoView({block:'nearest'})})}
+function moveMenu(d){if(!menuActions.length)return;menuIndex=(menuIndex+d+menuActions.length)%menuActions.length;highlightMenu(true);Audio.sfx('menu')}
+function showTitle(){mode='title';menu=null;dialog=null;paused=false;hubEnded=false;localJoined=false;$('#overlay').classList.add('hide');$('#dialogue').classList.add('hide');$('#hud').classList.add('hide');$('#attract').classList.add('hide');$('#title').classList.remove('hide');$('#area-banner').classList.add('hide');$('#boss-hud').classList.add('hide');$('#labels').classList.add('hide');$('#toast').classList.add('hide');$('#touch').classList.toggle('hide',!touchOnly());$('#menu-corner').classList.remove('hide');resetState();loadLevel(0);$('#area-banner').classList.add('hide');menuIndex=0;let hasSave=false;try{hasSave=!!localStorage.getItem('mochi-save')}catch{}const options=[['Begin adventure','A complete story chapter',()=>startGame(false,false)]];if(hasSave)options.push(['Continue adventure','Return to your last waybell',()=>startGame(true,false)]);options.push(['Two-player adventure','Share a couch. Save breakfast.',()=>startGame(false,true)],['Field guide & settings','Controls, sound and stick directions',()=>openMenu('settings','title')],['About this little game','Source, credits and development notes',()=>openMenu('credits','title')]);menuActions=options.map(o=>o[2]);$('#title-buttons').innerHTML=options.map((o,i)=>buttonHTML(o[0],o[1],i)).join('');bindButtons($('#title-buttons'));lastInputAt=performance.now();cameraDistance=26;Audio.zone=0}
+function startGame(cont=false,coop=false){Audio.init();Audio.muted=false;Audio.apply();resetState();localJoined=coop&&!AIHub.active;let n=0,spawn=null;if(cont&&!AIHub.active){try{const saved=JSON.parse(localStorage.getItem('mochi-save'));if(saved?.state){Object.assign(state,saved.state);n=state.checkpoint.level;spawn=[state.checkpoint.x,state.checkpoint.z];state.hp=Math.max(state.hp,Math.round(state.maxHp*.5))}}catch{}}loadLevel(n,spawn);mode='play';menu=null;dialog=null;paused=false;$('#title').classList.add('hide');$('#overlay').classList.add('hide');$('#hud').classList.remove('hide');$('#labels').classList.remove('hide');$('#attract').classList.add('hide');$('#touch').classList.add('hide');$('#menu-corner').classList.add('hide');if(!cont&&!AIHub.active){toast('D-pad ↑ / R to talk · Mayor Crumb is by the fountain');setTimeout(()=>{if(mode==='play'&&!state.flags.mayor)toast('Two blades. One overdue breakfast. Find Mayor Crumb.')},6500)}if(localJoined)toast('CO-OP · Player 2: second pad or arrows + numpad');updateHUD()}
+function joinPlayer(){if(localJoined||AIHub.active||mode!=='play')return;localJoined=true;const p2=makePlayer(player.x+2,player.z+1,1);players.push(p2);Audio.sfx('power');toast('A SECOND BELLBEARER · Player 2 joined')}
+function closeMenu(){if(!menu)return;if(['defeat','victory','session-over'].includes(menu)){menuBack();return}if(hubResult||hubEnded){openMenu('session-over','play');return}const ret=menuReturn;menu=null;$('#overlay').classList.add('hide');if(ret==='title'){mode='title';lastInputAt=performance.now();showTitle()}else{paused=false;$('#hud').classList.toggle('hide',mode!=='play');$('#menu-corner').classList.toggle('hide',mode==='play')}}
+function menuBack(){if(!menu)return;if((hubResult||hubEnded)&&menu!=='session-over'){openMenu('session-over','play');return}if(['settings','guide','credits','shop','smith'].includes(menu)&&menuReturn!=='title'){openMenu('pause','play');return}if(['defeat','victory','session-over'].includes(menu)){if(menu==='victory')returnTown();return}closeMenu()}
+function openMenu(type='pause',ret=null,keepIndex=false){if(mode==='attract'){showTitle();return}if(ret)menuReturn=ret;else if(!menu)menuReturn=mode==='title'?'title':'play';menu=type;paused=true;if(!keepIndex)menuIndex=0;$('#overlay').classList.remove('hide');$('#prompt').classList.add('hide');const b=$('#panel-body');let title='',lead='',kicker='TAKE A BREATHER',options=[];let content='';
+ if(type==='pause'){title='A well-earned pause.';lead=ZONES[level].name+' · '+Math.floor(state.time/60)+'m '+Math.floor(state.time%60)+'s · Fatigue '+Math.floor(state.fatigue)+'% · '+state.score.toLocaleString()+' points';options=[['Resume adventure','Back to the important business',closeMenu],['Field guide','The journey, combat and borrowed powers',()=>openMenu('guide')],['Settings','Sound, assists and stick directions',()=>openMenu('settings')],['About & credits','Source information and development feedback',()=>openMenu('credits')]];if(!AIHub.active)options.push(['Save & return to title','Your waybell and discoveries are kept',()=>{saveGame();showTitle()}])}
+ if(type==='settings'){kicker='MAKE YOURSELF COMFORTABLE';title='Your kind of adventure.';lead='Changes apply immediately. Left / right adjusts a selected setting.';const rows=[['volume','Master volume',Math.round(settings.volume*100)+'%'],['music','Music volume',Math.round(settings.music*100)+'%'],['voices','Gibberish voices',settings.voices?'On':'Off'],['invertX','Invert horizontal axes',settings.invertX?'Inverted':'Normal'],['invertY','Invert vertical axes',settings.invertY?'Inverted':'Normal'],['assist','Combat auto-facing',settings.assist?'On':'Off'],['shake','Camera shake',settings.shake?'On':'Off']];options=rows.map(([key,label,value])=>[label,value,()=>adjustSetting(key,1)]);options.push(['Field guide','Complete controls & chapter help',()=>openMenu('guide')],['Back','Keep these settings',menuBack])}
+ if(type==='guide'){const g=GUIDE[guidePage];kicker='FIELD GUIDE · '+(guidePage+1)+' / '+GUIDE.length;title=g.title;lead=g.lead;content='<div class="guide-grid">'+g.cards.map(c=>'<div class="guide-card"><h3>'+c[0]+'</h3><p>'+c[1]+'</p></div>').join('')+'</div>';options=[['Next page','Journey · Combat · Powers · Controls',()=>{guidePage=(guidePage+1)%GUIDE.length;openMenu('guide')}],['Back','Return to your adventure',menuBack]]}
+ if(type==='credits'){const c=creditPages[creditsPage];kicker=c.kicker+' · '+(creditsPage+1)+' / 4';title=c.title;lead=c.lead;content='<div class="credit-copy">'+c.body+'</div>';options=[['Next page','Source · Testing · Engine · Prompt',()=>{creditsPage=(creditsPage+1)%4;openMenu('credits')}],['Back','Keep adventuring',menuBack]]}
+ if(type==='shop'){kicker='ODDS & SCONES';title='A little something for later?';lead='Crowns: '+state.coins+' · Tonics: '+state.tonics;options=[['Buy a tonic · 15 crowns','Restores 55 health and 35 spirit',()=>{if(state.coins>=15){state.coins-=15;state.tonics++;Audio.sfx('coin');saveGame();openMenu('shop',null,true)}else toast('A few more crowns first. Crates are surprisingly generous.')}],['A hearty lunch · 25 crowns','Restore health, spirit and fatigue for the whole party',()=>{if(state.coins>=25){state.coins-=25;state.sp=100;state.fatigue=0;players.forEach(p=>heal(p,state.maxHp));Audio.sfx('coin');saveGame();openMenu('shop',null,true)}else toast('Not enough crowns. The inn is free, though.')}],['Back','Nothing else for now',closeMenu]]}
+ if(type==='smith'){kicker='THE BELLWETHER FORGE';title='A sharper sort of kindness.';lead='Blade level '+state.sword+' / 3 · Crowns '+state.coins;const cost=state.sword===1?40:75;options=[[state.sword<3?'Temper blade · '+cost+' crowns':'Blade fully tempered',state.sword<3?'+25% sword damage per level':'A very persuasive piece of cutlery',()=>{if(state.sword>=3){toast('This blade is as sharp as your wit. Sharper, perhaps.');return}if(state.coins<cost){toast('Find more crowns in crates, treasure and troublesome buns.');return}state.coins-=cost;state.sword++;Audio.sfx('power');saveGame();openMenu('smith',null,true)}],['Back','The edge can wait',closeMenu]]}
+ if(type==='defeat'){kicker='A BRIEF KNEAD';title='Heroes need a second rise.';lead='Your discoveries are safe. Take a breath, then try again.';options=[['Return to the waybell','Restore the party and keep your discoveries',()=>{state.hp=state.maxHp;state.sp=100;loadLevel(state.checkpoint.level,[state.checkpoint.x,state.checkpoint.z]);players.forEach(p=>p.hp=state.maxHp);menu='pause';closeMenu()}],['Return to title','The morning can wait a little longer',showTitle]]}
+ if(type==='victory'){kicker='THE DAWN IS YOURS';title='Breakfast, at last.';lead='Bellwether has its morning back. Its little hero has earned a very large pastry.';content=`<div class="score-line"><div><strong>${state.score.toLocaleString()}</strong><small>ADVENTURE POINTS</small></div><div><strong>${state.rescued.length} / 2</strong><small>FRIENDS RESCUED</small></div><div><strong>${Math.floor(state.time/60)}:${String(Math.floor(state.time%60)).padStart(2,'0')}</strong><small>TIME WELL SPENT</small></div></div>`;options=[['Back to Bellwether','Visit Pip for a thank-you pastry and finish exploring',returnTown],['Challenge the King again','A fresh royal crust, with everything you learned',()=>{state.won=false;state.hp=state.maxHp;state.sp=100;loadLevel(2,[0,-12]);menuReturn='play';menu='pause';closeMenu()}],['About & credits','The people, tools and notes behind this morning',()=>openMenu('credits')]]}
+ if(type==='session-over'){kicker=state.won?'DAWN RESTORED':'AI HUB · ROUND COMPLETE';title=state.won?'A bellbearer to remember.':'A fine little adventure.';lead='Your score has been sent to the hub. The hub will reveal the standings.';content=`<div class="score-line"><div><strong>${state.score.toLocaleString()}</strong><small>POINTS</small></div><div><strong>${state.rescued.length}</strong><small>RESCUES</small></div><div><strong>${state.powers.length}</strong><small>POWERS</small></div></div>`;options=[['Settings','Sound and controller directions',()=>openMenu('settings')],['About this game','Source, testing and development notes',()=>openMenu('credits')]]}
+ $('#panel-kicker').textContent=kicker;$('#panel-title').textContent=title;$('#panel-lead').textContent=lead;menuActions=options.map(o=>o[2]);menuIndex=clamp(menuIndex,0,Math.max(0,options.length-1));b.innerHTML=content+'<div class="panel-menu" style="margin-top:.8rem">'+options.map((o,i)=>buttonHTML(o[0],o[1],i)).join('')+'</div>';bindButtons(b);highlightMenu();$('#menu-corner').classList.add('hide');Audio.sfx('menu')}
+function adjustSetting(key,direction){if(typeof settings[key]==='boolean')settings[key]=!settings[key];else settings[key]=Math.round(clamp(settings[key]+direction*.1,0,1)*10)/10;Audio.apply();try{localStorage.setItem('mochi-settings',JSON.stringify(settings))}catch{}openMenu('settings',null,true)}
+function returnTown(){menu=null;$('#overlay').classList.add('hide');paused=false;transitionLevel(0,[0,11]);toast('The morning is back · Visit Pip at the bakery')}
+function toast(t,time=3.2){if(mode==='title'||mode==='loading')return;$('#toast').textContent=t;$('#toast').classList.remove('hide');toastTimer=time}
+function updateQuest(){let title,sub;if(state.won){title='A morning well earned';sub='Visit Pip at the Bellwether bakery for your reward.'}else if(level===0){title=state.flags.mayor?'A path through the pines':'A bell out of order';sub=state.flags.mayor?'Head north through the Hushwood arch.':'Talk to Mayor Crumb by the fountain.'}else if(level===1){if(!state.rescued.includes('pip')){title='A baker in a bind';sub='Break Pip’s amber prison west of the trail.'}else if(!state.powers.includes('ember')){title='Borrow a spark';sub='Weaken a Cinderbun, then hold R1 / E.'}else if(!state.flags.bridge){title='A warmer welcome';sub='Cast Ember near both north braziers. '+(state.flags.fire1?1:0)+(state.flags.fire2?' + 1':'')+' lit.'}else{title='Over the Ember Bridge';sub='The Crown Kiln waits north. Borrow Gale from a moth before you go.'}}else{if(!state.powers.includes('quake')){title='A scroll with gravitas';sub='Claim the earth scroll at the western shrine.'}else if(!state.rescued.includes('keeper')){title='A keeper under crust';sub='Quake the eastern stone. Break Pepper’s amber prison.'}else if(!state.flags.wind2){title='A breath before the bell';sub=state.powers.includes('gust')?'Cast Gale beside the north turbine.':'Borrow Gale from a Draft moth. Hold R1 / E.'}else{title='His royal crustiness';sub='Break the King’s armor with heavy strikes or Quake.'}}$('#quest-title').textContent=title;$('#quest-sub').textContent=sub}
+function projectLabel(el,x,y,z){const v=V(x,y,z).project(camera);if(v.z>1||v.z<-1){el.style.display='none';return}el.style.display='block';el.style.left=(v.x*.5+.5)*innerWidth+'px';el.style.top=(-v.y*.5+.5)*innerHeight+'px'}
+function updateHUD(){if(!player)return;$('#hp-fill').style.width=player.hp/state.maxHp*100+'%';$('#sp-fill').style.width=state.sp+'%';$('#hp-value').textContent=Math.ceil(player.hp)+' / '+state.maxHp;$('#sp-value').textContent='SPIRIT '+Math.floor(state.sp);$('#coins').textContent=state.coins;$('#rescue-count').textContent=state.rescued.length+' / 2';const power=POWERS[state.power];$('#ability-icon').textContent=power?.icon||'◇';$('#ability-name').textContent=power?.name||'An empty echo';$('#ability-help').textContent=power?power.help+' · L1 / Q to cycle':'Weaken a foe, then hold R1 / E';$('#p2').classList.toggle('hide',!localJoined);if(localJoined&&players[1])$('#p2').textContent='P2 · '+(players[1].down?'DOWN · Interact nearby to revive':Math.ceil(players[1].hp)+' / '+state.maxHp+' HP');$('#purse').style.top=localJoined?'20vh':'13vh';const o=nearestInteract(player);const show=!!o&&mode==='play'&&!dialog&&!menu;$('#prompt').classList.toggle('hide',!show);if(show)$('#prompt').innerHTML='<span class="key wide">'+(padMode?'↑':'R')+'</span> '+promptName(o);$('#boss-hud').classList.toggle('hide',!boss?.active||!!boss?.dead||!!menu);$('.location').classList.toggle('hide',!!boss?.active);const labels=padMode?[['□','Slash'],['R2','Heavy'],['✕','Jump'],['○','Dash'],['R1','Borrow'],['△','Power'],['↓','Tonic '+state.tonics],['≡','Pause']]:[['J','Slash'],['K','Heavy'],['Space','Jump'],['L','Dash'],['E','Borrow'],['F','Power'],['H','Tonic '+state.tonics],['Esc','Pause']];$('#controls').innerHTML=labels.map(l=>'<span><b class="key '+(l[0].length>1?'wide':'')+'">'+l[0]+'</b>'+l[1]+'</span>').join('');for(const e of enemies){if(e.dead)continue;projectLabel(e.label,e.x,2.8,e.z);e.label.style.opacity=dist(player,e)<18?'1':'0'}drawMap()}
+function drawMap(){const c=$('#map'),ctx=c.getContext('2d'),scale=3.5,px=x=>120+x*scale,pz=z=>120+z*scale;ctx.clearRect(0,0,240,240);ctx.save();ctx.translate(120,120);ctx.fillStyle=level===2?'#5d8175':'#829f67';ctx.beginPath();for(let i=0;i<12;i++){const a=i*TAU/12;ctx.lineTo(Math.sin(a)*103,Math.cos(a)*103*(level===0?.8:1))}ctx.closePath();ctx.fill();ctx.restore();ctx.strokeStyle='#d8ca95';ctx.lineWidth=9;ctx.beginPath();ctx.moveTo(120,pz(21));ctx.lineTo(120,pz(-24));ctx.stroke();if(level===1){ctx.fillStyle='#7dd4c2';ctx.fillRect(20,pz(-19),200,10)}if(level===0){for(const p of [[-11,7],[11,8],[-10,-7],[12,-8]]){ctx.fillStyle='#c69462';ctx.fillRect(px(p[0])-8,pz(p[1])-8,16,16)}ctx.strokeStyle='#fff1bf';ctx.lineWidth=2;ctx.beginPath();ctx.arc(120,pz(3),9,0,TAU);ctx.stroke()}for(const o of interactables){if((o.kind==='cage'&&!state.rescued.includes(o.id))||o.kind==='shrine'||o.kind==='checkpoint'||o.kind==='brazier'){ctx.fillStyle=o.kind==='cage'?'#ffda75':o.kind==='checkpoint'?'#d4ecd5':'#e9a85c';ctx.beginPath();ctx.arc(px(o.x),pz(o.z),3.5,0,TAU);ctx.fill()}}for(const e of enemies)if(!e.dead){ctx.fillStyle='#e88163';ctx.beginPath();ctx.arc(px(e.x),pz(e.z),2.5,0,TAU);ctx.fill()}if(boss&&!boss.dead){ctx.fillStyle='#f2b85d';ctx.fillRect(px(boss.x)-5,pz(boss.z)-5,10,10)}for(const p of players){ctx.save();ctx.translate(px(p.x),pz(p.z));ctx.rotate(-p.facing);ctx.fillStyle=p.index?'#9edddd':'#fff3ce';ctx.beginPath();ctx.moveTo(0,7);ctx.lineTo(-5,-4);ctx.lineTo(5,-4);ctx.closePath();ctx.fill();ctx.restore()}ctx.fillStyle='#fff1c9';ctx.font='bold 14px sans-serif';ctx.textAlign='center';ctx.fillText('N',120,20)}
+function touchOnly(){return !keyboardSeen&&navigator.maxTouchPoints>0&&matchMedia('(pointer: coarse)').matches&&!pads.length}
+
+function emptyCommand(){return {x:0,y:0,attack:false,heavy:false,jump:false,dash:false,guard:false,absorb:false,cast:false,cycle:false,interact:false,tonic:false,lock:false}}
+function kp(c){return pressedKeys.has(c)}function held(c){return !!keys[c]}
+function gpDown(i,b){return !!pads[i]?.buttons[b]?.pressed||pads[i]?.buttons[b]?.value>.5}
+function gpPress(i,b){return gpDown(i,b)&&!padPrevious[i]?.[b]}
+function axis(i,n){const a=pads[i]?.axes[n]||0;return Math.abs(a)<.18?0:Math.sign(a)*(Math.abs(a)-.18)/.82}
+function pollPads(){pads=[...(navigator.getGamepads?.()||[])].filter(Boolean);let activity=false;for(let i=0;i<pads.length;i++)if(pads[i].buttons.some(b=>b.pressed)||pads[i].axes.some(a=>Math.abs(a)>.22))activity=true;if(activity){lastInputAt=performance.now();padMode=true;if(mode==='attract'){showTitle();return true}}return false}
+function readCommand(index=0){const c=emptyCommand();let pad=index;if(index===0){c.x=(held('KeyD')?1:0)-(held('KeyA')?1:0);c.y=(held('KeyS')?1:0)-(held('KeyW')?1:0);if(!localJoined){c.x+=(held('ArrowRight')?1:0)-(held('ArrowLeft')?1:0);c.y+=(held('ArrowDown')?1:0)-(held('ArrowUp')?1:0)}Object.assign(c,{attack:kp('KeyJ'),heavy:kp('KeyK'),jump:kp('Space'),dash:kp('KeyL'),guard:held('ShiftLeft')||held('ShiftRight'),absorb:held('KeyE'),cast:kp('KeyF'),cycle:kp('KeyQ'),interact:kp('KeyR'),tonic:kp('KeyH'),lock:kp('Tab')})}else{c.x=(held('ArrowRight')?1:0)-(held('ArrowLeft')?1:0);c.y=(held('ArrowDown')?1:0)-(held('ArrowUp')?1:0);Object.assign(c,{attack:kp('Numpad1'),heavy:kp('Numpad2'),jump:kp('Numpad0'),dash:kp('NumpadDecimal'),guard:held('Delete'),absorb:held('End'),cast:kp('Numpad3'),cycle:kp('PageDown'),interact:kp('NumpadEnter'),tonic:kp('Home')})}
+ c.x+=axis(pad,0)*(settings.invertX?-1:1);c.y+=axis(pad,1)*(settings.invertY?-1:1);c.attack ||=gpPress(pad,2);c.heavy ||=gpPress(pad,7);c.jump ||=gpPress(pad,0);c.dash ||=gpPress(pad,1);c.guard ||=gpDown(pad,6);c.absorb ||=gpDown(pad,5);c.cast ||=gpPress(pad,3);c.cycle ||=gpPress(pad,4);c.interact ||=gpPress(pad,12);c.tonic ||=gpPress(pad,13);c.lock ||=gpPress(pad,11);c.x=clamp(c.x,-1,1);c.y=clamp(c.y,-1,1);return c}
+function handleUI(dt){menuCooldown-=dt;if(menu==='credits'||menu==='guide'){const body=$('#panel-body');body.scrollTop+=axis(0,3)*14;if(kp('PageDown'))body.scrollTop+=240;if(kp('PageUp'))body.scrollTop-=240;}const option=kp('Escape')||(gpPress(0,9)&&!gpDown(0,8));const confirm=kp('Enter')||kp('Space')||gpPress(0,0);const back=kp('Backspace')||gpPress(0,1);if(dialog){if(option||back)nextLine(true);else if(confirm||kp('KeyR')||gpPress(0,12))nextLine();return true}if(option){Audio.init();if(menu)closeMenu();else openMenu(mode==='title'?'settings':'pause');return true}if(menu||mode==='title'){if(back&&menu){menuBack();return true}let dy=(axis(0,1)>.5||gpDown(0,13)?1:0)-(axis(0,1)<-.5||gpDown(0,12)?1:0);if(kp('ArrowDown')||kp('KeyS')){moveMenu(1);menuCooldown=.2}else if(kp('ArrowUp')||kp('KeyW')){moveMenu(-1);menuCooldown=.2}else if(dy&&menuCooldown<=0){moveMenu(dy);menuCooldown=.2}let dx=(kp('ArrowRight')||gpPress(0,15)?1:0)-(kp('ArrowLeft')||gpPress(0,14)?1:0);if(dx&&menu==='settings'){const names=['volume','music','voices','invertX','invertY','assist','shake'];if(names[menuIndex])adjustSetting(names[menuIndex],dx)}else if(dx&&menu==='guide'){guidePage=(guidePage+dx+GUIDE.length)%GUIDE.length;openMenu('guide')}else if(dx&&menu==='credits'){creditsPage=(creditsPage+dx+4)%4;openMenu('credits')}if(confirm){Audio.init();Audio.sfx('confirm');menuActions[menuIndex]?.()}return true}if(mode==='play'&&!AIHub.active){if(kp('Digit2')||(!localJoined&&gpPress(1,0)))joinPlayer()}if(mode==='play'&&(kp('KeyC')||gpPress(0,14))){openMenu('guide');return true}return false}
+function endInput(){padPrevious=pads.map(p=>p.buttons.map(b=>b.pressed||b.value>.5));pressedKeys.clear()}
+function anyInput(){lastInputAt=performance.now();if(mode==='attract'){showTitle();return true}return false}
+addEventListener('keydown',e=>{keyboardSeen=true;if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Tab','Backspace','Home','End','PageDown','Delete'].includes(e.code))e.preventDefault();padMode=false;Audio.init();if(anyInput()){keys={};pressedKeys.clear();return}if(!e.repeat)pressedKeys.add(e.code||e.key);keys[e.code||e.key]=true});
+addEventListener('keyup',e=>{keys[e.code||e.key]=false});addEventListener('blur',()=>{keys={};pressedKeys.clear()});
+addEventListener('pointerdown',()=>{Audio.init();anyInput();padMode=false});addEventListener('pointermove',e=>{if(Math.abs(e.movementX)+Math.abs(e.movementY)>2)anyInput()});
+addEventListener('gamepaddisconnected',()=>{if(mode==='play'&&!AIHub.active&&!menu)openMenu('pause');toast('Controller disconnected · Keyboard controls are available')});
+$('#menu-corner').onclick=()=>openMenu('settings');$('#touch-settings').onclick=()=>openMenu('settings',mode==='title'?'title':'play');$('#dialogue').onclick=()=>nextLine();
+function enterAttract(){mode='attract';menu=null;dialog=null;localJoined=false;attractTime=0;attractStep=-1;$('#title').classList.add('hide');$('#hud').classList.add('hide');$('#labels').classList.add('hide');$('#attract').classList.remove('hide');$('#menu-corner').classList.add('hide');$('#touch').classList.add('hide');$('#toast').classList.add('hide');$('#area-banner').classList.add('hide')}
+let attractFlags={};
+function attractCommand(dt){attractTime+=dt;const t=attractTime%86,s=t<12?0:t<31?1:t<48?2:t<77?3:4,start=[0,12,31,48,77][s],st=t-start;if(s!==attractStep){attractStep=s;attractFlags={};resetState();state.sp=100;state.hp=100;const caps=[['A town worth saving','Rest, trade, explore — and meet the breakfast committee.'],['Borrow a little trouble','Two blades, quick feet, and the powers of your former enemies.'],['Make your own way','Light the Ember Bridge. Ride the wind. Leave no baker behind.'],['Meet his royal crustiness','Jump the shockwaves. Break the armor. Ring in the dawn.'],['A little hero. A new morning.','Bring a friend. Bellwether could use another pair of hands.']][s];$('#attract-title').textContent=caps[0];$('#attract-sub').textContent=caps[1];if(s===0||s===4)loadLevel(0,[5,11]);if(s===1)loadLevel(1,[-4,11]);if(s===2){state.powers=['ember','gust'];state.power='ember';loadLevel(1,[0,-10]);}if(s===3){state.powers=['ember','gust','quake'];state.power='quake';state.flags={wind2:true,crack:true};loadLevel(2,[0,-15]);boss.active=true;boss.timer=1;boss.hp=360;}$('#area-banner').classList.add('hide');$('#boss-hud').classList.add('hide')}
+ const c=emptyCommand();let target;if(s===0){target={x:Math.sin(st*.35)*7,z:6+Math.cos(st*.3)*5};c.jump=st%4<dt;}if(s===1){target=enemies.filter(e=>!e.dead).sort((a,b)=>dist(player,a)-dist(player,b))[0]||{x:-10,z:2};if(dist(player,target)<3){c.attack=true;c.absorb=true;c.heavy=st%4<dt;}if(st>9&&!attractFlags.rescue){attractFlags.rescue=true;player.body.setTranslation({x:-10,y:.9,z:4},true);const cage=interactables.find(o=>o.id==='pip');if(cage){cage.hp=1;doAttack(player,true);if(dialog){dialog=null;$('#dialogue').classList.add('hide')}}}c.dash=st%4<dt;}if(s===2){target={x:0,z:-11};if(st>1&&!attractFlags.fire1){lightBrazier(interactables.find(o=>o.id==='fire1'));attractFlags.fire1=true;castPower(player)}if(st>4&&!attractFlags.fire2){lightBrazier(interactables.find(o=>o.id==='fire2'));attractFlags.fire2=true;castPower(player)}if(st>7&&!attractFlags.wind){attractFlags.wind=true;player.body.setTranslation({x:9,y:1,z:4},true);state.power='gust';activateTurbine(interactables.find(o=>o.id==='wind1'));}if(st>7){target={x:16,z:2};c.jump=st%1.2<dt;c.cast=st%3<dt}c.attack=true;}if(s===3){target=boss;c.attack=true;c.heavy=st%1<dt;c.cast=st%3<dt;c.jump=st%2.2<dt;c.dash=st%4.7<dt;if(st>9&&st<14)state.power='gust';else state.power='quake';if(st>25&&!boss.dead)bossDamage(500,true);}if(s===4){target={x:Math.sin(st*.6)*5,z:6+Math.cos(st*.6)*4};c.jump=st%1.8<dt;if(frameNo%15===0)ring(player.x,player.z,palette.gold,.3,.6)}if(target){const dx=target.x-player.x,dz=target.z-player.z,l=Math.hypot(dx,dz);if(l>2.2){const a=cameraAngle;c.x=(dx*Math.cos(a)-dz*Math.sin(a))/l;c.y=(dx*Math.sin(a)+dz*Math.cos(a))/l}}$('#toast').classList.add('hide');$('#boss-hud').classList.add('hide');return c}
+function updateCamera(dt){if(!player)return;let x=player.x,z=player.z,y=1;if(mode==='title'){x=2;z=0;cameraAngle=.26+Math.sin(elapsed*.08)*.08;cameraDistance=29;y=1.5}else if(players.length>1){const alive=players.filter(p=>!p.down);if(alive.length){x=alive.reduce((a,p)=>a+p.x,0)/alive.length;z=alive.reduce((a,p)=>a+p.z,0)/alive.length}cameraDistance=lerp(cameraDistance,22+Math.min(8,dist(players[0],players[1])*.4),dt*2)}else{cameraDistance=lerp(cameraDistance,boss?.active?27:22,dt*2);if(mode==='play'&&!menu&&!dialog){cameraAngle+=axis(0,2)*(settings.invertX?-1:1)*dt*1.5;cameraDistance=clamp(cameraDistance+axis(0,3)*(settings.invertY?-1:1)*dt*5,17,30)}}if(boss?.active){x=lerp(x,boss.x,.25);z=lerp(z,boss.z,.25)}const dest=V(x+Math.sin(cameraAngle)*cameraDistance,mode==='title'?23:cameraDistance*.78,z+Math.cos(cameraAngle)*cameraDistance);const aim=V(x,y,z);if(mode==='title'){dest.x-=4;aim.x-=6}camera.position.lerp(dest,Math.min(1,dt*4.5));if(shake>0&&settings.shake){camera.position.x+=(Math.random()-.5)*shake;camera.position.y+=(Math.random()-.5)*shake;shake=Math.max(0,shake-dt*1.5)}camera.lookAt(aim)}
+let keyboardSeen=false;
+let lastFrame=0,accumulator=0,pendingCommands=[emptyCommand(),emptyCommand()];
+const edgeActions=['attack','heavy','jump','dash','cast','cycle','interact','tonic','lock'];
+function inputTick(){if(mode==='loading')return;pollPads();$('#touch').classList.toggle('hide',!touchOnly()||!!menu);const handled=handleUI(1/60);const fresh=[readCommand(0),readCommand(1)];for(let i=0;i<2;i++){const old=pendingCommands[i];for(const k of edgeActions)fresh[i][k]=!handled&&(fresh[i][k]||old[k]);pendingCommands[i]=fresh[i]}input={x:fresh[0].x,y:fresh[0].y,fire:held('KeyJ')||held('KeyK')||held('Space')||held('KeyE')||held('KeyF')||held('ShiftLeft')||[0,1,2,3,5,6,7].some(b=>gpDown(0,b))};endInput()}
+
+function frame(ms){requestAnimationFrame(frame);if(!renderer||mode==='loading')return;const dt=Math.min((ms-(lastFrame||ms))/1000,.05);lastFrame=ms;elapsed+=dt;frameNo++;let commands=pendingCommands.map(c=>({...c}));if(mode==='title'&&!menu&&performance.now()-lastInputAt>10000&&!touchOnly()&&!AIHub.active)enterAttract();if(mode==='attract')commands=[attractCommand(dt)];const canPlay=(mode==='play'||mode==='attract')&&!menu&&!dialog&&!transitioning&&!hubEnded&&(!AIHub.active||AIHub.time()>=0);if(canPlay){accumulator+=dt;let steps=0;while(accumulator>=1/60&&steps<4){simulate(1/60,commands);for(const c of commands){c.attack=false;c.heavy=false;c.jump=false;c.cast=false;c.cycle=false;c.dash=false;c.interact=false;c.tonic=false;c.lock=false}accumulator-=1/60;steps++;pendingCommands.forEach(c=>edgeActions.forEach(k=>c[k]=false));if(menu||dialog)break}}else accumulator=0;animateDecor(dt);if(!canPlay)for(const r of rigs)animateRig(r,dt);updateEffects(dt);updateCamera(dt);if(mode==='play')updateHUD();if(toastTimer>0){toastTimer-=dt;if(toastTimer<=0)$('#toast').classList.add('hide')}if(zoneBanner>0&&mode==='play'){zoneBanner-=dt;if(zoneBanner<=0)$('#area-banner').classList.add('hide')}if(AIHub.active&&hubInfo&&!hubEnded&&!hubResult){const clock=AIHub.time();$('#countdown').classList.toggle('hide',clock>=0);if(clock<0)$('#countdown').innerHTML=Math.ceil(-clock/1000)+'<small>AI HUB · GET READY, BELLBEARER</small>';if(frameNo%45===0)AIHub.progress({score:state.score,label:ZONES[level].name});}renderer.render(scene,camera)}
+AIHub.probe(()=>({scene:mode==='loading'?'ready':mode==='title'?'title':hubResult||hubEnded?'over':menu?'menu':'play',menu:!!menu,world:simTime,input}));
+AIHub.on('time-up',()=>{if(!hubResult)finishHub()});AIHub.on('end',()=>{hubEnded=true;Audio.stop();input={x:0,y:0,fire:false};dialog=null;$('#dialogue').classList.add('hide');$('#countdown').classList.add('hide');openMenu('session-over')});
+async function boot(){try{const hubPromise=AIHub.active?AIHub.connect({mode:'parallel',seats:[1,4]}):Promise.resolve(null);if(!navigator.gpu)throw Error('This adventure needs WebGPU. Open it in a WebGPU-enabled browser over HTTPS or localhost.');const adapter=await navigator.gpu.requestAdapter();if(!adapter)throw Error('A WebGPU graphics adapter is unavailable. Enable WebGPU or use a compatible browser and GPU.');await RAPIER.init();scene=new THREE.Scene();camera=new THREE.PerspectiveCamera(43,innerWidth/innerHeight,.1,180);renderer=new THREE.WebGPURenderer({canvas:$('#game'),antialias:true,alpha:false});renderer._getFallback=null;await renderer.init();if(!renderer.backend.isWebGPUBackend)throw Error('WebGPU is required. No WebGL fallback is enabled.');renderer.setPixelRatio(devicePixelRatio);renderer.setSize(innerWidth,innerHeight);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.15;scene.add(new THREE.HemisphereLight(0xffefc7,0x4c7b79,2));const sun=new THREE.DirectionalLight(0xffe6a5,3);sun.position.set(-15,30,20);scene.add(sun);hubInfo=await hubPromise;$('#load').classList.add('hide');if(hubInfo){startGame(false,false);AIHub.ready();AIHub.progress({score:0,label:'Bellwether'})}else showTitle();addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});window.Mochi={version:'1.0.0',inspect:()=>({mode,level,menu,state:JSON.parse(JSON.stringify(state)),player:{x:player.x,y:player.y,z:player.z,hp:player.hp},players:players.length,boss:boss?{hp:boss.hp,shield:boss.shield,active:boss.active,dead:boss.dead}:null,backend:renderer.backend.isWebGPUBackend?'WebGPU':'unknown'}),content:{zones:ZONES,powers:POWERS,spawns:SPAWNS}};if(new URLSearchParams(location.search).has('test'))window.Mochi.test={scene,renderer,camera,THREE,audio:Audio,settings,players:()=>players,showTitle,nextLine,updateAbsorb,attractCommand,start:startGame,load:loadLevel,learn:learnPower,cast:()=>castPower(player),attack:(heavy=false)=>{player.attackCD=0;doAttack(player,heavy)},teleport:(x,z,y=.9)=>{player.body.setTranslation({x,y,z},true);player.x=x;player.z=z;player.y=y-.87;player.vy=0},interact:()=>interact(player),state,enemies:()=>enemies,objects:()=>interactables,damage:(n)=>hurt(player,n),bossDamage,attract:enterAttract,menu:openMenu,close:closeMenu,save:saveGame,join:joinPlayer,step:(dt=1/60,c={})=>simulate(dt,[{...emptyCommand(),...c},emptyCommand()]),refill:()=>{state.sp=100;players.forEach(p=>p.hp=state.maxHp)}};await renderer.compileAsync(scene,camera);lastInputAt=performance.now();window.Mochi.ready=true;setInterval(inputTick,16);requestAnimationFrame(frame)}catch(e){console.error(e);$('#load-text').textContent=e.message;$('#load h1').textContent='This morning needs WebGPU.';$('#load .sigil').textContent='◇';AIHub.fail(e.message)}}
+boot();
+
+</script></body></html>

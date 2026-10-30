@@ -1,0 +1,1512 @@
+<!--
+Source Information
+- Date: 2026-10-29 04:15
+- Source: Command & Conquer
+- Game: Tiber Harvest Wars (title picked by Math.random from 50 brainstormed titles, index 47)
+- Tech: Three.js 0.180.0 (WebGPU, no fallback), Rapier 0.19.3 (@dimforge/rapier3d-compat), Gamepad API, Web Audio API, BroadcastChannel (standalone multiplayer), AI Hub Session Protocol v1 (session.js 1.3.0 pasted unmodified)
+- Art Direction: Stylized cel-shaded (MeshToonMaterial + gradient map + inverted-hull outlines, saturated faction colours)
+- Animation: Procedural (turret tracking, track/wheel spin, harvester arm, crystal pulse, rotor/hover bob, recoil, death explosions)
+- Audio: Code-written music (procedural synth march loop) and sound effects (Web Audio synthesis); Animalese/Simlish-style gibberish voice (formant blip synthesis) for EVA alerts
+- Online: AI Hub parallel session (score race) + standalone BroadcastChannel lobby multiplayer; no chat per hub rules
+- Testing: Lightweight headless load check permitted
+- Environment: Muse Code CLI (headless); Linux; browser unknown
+- Model: Meta, muse-wonder-1.0, reasoning effort max
+- Usage: unknown
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="6">
+<meta name="hub:session-goal" content="Highest war score when time runs out">
+<meta name="hub:session-howto" content="Left stick cursor, Cross select, Circle cancel, R1 build">
+<meta name="hub:webgpu" content="required">
+<title>Tiber Harvest Wars</title>
+<style>
+:root{--ink:#eaf6ff;--dim:#9fc3e0;--aegis:#3b82f6;--crim:#e8443a;--gold:#ffd23f;--panel:rgba(8,22,38,.92);--line:#2e6ea6;--good:#37e08b;--bad:#ff5d5d}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:#06121f;color:var(--ink);font-family:"Segoe UI",system-ui,sans-serif}
+#gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+button{font:inherit;color:var(--ink);background:#12365a;border:2px solid var(--line);border-radius:10px;padding:12px 18px;min-height:52px;cursor:pointer}
+button:focus-visible,[tabindex]:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
+button:disabled{opacity:.45;cursor:default}
+.screen{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:radial-gradient(ellipse at 50% 35%,rgba(20,60,110,.88),rgba(3,10,20,.96));z-index:40;padding:24px;text-align:center}
+.screen[hidden]{display:none}
+h1{font-size:clamp(38px,7vw,76px);margin:0;letter-spacing:2px;color:var(--gold);text-shadow:0 4px 0 #7a4d00,0 0 34px rgba(255,210,63,.35)}
+.sub{color:var(--dim);font-size:clamp(16px,2.4vw,22px);max-width:760px;line-height:1.45}
+.menu{display:flex;flex-direction:column;gap:10px;width:min(430px,92vw)}
+.menu button{font-size:21px;text-align:left}
+.menu button.sel{border-color:var(--gold);background:#1b4f83;box-shadow:0 0 0 2px rgba(255,210,63,.35)}
+.row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:center}
+.card{background:var(--panel);border:2px solid var(--line);border-radius:14px;padding:18px 20px;max-width:820px;width:min(820px,94vw);text-align:left;font-size:18px;line-height:1.5;max-height:62vh;overflow:auto}
+.card h2{margin:0 0 8px;color:var(--gold)} .card p{margin:6px 0}
+label{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:7px 0;border-bottom:1px solid rgba(120,180,230,.18);font-size:19px}
+input[type=range]{width:190px} select{font:inherit;background:#12365a;color:var(--ink);border:2px solid var(--line);border-radius:8px;padding:8px}
+#hud{position:fixed;inset:0;pointer-events:none;z-index:20}
+#hud[hidden]{display:none}
+#topbar{position:absolute;top:0;left:0;right:0;display:flex;gap:14px;align-items:center;padding:10px 14px;background:linear-gradient(180deg,rgba(4,14,26,.92),rgba(4,14,26,0));font-size:19px;font-weight:700}
+.pill{background:var(--panel);border:2px solid var(--line);border-radius:999px;padding:6px 14px}
+.pill.warn{border-color:var(--bad);color:#ffb3b3}
+#obj{position:absolute;top:64px;left:14px;background:var(--panel);border:2px solid var(--line);border-radius:12px;padding:10px 14px;font-size:17px;max-width:360px;line-height:1.4}
+#alerts{position:absolute;top:64px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;gap:6px;align-items:center;width:min(680px,80vw)}
+.alert{background:rgba(10,30,55,.94);border:2px solid var(--gold);color:#ffe9a8;border-radius:10px;padding:8px 16px;font-size:19px;font-weight:700}
+.alert.bad{border-color:var(--bad);color:#ffc4c4}
+#dock{position:absolute;right:12px;top:64px;bottom:118px;width:308px;background:var(--panel);border:2px solid var(--line);border-radius:14px;padding:10px;pointer-events:auto;display:flex;flex-direction:column;gap:8px}
+#dock h3{margin:2px 0;color:var(--gold);font-size:19px}
+.tabs{display:flex;gap:6px}.tabs button{flex:1;padding:8px 4px;min-height:44px;font-size:16px}
+.tabs button.sel{border-color:var(--gold);background:#1b4f83}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;overflow:auto}
+.buildBtn{text-align:left;font-size:16px;line-height:1.25;padding:9px 10px;min-height:64px;height:auto;overflow:visible}
+.buildBtn small{display:block;color:var(--dim)} .buildBtn.sel{border-color:var(--gold)}
+.buildBtn .q{color:var(--gold);font-weight:800}
+#selInfo{font-size:16px;line-height:1.4;background:rgba(255,255,255,.06);border-radius:10px;padding:8px 10px;min-height:74px}
+#queueBar{height:12px;background:#0a2038;border-radius:99px;overflow:hidden;border:1px solid var(--line)}
+#queueFill{height:100%;width:0%;background:var(--gold)}
+#minimapWrap{position:absolute;left:12px;bottom:12px;background:var(--panel);border:2px solid var(--line);border-radius:14px;padding:8px;pointer-events:auto}
+#minimap{display:block;width:216px;height:216px;border-radius:8px;background:#0a1c10;cursor:pointer}
+#cmdbar{position:absolute;left:244px;right:332px;bottom:12px;display:flex;gap:8px;justify-content:center;pointer-events:auto;flex-wrap:wrap}
+#cmdbar button{font-size:16px;padding:10px 14px;min-height:50px}
+#hintbar{position:absolute;left:50%;transform:translateX(-50%);bottom:82px;background:rgba(4,14,26,.9);border:1px solid var(--line);border-radius:999px;padding:7px 16px;font-size:16px;color:var(--dim);white-space:nowrap}
+#cursor{position:fixed;width:26px;height:26px;margin:-13px 0 0 -13px;border:3px solid var(--gold);border-radius:50%;z-index:60;pointer-events:none;box-shadow:0 0 12px rgba(255,210,63,.7)}
+#cursor::after{content:"";position:absolute;left:50%;top:50%;width:4px;height:4px;margin:-2px;background:var(--gold);border-radius:50%}
+#dragbox{position:fixed;border:2px solid var(--good);background:rgba(55,224,139,.15);z-index:30;pointer-events:none}
+#superBtn.ready{border-color:var(--gold);box-shadow:0 0 16px rgba(255,210,63,.8);color:var(--gold)}
+.kbd{background:#1b4f83;border:1px solid var(--line);border-bottom-width:3px;border-radius:6px;padding:1px 8px;font-weight:700}
+#touchMsg{position:fixed;inset:auto 12px 12px 12px;z-index:80;background:#3a0d0d;border:2px solid var(--bad);border-radius:12px;padding:14px 18px;font-size:20px;display:none;align-items:center;gap:12px;justify-content:space-between}
+#bigCenter{position:absolute;top:38%;left:50%;transform:translate(-50%,-50%);font-size:52px;font-weight:900;color:var(--gold);text-shadow:0 3px 0 #000;text-align:center;pointer-events:none}
+@media (max-width:900px){#dock{width:250px}#cmdbar{display:none}#obj{display:none}}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="cursor" hidden></div><div id="dragbox" hidden></div>
+<div id="hud" hidden>
+  <div id="topbar"><span class="pill" id="resCredits">⛁ 0</span><span class="pill" id="resPower">⚡ 0/0</span><span class="pill" id="resPop">Units 0</span><span class="pill" id="resScore">Score 0</span><span class="pill" id="resTimer">06:00</span><span class="pill" id="netPill">Solo</span></div>
+  <div id="obj"></div><div id="alerts"></div><div id="bigCenter"></div>
+  <div id="dock">
+    <h3 id="dockTitle">Command — Build</h3>
+    <div class="tabs" id="dockTabs"><button data-tab="build" class="sel">Build ▸R1</button><button data-tab="train">Train</button><button data-tab="tech">Tech</button></div>
+    <div class="grid" id="buildGrid"></div>
+    <div id="queueBar"><div id="queueFill"></div></div>
+    <div id="selInfo">Select a unit or building. Cross / Left-click selects. Circle / Right-click orders a move.</div>
+    <div class="row"><button id="superBtn">☄ Ion Cannon — locked</button></div>
+    <div class="row"><button id="repairBtn">🔧 Repair selected (50⛁)</button><button id="sellBtn">Sell</button></div>
+  </div>
+  <div id="minimapWrap"><canvas id="minimap" width="216" height="216"></canvas><div style="font-size:13px;color:var(--dim);text-align:center">Minimap — click to jump camera</div></div>
+  <div id="cmdbar">
+    <button data-cmd="move">➤ Move</button><button data-cmd="attack">⚔ Attack-move</button><button data-cmd="stop">■ Stop</button>
+    <button data-cmd="hold">✋ Hold</button><button data-cmd="patrol">↻ Patrol</button><button data-cmd="army">★ All Army (F)</button>
+  </div>
+</div>
+<div id="hintbar" hidden>🎮 Left stick: cursor · Cross: select/confirm · Circle: order/cancel · Right stick: camera · Options: pause</div>
+<div id="touchMsg"><span>⚠ Controller or keyboard required — touch alone cannot command this war.</span><button id="touchSettingsBtn">⚙ Settings</button></div>
+
+<div class="screen" id="scr-title">
+  <div style="font-size:19px;letter-spacing:6px;color:var(--dim)">COMMAND THE HARVEST · HOLD THE LINE</div>
+  <h1>TIBER HARVEST WARS</h1>
+  <p class="sub">The crystals are bleeding the world dry — and both armies want them. Build your base, harvest the Tiber fields, and erase the Crimson Hand before their missile silos erase you. <b style="color:var(--gold)">For Kane? No. For the harvest.</b></p>
+  <div class="menu" id="mainMenu">
+    <button data-act="play" class="sel">▶ &nbsp;Skirmish — Destroy the Crimson Hand</button>
+    <button data-act="multi">🌐 &nbsp;Multiplayer Lobby</button>
+    <button data-act="how">❓ &nbsp;Field Manual (How to Play)</button>
+    <button data-act="settings">⚙ &nbsp;Settings</button>
+    <button data-act="about">ℹ &nbsp;About / Credits</button>
+  </div>
+  <p class="sub" id="titleStatus">Commander, the battlefield is live behind this screen. Idle 10s for attract mode — any input returns command to you.</p>
+  <p class="sub" style="font-size:15px">Keyboard + mouse fully supported · PS5 DualSense recommended · Sound on 🔊</p>
+</div>
+
+<div class="screen" id="scr-lobby" hidden>
+  <h1 style="font-size:44px">SKIRMISH SETUP</h1>
+  <div class="card">
+    <label>Faction <span><b style="color:var(--aegis)">AEGIS Coalition</b> (you) vs <b style="color:#ff7a70">Crimson Hand</b></span></label>
+    <label>Enemy difficulty <select id="optDiff"><option value="0">Recruit — learns slowly</option><option value="1" selected>Veteran — a real war</option><option value="2">Elite — no mercy</option></select></label>
+    <label>Map <select id="optMap"><option value="0">Tiber Delta (balanced)</option><option value="1">Crystal Canyon (rich centre)</option><option value="2">Twin Bases (open field)</option></select></label>
+    <label>Starting credits <select id="optCred"><option value="2500">2,500 ⛁</option><option value="4000" selected>4,000 ⛁</option><option value="7000">7,000 ⛁</option></select></label>
+    <label>Round length (hub race clock) <select id="optLen"><option value="360">6 minutes</option><option value="540">9 minutes</option><option value="99999">Endless — until victory</option></select></label>
+    <p>Victory: destroy the Crimson Construction Yard and every Crimson production building. Defeat: lose your Construction Yard with no MCV left to rebuild it. Your score is harvested Tiber + kills + structures razed.</p>
+  </div>
+  <div class="row"><button id="btnLaunch" style="font-size:22px;border-color:var(--gold)">▶ &nbsp;DEPLOY, COMMANDER</button><button data-back>◀ Back</button></div>
+</div>
+
+<div class="screen" id="scr-multi" hidden>
+  <h1 style="font-size:44px">MULTIPLAYER</h1>
+  <div class="card">
+    <h2>Lobby — same-device &amp; same-network tabs</h2>
+    <p>Open this file in a second tab or device browser on the same network tool to spar. Rooms sync orders and army snapshots about 8×/second; each commander still commands only their own forces. Inside an AI Hub session the hub seats and clock take over automatically (parallel score race).</p>
+    <label>Commander callsign <input id="mpName" value="Commander" maxlength="14" style="font:inherit;background:#12365a;color:var(--ink);border:2px solid var(--line);border-radius:8px;padding:8px"></label>
+    <label>Room code <input id="mpRoom" value="TIBER" maxlength="6" style="font:inherit;text-transform:uppercase;background:#12365a;color:var(--ink);border:2px solid var(--line);border-radius:8px;padding:8px"></label>
+    <div class="row"><button id="mpHost">Host Room</button><button id="mpJoin">Join Room</button><button id="mpStart" disabled>Start Shared Battle</button></div>
+    <p id="mpStatus">Not connected. Solo skirmish is always available from the title screen.</p>
+    <div id="mpPlayers" style="font-size:18px;line-height:1.6"></div>
+  </div>
+  <div class="row"><button data-back>◀ Back</button></div>
+</div>
+
+<div class="screen" id="scr-how" hidden>
+  <h1 style="font-size:44px">FIELD MANUAL</h1>
+  <div class="card">
+    <h2>The war in 60 seconds</h2>
+    <p>🟢 <b>Harvest:</b> your Harvester auto-runs between green Tiber crystals and your Refinery. Crystals regrow slowly — fight for the rich centre fields.</p>
+    <p>🏗 <b>Build:</b> Power Plant → Refinery → Barracks / War Factory → Tech Lab. Watch ⚡ power: below zero, production crawls and turrets go dark. Place buildings near your Construction Yard (glowing pad). Select the Yard / Barracks / Factory, then pick from the right-hand dock.</p>
+    <p>⚔ <b>Fight:</b> select troops, then Circle / right-click ground to move, ⚔ Attack-move to advance-and-fire, Square / A for attack-move with controller. Rocket troops shred armour; rifles shred infantry; artillery out-ranges turrets but is fragile up close. Engineers capture enemy buildings (walk them into one) and repair yours.</p>
+    <p>☄ <b>Ion Cannon:</b> needs a Tech Lab, then charges ~90s. Pick the ready button, then pick a target. The Crimson missile is telegraphed with a red ring — move out of it.</p>
+    <p>⌨ <b>Keys:</b> WASD/arrows pan · wheel zoom · Q/E rotate · Left-click select, drag = box-select · Right-click smart order · A attack-move · S stop · H hold · P patrol · F all army · 1–4 control groups (Ctrl+number sets) · Space centre on alert · Esc pause/settings.</p>
+    <p>🎮 <b>DualSense:</b> Left stick cursor · Cross select/confirm · Circle smart order/back · Square attack-move · Triangle all-army · L1/R1 build tabs · R2/L2 zoom · Options pause · L3 HQ · R3 idle harvester. Menus: D-pad / left stick + Cross.</p>
+  </div>
+  <div class="row"><button data-back>◀ Back</button></div>
+</div>
+
+<div class="screen" id="scr-settings" hidden>
+  <h1 style="font-size:44px">SETTINGS</h1>
+  <div class="card" id="settingsCard">
+    <label>Master volume <input type="range" id="setVol" min="0" max="100" value="80"></label>
+    <label>Music volume <input type="range" id="setMus" min="0" max="100" value="70"></label>
+    <label>Voice (EVA) volume <input type="range" id="setVoice" min="0" max="100" value="80"></label>
+    <label>Invert horizontal (gamepad fix) <input type="checkbox" id="setInvX"></label>
+    <label>Invert vertical (gamepad fix) <input type="checkbox" id="setInvY"></label>
+    <label>Camera pan speed <input type="range" id="setCam" min="40" max="220" value="100"></label>
+    <label>Mouse edge-pan <input type="checkbox" id="setEdge" checked></label>
+    <label>Screen shake <input type="checkbox" id="setShake" checked></label>
+    <label>Colour-blind friendly palettes <input type="checkbox" id="setCB"></label>
+    <label>Graphics quality <select id="setQ"><option value="0">Performance</option><option value="1" selected>Balanced</option><option value="2">Ultra — all shadows &amp; particles</option></select></label>
+    <p style="color:var(--dim)">Settings save on this device (outside AI Hub sessions). Esc / Options / Circle closes. In a hub session, Quit and Restart are disabled by the hub — the round clock rules.</p>
+  </div>
+  <div class="row"><button id="setResume">Resume Battle</button><button id="setRestart">Restart Skirmish</button><button id="setQuit">Quit to Title</button><button data-back>◀ Back</button></div>
+</div>
+
+<div class="screen" id="scr-about" hidden>
+  <h1 style="font-size:44px">ABOUT</h1>
+  <div class="card" id="aboutCard"></div>
+  <div class="row"><button data-back>◀ Back</button></div>
+</div>
+
+<div class="screen" id="scr-end" hidden>
+  <h1 id="endTitle">VICTORY</h1>
+  <p class="sub" id="endText"></p>
+  <div class="card" id="endStats" style="text-align:center;font-size:20px"></div>
+  <div class="row"><button id="endAgain">▶ Play Again</button><button id="endTitleBtn">Title Screen</button></div>
+</div>
+
+<div class="screen" id="scr-error" hidden>
+  <h1 style="font-size:40px;color:var(--bad)">SIGNAL LOST</h1>
+  <p class="sub" id="errText">This war needs WebGPU. Please open this file in a current Chrome / Edge on a GPU-enabled device.</p>
+  <div class="row"><button onclick="location.reload()">Retry</button></div>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { WebGPURenderer } from 'three/webgpu';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+const $=id=>document.getElementById(id);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v)), lerp=(a,b,t)=>a+(b-a)*t;
+const V3=(x=0,y=0,z=0)=>new THREE.Vector3(x,y,z);
+let seedN=1337; const srand=()=>{seedN=(seedN*1664525+1013904223)>>>0;return seedN/4294967296;};
+const ABOUT_HTML=`<h2>Tiber Harvest Wars — Credits</h2>
+<p><b>Source:</b> Command &amp; Conquer (spiritual successor; all art, code and audio original)</p>
+<p><b>Date:</b> 2026-10-29 04:15 · <b>Model:</b> Meta, muse-wonder-1.0, reasoning effort max · <b>Environment:</b> Muse Code CLI (headless); Linux; browser unknown · <b>Usage:</b> unknown</p>
+<p><b>Tech:</b> Three.js 0.180.0 WebGPU (no fallback) · Rapier 0.19.3 physics · Gamepad API · Web Audio synthesis · BroadcastChannel multiplayer · AI Hub Session Protocol v1 (session.js 1.3.0)</p>
+<p><b>Art:</b> Cel-shaded toon rendering with inverted-hull outlines · <b>Animation:</b> fully procedural · <b>Audio:</b> code-written synth score + SFX, Animalese-style gibberish EVA voice</p>
+<p><b>Online:</b> AI Hub parallel score-race sessions + standalone tab-to-tab lobby · <b>Testing:</b> lightweight headless checks</p>
+<p style="color:var(--dim)">Built as a complete vertical slice: economy, base building, combined-arms combat, fog of war, enemy command AI, superweapons, veterancy, upgrades and controller-first 10-foot UX. The crystals must flow, Commander.</p>`;
+$('aboutCard').innerHTML=ABOUT_HTML;
+/* ================= AUDIO: synth music, SFX, gibberish EVA voice ================= */
+const AudioSys={ctx:null,master:null,musG:null,sfxG:null,voxG:null,started:false,musTimer:null,step:0,intensity:0,
+ init(){ if(this.ctx) return; const C=new (window.AudioContext||window.webkitAudioContext)(); this.ctx=C;
+  this.master=C.createGain(); this.master.connect(C.destination);
+  this.musG=C.createGain(); this.musG.connect(this.master); this.sfxG=C.createGain(); this.sfxG.connect(this.master); this.voxG=C.createGain(); this.voxG.connect(this.master);
+  this.applySettings(); this.startMusic(); },
+ applySettings(){ if(!this.ctx) return; const s=Settings.data; this.master.gain.value=s.vol; this.musG.gain.value=s.mus*.5; this.sfxG.gain.value=.9; this.voxG.gain.value=s.voice; },
+ tone(f,d,type='square',g=.15,when=0,slide=0,dest=null){ if(!this.ctx) return; const C=this.ctx,t=C.currentTime+when,o=C.createOscillator(),gn=C.createGain();
+  o.type=type; o.frequency.setValueAtTime(f,t); if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(20,f+slide),t+d);
+  gn.gain.setValueAtTime(g,t); gn.gain.exponentialRampToValueAtTime(.001,t+d); o.connect(gn); gn.connect(dest||this.sfxG); o.start(t); o.stop(t+d+.02); },
+ noise(d=.3,g=.3,when=0,fc=800){ if(!this.ctx) return; const C=this.ctx,t=C.currentTime+when,len=Math.max(1,(d*C.sampleRate)|0),buf=C.createBuffer(1,len,C.sampleRate),ch=buf.getChannelData(0);
+  for(let i=0;i<len;i++) ch[i]=(Math.random()*2-1)*(1-i/len); const src=C.createBufferSource(); src.buffer=buf; const f=C.createBiquadFilter(); f.type='lowpass'; f.frequency.value=fc;
+  const gn=C.createGain(); gn.gain.value=g; src.connect(f); f.connect(gn); gn.connect(this.sfxG); src.start(t); },
+ click(){this.tone(880,.06,'square',.08)}, select(){this.tone(660,.07,'square',.09); this.tone(990,.08,'square',.07,.05)},
+ move(){this.tone(520,.08,'sine',.1)}, error(){this.tone(160,.18,'sawtooth',.12)}, build(){this.tone(220,.3,'triangle',.14,0,440)},
+ cash(){this.tone(1320,.09,'square',.1); this.tone(1760,.12,'square',.09,.07)},
+ shoot(kind){ if(kind==='shell'){this.noise(.16,.22,0,500); this.tone(90,.16,'sawtooth',.16,0,-40);} else if(kind==='rocket'){this.noise(.22,.16,0,1400); this.tone(300,.2,'sawtooth',.08,0,500);} else if(kind==='laser'){this.tone(1400,.12,'sawtooth',.1,0,-900);} else this.tone(980,.07,'square',.09,0,-300); },
+ boom(big){ this.noise(big?.7:.35,big?.5:.3,0,big?300:600); this.tone(big?55:80,big?.6:.3,'sine',.4,0,-30); },
+ ion(){ this.tone(60,1.4,'sawtooth',.25,0,900); this.noise(1.2,.3,.2,2000); setTimeout(()=>this.boom(true),650); },
+ startMusic(){ if(this.musTimer) return; const bass=[55,55,65.4,49,55,55,73.4,82.4], arp=[220,261.6,329.6,392,329.6,261.6];
+  this.musTimer=setInterval(()=>{ if(!this.ctx||document.hidden) return; const s=this.step++, inten=this.intensity;
+   if(s%2===0){ this.tone(bass[(s>>1)%8],.42,'sawtooth',.10,0,0,this.musG); this.tone(bass[(s>>1)%8]*2,.3,'triangle',.06,0,0,this.musG); }
+   if(inten>.25||s%4===0) this.tone(arp[s%6]*(inten>.7?2:1),.16,'square',.045,0,0,this.musG);
+   if(s%4===0) this.noise(.05,.05,0,6000); if(s%8===4) this.noise(.12,.07,0,300);
+  },230); },
+ speak(text,urgent){ if(!this.ctx) return; const words=String(text).split(' '); let t=0;
+  for(const w of words){ const n=clamp(w.length,2,7); for(let i=0;i<n;i++){ const f=urgent?520+Math.random()*260:380+Math.random()*220;
+    this.tone(f,.07,'triangle',.16,t,Math.random()*160-80,this.voxG); t+=.075; } t+=.09; }
+  showAlert(text,urgent); }
+};
+function showAlert(text,bad){ const box=$('alerts'); const d=document.createElement('div'); d.className='alert'+(bad?' bad':''); d.textContent=text; box.appendChild(d);
+ while(box.children.length>3) box.firstChild.remove(); setTimeout(()=>{ d.style.opacity='0'; d.style.transition='opacity .5s'; setTimeout(()=>d.remove(),520); },3400); }
+/* ================= SETTINGS ================= */
+const Settings={data:{vol:.8,mus:.7,voice:.8,invX:false,invY:false,cam:1,edge:true,shake:true,cb:false,q:1},
+ load(){ try{ if(!window.AIHub?.active){ const j=JSON.parse(localStorage.getItem('thw-settings')||'null'); if(j) Object.assign(this.data,j); } }catch(e){} this.syncUI(); },
+ save(){ try{ if(!window.AIHub?.active) localStorage.setItem('thw-settings',JSON.stringify(this.data)); }catch(e){} AudioSys.applySettings(); },
+ syncUI(){ const d=this.data; $('setVol').value=d.vol*100; $('setMus').value=d.mus*100; $('setVoice').value=d.voice*100; $('setInvX').checked=d.invX; $('setInvY').checked=d.invY; $('setCam').value=d.cam*100; $('setEdge').checked=d.edge; $('setShake').checked=d.shake; $('setCB').checked=d.cb; $('setQ').value=d.q; }
+};
+/* ================= GAME STATE & DEFINITIONS ================= */
+const WORLD=96, HALF=WORLD/2;
+const BUILD_DEFS={
+ yard:{name:'Construction Yard',icon:'🏛',cost:0,power:0,hp:2200,size:5,time:1,desc:'Command heart. Builds structures.'},
+ power:{name:'Power Plant',icon:'⚡',cost:300,power:120,hp:750,size:3,time:6,desc:'+120 power. Keep the lights on.'},
+ refinery:{name:'Tiberium Refinery',icon:'💎',cost:1200,power:-30,hp:1100,size:4,time:12,desc:'Processes Tiberium. Includes a Harvester bay.'},
+ barracks:{name:'Barracks',icon:'🎖',cost:400,power:-20,hp:900,size:3,time:8,desc:'Trains infantry.'},
+ factory:{name:'War Factory',icon:'🏭',cost:1000,power:-30,hp:1300,size:4,time:12,desc:'Builds vehicles.'},
+ turret:{name:'Guard Turret',icon:'🗼',cost:600,power:-25,hp:850,size:2,time:8,desc:'Auto-cannon defence. Needs power.'},
+ techlab:{name:'Tech Lab',icon:'🔬',cost:1500,power:-40,hp:900,size:3,time:14,desc:'Unlocks Artillery, upgrades, Ion Cannon.'},
+ silo:{name:'Tiberium Silo',icon:'🛢',cost:250,power:-5,hp:600,size:2,time:5,desc:'+2000 credit storage.'},
+};
+const UNIT_DEFS={
+ harvester:{name:'Harvester',icon:'🚜',cost:900,hp:900,speed:3.2,range:0,dmg:0,rof:1,sight:9,from:'refinery',desc:'Harvests Tiberium. Unarmed.'},
+ rifle:{name:'Rifle Squad',icon:'🪖',cost:150,hp:220,speed:4.6,range:9,dmg:14,rof:.55,sight:11,from:'barracks',desc:'Anti-infantry staple.'},
+ rocket:{name:'Rocket Squad',icon:'🚀',cost:300,hp:180,speed:4.2,range:12,dmg:32,rof:1.1,sight:12,from:'barracks',desc:'Shreds armour and air-defence.'},
+ engineer:{name:'Engineer',icon:'🧰',cost:400,hp:160,speed:4.8,range:1.6,dmg:0,rof:1,sight:10,from:'barracks',desc:'Captures enemy buildings, repairs yours.'},
+ buggy:{name:'Recon Buggy',icon:'🏎',cost:350,hp:320,speed:8.5,range:10,dmg:12,rof:.4,sight:15,from:'factory',desc:'Fast scout. Sees far, hits soft.'},
+ ltank:{name:'Light Tank',icon:'▣',cost:600,hp:620,speed:5.6,range:11,dmg:30,rof:.9,sight:12,from:'factory',desc:'Quick armour, honest gun.'},
+ mtank:{name:'Medium Tank',icon:'⬢',cost:850,hp:980,speed:4.6,range:12,dmg:48,rof:1.15,sight:12,from:'factory',desc:'The fist of AEGIS.'},
+ artillery:{name:'Artillery',icon:'💥',cost:1100,hp:420,speed:3.6,range:24,dmg:70,rof:2.2,sight:13,from:'factory',needTech:true,desc:'Out-ranges turrets. Fragile. Needs Tech Lab.'},
+ mcv:{name:'MCV',icon:'🚛',cost:2500,hp:1100,speed:3.4,range:0,dmg:0,rof:1,sight:10,from:'factory',desc:'Deploys into a new Construction Yard.'},
+};
+const UPG_DEFS={
+ armor:{name:'Composite Armor',icon:'🛡',cost:800,time:20,desc:'All units & buildings +25% max HP.'},
+ shells:{name:'HV Shells',icon:'🎯',cost:800,time:20,desc:'All weapons +20% damage.'},
+ logistics:{name:'Adv. Logistics',icon:'⚙',cost:600,time:16,desc:'All units +15% speed, faster harvesting.'},
+};
+const G={scene:null,camera:null,renderer:null,world:null,rapier:null,running:false,paused:false,over:false,attract:false,hubMode:false,mpMode:false,
+ time:0,roundLen:360,diff:1,mapId:0, credits:4000, creditsSpent:0, harvested:0, kills:0, losses:0, razed:0,
+ powerUsed:0,powerMax:0,storage:6000, selected:[], hoverBuild:null, buildTab:'build', cmdMode:'smart', superCD:0, superReady:false, superArm:false,
+ cam:{x:0,z:18,dist:42,yaw:.6,shake:0}, cursor:{x:innerWidth/2,y:innerHeight/2,active:false}, groups:{1:[],2:[],3:[],4:[]},
+ units:[],buildings:[],crystals:[],props:[],shots:[],parts:[],floaters:[], nextId:1, ai:null, fog:null, lastInput:performance.now(), idleWarned:false,
+ stats:{built:0,trained:0}, upgrades:{}, research:null, buildQueue:[], mouse:{x:innerWidth/2,y:innerHeight/2,down:false,dragging:false,sx:0,sy:0}, keys:{}, padPrev:[], padCursorInit:false};
+const FACTION_COL=f=> Settings.data.cb ? (f===0?0x2f9effff:0xff8c1a) : (f===0?0x3b82f6:0xe8443a);
+function scoreNow(){ return Math.round(G.harvested + G.kills*120 + G.razed*400 + G.credits*.05); }
+function isTouchOnly(){ return ('ontouchstart' in window) && !navigator.getGamepads && !matchMedia('(pointer:fine)').matches; }
+/* ================= SCREENS & MENU NAV (10-foot, controller-first) ================= */
+const Screens=['title','lobby','multi','how','settings','about','end','error'];
+let curScreen='title', menuFocus=0, settingsReturn='title', inBattle=false;
+function showScreen(name){ curScreen=name; for(const s of Screens) $('scr-'+s).hidden = s!==name; $('hud').hidden = !(name===null||inBattle&&name==='settings'&&false);
+ if(inBattle) $('hud').hidden=false; if(name) $('hud').hidden = !inBattle;
+ $('hintbar').hidden = !(inBattle&&!name); menuFocus=0; refreshMenuSel(); }
+function screenButtons(){ const el=$('scr-'+curScreen); if(!el) return []; return [...el.querySelectorAll('button,select,input')].filter(b=>!b.disabled&&b.offsetParent!==null); }
+function refreshMenuSel(){ const bs=screenButtons(); bs.forEach((b,i)=>b.classList.toggle('sel',i===menuFocus)); const b=bs[menuFocus]; if(b&&curScreen) b.focus({preventScroll:true}); }
+function menuMove(d){ const bs=screenButtons(); if(!bs.length) return; menuFocus=(menuFocus+d+bs.length)%bs.length; refreshMenuSel(); AudioSys.click(); }
+function menuConfirm(){ const b=screenButtons()[menuFocus]; if(b) b.click(); }
+function openSettings(from){ settingsReturn=from||curScreen||'title'; if(inBattle){ G.paused=true; } showScreen('settings'); $('setResume').style.display=inBattle?'':'none'; $('setRestart').style.display=(inBattle&&!window.AIHub?.active)?'':'none'; $('setQuit').style.display=window.AIHub?.active?'none':''; }
+function closeSettings(){ if(inBattle&&curScreen==='settings'){ G.paused=false; showScreen(null); $('hud').hidden=false; } else showScreen(settingsReturn==='settings'?'title':settingsReturn); }
+document.querySelectorAll('[data-back]').forEach(b=>b.addEventListener('click',()=>{ AudioSys.init(); AudioSys.click(); if(inBattle&&settingsReturn==='battle'){ G.paused=false; showScreen(null); $('hud').hidden=false; } else showScreen('title'); }));
+$('mainMenu').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b) return; AudioSys.init(); AudioSys.select();
+ const a=b.dataset.act; if(a==='play') showScreen('lobby'); else if(a==='multi') showScreen('multi'); else if(a==='how') showScreen('how'); else if(a==='settings') openSettings('title'); else if(a==='about') showScreen('about'); });
+$('touchSettingsBtn').addEventListener('click',()=>{ AudioSys.init(); openSettings('title'); });
+/* ================= THREE.JS R180 WEBGPU + CEL SHADING + RAPIER ================= */
+let gradientMap=null;
+function toonMat(color,opts={}){ return new THREE.MeshToonMaterial({color,gradientMap,...opts}); }
+function addOutline(mesh,scale=1.06,color=0x0a1626){ const m=new THREE.Mesh(mesh.geometry,new THREE.MeshBasicMaterial({color,side:THREE.BackSide}));
+ m.scale.setScalar(scale); m.raycast=()=>{}; mesh.add(m); return m; }
+let toonGroup=null;
+async function initGraphics(){
+ if(!navigator.gpu) throw new Error('WebGPU unavailable');
+ const canvas=$('gl'); const renderer=new WebGPURenderer({canvas,antialias:true,powerPreference:'high-performance'});
+ renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(innerWidth,innerHeight);
+ renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFShadowMap; renderer.toneMapping=THREE.ACESFilmicToneMapping; renderer.toneMappingExposure=1.05;
+ await renderer.init(); G.renderer=renderer;
+ const scene=new THREE.Scene(); scene.background=new THREE.Color(0x87b8d9); scene.fog=new THREE.Fog(0x9fc3e0,90,240); G.scene=scene;
+ const cam=new THREE.PerspectiveCamera(52,innerWidth/innerHeight,.1,500); G.camera=cam;
+ const grad=new Uint8Array([90,140,200,255]); const gt=new THREE.DataTexture(grad,4,1,THREE.RedFormat); gt.minFilter=THREE.NearestFilter; gt.magFilter=THREE.NearestFilter; gt.needsUpdate=true; gradientMap=gt;
+ scene.add(new THREE.HemisphereLight(0xcfe8ff,0x3a5f2f,1.15));
+ const sun=new THREE.DirectionalLight(0xfff2cc,2.6); sun.position.set(40,70,25); sun.castShadow=true;
+ sun.shadow.mapSize.set(Settings.data.q===0?1024:2048,Settings.data.q===0?1024:2048);
+ sun.shadow.camera.left=-70; sun.shadow.camera.right=70; sun.shadow.camera.top=70; sun.shadow.camera.bottom=-70; sun.shadow.camera.far=220; sun.name='sun'; scene.add(sun); scene.add(sun.target);
+ const fill=new THREE.DirectionalLight(0x8ecbff,.7); fill.position.set(-30,40,-40); scene.add(fill);
+ // Rapier physics world (top-down: gravity Y only for shells; units locked)
+ const RAPIERmod = RAPIER.default||RAPIER; await RAPIERmod.init(); G.rapier=RAPIERmod;
+ G.world=new RAPIERmod.World({x:0,y:-9.81,z:0}); G.world.timestep=1/60;
+ addEventListener('resize',()=>{ renderer.setSize(innerWidth,innerHeight); cam.aspect=innerWidth/innerHeight; cam.updateProjectionMatrix(); });
+}
+function groundHeight(x,z){ return Math.sin(x*.08)*Math.cos(z*.07)*.7 + Math.sin(x*.021+2)*1.1; }
+function buildTerrain(mapId){
+ const scene=G.scene; const old=scene.getObjectByName('world'); if(old) scene.remove(old);
+ const grp=new THREE.Group(); grp.name='world'; scene.add(grp); toonGroup=grp;
+ const geo=new THREE.PlaneGeometry(WORLD,WORLD,72,72); geo.rotateX(-Math.PI/2);
+ const pos=geo.attributes.position; const cols=[];
+ for(let i=0;i<pos.count;i++){ const x=pos.getX(i),z=pos.getZ(i); const edge=Math.max(Math.abs(x),Math.abs(z)); const flat=clamp((edge-30)/14,0,1);
+  pos.setY(i,groundHeight(x,z)*flat); const c=new THREE.Color(); const n=Math.sin(x*.5)*Math.cos(z*.45);
+  c.setHex(n>.55?0x6fae4e:(n<-.6?0x8a9a5b:0x7cbb57)); if(edge>44) c.setHex(0x9aa06b); cols.push(c.r,c.g,c.b); }
+ geo.setAttribute('color',new THREE.Float32BufferAttribute(cols,3)); geo.computeVertexNormals();
+ const ground=new THREE.Mesh(geo,new THREE.MeshToonMaterial({vertexColors:true,gradientMap})); ground.receiveShadow=true; ground.name='ground'; grp.add(ground);
+ // build pad decals at both bases
+ for(const [bx,bz,col] of [[-32,30,0x3b82f6],[32,-30,0xe8443a]]){ const pad=new THREE.Mesh(new THREE.CircleGeometry(11,28),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:.16}));
+  pad.rotation.x=-Math.PI/2; pad.position.set(bx,.12,bz); grp.add(pad); const ring=new THREE.Mesh(new THREE.RingGeometry(10.6,11,28),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:.5,side:THREE.DoubleSide}));
+  ring.rotation.x=-Math.PI/2; ring.position.set(bx,.13,bz); grp.add(ring); }
+ // scattered rocks / trees / cliffs as physics props
+ const rockGeo=new THREE.DodecahedronGeometry(1,0), treeTop=new THREE.ConeGeometry(1.1,2.6,7), trunkG=new THREE.CylinderGeometry(.22,.3,1.1,6);
+ for(let i=0;i<70;i++){ const x=(srand()*2-1)*44, z=(srand()*2-1)*44; if(Math.hypot(x+32,z-30)<13||Math.hypot(x-32,z+30)<13||Math.abs(x)<7&&Math.abs(z)<7) continue;
+  const y=groundHeight(x,z)*clamp((Math.max(Math.abs(x),Math.abs(z))-30)/14,0,1);
+  if(srand()<.55){ const r=new THREE.Mesh(rockGeo,toonMat(0x8d99ae)); r.position.set(x,y+.4,z); r.scale.setScalar(.7+srand()*1.3); r.rotation.set(srand()*3,srand()*3,srand()*3); r.castShadow=true; grp.add(r); addPropBody(x,z,r.scale.x*.9); G.props.push({x,z,r:r.scale.x}); }
+  else { const t=new THREE.Group(); const tr=new THREE.Mesh(trunkG,toonMat(0x7a4a21)); tr.position.y=.5; const top=new THREE.Mesh(treeTop,toonMat(0x2e7d32)); top.position.y=2.1; top.castShadow=true; t.add(tr,top); addOutline(top,1.05); t.position.set(x,y,z); grp.add(t); addPropBody(x,z,.6); G.props.push({x,z,r:.7}); } }
+ // Tiberium fields: positions depend on map
+ G.crystals.forEach(c=>{ scene.remove(c.mesh); }); G.crystals=[];
+ const fields = mapId===1 ? [[0,0,26],[-32,30,10],[32,-30,10],[-18,-14,12],[18,14,12]] : mapId===2 ? [[0,0,18],[-32,30,12],[32,-30,12],[0,26,10],[0,-26,10]] : [[0,0,16],[-32,30,12],[32,-30,12],[-14,16,10],[14,-16,10]];
+ for(const [fx,fz,n] of fields) for(let i=0;i<n;i++){ const x=fx+(srand()*2-1)*6.5, z=fz+(srand()*2-1)*6.5; spawnCrystal(x,z,grp); }
+ // fog overlay plane (canvas texture, updated from fog grid)
+ const fc=document.createElement('canvas'); fc.width=fc.height=96; const fogTex=new THREE.CanvasTexture(fc); fogTex.magFilter=THREE.LinearFilter;
+ const fogMesh=new THREE.Mesh(new THREE.PlaneGeometry(WORLD,WORLD),new THREE.MeshBasicMaterial({map:fogTex,transparent:true,depthWrite:false}));
+ fogMesh.rotation.x=-Math.PI/2; fogMesh.position.y=2.4; fogMesh.name='fog'; fogMesh.renderOrder=5; grp.add(fogMesh);
+ G.fog={grid:new Uint8Array(48*48), seen:new Uint8Array(48*48), canvas:fc, ctx:fc.getContext('2d'), tex:fogTex, mesh:fogMesh, dirty:true};
+}
+function addPropBody(x,z,r){ const R=G.rapier; const b=G.world.createRigidBody(R.RigidBodyDesc.fixed().setTranslation(x,1,z)); G.world.createCollider(R.ColliderDesc.cuboid(r,2,r),b); }
+function spawnCrystal(x,z,parent){
+ const g=new THREE.Group(); const mat=toonMat(0x2ee66b,{emissive:0x0d5c28,emissiveIntensity:.7});
+ const main=new THREE.Mesh(new THREE.OctahedronGeometry(.85,0),mat); main.position.y=.9; main.castShadow=true; g.add(main); addOutline(main,1.12,0x063d1a);
+ for(let i=0;i<3;i++){ const s=new THREE.Mesh(new THREE.OctahedronGeometry(.4,0),mat); s.position.set((srand()-.5)*1.4,.45,(srand()-.5)*1.4); g.add(s); }
+ g.position.set(x,groundHeight(x,z)*.4+.05,z); (parent||G.scene).add(g);
+ G.crystals.push({x,z,amount:100,mesh:g,phase:srand()*6}); }
+/* ================= ENTITY FACTORIES (cel-shaded procedural models) ================= */
+function makeHealthBar(w=1.6){ const c=document.createElement('canvas'); c.width=64; c.height=10; const bx=c.getContext('2d'); bx.fillStyle='#101820'; bx.fillRect(0,0,64,10); bx.fillStyle='#37e08b'; bx.fillRect(1,1,62,8); const tex=new THREE.CanvasTexture(c);
+ const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,depthTest:false,transparent:true})); sp.scale.set(w,.28,1); sp.renderOrder=20; sp.userData={c,tex}; return sp; }
+function drawBar(e){ const sp=e.bar; if(!sp) return; const {c,tex}=sp.userData; const x=c.getContext('2d'); const p=clamp(e.hp/e.maxHp,0,1);
+ x.clearRect(0,0,64,10); x.fillStyle='#101820'; x.fillRect(0,0,64,10); x.fillStyle=p>.5?'#37e08b':p>.25?'#ffd23f':'#ff5d5d'; x.fillRect(1,1,62*p,8);
+ if(e.vet>=1){ x.fillStyle='#ffd23f'; for(let i=0;i<e.vet;i++) x.fillRect(2+i*8,1,5,2); } tex.needsUpdate=true; sp.visible = e.hp<e.maxHp || e.selected; }
+function makeUnitMesh(type,faction){
+ const col=FACTION_COL(faction), dark=toonMat(0x2b3a4a), grp=new THREE.Group(); let turret=null, extra={};
+ const body=(geo,c,x=0,y=.5,z=0)=>{ const m=new THREE.Mesh(geo,toonMat(c)); m.position.set(x,y,z); m.castShadow=true; grp.add(m); addOutline(m,1.07); return m; };
+ if(type==='harvester'){ body(new THREE.BoxGeometry(1.7,.8,2.4),col,0,.65,0); body(new THREE.BoxGeometry(1.2,.6,1),0xffd23f,0,1.25,-.4);
+  const arm=body(new THREE.BoxGeometry(.3,.3,1.6),0x8d99ae,.7,.8,.9); extra.arm=arm; for(let i=0;i<4;i++){ const w=body(new THREE.CylinderGeometry(.42,.42,.3,10),0x1c2836,i<2?-.95:.95,.42,i<2?-0.8:0.8); w.rotation.z=Math.PI/2; } }
+ else if(type==='rifle'||type==='rocket'||type==='engineer'){ const cc=type==='engineer'?0xffd23f:col;
+  body(new THREE.CapsuleGeometry(.32,.55,3,8),cc,0,.75,0); body(new THREE.SphereGeometry(.26,10,8),0xf2c89b,0,1.55,0);
+  const gun=body(new THREE.BoxGeometry(.14,.14,.8),0x1c2836,.3,1.05,.3); if(type==='rocket'){ gun.scale.set(1.6,1.6,1.4); gun.position.y=1.35; } turret=gun; }
+ else if(type==='buggy'){ body(new THREE.BoxGeometry(1.1,.5,1.9),col,0,.6,0); const gun=body(new THREE.BoxGeometry(.16,.16,.9),0x1c2836,0,1,.3); turret=gun;
+  for(const [x,z] of [[-.65,-.7],[.65,-.7],[-.65,.7],[.65,.7]]){ const w=body(new THREE.CylinderGeometry(.34,.34,.24,10),0x1c2836,x,.34,z); w.rotation.z=Math.PI/2; } }
+ else if(type==='ltank'||type==='mtank'||type==='artillery'){ const s=type==='mtank'?1.25:type==='artillery'?1.1:1;
+  body(new THREE.BoxGeometry(1.5*s,.6,2.3*s),col,0,.6,0); body(new THREE.BoxGeometry(1.7*s,.35,.6),0x1c2836,0,.38,-.9*s); body(new THREE.BoxGeometry(1.7*s,.35,.6),0x1c2836,0,.38,.9*s);
+  const t=new THREE.Group(); t.position.set(0,1.05,0); const dome=new THREE.Mesh(new THREE.CylinderGeometry(.62*s,.75*s,.5,8),toonMat(col)); dome.castShadow=true; t.add(dome); addOutline(dome,1.07);
+  const bl=type==='artillery'?2.6:1.7; const barrel=new THREE.Mesh(new THREE.CylinderGeometry(.11,.13,bl,8),toonMat(0x1c2836)); barrel.rotation.x=Math.PI/2; barrel.position.set(0,.1,bl/2); t.add(barrel); addOutline(barrel,1.15);
+  if(type==='artillery') barrel.rotation.x=-.5; grp.add(t); turret=t; }
+ else if(type==='mcv'){ body(new THREE.BoxGeometry(1.8,.9,3),col,0,.8,0); body(new THREE.BoxGeometry(1.5,.7,1.4),0xdfe9f5,0,1.55,-.6);
+  for(const [x,z] of [[-1,-1.1],[1,-1.1],[-1,1.1],[1,1.1]]){ const w=body(new THREE.CylinderGeometry(.45,.45,.3,10),0x1c2836,x,.45,z); w.rotation.z=Math.PI/2; } }
+ const ring=new THREE.Mesh(new THREE.RingGeometry(.85,1.05,24),new THREE.MeshBasicMaterial({color:0x37e08b,transparent:true,opacity:0,side:THREE.DoubleSide,depthWrite:false}));
+ ring.rotation.x=-Math.PI/2; ring.position.y=.08; grp.add(ring); grp.userData.ring=ring; return {grp,turret,extra};
+}
+function makeBuildingMesh(type,faction){
+ const col=FACTION_COL(faction), grp=new THREE.Group(); const B=(geo,c,x=0,y=0,z=0)=>{ const m=new THREE.Mesh(geo,toonMat(c)); m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true; grp.add(m); addOutline(m,1.05); return m; };
+ if(type==='yard'){ B(new THREE.BoxGeometry(4.6,1.6,4.6),col,0,.8,0); B(new THREE.CylinderGeometry(1.2,1.5,2.6,8),0xdfe9f5,0,2.6,0); const dish=B(new THREE.SphereGeometry(1,10,6,0,Math.PI*2,0,Math.PI/2),0xffd23f,1.2,3.4,0); dish.rotation.z=-.6; }
+ else if(type==='power'){ B(new THREE.CylinderGeometry(1.1,1.3,3.2,10),0x9fb6cc,0,1.6,0); B(new THREE.SphereGeometry(.8,10,8),0xffd23f,0,3.6,0); B(new THREE.BoxGeometry(2.6,.8,2.6),col,0,.4,0); }
+ else if(type==='refinery'){ B(new THREE.BoxGeometry(3.6,1.8,3.6),col,0,.9,0); B(new THREE.CylinderGeometry(.9,.9,2.2,10),0x2ee66b,1,2.6,0); B(new THREE.BoxGeometry(1.6,1,2.4),0x8d99ae,-1.2,.5,1.8); }
+ else if(type==='barracks'){ B(new THREE.BoxGeometry(3,1.4,2.4),col,0,.7,0); B(new THREE.BoxGeometry(3.2,.3,2.6),0x1c2836,0,1.55,0); B(new THREE.BoxGeometry(.2,1.6,.2),0xffd23f,1.6,1.8,0); }
+ else if(type==='factory'){ B(new THREE.BoxGeometry(4,2,3.4),col,0,1,0); B(new THREE.BoxGeometry(2,1.2,1.6),0x1c2836,0,.6,2.2); B(new THREE.CylinderGeometry(.4,.4,1.6,8),0x8d99ae,-1.4,2.6,-1); }
+ else if(type==='turret'){ B(new THREE.CylinderGeometry(.8,1,1,8),0x5b6b7d,0,.5,0); const t=B(new THREE.BoxGeometry(.9,.6,.9),col,0,1.3,0); B(new THREE.CylinderGeometry(.09,.09,1.6,8),0x1c2836,0,1.35,.8).rotation.x=Math.PI/2; grp.userData.turretHead=t; }
+ else if(type==='techlab'){ B(new THREE.BoxGeometry(3,1.6,3),col,0,.8,0); B(new THREE.SphereGeometry(1.1,12,8,0,Math.PI*2,0,Math.PI/2),0x7ee2ff,0,1.6,0); }
+ else if(type==='silo'){ B(new THREE.CylinderGeometry(1,1,1.8,10),0x8d99ae,0,.9,0); B(new THREE.SphereGeometry(1,10,6,0,Math.PI*2,0,Math.PI/2),0x2ee66b,0,1.8,0); }
+ const ring=new THREE.Mesh(new THREE.RingGeometry(1.4,1.6,24),new THREE.MeshBasicMaterial({color:0x37e08b,transparent:true,opacity:0,side:THREE.DoubleSide,depthWrite:false}));
+ ring.rotation.x=-Math.PI/2; ring.position.y=.09; ring.scale.setScalar(BUILD_DEFS[type].size*.62); grp.add(ring); grp.userData.ring=ring; return grp;
+}
+/* ---- spawn / remove entities (mesh + Rapier body kept in sync) ---- */
+function spawnBuilding(type,faction,x,z,instant=true){
+ const def=BUILD_DEFS[type]; const grp=makeBuildingMesh(type,faction); grp.position.set(x,0,z); G.scene.add(grp);
+ const R=G.rapier; const body=G.world.createRigidBody(R.RigidBodyDesc.fixed().setTranslation(x,1,z));
+ G.world.createCollider(R.ColliderDesc.cuboid(def.size/2,2,def.size/2),body);
+ const e={id:G.nextId++,kind:'building',type,faction,x,z,hp:def.hp*(G.upgrades.armor&&faction===0?1.25:1),maxHp:def.hp*(G.upgrades.armor&&faction===0?1.25:1),
+  mesh:grp,body,cool:0,queue:[],qT:0,vet:0,bar:makeHealthBar(def.size*.8),selected:false,rally:{x:x,z:z+def.size/2+3},dead:false};
+ e.bar.position.set(x,4.6,z); G.scene.add(e.bar); grp.traverse(o=>{o.userData.ent=e;}); G.buildings.push(e);
+ if(faction===0){ G.stats.built++; recalcPower(); } return e;
+}
+function spawnUnit(type,faction,x,z){
+ const def=UNIT_DEFS[type]; const {grp,turret,extra}=makeUnitMesh(type,faction); grp.position.set(x,0,z); G.scene.add(grp);
+ const R=G.rapier; const body=G.world.createRigidBody(R.RigidBodyDesc.kinematicPositionBased().setTranslation(x,.6,z).lockRotations());
+ G.world.createCollider(R.ColliderDesc.ball(.62),body);
+ const hpMul=(G.upgrades.armor&&faction===0)?1.25:1, spMul=(G.upgrades.logistics&&faction===0)?1.15:1;
+ const e={id:G.nextId++,kind:'unit',type,faction,x,z,vx:0,vz:0,hp:def.hp*hpMul,maxHp:def.hp*hpMul,mesh:grp,turret,extra,body,
+  order:{mode:'idle'},target:null,cool:Math.random()*.4,vet:0,xp:0,cargo:0,harv:null,bar:makeHealthBar(1.5),selected:false,dead:false,face:0,patrolA:null,stuck:0,lastX:x,lastZ:z};
+ e.bar.position.set(x,2.2,z); G.scene.add(e.bar); grp.traverse(o=>{o.userData.ent=e;}); G.units.push(e); if(faction===0) G.stats.trained++; return e;
+}
+function removeEnt(e){ e.dead=true; G.scene.remove(e.mesh); G.scene.remove(e.bar); if(e.body) G.world.removeRigidBody(e.body);
+ G.selected=G.selected.filter(s=>s!==e); spawnExplosion(e.x,1,e.z,e.kind==='building'?2:1,e.faction); }
+/* ================= FX: explosions, tracers, floaters ================= */
+const partPool=[];
+function spawnExplosion(x,y,z,scale=1,faction=0){ AudioSys.boom(scale>1.4);
+ const n=Settings.data.q===0?10:22; const col=faction===0?0xffa53b:0xff6b5e;
+ for(let i=0;i<n;i++){ let p=partPool.pop(); if(!p){ p={mesh:new THREE.Mesh(new THREE.SphereGeometry(.16,6,5),new THREE.MeshBasicMaterial({color:0xffa53b}))}; }
+  p.mesh.material.color.setHex(i%3?col:0xffd23f); p.mesh.position.set(x,y,z); p.mesh.scale.setScalar(scale*(0.7+Math.random()*.8)); G.scene.add(p.mesh);
+  p.vx=(Math.random()-.5)*7*scale; p.vy=Math.random()*6*scale+2; p.vz=(Math.random()-.5)*7*scale; p.life=.7+Math.random()*.5; p.max=p.life; G.parts.push(p); }
+ if(Settings.data.shake) G.cam.shake=Math.min(1,G.cam.shake+.35*scale);
+ const flash=new THREE.PointLight(0xffa53b,60*scale,18,1.6); flash.position.set(x,2.5,z); G.scene.add(flash); G.parts.push({flash,life:.18,max:.18,vx:0,vy:0,vz:0,mesh:null}); }
+function spawnTracer(x1,y1,z1,x2,y2,z2,kind){ const geo=new THREE.BufferGeometry().setFromPoints([V3(x1,y1,z1),V3(x2,y2,z2)]);
+ const col=kind==='rocket'?0xffb03a:kind==='arty'?0xff7a5e:0xffe9a8; const line=new THREE.Line(geo,new THREE.LineBasicMaterial({color:col,transparent:true,opacity:.95}));
+ G.scene.add(line); G.parts.push({line,life:kind==='arty'?.3:.09,max:.3,vx:0,vy:0,vz:0,mesh:null,flash:null});
+ if(kind!=='rifle'){ const f=new THREE.PointLight(col,14,9,1.8); f.position.set(x1,y1,z1); G.scene.add(f); G.parts.push({flash:f,life:.08,max:.08,vx:0,vy:0,vz:0,mesh:null}); } }
+function spawnShell(x,y,z,tx,ty,tz,from,target,dmg,kind){ const m=new THREE.Mesh(new THREE.SphereGeometry(kind==='arty'?.22:.13,7,6),new THREE.MeshBasicMaterial({color:kind==='arty'?0xff7a5e:0xffd23f}));
+ m.position.set(x,y,z); G.scene.add(m); G.shots.push({mesh:m,x,y,z,tx,ty,tz,from,target,dmg,kind,t:0,dur:clamp(Math.hypot(tx-x,tz-z)/26,.25,1.4),y0:y}); }
+function updateFX(dt){ for(let i=G.parts.length-1;i>=0;i--){ const p=G.parts[i]; p.life-=dt;
+  if(p.mesh){ p.mesh.position.x+=p.vx*dt; p.mesh.position.y+=p.vy*dt; p.mesh.position.z+=p.vz*dt; p.vy-=9*dt; p.mesh.scale.multiplyScalar(1-dt*1.4); }
+  if(p.flash) p.flash.intensity=Math.max(0,p.flash.intensity*(p.life/p.max)*.9);
+  if(p.line) p.line.material.opacity=Math.max(0,p.life/p.max)*.95;
+  if(p.life<=0){ if(p.mesh){ G.scene.remove(p.mesh); if(partPool.length<160) partPool.push(p); } if(p.flash) G.scene.remove(p.flash); if(p.line){ G.scene.remove(p.line); p.line.geometry.dispose(); } G.parts.splice(i,1); } }
+ for(let i=G.shots.length-1;i>=0;i--){ const s=G.shots[i]; s.t+=dt; const k=clamp(s.t/s.dur,0,1);
+  s.mesh.position.set(lerp(s.x,s.tx,k), lerp(s.y0,s.ty,k)+Math.sin(k*Math.PI)*(s.kind==='arty'?5:1.2), lerp(s.z,s.tz,k));
+  if(k>=1){ G.scene.remove(s.mesh); G.shots.splice(i,1); if(s.target&&!s.target.dead) applyDamage(s.from,s.target,s.dmg,s.kind); else if(s.kind==='arty') splashDamage(s.tx,s.tz,3.2,s.dmg*.6,s.from); spawnExplosion(s.tx,1,s.tz,s.kind==='arty'?.8:.45,s.from?.faction??1); } }
+ for(const c of G.crystals){ if(c.amount>0){ c.mesh.rotation.y+=dt*.7; const s=.9+Math.sin(G.time*2+c.phase)*.12; c.mesh.scale.setScalar(s*(0.4+0.6*c.amount/100)); } }
+}
+function splashDamage(x,z,r,dmg,from){ for(const e of [...G.units,...G.buildings]) if(!e.dead&&e.faction!==from.faction&&Math.hypot(e.x-x,e.z-z)<r+(e.kind==='building'?2:0)) applyDamage(from,e,dmg,'arty'); }
+/* ================= ECONOMY / POWER / PRODUCTION ================= */
+function recalcPower(){ let mx=0,use=0,store=6000; for(const b of G.buildings) if(!b.dead&&b.faction===0){ const d=BUILD_DEFS[b.type];
+ if(d.power>0) mx+=d.power; else use-=d.power; if(b.type==='silo') store+=2000; if(b.type==='refinery') store+=1500; } G.powerMax=mx; G.powerUsed=use; G.storage=store; }
+function powerFactor(){ return G.powerUsed<=G.powerMax?1:.45; }
+function hasBuilding(f,t){ return G.buildings.some(b=>!b.dead&&b.faction===f&&b.type===t); }
+function spend(n){ if(G.credits<n) return false; G.credits-=n; G.creditsSpent+=n; return true; }
+function nearestRefinery(f,x,z){ let best=null,bd=1e9; for(const b of G.buildings) if(!b.dead&&b.faction===f&&b.type==='refinery'){ const d=Math.hypot(b.x-x,b.z-z); if(d<bd){bd=d;best=b;} } return best; }
+function tryBuild(type){ const def=BUILD_DEFS[type]; const yard=G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='yard');
+ if(!yard){ AudioSys.error(); showAlert('No Construction Yard — deploy an MCV first.',true); return; }
+ if(type==='techlab'&&!hasBuilding(0,'factory')){ AudioSys.error(); showAlert('Tech Lab needs a War Factory first.',true); return; }
+ if(G.buildQueue.some(q=>q.type===type&&q.kind==='build')){ AudioSys.error(); showAlert('Already constructing that structure.',true); return; }
+ if(!spend(def.cost)){ AudioSys.error(); AudioSys.speak('Insufficient funds',true); return; }
+ G.buildQueue.push({kind:'build',type,t:0,total:def.time/powerFactor(),done:false}); AudioSys.build(); AudioSys.speak(def.name+' construction started'); refreshDock(); }
+function cancelBuild(i){ const q=G.buildQueue[i]; if(!q) return; G.credits+= q.kind==='build'?BUILD_DEFS[q.type].cost:UNIT_DEFS[q.type].cost; G.buildQueue.splice(i,1); refreshDock(); AudioSys.click(); }
+function tryTrain(type,src){ const def=UNIT_DEFS[type];
+ if(def.needTech&&!hasBuilding(0,'techlab')){ AudioSys.error(); showAlert('Artillery needs a Tech Lab.',true); return; }
+ if(!spend(def.cost)){ AudioSys.error(); AudioSys.speak('Insufficient funds',true); return; }
+ const b=src||G.buildings.find(x=>!x.dead&&x.faction===0&&x.type===def.from); if(!b){ G.credits+=def.cost; AudioSys.error(); showAlert('No '+def.from+' available.',true); return; }
+ b.queue.push({kind:'unit',type,t:0,total:(type==='harvester'?8:5+def.cost/220)/powerFactor(),src:b.id}); AudioSys.click(); refreshDock(); }
+function tryUpgrade(key){ const def=UPG_DEFS[key]; if(G.upgrades[key]||G.research) return;
+ if(!spend(def.cost)){ AudioSys.error(); AudioSys.speak('Insufficient funds',true); return; }
+ G.research={key,t:0,total:def.time}; AudioSys.speak('Research started — '+def.name); refreshDock(); }
+function applyUpgrade(key){ G.upgrades[key]=true; if(key==='armor'){ for(const e of [...G.units,...G.buildings]) if(!e.dead&&e.faction===0){ e.maxHp*=1.25; e.hp*=1.25; } recalcPower(); }
+ AudioSys.speak('Upgrade complete — '+UPG_DEFS[key].name); refreshDock(); }
+/* ================= COMBAT & UNIT BRAINS ================= */
+function dist(a,b){ return Math.hypot(a.x-b.x,a.z-b.z); }
+function applyDamage(from,to,dmg,kind){ if(!to||to.dead) return; let m=1;
+ if(from&&from.kind==='unit'){ if(from.type==='rifle'&&to.kind==='building') m=.6; if(from.type==='rocket'&&to.kind==='unit'&&(to.type==='rifle'||to.type==='rocket'||to.type==='engineer')) m=.7;
+  if(from.vet>=1) m*=1.12; if(from.vet>=2) m*=1.12; if(from.faction===0&&G.upgrades.shells) m*=1.2; }
+ if(to.type==='turret'&&to.faction===0&&G.powerUsed>G.powerMax) m*=1; // turret simply stops firing when dark; armour unchanged
+ to.hp-=dmg*m; to.lastHitBy=from; to.lastHitT=G.time; if(to.faction===0&&to.kind==='building'&&Math.random()<.25) onPlayerBuildingHit(to);
+ if(from&&from.faction!==undefined&&to.hp>0&&to.kind==='unit'&&to.order.mode!=='attack'&&!to.target) { /* retaliation handled in tick */ }
+ if(to.hp<=0&&!to.dead){ const killer=from; removeEnt(to);
+  if(killer&&killer.kind==='unit'&&!killer.dead){ killer.xp++; const nv=killer.xp>=8?3:killer.xp>=4?2:killer.xp>=2?1:0; if(nv>killer.vet){ killer.vet=nv; killer.maxHp*=1.15; killer.hp*=1.15; if(killer.faction===0) showAlert('Unit promoted — '+(UNIT_DEFS[killer.type]?.name||'Unit')+' is now '+(nv===3?'ELITE':nv===2?'Veteran':'Regular')); } }
+  if(to.faction===1){ G.kills+=to.kind==='unit'?1:0; if(to.kind==='building'){ G.razed++; } if(killer&&killer.faction===0){} }
+  if(to.faction===0){ G.losses++; if(to.kind==='building'){ AudioSys.speak('Structure lost',true); recalcPower(); checkDefeatSoon(); } }
+  if(to.faction===1&&to.kind==='building') checkVictorySoon();
+  refreshDock(); }
+ drawBar(to); }
+let alertCD=0;
+function onPlayerBuildingHit(b){ if(G.time<alertCD) return; alertCD=G.time+6; AudioSys.speak('Our base is under attack',true); G.lastAlertPos={x:b.x,z:b.z}; }
+function findTarget(e){ const def=e.kind==='unit'?UNIT_DEFS[e.type]:{range:13,sight:14}; const sight=e.kind==='building'?14:def.sight;
+ let best=null,bd=sight; const foes=e.kind==='building'?G.units:G.units.concat(G.buildings);
+ for(const o of [...G.units,...G.buildings]){ if(o.dead||o.faction===e.faction) continue; if(e.type==='harvester'||e.type==='mcv'||e.type==='engineer') continue;
+  const d=Math.hypot(o.x-e.x,o.z-e.z); if(d<bd){ bd=d; best=o; } } return best; }
+function fireAt(e,t){ const def=e.kind==='unit'?UNIT_DEFS[e.type]:{dmg:26,rof:1}; const kind=e.type==='artillery'?'arty':e.type==='rocket'?'rocket':(e.type==='ltank'||e.type==='mtank'||e.type==='turret')?'shell':'rifle';
+ const dmg=(e.kind==='building'?26:def.dmg)*(e.faction===0&&G.upgrades.shells?1.2:1)*(e.vet>=1?1.12:1)*(e.vet>=2?1.12:1);
+ AudioSys.shoot(kind); AudioSys.intensity=Math.min(1,AudioSys.intensity+.12);
+ const y1=e.kind==='building'?2.2:1.3, y2=t.kind==='building'?1.6:1;
+ if(kind==='arty'||kind==='rocket') spawnShell(e.x,y1,e.z,t.x,y2,t.z,e,t,dmg,kind); else { spawnTracer(e.x,y1,e.z,t.x,y2,t.z,kind); applyDamage(e,t,dmg,kind); }
+ if(e.turret) e.turret.rotation.y=Math.atan2(t.x-e.x,t.z-e.z)-e.mesh.rotation.y; }
+function issueOrder(units,order){ for(const u of units){ if(u.dead||u.kind!=='unit') continue; u.order={...order}; u.target=order.target||null;
+ if(order.mode==='patrol') u.patrolA={x:u.x,z:u.z}; if(u.type==='harvester'&&order.mode==='move') u.order={mode:'harvest'}; }
+ AudioSys.move(); mpBroadcastOrder(units,order); }
+function steerUnit(u,tx,tz,dt,arrive=1.1){ const def=UNIT_DEFS[u.type]; const sp=def.speed*(G.upgrades.logistics&&u.faction===0?1.15:1)*(u.vet>=3?1.08:1);
+ const dx=tx-u.x, dz=tz-u.z, d=Math.hypot(dx,dz); if(d<arrive){ u.vx*=0.6; u.vz*=0.6; return true; }
+ let mx=dx/d, mz=dz/d; // separation from neighbours + prop avoidance (Rapier resolves hard overlaps)
+ for(const o of G.units){ if(o===u||o.dead) continue; const ox=u.x-o.x, oz=u.z-o.z, od=Math.hypot(ox,oz); if(od>0.01&&od<1.7){ mx+=ox/od*.7; mz+=oz/od*.7; } }
+ for(const p of G.props){ const ox=u.x-p.x, oz=u.z-p.z, od=Math.hypot(ox,oz); if(od>0.01&&od<p.r+1.2){ mx+=ox/od*1.2; mz+=oz/od*1.2; } }
+ const ml=Math.hypot(mx,mz)||1; u.vx=lerp(u.vx,mx/ml*sp,.18); u.vz=lerp(u.vz,mz/ml*sp,.18);
+ u.x=clamp(u.x+u.vx*dt,-HALF+1,HALF-1); u.z=clamp(u.z+u.vz*dt,-HALF+1,HALF-1);
+ u.face=Math.atan2(u.vx,u.vz); return false; }
+function unitTick(u,dt){ if(u.dead) return; const def=UNIT_DEFS[u.type]; u.cool-=dt;
+ // stuck detection: if ordered to move but barely moving, sidestep
+ if(u.order.mode==='move'||u.order.mode==='attackmove'||u.order.mode==='harvest'){ if(Math.hypot(u.x-u.lastX,u.z-u.lastZ)<.15) u.stuck+=dt; else u.stuck=0; u.lastX=u.x; u.lastZ=u.z; }
+ if(u.type==='harvester') return harvesterTick(u,dt);
+ if(u.type==='engineer') return engineerTick(u,dt);
+ if(u.type==='mcv'){ if(u.order.mode==='deploy'){ deployMCV(u); } }
+ let tgt=u.target&&!u.target.dead?u.target:null;
+ if(u.order.mode==='attack'&&!tgt){ u.order.mode='idle'; }
+ if(!tgt&&(u.order.mode==='idle'||u.order.mode==='attackmove'||u.order.mode==='hold'||u.order.mode==='guard')) tgt=findTarget(u);
+ if(tgt){ const d=dist(u,tgt); const rng=def.range;
+  if(u.turret) u.turret.rotation.y=Math.atan2(tgt.x-u.x,tgt.z-u.z)-u.mesh.rotation.y;
+  if(d<=rng){ u.vx*=.7; u.vz*=.7; if(u.cool<=0){ fireAt(u,tgt); u.cool=def.rof*(0.9+Math.random()*.2); } }
+  else if(u.order.mode!=='hold') steerUnit(u,tgt.x,tgt.z,dt,rng*.92);
+  return; }
+ const o=u.order;
+ if(o.mode==='move'){ if(steerUnit(u,o.x,o.z,dt,1.2)) u.order.mode='idle'; }
+ else if(o.mode==='attackmove'){ if(steerUnit(u,o.x,o.z,dt,1.4)) u.order.mode='idle'; }
+ else if(o.mode==='patrol'&&o.x!==undefined){ const destA=u.patrolFlip?u.patrolA:{x:o.x,z:o.z}; if(steerUnit(u,destA.x,destA.z,dt,1.4)) u.patrolFlip=!u.patrolFlip; }
+ else if(o.mode==='deploy'){ deployMCV(u); }
+ // idle auto-acquire retaliation
+ if(u.order.mode==='idle'&&u.lastHitBy&&G.time-(u.lastHitT||0)<4&&!u.lastHitBy.dead){ u.target=u.lastHitBy; }
+}
+function harvesterTick(u,dt){ const o=u.order; const speedMul=G.upgrades.logistics&&u.faction===0?1.3:1;
+ if(o.mode==='idle'||o.mode==='harvest'){ // full cycle: find crystal -> fill -> refinery -> repeat
+  if(u.cargo>=100){ const r=nearestRefinery(u.faction,u.x,u.z); if(!r){ return; } if(steerUnit(u,r.x,r.z,dt,3.4)){ // deposit
+    const gain=Math.round(u.cargo*2.2); u.cargo=0; if(u.faction===0){ const room=Math.max(0,G.storage-G.credits); const add=Math.min(gain,room+4000); G.credits+=add; G.harvested+=gain; AudioSys.cash();
+     if(room<=0&&Math.random()<.3) showAlert('Tiberium storage full — build Silos.',true); if(window.AIHub?.active) AIHub.progress({score:scoreNow(),label:'⛁ '+Math.floor(G.credits)}); } else if(G.ai) G.ai.credits+=gain; } return; }
+  let c=u.harv&&u.harv.amount>0?u.harv:null; if(!c||c.amount<=0){ let bd=1e9; for(const k of G.crystals) if(k.amount>2){ const d=Math.hypot(k.x-u.x,k.z-u.z); if(d<bd){bd=d;c=k;} } u.harv=c; }
+  if(!c) return; if(steerUnit(u,c.x,c.z,dt,1.3)){ u.cargo=Math.min(100,u.cargo+dt*22*speedMul); c.amount=Math.max(0,c.amount-dt*22*speedMul);
+   if(u.extra&&u.extra.arm) u.extra.arm.rotation.x=Math.sin(G.time*7)*.4; if(c.amount<=0){ c.mesh.visible=false; setTimeout(()=>{ if(!c.mesh.parent) return; c.amount=100; c.mesh.visible=true; },45000); } } return; }
+ if(o.mode==='move'){ if(steerUnit(u,o.x,o.z,dt,1.2)) u.order.mode='harvest'; } }
+function engineerTick(u,dt){ const o=u.order;
+ if(o.mode==='capture'&&o.target&&!o.target.dead){ if(steerUnit(u,o.target.x,o.target.z,dt,3)){ const t=o.target; t.faction=u.faction; t.hp=Math.min(t.maxHp,t.hp+t.maxHp*.35);
+   t.mesh.traverse(m=>{ if(m.isMesh&&m.material&&m.material.isMeshToonMaterial) m.material.color.setHex(FACTION_COL(u.faction)); });
+   AudioSys.speak(u.faction===0?'Structure captured':'Structure lost',u.faction!==0); if(u.faction===0){ G.razed++; } recalcPower(); removeEntSilent(u); } return; }
+ if(o.mode==='repair'&&o.target&&!o.target.dead){ if(steerUnit(u,o.target.x,o.target.z,dt,3.2)){ o.target.hp=Math.min(o.target.maxHp,o.target.hp+40*dt); drawBar(o.target); if(o.target.hp>=o.target.maxHp) u.order.mode='idle'; } return; }
+ if(o.mode==='move'){ if(steerUnit(u,o.x,o.z,dt,1.1)) u.order.mode='idle'; return; }
+ if(o.mode==='attackmove'){ const t=findTarget(u); if(t&&t.kind==='building') u.order={mode:'capture',target:t}; else if(o.x!==undefined) steerUnit(u,o.x,o.z,dt,1.2); }
+}
+function removeEntSilent(u){ u.dead=true; G.scene.remove(u.mesh); G.scene.remove(u.bar); if(u.body) G.world.removeRigidBody(u.body); G.selected=G.selected.filter(s=>s!==u); }
+function deployMCV(u){ if(u.dead) return; const x=u.x,z=u.z,f=u.faction; removeEntSilent(u); const y=spawnBuilding('yard',f,x,z); AudioSys.speak(f===0?'Construction Yard deployed':'Enemy base expanded',f!==0); if(f===0) recalcPower(); }
+/* ================= ENEMY COMMAND AI (Crimson Hand) ================= */
+function makeAI(diff){ const mult=[.75,1,1.35][diff];
+ return {credits:4200*mult,wave:0,waveT:55/mult,think:2,creditsTick:0,superT:150,superWarned:false,buildStep:0,attackGroup:[],
+  plan:['power','refinery','barracks','power','factory','turret','techlab','power','factory']}; }
+function aiTick(dt){ const ai=G.ai; if(!ai||G.over) return; ai.think-=dt; ai.waveT-=dt; ai.superT-=dt;
+ // passive trickle keeps the war funded on higher difficulties; harvesters do the real work
+ ai.creditsTick+=dt; if(ai.creditsTick>4){ ai.creditsTick=0; ai.credits+=18*(G.diff+1); }
+ if(ai.think>0) return; ai.think=1.2;
+ const myB=G.buildings.filter(b=>!b.dead&&b.faction===1), myU=G.units.filter(u=>!u.dead&&u.faction===1);
+ const yard=myB.find(b=>b.type==='yard'); if(!yard) return;
+ const anchor={x:32,z:-30};
+ // Build order: place next structure near enemy yard if affordable
+ const want=ai.plan[Math.min(ai.buildStep,ai.plan.length-1)];
+ if(want&&!myB.some(b=>b.type===want)||want==='power'||want==='factory'){ const def=BUILD_DEFS[want];
+  if(ai.credits>=def.cost){ // find free spot in rings around yard
+   for(let r=6;r<15;r+=2){ let placed=false; for(let a=0;a<8;a++){ const x=anchor.x+Math.cos(a/8*6.28)*r, z=anchor.z+Math.sin(a/8*6.28)*r;
+     if(Math.abs(x)>HALF-4||Math.abs(z)>HALF-4) continue; if(G.buildings.some(b=>!b.dead&&Math.hypot(b.x-x,b.z-z)<5)) continue;
+     if(G.props.some(p=>Math.hypot(p.x-x,p.z-z)<3)) continue;
+     spawnBuilding(want,1,x,z); ai.credits-=def.cost; ai.buildStep++; placed=true; break; } if(placed) break; } } }
+ // Ensure harvesters x2, then army production through idle producers
+ const harv=myU.filter(u=>u.type==='harvester');
+ const ref=myB.find(b=>b.type==='refinery'), bar=myB.find(b=>b.type==='barracks'), fac=myB.find(b=>b.type==='factory'), tech=myB.some(b=>b.type==='techlab');
+ const train=(type,fromB)=>{ if(!fromB) return false; const d=UNIT_DEFS[type]; if(ai.credits<d.cost) return false; if(fromB.queue.length>1) return false;
+  ai.credits-=d.cost; fromB.queue.push({kind:'unit',type,t:0,total:6,src:fromB.id,ai:true}); return true; };
+ if(ref&&harv.length<2) train('harvester',ref);
+ else if(bar&&myU.filter(u=>u.type==='rifle').length<4) train(Math.random()<.6?'rifle':'rocket',bar);
+ else if(fac){ const pool=tech&&Math.random()<.3?['artillery','mtank','ltank']:['ltank','mtank','buggy']; train(pool[(Math.random()*pool.length)|0],fac); }
+ // Repair damaged buildings with spare credits
+ for(const b of myB) if(b.hp<b.maxHp*.6&&ai.credits>200){ b.hp=Math.min(b.maxHp,b.hp+30); ai.credits-=12; }
+ // Attack waves: gather idle army near yard, launch at player weakest approach
+ const army=myU.filter(u=>u.type!=='harvester'&&u.type!=='engineer'&&u.type!=='mcv');
+ if(ai.waveT<=0){ ai.wave++; ai.waveT=Math.max(38,85-ai.wave*6)/(G.diff*.3+1);
+  const px=G.buildings.filter(b=>!b.dead&&b.faction===0); const goal=px.find(b=>b.type==='yard')||px[0]||{x:-32,z:30};
+  const squad=army.slice(0,Math.min(army.length,4+ai.wave*2));
+  for(const u of squad) u.order={mode:'attackmove',x:goal.x+(Math.random()-.5)*8,z:goal.z+(Math.random()-.5)*8};
+  if(squad.length&&G.time>60) AudioSys.speak('Enemy forces approaching',true); }
+ // Defend: idle army near base engages anything close to yard
+ for(const u of army) if(u.order.mode==='idle'){ const t=findTarget(u); if(t&&Math.hypot(t.x-yard.x,t.z-yard.z)<26) u.order={mode:'attack',target:t}; }
+ // Crimson superweapon: telegraphed missile on player clusters
+ if(ai.superT<=0){ ai.superT=110-Math.min(30,ai.wave*3); const targets=G.units.filter(u=>!u.dead&&u.faction===0&&u.type!=='harvester');
+  if(targets.length){ const c=targets[(Math.random()*targets.length)|0]; telegraphStrike(c.x,c.z,7,140,'Crimson cluster missile inbound — scatter your forces!',1); } }
+}
+function telegraphStrike(x,z,r,dmg,label,fromFaction){ showAlert('⚠ '+label,true); AudioSys.speak('Missile launch detected',true);
+ const ring=new THREE.Mesh(new THREE.RingGeometry(r-.4,r,36),new THREE.MeshBasicMaterial({color:0xff2222,transparent:true,opacity:.9,side:THREE.DoubleSide,depthWrite:false}));
+ ring.rotation.x=-Math.PI/2; ring.position.set(x,.35,z); G.scene.add(ring); const fill=new THREE.Mesh(new THREE.CircleGeometry(r,36),new THREE.MeshBasicMaterial({color:0xff2222,transparent:true,opacity:.18,depthWrite:false}));
+ fill.rotation.x=-Math.PI/2; fill.position.set(x,.34,z); G.scene.add(fill);
+ let t=0; const iv=setInterval(()=>{ t+=.1; ring.material.opacity=.5+Math.sin(t*14)*.4; if(t>=3){ clearInterval(iv); G.scene.remove(ring); G.scene.remove(fill);
+  AudioSys.ion(); spawnExplosion(x,1.5,z,2.2,fromFaction); for(const e of [...G.units,...G.buildings]) if(!e.dead&&e.faction!==fromFaction&&Math.hypot(e.x-x,e.z-z)<r) applyDamage({faction:fromFaction,kind:'unit',type:'artillery',vet:0},e,dmg,'arty');
+  if(Settings.data.shake) G.cam.shake=1; } },100); }
+function fireIonCannon(x,z){ AudioSys.ion(); const beam=new THREE.Mesh(new THREE.CylinderGeometry(.7,.9,60,12,1,true),new THREE.MeshBasicMaterial({color:0x9be8ff,transparent:true,opacity:.9,side:THREE.DoubleSide,depthWrite:false}));
+ beam.position.set(x,30,z); G.scene.add(beam); const light=new THREE.PointLight(0x9be8ff,300,60,1.2); light.position.set(x,8,z); G.scene.add(light);
+ setTimeout(()=>{ spawnExplosion(x,1.5,z,2.6,0); for(const e of [...G.units,...G.buildings]) if(!e.dead&&e.faction===1&&Math.hypot(e.x-x,e.z-z)<7.5) applyDamage({faction:0,kind:'unit',type:'artillery',vet:0},e,260,'arty');
+  if(Settings.data.shake) G.cam.shake=1; },450);
+ setTimeout(()=>{ G.scene.remove(beam); G.scene.remove(light); },1100); G.superCD=90; G.superReady=false; refreshDock(); }
+/* ================= FOG OF WAR + MINIMAP ================= */
+const FOGN=48;
+function fogUpdate(){ if(!G.fog) return; const F=G.fog; F.grid.fill(0);
+ const reveal=(x,z,r)=>{ const gx=((x+HALF)/WORLD*FOGN)|0, gz=((z+HALF)/WORLD*FOGN)|0, gr=Math.ceil(r/WORLD*FOGN);
+  for(let j=gz-gr;j<=gz+gr;j++) for(let i=gx-gr;i<=gx+gr;i++){ if(i<0||j<0||i>=FOGN||j>=FOGN) continue; if(Math.hypot(i-gx,j-gz)<=gr){ F.grid[j*FOGN+i]=1; F.seen[j*FOGN+i]=1; } } };
+ for(const b of G.buildings) if(!b.dead&&b.faction===0) reveal(b.x,b.z,13);
+ for(const u of G.units) if(!u.dead&&u.faction===0) reveal(u.x,u.z,UNIT_DEFS[u.type].sight);
+ if(G.attract||G.hubMode&&false){ F.grid.fill(1); }
+ const ctx=F.ctx, img=ctx.createImageData(FOGN,FOGN);
+ // draw into 48px then scale via drawImage smoothing on 96 canvas: direct put at 48 and let texture stretch
+ const c2=document.createElement('canvas'); // reuse fog canvas at 48 logical: set size once
+ for(let i=0;i<FOGN*FOGN;i++){ const v=F.grid[i]?0:(F.seen[i]?70:165); img.data[i*4]=8; img.data[i*4+1]=16; img.data[i*4+2]=30; img.data[i*4+3]=v; }
+ // paint via temp
+ if(!F.tmp){ F.tmp=document.createElement('canvas'); F.tmp.width=F.tmp.height=FOGN; }
+ F.tmp.getContext('2d').putImageData(img,0,0); ctx.imageSmoothingEnabled=true; ctx.clearRect(0,0,96,96); ctx.drawImage(F.tmp,0,0,96,96); F.tex.needsUpdate=true;
+ // enemy visibility follows fog
+ for(const e of [...G.units,...G.buildings]){ if(e.faction===0) continue; const gx=clamp(((e.x+HALF)/WORLD*FOGN)|0,0,FOGN-1), gz=clamp(((e.z+HALF)/WORLD*FOGN)|0,0,FOGN-1);
+  const vis=!!F.grid[gz*FOGN+gx]||G.attract; e.mesh.visible=vis; e.bar.visible=vis&&(e.hp<e.maxHp||e.selected); }
+}
+const mm=$('minimap'), mmx=mm.getContext('2d');
+function drawMinimap(){ const s=216/WORLD; mmx.fillStyle='#14280f'; mmx.fillRect(0,0,216,216);
+ mmx.fillStyle='#2ee66b'; for(const c of G.crystals) if(c.amount>2){ const gx=clamp(((c.x+HALF)/WORLD*FOGN)|0,0,47), gz=clamp(((c.z+HALF)/WORLD*FOGN)|0,0,47); if(G.fog&&(G.fog.seen[gz*48+gx]||G.attract)) mmx.fillRect((c.x+HALF)*s-1,(c.z+HALF)*s-1,3,3); }
+ for(const b of G.buildings){ if(b.dead) continue; if(b.faction===1&&!G.attract){ const gx=clamp(((b.x+HALF)/WORLD*FOGN)|0,0,47), gz=clamp(((b.z+HALF)/WORLD*FOGN)|0,0,47); if(!G.fog?.seen[gz*48+gx]) continue; }
+  mmx.fillStyle=b.faction===0?(Settings.data.cb?'#2f9eff':'#3b82f6'):(Settings.data.cb?'#ff8c1a':'#e8443a'); const sz=b.type==='yard'?8:6; mmx.fillRect((b.x+HALF)*s-sz/2,(b.z+HALF)*s-sz/2,sz,sz); }
+ for(const u of G.units){ if(u.dead) continue; if(u.faction===1&&!u.mesh.visible) continue; mmx.fillStyle=u.faction===0?'#bfe0ff':'#ffc4c4'; mmx.fillRect((u.x+HALF)*s-1.5,(u.z+HALF)*s-1.5,3,3); }
+ // fog darkening
+ if(G.fog&&!G.attract){ mmx.fillStyle='rgba(4,10,18,0.55)'; for(let j=0;j<FOGN;j++) for(let i=0;i<FOGN;i++) if(!G.fog.seen[j*FOGN+i]) mmx.fillRect(i*(216/FOGN),j*(216/FOGN),216/FOGN+1,216/FOGN+1); }
+ mmx.strokeStyle='#ffd23f'; mmx.lineWidth=2; const vw=G.cam.dist*1.15; mmx.strokeRect((G.cam.x-vw/2+HALF)*s,(G.cam.z-vw/2+HALF)*s,vw*s,vw*s);
+ if(G.lastAlertPos&&G.time%1<.6){ mmx.fillStyle='#ff2222'; mmx.beginPath(); mmx.arc((G.lastAlertPos.x+HALF)*s,(G.lastAlertPos.z+HALF)*s,6,0,7); mmx.fill(); } }
+mm.addEventListener('pointerdown',e=>{ const r=mm.getBoundingClientRect(); const wx=((e.clientX-r.left)/r.width)*WORLD-HALF, wz=((e.clientY-r.top)/r.height)*WORLD-HALF;
+ if(G.superArm){ fireIonCannon(wx,wz); G.superArm=false; refreshDock(); return; }
+ G.cam.x=clamp(wx,-HALF+8,HALF-8); G.cam.z=clamp(wz,-HALF+8,HALF-8); AudioSys.click(); noteInput(); });
+/* ================= BATTLE SETUP, PLACEMENT, PRODUCTION ================= */
+let ghost=null, ghostType=null, ghostOK=false;
+function makeGhost(type){ clearGhost(); ghostType=type; ghost=new THREE.Group();
+ const m=makeBuildingMesh(type,0); m.traverse(o=>{ if(o.material){ o.material=o.material.clone(); o.material.transparent=true; o.material.opacity=.55; } }); ghost.add(m);
+ const s=BUILD_DEFS[type].size; const base=new THREE.Mesh(new THREE.PlaneGeometry(s,s),new THREE.MeshBasicMaterial({color:0x37e08b,transparent:true,opacity:.3,depthWrite:false}));
+ base.rotation.x=-Math.PI/2; base.position.y=.15; base.name='ghostBase'; ghost.add(base); ghost.position.set(G.cam.x,0,G.cam.z); G.scene.add(ghost); refreshDock(); }
+function clearGhost(){ if(ghost){ G.scene.remove(ghost); ghost=null; ghostType=null; } }
+function placementOK(x,z,type){ const s=BUILD_DEFS[type].size; if(Math.abs(x)>HALF-s||Math.abs(z)>HALF-s) return false;
+ const yard=G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='yard'); if(yard&&Math.hypot(x-yard.x,z-yard.z)>26) return false;
+ // must be near any own building (C&C-style adjacency radius)
+ if(!G.buildings.some(b=>!b.dead&&b.faction===0&&Math.hypot(b.x-x,b.z-z)<13)) return false;
+ for(const b of G.buildings) if(!b.dead&&Math.hypot(b.x-x,b.z-z)<(BUILD_DEFS[b.type].size+s)/2+.6) return false;
+ for(const p of G.props) if(Math.hypot(p.x-x,p.z-z)<p.r+s/2) return false;
+ for(const c of G.crystals) if(c.amount>2&&Math.hypot(c.x-x,c.z-z)<s/2+1) return false;
+ return true; }
+function confirmPlacement(wx,wz){ if(!ghostType) return; if(!placementOK(wx,wz,ghostType)){ AudioSys.error(); showAlert('Cannot deploy there — build near your base on clear ground.',true); return; }
+ const t=ghostType; clearGhost(); const b=spawnBuilding(t,0,wx,wz); AudioSys.speak(BUILD_DEFS[t].name+' deployed'); AudioSys.build();
+ if(t==='refinery'){ const h=spawnUnit('harvester',0,wx+3,wz+3); h.order={mode:'harvest'}; showAlert('Harvester ready — it will harvest automatically.'); }
+ recalcPower(); refreshDock(); }
+function startBattle(opts={}){ // opts: {diff,map,credits,len,attract,hub,mp}
+ for(const e of [...G.units,...G.buildings]){ G.scene.remove(e.mesh); G.scene.remove(e.bar); if(e.body) G.world.removeRigidBody(e.body); }
+ G.units=[]; G.buildings=[]; G.selected=[]; G.buildQueue=[]; G.shots.forEach(s=>G.scene.remove(s.mesh)); G.shots=[];
+ G.parts.forEach(p=>{ if(p.mesh) G.scene.remove(p.mesh); if(p.flash) G.scene.remove(p.flash); if(p.line) G.scene.remove(p.line); }); G.parts=[];
+ G.props=[]; G.time=0; G.over=false; G.paused=false; G.kills=0; G.losses=0; G.razed=0; G.harvested=0; G.creditsSpent=0; G.upgrades={}; G.research=null;
+ G.diff=opts.diff??1; G.mapId=opts.map??0; G.roundLen=opts.len??360; G.credits=opts.credits??4000; G.attract=!!opts.attract; G.hubMode=!!opts.hub; G.mpMode=!!opts.mp;
+ try{ if(G.world) G.world.free(); }catch(e){} G.world=new G.rapier.World({x:0,y:-9.81,z:0}); G.world.timestep=1/60;
+ seedN=opts.attract?999:20261029+G.mapId*77+G.diff*13; buildTerrain(G.mapId);
+ G.ai=makeAI(G.diff); G.superCD=hasTechSuperStart(); G.superReady=false; G.superArm=false;
+ const px=-32,pz=30, ex=32,ez=-30;
+ spawnBuilding('yard',0,px,pz); spawnBuilding('power',0,px+6,pz-2); const ref=spawnBuilding('refinery',0,px-6,pz-3);
+ spawnUnit('harvester',0,px-3,pz+4).order={mode:'harvest'}; spawnUnit('rifle',0,px+3,pz+5); spawnUnit('rifle',0,px+4,pz+3); spawnUnit('buggy',0,px+5,pz+5);
+ spawnBuilding('yard',1,ex,ez); spawnBuilding('power',1,ex-6,ez+2); spawnBuilding('refinery',1,ex+6,ez+3);
+ spawnUnit('harvester',1,ex+3,ez-4).order={mode:'harvest'}; spawnUnit('rifle',1,ex-3,ez-5); spawnUnit('ltank',1,ex-5,ez-3);
+ G.cam.x=px; G.cam.z=pz+6; G.cam.dist=42; G.cam.yaw=.6; recalcPower();
+ inBattle=true; showScreen(null); $('hud').hidden=false; $('hintbar').hidden=false; updateObjectives();
+ if(G.attract){ $('obj').innerHTML='<b>ATTRACT MODE</b> — demo battle in progress.<br>Press any key / button to take command.'; }
+ else AudioSys.speak('Welcome back Commander — build a War Factory and destroy the Crimson Hand');
+ refreshDock(); fogUpdate(); drawMinimap();
+ if(window.AIHub?.active&&G.hubMode) AIHub.progress({score:0,label:'Deploying'});
+}
+function hasTechSuperStart(){ return 25; }
+function updateObjectives(){ if(G.attract) return; $('obj').innerHTML=`<b>OBJECTIVE</b><br>☄ Destroy the <span style="color:#ff8f86">Crimson Yard + Barracks / Factory / Tech Lab</span>.<br>🛡 Protect your Construction Yard.<br><span style="color:var(--dim)">Harvest Tiber · Build War Factory → Tech Lab → Ion Cannon.</span>`; }
+function productionTick(dt){ const pf=powerFactor();
+ for(let i=G.buildQueue.length-1;i>=0;i--){ const q=G.buildQueue[i]; q.total=BUILD_DEFS[q.type].time/pf; q.t+=dt; if(q.t>=q.total&&!q.done){ q.done=true; makeGhost(q.type); AudioSys.speak(BUILD_DEFS[q.type].name+' ready — pick a deployment site'); G.buildQueue.splice(i,1); refreshDock(); } }
+ for(const b of G.buildings){ if(b.dead) continue;
+  if(b.type==='turret'){ b.cool-=dt; if(b.faction===0&&G.powerUsed>G.powerMax) continue; if(b.faction===1&&false) continue;
+   const t=findTarget(b); if(t&&dist(b,t)<=13&&b.cool<=0){ fireAt(b,t); b.cool=1; const h=b.mesh.userData.turretHead; if(h) h.rotation.y=Math.atan2(t.x-b.x,t.z-b.z); } continue; }
+  if(!b.queue.length) continue; const q=b.queue[0]; q.t+=dt*(b.faction===1?1:pf); const fill=$('queueFill');
+  if(q.t>=q.total){ b.queue.shift(); const def=UNIT_DEFS[q.type]; const sx=b.x+(Math.random()-.5)*3, sz=b.z+BUILD_DEFS[b.type].size/2+2+(Math.random()-.5)*1.5;
+   const u=spawnUnit(q.type,b.faction,sx,sz); u.order={mode:'move',x:b.rally.x,z:b.rally.z}; if(q.type==='harvester') u.order={mode:'harvest'};
+   if(b.faction===0){ AudioSys.speak(UNIT_DEFS[q.type].name+' ready'); } refreshDock(); } }
+ if(G.research){ G.research.t+=dt*pf; if(G.research.t>=G.research.total){ const k=G.research.key; G.research=null; applyUpgrade(k); } }
+ if(G.superCD>0&&hasBuilding(0,'techlab')){ G.superCD-=dt; if(G.superCD<=0){ G.superReady=true; AudioSys.speak('Ion Cannon ready',true); } if(!hasBuilding(0,'techlab')) G.superReady=false; }
+ else if(!hasBuilding(0,'techlab')) G.superReady=false;
+}
+function checkVictorySoon(){ setTimeout(()=>{ if(G.over) return; const prod=G.buildings.filter(b=>!b.dead&&b.faction===1&&(b.type==='yard'||b.type==='barracks'||b.type==='factory'||b.type==='techlab'));
+ if(!prod.length) endBattle(true,'The Crimson Hand is broken. Their yard burns, their factories are silent — the harvest is ours, Commander.'); },400); }
+function checkDefeatSoon(){ setTimeout(()=>{ if(G.over) return; const yard=G.buildings.some(b=>!b.dead&&b.faction===0&&b.type==='yard'); const mcv=G.units.some(u=>!u.dead&&u.faction===0&&u.type==='mcv');
+ if(!yard&&!mcv) endBattle(false,'Your Construction Yard is gone and no MCV remains to rebuild it. The Crimson flag flies over your crystals — this time.'); },400); }
+function endBattle(win,text){ if(G.over) return; G.over=true; AudioSys.intensity=win?.4:.8; AudioSys.speak(win?'Mission accomplished Commander':'Mission failed',!win);
+ $('endTitle').textContent=win?'★ VICTORY ★':'✖ DEFEAT'; $('endTitle').style.color=win?'var(--gold)':'var(--bad)'; $('endText').textContent=text;
+ $('endStats').innerHTML=`Score <b>${scoreNow()}</b> · ⛁ Harvested ${Math.floor(G.harvested)} · Kills ${G.kills} · Structures razed ${G.razed} · Losses ${G.losses}<br>Time ${fmtTime(G.time)} · Buildings built ${G.stats.built} · Units trained ${G.stats.trained}`;
+ showScreen('end'); if(window.AIHub?.active){ AIHub.result({score:scoreNow(),stats:{harvested:Math.floor(G.harvested),kills:G.kills,razed:G.razed}}); }
+ if(G.mpMode) mpBroadcast({t:'end',win,score:scoreNow()}); }
+function fmtTime(s){ s=Math.max(0,Math.ceil(s)); return String((s/60)|0).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
+/* ================= DOCK UI (build / train / tech) ================= */
+$('dockTabs').addEventListener('click',e=>{ const b=e.target.closest('button'); if(!b) return; G.buildTab=b.dataset.tab; AudioSys.click(); refreshDock(); noteInput(); });
+document.querySelectorAll('#dockTabs button').forEach(b=>b.addEventListener('click',()=>{}));
+function prodBuildingFor(tab){ if(tab==='train'){ const s=G.selected.find(e=>!e.dead&&e.faction===0&&(e.type==='barracks'||e.type==='factory'||e.type==='refinery')); if(s) return s;
+ return G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='barracks')||G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='factory')||G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='refinery'); } return null; }
+function refreshDock(){ document.querySelectorAll('#dockTabs button').forEach(b=>b.classList.toggle('sel',b.dataset.tab===G.buildTab));
+ $('dockTitle').textContent=G.buildTab==='build'?'Command — Build (select Yard first not needed)':G.buildTab==='train'?'Command — Train Forces':'Command — Tech & Upgrades';
+ const grid=$('buildGrid'); grid.innerHTML='';
+ if(G.buildTab==='build'){ for(const [key,d] of Object.entries(BUILD_DEFS)){ if(key==='yard') continue; const btn=document.createElement('button'); btn.className='buildBtn';
+  const queued=G.buildQueue.some(q=>q.type===key); btn.innerHTML=`${d.icon} ${d.name} <span class="q">${d.cost}⛁</span><small>${d.desc}${d.power>0?' · +'+d.power+'⚡':d.power<0?' · '+d.power+'⚡':''}${queued?' · BUILDING…':''}</small>`;
+  btn.disabled=G.credits<d.cost; btn.addEventListener('click',()=>{ AudioSys.init(); tryBuild(key); noteInput(); }); grid.appendChild(btn); }
+  if(G.buildQueue.length){ const q=G.buildQueue[0]; const row=document.createElement('button'); row.className='buildBtn sel'; row.innerHTML=`⏳ ${BUILD_DEFS[q.type].name} — ${Math.ceil(q.total-q.t)}s <small>Click to cancel &amp; refund</small>`; row.addEventListener('click',()=>cancelBuild(0)); grid.appendChild(row); } }
+ else if(G.buildTab==='train'){ const src=prodBuildingFor('train');
+  for(const [key,d] of Object.entries(UNIT_DEFS)){ if(key==='mcv'&&!hasBuilding(0,'factory')) continue; const btn=document.createElement('button'); btn.className='buildBtn';
+  const need=d.needTech&&!hasBuilding(0,'techlab'); btn.innerHTML=`${d.icon} ${d.name} <span class="q">${d.cost}⛁</span><small>${d.desc}${need?' · NEEDS TECH LAB':''}</small>`;
+  btn.disabled=G.credits<d.cost||need||!src; btn.addEventListener('click',()=>{ AudioSys.init(); tryTrain(key,src); noteInput(); }); grid.appendChild(btn); }
+  if(!src){ const p=document.createElement('div'); p.style.gridColumn='1/-1'; p.textContent='Build a Barracks or War Factory to train forces.'; grid.appendChild(p); } }
+ else { for(const [key,d] of Object.entries(UPG_DEFS)){ const btn=document.createElement('button'); btn.className='buildBtn';
+  const done=G.upgrades[key], busy=G.research&&G.research.key===key; btn.innerHTML=`${d.icon} ${d.name} <span class="q">${done?'✓ DONE':busy?'RESEARCHING…':d.cost+'⛁'}</span><small>${d.desc}</small>`;
+  btn.disabled=done||!!G.research||G.credits<d.cost||!hasBuilding(0,'techlab'); btn.addEventListener('click',()=>{ AudioSys.init(); tryUpgrade(key); noteInput(); }); grid.appendChild(btn); }
+  const p=document.createElement('div'); p.style.gridColumn='1/-1'; p.style.fontSize='15px'; p.textContent=hasBuilding(0,'techlab')?'Tech Lab online. Ion Cannon charges while a Tech Lab stands.':'Build a Tech Lab (needs War Factory) to unlock research.'; grid.appendChild(p); }
+ // superweapon button
+ const sb=$('superBtn'); if(!hasBuilding(0,'techlab')){ sb.textContent='☄ Ion Cannon — needs Tech Lab'; sb.classList.remove('ready'); sb.disabled=true; }
+ else if(G.superArm){ sb.textContent='☄ ION CANNON ARMED — pick a target!'; sb.classList.add('ready'); sb.disabled=false; }
+ else if(G.superReady){ sb.textContent='☄ ION CANNON READY — fire!'; sb.classList.add('ready'); sb.disabled=false; }
+ else { sb.textContent=`☄ Ion Cannon charging… ${Math.ceil(G.superCD)}s`; sb.classList.remove('ready'); sb.disabled=true; }
+ // queue progress + selection info
+ let prog=0; const qb=G.buildQueue[0]; if(qb) prog=qb.t/qb.total; else { const pb=G.buildings.find(b=>!b.dead&&b.faction===0&&b.queue.length); if(pb) prog=pb.queue[0].t/pb.queue[0].total; else if(G.research) prog=G.research.t/G.research.total; }
+ $('queueFill').style.width=(prog*100)+'%'; updateSelInfo(); }
+function updateSelInfo(){ const el=$('selInfo'); const s=G.selected.filter(e=>!e.dead);
+ if(G.superArm){ el.innerHTML='<b style="color:var(--gold)">ION CANNON ARMED</b> — click a target on the field or minimap. Circle/Esc cancels.'; return; }
+ if(ghostType){ el.innerHTML=`<b>Deploying ${BUILD_DEFS[ghostType].name}</b> — move the ghost, <b>Cross / Left-click</b> places it, <b>Circle / Right-click</b> cancels. Green = valid.`; return; }
+ if(!s.length){ el.innerHTML='Select a unit or building.<br><span style="color:var(--dim)">Cross / Left-click selects · Circle / Right-click orders · Drag boxes a squad · F = all army</span>'; return; }
+ if(s.length===1){ const e=s[0]; const d=e.kind==='unit'?UNIT_DEFS[e.type]:BUILD_DEFS[e.type];
+  el.innerHTML=`<b>${d.icon} ${d.name}</b> ${e.faction===0?'(AEGIS)':'(CRIMSON — inspect only)'} ${e.vet?('★'.repeat(e.vet)):''}<br>HP ${Math.ceil(e.hp)}/${Math.ceil(e.maxHp)} · ${d.desc}${e.kind==='unit'&&e.type==='harvester'?`<br>Tiberium cargo ${Math.floor(e.cargo||0)}/100`:''}${e.kind==='building'&&e.queue.length?`<br>Producing: ${e.queue.map(q=>UNIT_DEFS[q.type].name).join(', ')}`:''}${e.kind==='building'&&e.faction===0?'<br><span style="color:var(--dim)">Rally: order this building\'s fresh units by selecting it, then Circle-click ground.</span>':''}`; return; }
+ const counts={}; for(const e of s) counts[UNIT_DEFS[e.type]?.name||e.type]=(counts[UNIT_DEFS[e.type]?.name||e.type]||0)+1;
+ el.innerHTML=`<b>${s.length} units selected</b><br>`+Object.entries(counts).map(([k,v])=>`${k} ×${v}`).join(' · ')+'<br><span style="color:var(--dim)">Circle orders the squad · Square attack-move · Double-tap group recalls</span>'; }
+$('superBtn').addEventListener('click',()=>{ if(!G.superReady) return; G.superArm=true; AudioSys.speak('Ion Cannon armed — designate target',true); refreshDock(); noteInput(); });
+$('repairBtn').addEventListener('click',()=>{ const s=G.selected.filter(e=>!e.dead&&e.faction===0); if(!s.length){ showAlert('Select a damaged unit or building to repair.',true); AudioSys.error(); return; }
+ let fixed=0; for(const e of s) if(e.hp<e.maxHp){ if(!spend(50)){ showAlert('Insufficient funds for repairs.',true); break; } e.hp=Math.min(e.maxHp,e.hp+e.maxHp*.3); drawBar(e); fixed++; }
+ if(fixed) AudioSys.speak('Repairs underway'); refreshDock(); noteInput(); });
+$('sellBtn').addEventListener('click',()=>{ const s=G.selected.filter(e=>!e.dead&&e.faction===0&&e.kind==='building'&&e.type!=='yard'); if(!s.length){ showAlert('Select one of your buildings (not the Yard) to sell.',true); AudioSys.error(); return; }
+ const e=s[0]; G.credits+=Math.round(BUILD_DEFS[e.type].cost*.6); AudioSys.speak('Structure sold'); removeEnt(e); recalcPower(); refreshDock(); noteInput(); });
+document.querySelectorAll('#cmdbar button').forEach(b=>b.addEventListener('click',()=>{ const c=b.dataset.cmd; AudioSys.init();
+ if(c==='army'){ selectArmy(); } else { G.cmdMode=c==='move'?'move':c==='attack'?'attackmove':c; showAlert('Order mode: '+b.textContent.trim()+' — now Circle / right-click a destination.'); if(c==='stop') issueOrder(G.selected.filter(e=>e.kind==='unit'),{mode:'idle'}); if(c==='hold') issueOrder(G.selected.filter(e=>e.kind==='unit'),{mode:'hold'}); }
+ noteInput(); }));
+function selectArmy(){ setSelection(G.units.filter(u=>!u.dead&&u.faction===0&&u.type!=='harvester')); AudioSys.speak('All combat units selected'); }
+function setSelection(list){ for(const e of G.selected) { e.selected=false; if(e.mesh.userData.ring) e.mesh.userData.ring.material.opacity=0; const r=e.mesh.getObjectByProperty('name','selRing'); }
+ G.selected=list.filter(e=>!e.dead); for(const e of G.selected){ e.selected=true; const ring=e.kind==='unit'?e.mesh.userData.ring:e.mesh.userData.ring; if(ring) ring.material.opacity=.95; if(e.kind==='building'&&e.mesh.userData.ring) e.mesh.userData.ring.material.opacity=.95; drawBar(e); } updateSelInfo(); }
+/* ================= INPUT: raycast picking, mouse + keyboard (mapped to pad model) ================= */
+const ray=new THREE.Raycaster(), ndc=new THREE.Vector2(); const groundPlane=new THREE.Plane(V3(0,1,0),0);
+function pickAt(cx,cy){ ndc.set((cx/innerWidth)*2-1,-(cy/innerHeight)*2+1); ray.setFromCamera(ndc,G.camera);
+ const hits=ray.intersectObjects(G.scene.children,true); for(const h of hits){ let o=h.object; while(o){ if(o.userData.ent&&!o.userData.ent.dead) return {ent:o.userData.ent,point:h.point}; o=o.parent; } if(h.object.name==='ground') return {point:h.point}; }
+ const pt=V3(); ray.ray.intersectPlane(groundPlane,pt); return {point:pt}; }
+function screenPos(e){ const v=V3(e.x,1,e.z).project(G.camera); return {x:(v.x*.5+.5)*innerWidth,y:(-v.y*.5+.5)*innerHeight,behind:v.z>1}; }
+function noteInput(){ G.lastInput=performance.now(); if(G.attract){ exitAttract(); } }
+function smartOrderAt(cx,cy,modeOverride){ const p=pickAt(cx,cy); if(!p.point) return; const units=G.selected.filter(e=>!e.dead&&e.kind==='unit'&&e.faction===0);
+ const buildingsSel=G.selected.filter(e=>!e.dead&&e.kind==='building'&&e.faction===0);
+ if(G.superArm){ fireIonCannon(p.point.x,p.point.z); G.superArm=false; refreshDock(); return; }
+ if(ghostType){ confirmPlacement(p.point.x,p.point.z); return; }
+ if(p.ent&&p.ent.faction===0&&buildingsSel.length&&p.ent.kind==='building'){ /* rally handled below */ }
+ if(buildingsSel.length&&!units.length){ for(const b of buildingsSel) b.rally={x:p.point.x,z:p.point.z}; AudioSys.speak('Rally point set'); showAlert('Rally point set — fresh units will muster there.'); return; }
+ if(!units.length) return;
+ if(p.ent&&p.ent.faction===1){ const hasEng=units.some(u=>u.type==='engineer'); const fighters=units.filter(u=>u.type!=='engineer');
+  if(hasEng&&p.ent.kind==='building') issueOrder(units.filter(u=>u.type==='engineer'),{mode:'capture',target:p.ent});
+  if(fighters.length) issueOrder(fighters,{mode:'attack',target:p.ent}); if(!hasEng&&!fighters.length) issueOrder(units,{mode:'attack',target:p.ent}); AudioSys.speak('Attacking target'); return; }
+ if(p.ent&&p.ent.faction===0&&p.ent.kind==='building'&&units.some(u=>u.type==='engineer')){ issueOrder(units.filter(u=>u.type==='engineer'),{mode:'repair',target:p.ent}); return; }
+ const mode=modeOverride||(G.cmdMode==='attackmove'?'attackmove':'move');
+ // formation offsets so squads do not stack
+ units.forEach((u,i)=>{ const ox=(i%4-1.5)*1.6, oz=((i/4)|0)*1.6; let m=mode; if(u.type==='harvester') m='move';
+  if(u.type==='mcv'&&Math.hypot(p.point.x-u.x,p.point.z-u.z)<2) m='deploy'; u.order={mode:m,x:p.point.x+ox,z:p.point.z+oz}; u.target=null; if(m==='patrol') u.patrolA={x:u.x,z:u.z}; });
+ AudioSys.move(); mpBroadcastOrder(units,{mode,x:p.point.x,z:p.point.z}); }
+function selectAt(cx,cy,additive){ const p=pickAt(cx,cy);
+ if(G.superArm){ if(p.point){ fireIonCannon(p.point.x,p.point.z); G.superArm=false; refreshDock(); } return; }
+ if(ghostType){ if(p.point) confirmPlacement(p.point.x,p.point.z); return; }
+ if(p.ent){ if(additive){ const cur=new Set(G.selected); cur.has(p.ent)?cur.delete(p.ent):cur.add(p.ent); setSelection([...cur].filter(e=>e.faction===0||e.kind==='building')); if(p.ent.faction===1) setSelection([p.ent]); }
+  else setSelection([p.ent]); AudioSys.select(); if(p.ent.faction===0&&p.ent.kind==='unit'&&p.ent.type==='mcv') showAlert('MCV selected — Circle-click near it again to deploy a new Yard, or order it to a new base site.'); }
+ else if(!additive) setSelection([]); }
+const gl=$('gl');
+gl.addEventListener('pointerdown',e=>{ AudioSys.init(); noteInput(); if(!inBattle||G.paused||curScreen) return;
+ if(e.pointerType==='touch'){ return; }
+ G.mouse.down=true; G.mouse.sx=e.clientX; G.mouse.sy=e.clientY; G.mouse.dragging=false;
+ if(e.button===2){ smartOrderAt(e.clientX,e.clientY); } });
+gl.addEventListener('pointermove',e=>{ G.mouse.x=e.clientX; G.mouse.y=e.clientY; G.cursor.x=e.clientX; G.cursor.y=e.clientY;
+ if(G.mouse.down&&Math.hypot(e.clientX-G.mouse.sx,e.clientY-G.mouse.sy)>8){ G.mouse.dragging=true; const d=$('dragbox'); d.hidden=false;
+  d.style.left=Math.min(e.clientX,G.mouse.sx)+'px'; d.style.top=Math.min(e.clientY,G.mouse.sy)+'px'; d.style.width=Math.abs(e.clientX-G.mouse.sx)+'px'; d.style.height=Math.abs(e.clientY-G.mouse.sy)+'px'; }
+ if(ghost&&e.pointerType!=='touch'){ const p=pickAt(e.clientX,e.clientY); if(p.point){ ghost.position.set(p.point.x,0,p.point.z); ghostOK=placementOK(p.point.x,p.point.z,ghostType);
+  ghost.traverse(o=>{ if(o.name==='ghostBase') o.material.color.setHex(ghostOK?0x37e08b:0xff2222); }); } } });
+addEventListener('pointerup',e=>{ if(!G.mouse.down) return; G.mouse.down=false; $('dragbox').hidden=true;
+ if(!inBattle||G.paused||curScreen) return; if(e.target!==gl) return;
+ if(G.mouse.dragging){ const x1=Math.min(G.mouse.sx,e.clientX),x2=Math.max(G.mouse.sx,e.clientX),y1=Math.min(G.mouse.sy,e.clientY),y2=Math.max(G.mouse.sy,e.clientY);
+  const picked=G.units.filter(u=>!u.dead&&u.faction===0&&u.mesh.visible).filter(u=>{ const s=screenPos(u); return !s.behind&&s.x>=x1&&s.x<=x2&&s.y>=y1&&s.y<=y2; });
+  setSelection(picked.length?picked:G.selected); AudioSys.select(); }
+ else if(e.button===0) selectAt(e.clientX,e.clientY,e.shiftKey);
+ G.mouse.dragging=false; });
+gl.addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('wheel',e=>{ if(!inBattle||curScreen) return; G.cam.dist=clamp(G.cam.dist+e.deltaY*.03,16,78); noteInput(); },{passive:true});
+addEventListener('keydown',e=>{ AudioSys.init(); noteInput(); const k=e.key;
+ if(curScreen==='settings'&&(k==='Escape')){ closeSettings(); return; }
+ if(k==='Escape'){ if(ghostType){ clearGhost(); refreshDock(); return; } if(G.superArm){ G.superArm=false; refreshDock(); return; }
+  if(inBattle&&!curScreen){ openSettings('battle'); } else if(curScreen) { /* Esc in menus does nothing */ } return; }
+ if(curScreen){ if(k==='ArrowDown'||k==='s'&&curScreen) { /* menu nav only when not typing */ }
+  if(document.activeElement&&document.activeElement.tagName==='INPUT'&&document.activeElement.type==='text') return;
+  if(k==='ArrowDown') menuMove(1); else if(k==='ArrowUp') menuMove(-1); else if(k==='Enter'||k===' ') { e.preventDefault(); menuConfirm(); } return; }
+ if(!inBattle) return; G.keys[k.toLowerCase()]=true;
+ if(k==='a'||k==='A'){ G.cmdMode='attackmove'; showAlert('Attack-move Armed'); }
+ if(k==='s'||k==='S') issueOrder(G.selected.filter(u=>u.kind==='unit'),{mode:'idle'});
+ if(k==='h'||k==='H') issueOrder(G.selected.filter(u=>u.kind==='unit'),{mode:'hold'});
+ if(k==='p'||k==='P'){ G.cmdMode='patrol'; showAlert('Patrol Armed'); }
+ if(k==='f'||k==='F') selectArmy();
+ if(k===' '){ e.preventDefault(); if(G.lastAlertPos){ G.cam.x=G.lastAlertPos.x; G.cam.z=G.lastAlertPos.z; } }
+ if(['1','2','3','4'].includes(k)){ const n=+k; if(e.ctrlKey||e.metaKey){ G.groups[n]=G.selected.filter(u=>u.kind==='unit'); showAlert('Control group '+n+' set ('+G.groups[n].length+' units)'); }
+  else if(G.groups[n].length) setSelection(G.groups[n]); }
+ if(k==='Delete'||k==='Backspace'){ const s=G.selected.filter(u=>u.kind==='unit'); /* no suicide hotkey: ignore */ }
+});
+addEventListener('keyup',e=>{ G.keys[e.key.toLowerCase()]=false; });
+/* ================= GAMEPAD (PS5 DualSense, standard mapping) ================= */
+const padState={x:innerWidth/2,y:innerHeight/2,seen:false};
+function padDown(i){ const gps=navigator.getGamepads?navigator.getGamepads():[]; const gp=gps&&[...gps].find(g=>g&&g.connected); if(!gp) return false; return !!gp.buttons[i]?.pressed; }
+function pollGamepad(dt){ const gps=navigator.getGamepads?navigator.getGamepads():[]; const gp=gps&&[...gps].find(g=>g&&g.connected); const curEl=$('cursor');
+ if(!gp){ G.padPrev=[]; return; } curEl.hidden=!(inBattle&&!curScreen); $('hintbar').hidden=!(inBattle&&!curScreen);
+ const pressed=i=>!!gp.buttons[i]?.pressed, edge=i=>pressed(i)&&!G.padPrev[i];
+ let lx=gp.axes[0]||0, ly=gp.axes[1]||0, rx=gp.axes[2]||0, ry=gp.axes[3]||0;
+ if(Settings.data.invX){ lx=-lx; rx=-rx; } if(Settings.data.invY){ ly=-ly; ry=-ry; }
+ const dz=v=>Math.abs(v)<.16?0:v;
+ lx=dz(lx); ly=dz(ly); rx=dz(rx); ry=dz(ry);
+ const create=pressed(8), options=pressed(9);
+ if(create&&options){ /* hub owns this combo: ignore Options */ }
+ else if(edge(9)){ if(curScreen==='settings') closeSettings(); else if(inBattle&&!curScreen) openSettings('battle'); else if(curScreen) showScreen('title'); noteInput(); }
+ if(curScreen){ // menu navigation
+  if(edge(12)||ly<-.6&&!G.padPrev.lyU) menuMove(-1); if(edge(14)||ly>.6&&!G.padPrev.lyD) menuMove(1);
+  if(edge(13)) menuMove(-1); if(edge(15)) menuMove(1);
+  if(edge(0)) menuConfirm(); if(edge(1)){ if(curScreen==='settings') closeSettings(); else if(curScreen!=='title') showScreen('title'); }
+  G.padPrev=gp.buttons.map(b=>b.pressed); G.padPrev.lyU=ly<-.6; G.padPrev.lyD=ly>.6; return; }
+ if(!inBattle||G.paused){ G.padPrev=gp.buttons.map(b=>b.pressed); return; }
+ // virtual cursor from left stick; right stick pans camera
+ padState.x=clamp(padState.x+lx*900*dt,0,innerWidth); padState.y=clamp(padState.y+ly*900*dt,0,innerHeight);
+ curEl.style.left=padState.x+'px'; curEl.style.top=padState.y+'px'; G.cursor.x=padState.x; G.cursor.y=padState.y;
+ if(ghost){ const p=pickAt(padState.x,padState.y); if(p.point){ ghost.position.set(p.point.x,0,p.point.z); ghostOK=placementOK(p.point.x,p.point.z,ghostType); ghost.traverse(o=>{ if(o.name==='ghostBase') o.material.color.setHex(ghostOK?0x37e08b:0xff2222); }); } }
+ const panSp=26*Settings.data.cam; G.cam.x=clamp(G.cam.x+rx*panSp*dt,-HALF+6,HALF-6); G.cam.z=clamp(G.cam.z+ry*panSp*dt,-HALF+6,HALF-6);
+ if(pressed(12)) G.cam.z-=panSp*dt; if(pressed(14)) G.cam.z+=panSp*dt; if(pressed(13)) G.cam.x-=panSp*dt; if(pressed(15)) G.cam.x+=panSp*dt;
+ if(pressed(7)) G.cam.dist=clamp(G.cam.dist-38*dt,16,78); if(pressed(6)) G.cam.dist=clamp(G.cam.dist+38*dt,16,78);
+ if(edge(0)){ AudioSys.init(); selectAt(padState.x,padState.y,false); noteInput(); }
+ if(edge(1)){ if(ghostType){ clearGhost(); refreshDock(); } else if(G.superArm){ G.superArm=false; refreshDock(); } else smartOrderAt(padState.x,padState.y); noteInput(); }
+ if(edge(2)){ smartOrderAt(padState.x,padState.y,'attackmove'); noteInput(); }
+ if(edge(3)){ selectArmy(); noteInput(); }
+ if(edge(4)){ const tabs=['build','train','tech']; G.buildTab=tabs[(tabs.indexOf(G.buildTab)+2)%3]; refreshDock(); AudioSys.click(); noteInput(); }
+ if(edge(5)){ const tabs=['build','train','tech']; G.buildTab=tabs[(tabs.indexOf(G.buildTab)+1)%3]; refreshDock(); AudioSys.click(); noteInput(); }
+ if(edge(10)){ const y=G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='yard'); if(y){ G.cam.x=y.x; G.cam.z=y.z+6; setSelection([y]); } noteInput(); }
+ if(edge(11)){ const h=G.units.find(u=>!u.dead&&u.faction===0&&u.type==='harvester'&&u.order.mode!=='harvest')||G.units.find(u=>!u.dead&&u.faction===0&&u.type==='harvester'); if(h){ G.cam.x=h.x; G.cam.z=h.z; setSelection([h]); } noteInput(); }
+ if(Math.abs(lx)>.2||Math.abs(ly)>.2||Math.abs(rx)>.2||Math.abs(ry)>.2||gp.buttons.some(b=>b.pressed)) noteInput();
+ G.padPrev=gp.buttons.map(b=>b.pressed); G.padPrev.lyU=ly<-.6; G.padPrev.lyD=ly>.6; }
+/* ================= ATTRACT MODE + DEMO COMMANDER (also pilots P0 in attract) ================= */
+let attractT=0, attractThink=0;
+function enterAttract(){ if(inBattle&&!G.over&&!G.attract) { /* keep current battle, hand P0 to demo pilot */ G.attract=true; $('bigCenter').textContent='▶ ATTRACT MODE — DEMO BATTLE'; setTimeout(()=>$('bigCenter').textContent='',2600); $('obj').innerHTML='<b>ATTRACT MODE</b> — demo battle in progress.<br>Press any key / button to take command.'; return; }
+ startBattle({diff:1,map:(Math.random()*3)|0,credits:6000,len:99999,attract:true}); }
+function exitAttract(){ if(!G.attract) return; G.attract=false; $('bigCenter').textContent=''; G.lastInput=performance.now();
+ if(inBattle&&!G.over){ updateObjectives(); showAlert('⚑ You have command, Commander — the demo battle is now yours. Destroy the Crimson Hand!'); AudioSys.speak('You have command Commander'); }
+ else { inBattle=false; G.paused=false; showScreen('title'); $('hud').hidden=true; $('hintbar').hidden=true; } }
+function attractTick(dt){ if(!G.attract) return; attractT+=dt; attractThink-=dt;
+ G.cam.x=Math.sin(attractT*.07)*22; G.cam.z=Math.cos(attractT*.05)*22; G.cam.dist=48+Math.sin(attractT*.11)*10;
+ if(attractThink>0) return; attractThink=2.2;
+ // Demo pilot for AEGIS with cheat credits: showcases building, training, attack-move, superweapon
+ G.credits=Math.max(G.credits,2600);
+ const acts=['power','refinery','barracks','factory','turret','techlab','power'];
+ const missing=acts.find(a=>!hasBuilding(0,a)); if(missing&&!G.buildQueue.length&&!ghostType) tryBuild(missing);
+ if(ghostType){ // place near yard
+  const y=G.buildings.find(b=>b.faction===0&&b.type==='yard'); if(y) confirmPlacement(y.x+6+(Math.random()-.5)*6,y.z-4+(Math.random()-.5)*6); }
+ const bar=G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='barracks'), fac=G.buildings.find(b=>!b.dead&&b.faction===0&&b.type==='factory');
+ if(bar&&bar.queue.length===0) tryTrain(Math.random()<.5?'rifle':'rocket',bar);
+ if(fac&&fac.queue.length===0) tryTrain(hasBuilding(0,'techlab')&&Math.random()<.35?'artillery':'mtank',fac);
+ const army=G.units.filter(u=>!u.dead&&u.faction===0&&u.type!=='harvester'&&u.order.mode==='idle');
+ if(army.length>=4){ const ey=G.buildings.find(b=>b.faction===1&&b.type==='yard'); if(ey) for(const u of army) u.order={mode:'attackmove',x:ey.x+(Math.random()-.5)*10,z:ey.z+(Math.random()-.5)*10}; }
+ if(G.superReady&&!G.superArm){ const t=G.buildings.find(b=>!b.dead&&b.faction===1); if(t) fireIonCannon(t.x,t.z); }
+ if(G.over){ setTimeout(()=>{ if(G.attract) startBattle({diff:1,map:(Math.random()*3)|0,credits:6000,len:99999,attract:true}); },2500); }
+}
+/* ================= MULTIPLAYER: BroadcastChannel lobby + AI Hub ================= */
+let mpChan=null, mpPeers=new Map(), mpId='P'+Math.random().toString(36).slice(2,7), mpIsHost=false, mpSyncT=0;
+function mpBroadcast(m){ try{ mpChan&&mpChan.postMessage(m); }catch(e){} if(window.AIHub?.active){ try{ AIHub.send(m); }catch(e){} } }
+function mpBroadcastOrder(units,order){ if(!G.mpMode&&!window.AIHub?.active) return; if(!units.length) return;
+ mpBroadcast({t:'order',ids:units.map(u=>u.id),mode:order.mode,x:order.x,z:order.z,target:order.target?order.target.id:null}); }
+function mpSetup(room){ if(mpChan) mpChan.close(); mpChan=new BroadcastChannel('thw-'+room.toUpperCase()); mpPeers.clear();
+ mpChan.onmessage=e=>{ const m=e.data; if(!m||m.from===mpId) return;
+  if(m.t==='hello'){ mpPeers.set(m.from,{name:m.name,host:m.host}); renderMpPlayers(); mpBroadcast({t:'iam',from:mpId,name:$('mpName').value||'Commander',host:mpIsHost}); }
+  if(m.t==='iam'){ mpPeers.set(m.from,{name:m.name,host:m.host}); renderMpPlayers(); }
+  if(m.t==='start'){ startBattle({diff:1,map:0,credits:4000,len:540,mp:true}); $('netPill').textContent='🌐 Room '+room.toUpperCase()+' · '+mpPeers.size+' peer(s)'; }
+  if(m.t==='order'&&inBattle){ for(const id of m.ids){ const u=G.units.find(x=>x.id===id); if(u) { u.order={mode:m.mode,x:m.x,z:m.z}; if(m.target){ const t=[...G.units,...G.buildings].find(x=>x.id===m.target); if(t) u.target=t; } } } }
+  if(m.t==='end'&&inBattle&&!G.over){ showAlert('Peer reports the battle has ended — score '+m.score); }
+  if(m.t==='snap'&&inBattle){ /* snapshots reconcile scores on the HUD pill only; each sim stays authoritative for its own army */
+   $('netPill').textContent='🌐 Peer score '+m.score+' · ⛁ '+Math.floor(m.credits); } };
+ mpBroadcast({t:'hello',from:mpId,name:$('mpName').value||'Commander',host:mpIsHost}); }
+function renderMpPlayers(){ const el=$('mpPlayers'); const names=[($('mpName').value||'Commander')+' (you)'+(mpIsHost?' — HOST':'')]; for(const p of mpPeers.values()) names.push(p.name+(p.host?' — HOST':''));
+ el.innerHTML=names.map(n=>'👤 '+n.replace(/</g,'&lt;')).join('<br>'); $('mpStatus').textContent='Connected — '+names.length+' commander(s) in room. '+(mpIsHost?'You host: press Start Shared Battle when ready.':'Waiting for the host to start…');
+ $('mpStart').disabled=!mpIsHost; }
+$('mpHost').addEventListener('click',()=>{ AudioSys.init(); mpIsHost=true; mpSetup(($('mpRoom').value||'TIBER')); renderMpPlayers(); AudioSys.speak('Lobby hosted — share the room code'); });
+$('mpJoin').addEventListener('click',()=>{ AudioSys.init(); mpIsHost=false; mpSetup(($('mpRoom').value||'TIBER')); $('mpStatus').textContent='Joining room… if nobody answers in a few seconds, check the room code matches the host.'; setTimeout(renderMpPlayers,600); });
+$('mpStart').addEventListener('click',()=>{ mpBroadcast({t:'start',from:mpId}); startBattle({diff:1,map:0,credits:4000,len:540,mp:true}); $('netPill').textContent='🌐 Shared battle'; });
+function hubInit(){ if(!window.AIHub) return;
+ AIHub.probe(()=>({scene:G.over?'over':(curScreen? (curScreen==='title'?'title':'menu'):(inBattle?'play':'title')),menu:curScreen==='settings',world:G.time,input:{x:Math.round(G.cursor.x),y:Math.round(G.cursor.y),fire:padDown(0)||G.mouse.down?1:0}}));
+ if(!AIHub.active) return; G.hubMode=true;
+ AIHub.connect({mode:'parallel',seats:[1,4]}).then(info=>{ if(!info){ G.hubMode=false; showScreen('title'); return; }
+  $('netPill').textContent='Hub · '+(info.players?.length||1)+'P · seed '+info.seed;
+  startBattle({diff:1,map:0,credits:4000,len:360,hub:true});
+  AIHub.on('time-up',()=>{ if(!G.over) endBattle(scoreNow()>=600,'Time. The hub calls the round — your harvest is weighed, Commander.'); else AIHub.result({score:scoreNow()}); });
+  AIHub.on('end',()=>{ G.paused=true; AudioSys.intensity=0; showAlert('Session ended by the hub. Final score '+scoreNow()); });
+  AIHub.on('leave',()=>{ showAlert('A commander has left the session. Your battle continues.'); });
+  AIHub.ready(); }).catch(()=>{ G.hubMode=false; showScreen('title'); }); }
+/* ================= CAMERA, MAIN LOOP, HUD ================= */
+function updateCamera(dt){ const k=G.keys, sp=30*Settings.data.cam*dt;
+ if(k['w']||k['arrowup']) G.cam.z-=sp; if(k['s']||k['arrowdown']) G.cam.z+=sp; if(k['a']||k['arrowleft']) G.cam.x-=sp; if(k['d']||k['arrowright']) G.cam.x+=sp;
+ if(k['q']) G.cam.yaw+=1.6*dt; if(k['e']) G.cam.yaw-=1.6*dt;
+ if(Settings.data.edge&&!curScreen&&inBattle&&!G.attract){ const m=14; if(G.mouse.x<m) G.cam.x-=sp; if(G.mouse.x>innerWidth-m) G.cam.x+=sp; if(G.mouse.y<m) G.cam.z-=sp; if(G.mouse.y>innerHeight-m) G.cam.z+=sp; }
+ G.cam.x=clamp(G.cam.x,-HALF+5,HALF-5); G.cam.z=clamp(G.cam.z,-HALF+5,HALF-5);
+ if(G.cam.shake>0) G.cam.shake=Math.max(0,G.cam.shake-dt*1.6);
+ const shx=(Math.random()-.5)*G.cam.shake*1.4, shz=(Math.random()-.5)*G.cam.shake*1.4;
+ const cx=G.cam.x+Math.sin(G.cam.yaw)*G.cam.dist*.62+shx, cz=G.cam.z+Math.cos(G.cam.yaw)*G.cam.dist*.62+shz, cy=G.cam.dist*.78;
+ G.camera.position.set(cx,cy,cz); G.camera.lookAt(G.cam.x+shx*.4,0,G.cam.z+shz*.4);
+ const sun=G.scene.getObjectByName('sun'); if(sun){ sun.position.set(G.cam.x+40,70,G.cam.z+25); sun.target.position.set(G.cam.x,0,G.cam.z); } }
+let lastT=performance.now(), fogT=0, mmT=0, hudT=0, hubProgT=0;
+function frame(now){ requestAnimationFrame(frame); let dt=Math.min(.05,(now-lastT)/1000||.016); lastT=now;
+ try{ pollGamepad(dt);
+  if(inBattle&&!G.paused&&!G.over){ G.time+=dt; attractTick(dt); if(!G.attract){ aiTick(dt); } else { aiTick(dt); }
+   productionTick(dt);
+   for(const u of [...G.units]) unitTick(u,dt);
+   G.units=G.units.filter(u=>!u.dead); G.buildings=G.buildings.filter(b=>!b.dead);
+   // sync meshes + physics (kinematic bodies follow sim; Rapier steps for contacts/rays)
+   for(const u of G.units){ u.body.setNextKinematicTranslation({x:u.x,y:.6,z:u.z}); u.mesh.position.set(u.x,0,u.z);
+    if(Math.abs(u.vx)+Math.abs(u.vz)>.3) u.mesh.rotation.y=lerp(u.mesh.rotation.y,u.face,.25); else if(u.target&&!u.target.dead&&u.turret) u.mesh.rotation.y=lerp(u.mesh.rotation.y,Math.atan2(u.target.x-u.x,u.target.z-u.z),.2);
+    u.bar.position.set(u.x,2.25,u.z); if(u.mesh.userData.ring) u.mesh.userData.ring.material.opacity=u.selected?.95:0; }
+   for(const b of G.buildings){ b.bar.position.set(b.x,BUILD_DEFS[b.type].size*.95+1.6,b.z); if(b.mesh.userData.ring) b.mesh.userData.ring.material.opacity=b.selected?.9:0; }
+   try{ G.world.step(); }catch(e){}
+   updateFX(dt); AudioSys.intensity=Math.max(0,AudioSys.intensity-dt*.25);
+   fogT+=dt; if(fogT>.35){ fogT=0; fogUpdate(); } mmT+=dt; if(mmT>.18){ mmT=0; drawMinimap(); }
+   hudT+=dt; if(hudT>.25){ hudT=0; updateHUD(); }
+   if(G.mpMode){ mpSyncT+=dt; if(mpSyncT>.12){ mpSyncT=0; mpBroadcast({t:'snap',from:mpId,score:scoreNow(),credits:G.credits}); } }
+   if(window.AIHub?.active){ hubProgT+=dt; if(hubProgT>1){ hubProgT=0; AIHub.progress({score:scoreNow(),label:'⛁ '+Math.floor(G.credits)+' · K'+G.kills}); } }
+   if(G.roundLen<90000&&G.time>=G.roundLen&&!G.over){ if(window.AIHub?.active) AIHub.result({score:scoreNow()}); endBattle(scoreNow()>=600,'Time expired. The harvest is weighed — '+(scoreNow()>=600?'the Coalition holds the fields.':'the Crimson Hand out-harvested you. Build faster next time, Commander.')); }
+   // attract idle check on title
+  }
+  if(!inBattle){ // living title backdrop: demo forces skirmish behind the menus
+   for(const u of [...G.units]) if(!u.dead) unitTick(u,Math.min(dt,.033));
+   G.units=G.units.filter(u=>!u.dead);
+   for(const u of G.units){ u.body.setNextKinematicTranslation({x:u.x,y:.6,z:u.z}); u.mesh.position.set(u.x,0,u.z); if(Math.abs(u.vx)+Math.abs(u.vz)>.3) u.mesh.rotation.y=lerp(u.mesh.rotation.y,u.face,.25); u.bar.position.set(u.x,2.25,u.z); }
+   try{ G.world.step(); }catch(e){} updateFX(dt);
+   if(!window.AIHub?.active&&performance.now()-G.lastInput>10000&&curScreen==='title'&&!G.attract) enterAttract(); }
+  if(inBattle&&G.attract){ fogT+=dt; if(fogT>.35){ fogT=0; fogUpdate(); } mmT+=dt; if(mmT>.18){ mmT=0; drawMinimap(); } }
+  updateCamera(dt); G.renderer.render(G.scene,G.camera);
+ }catch(err){ console.error(err); }
+}
+function updateHUD(){ $('resCredits').textContent='⛁ '+Math.floor(G.credits)+' / '+G.storage+(G.credits>=G.storage?' FULL':'');
+ $('resCredits').classList.toggle('warn',G.credits<150);
+ const low=G.powerUsed>G.powerMax; $('resPower').textContent='⚡ '+(G.powerMax-G.powerUsed)+' free ('+G.powerUsed+'/'+G.powerMax+')'; $('resPower').classList.toggle('warn',low);
+ if(low&&Math.random()<.02) showAlert('Low power — production slowed, turrets offline. Build Power Plants!',true);
+ $('resPop').textContent='Units '+G.units.filter(u=>!u.dead&&u.faction===0).length+' · Army '+G.units.filter(u=>!u.dead&&u.faction===0&&u.type!=='harvester').length;
+ $('resScore').textContent='Score '+scoreNow(); $('resTimer').textContent=G.roundLen>=90000?'∞ Endless':fmtTime(Math.max(0,G.roundLen-G.time))+' left';
+ $('resTimer').classList.toggle('warn',G.roundLen<90000&&G.roundLen-G.time<60);
+ // refresh sell/repair affordability + dock periodically (cheap)
+ if((G.time*4|0)%5===0) refreshDock(); else { const sb=$('superBtn'); if(hasBuilding(0,'techlab')&&!G.superReady&&!G.superArm) sb.textContent=`☄ Ion Cannon charging… ${Math.ceil(G.superCD)}s`; updateSelInfo(); } }
+/* ================= SETTINGS WIRING & BUTTONS ================= */
+function bindSettings(){ const d=Settings.data;
+ $('setVol').addEventListener('input',e=>{ d.vol=e.target.value/100; Settings.save(); }); $('setMus').addEventListener('input',e=>{ d.mus=e.target.value/100; Settings.save(); });
+ $('setVoice').addEventListener('input',e=>{ d.voice=e.target.value/100; Settings.save(); });
+ $('setInvX').addEventListener('change',e=>{ d.invX=e.target.checked; Settings.save(); }); $('setInvY').addEventListener('change',e=>{ d.invY=e.target.checked; Settings.save(); });
+ $('setCam').addEventListener('input',e=>{ d.cam=e.target.value/100; Settings.save(); });
+ $('setEdge').addEventListener('change',e=>{ d.edge=e.target.checked; Settings.save(); }); $('setShake').addEventListener('change',e=>{ d.shake=e.target.checked; Settings.save(); });
+ $('setCB').addEventListener('change',e=>{ d.cb=e.target.checked; Settings.save(); showAlert('Palettes updated — new units and minimap use the colour-blind friendly scheme.'); });
+ $('setQ').addEventListener('change',e=>{ d.q=+e.target.value; Settings.save(); showAlert('Quality set — shadow resolution applies next battle; particle density applies now.'); });
+ $('setResume').addEventListener('click',()=>closeSettings()); $('setQuit').addEventListener('click',()=>{ inBattle=false; G.paused=false; showScreen('title'); G.lastInput=performance.now(); });
+ $('setRestart').addEventListener('click',()=>{ G.paused=false; startBattle({diff:+$('optDiff').value,map:+$('optMap').value,credits:+$('optCred').value,len:+$('optLen').value}); }); }
+$('btnLaunch').addEventListener('click',()=>{ AudioSys.init(); AudioSys.select(); startBattle({diff:+$('optDiff').value,map:+$('optMap').value,credits:+$('optCred').value,len:+$('optLen').value}); });
+$('endAgain').addEventListener('click',()=>{ AudioSys.init(); startBattle({diff:G.diff,map:G.mapId,credits:4000,len:G.roundLen>=90000?99999:G.roundLen}); });
+$('endTitleBtn').addEventListener('click',()=>{ inBattle=false; showScreen('title'); G.lastInput=performance.now(); });
+/* ================= BOOT ================= */
+(async function boot(){ Settings.load(); bindSettings();
+ if(isTouchOnly()) $('touchMsg').style.display='flex';
+ try{ await initGraphics(); }
+ catch(err){ console.error(err); $('errText').textContent='This war needs WebGPU (Three.js R180 WebGPU, no fallback). Your browser could not create a WebGPU device. Please open this file in a current Chrome / Edge with GPU enabled. Details: '+(err.message||err);
+  showScreen('error'); if(window.AIHub?.active) AIHub.fail('WebGPU unavailable: '+(err.message||err)); return; }
+ // live title backdrop battle (also the attract stage)
+ seedN=4242; buildTerrain(0);
+ G.cam.x=-10; G.cam.z=8; G.cam.dist=52;
+ // decorative demo forces behind title (no battle state yet)
+ spawnBuilding('yard',0,-32,30); spawnBuilding('refinery',0,-38,27); spawnBuilding('yard',1,32,-30);
+ spawnUnit('harvester',0,-35,25).order={mode:'harvest'}; spawnUnit('mtank',0,-26,24); spawnUnit('ltank',1,26,-24);
+ inBattle=false; showScreen('title'); G.lastInput=performance.now();
+ hubInit(); requestAnimationFrame(frame);
+ // title backdrop demo loop: keep the two tanks skirmishing for life behind menus
+ setInterval(()=>{ if(inBattle) return; const a=G.units.find(u=>u.type==='mtank'), b=G.units.find(u=>u.type==='ltank');
+  if(a&&b&&!a.dead&&!b.dead){ a.order={mode:'attackmove',x:b.x,z:b.z}; b.order={mode:'attackmove',x:a.x,z:a.z}; }
+  if(curScreen==='title'&&!G.attract&&performance.now()-G.lastInput>10000) enterAttract(); },3000);
+})();
+</script>
+</body>
+</html>

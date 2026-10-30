@@ -1,0 +1,1359 @@
+<!DOCTYPE html>
+<!--
+Source Information
+- Date: 2026-10-29 02:02
+- Baldur's Gate
+- Tech: Three.js 0.180.0 (WebGPURenderer, WebGPU only, no fallback), Rapier 0.19.3 (@dimforge/rapier3d-compat), Gamepad API, Web Audio API, AI Hub Session Protocol v1 client 1.3.0 (co-op), BroadcastChannel (standalone multiplayer), vanilla JS/CSS, import maps via jsDelivr CDN
+- Art Direction: Stylized cel-shaded (MeshToonMaterial with 4-step gradient map, inverted-hull outlines, saturated storybook palette)
+- Animation: Procedural code animation (limb swing, bob, spell/particle effects, camera moves); no skeletal assets
+- Audio: Code-written procedural music and sound effects (Web Audio synthesis) and Animalese/Simlish gibberish voice synthesis for all voice work
+- Online: AI Hub co-op sessions (host-authoritative world, 1-4 players) via lib/hub session.js; standalone room-code multiplayer via BroadcastChannel; single-player offline
+- Testing: Lightweight — Node DOM/canvas harness load smoke (init + RAF frames), syntax checks, CDN reachability checks; no FPS/optimization targets
+- Environment: Muse Code CLI (headless); Linux; browser unknown
+- Model: Meta, muse-wonder-1.0, reasoning effort max
+- Usage: unknown
+Game: The Ironwood Conspiracy — an original spiritual successor to Baldur's Gate. Title picked by RNG (index 26 of 50 brainstormed titles).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="co-op">
+<meta name="hub:session-minutes" content="8">
+<meta name="hub:session-goal" content="Defeat the Hollow Lich together">
+<meta name="hub:session-howto" content="Left stick move, Cross talk/attack, Options menu">
+<meta name="hub:webgpu" content="required">
+<title>The Ironwood Conspiracy</title>
+<style>
+:root{--ink:#f3e9d2;--parch:#2a2118;--gold:#c9a86a;--blood:#b5443c;--focus:#ffd97a}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#171310;font-family:Georgia,'Times New Roman',serif;color:var(--ink)}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+button{font-family:inherit;cursor:pointer}
+.panel{background:linear-gradient(180deg,#33291d,#241c13);border:2px solid var(--gold);border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.6)}
+.menuBtn{display:block;width:100%;text-align:left;background:#3a2f22;color:var(--ink);border:2px solid #6b5a3e;border-radius:8px;padding:14px 18px;font-size:22px;margin:8px 0}
+.menuBtn.focused,.menuBtn:hover,.menuBtn:focus-visible{border-color:var(--focus);background:#54432a;outline:3px solid var(--focus)}
+.screen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;z-index:20}
+.hidden{display:none!important}
+#titleScreen{background:radial-gradient(ellipse at 50% 35%,rgba(20,30,20,.25),rgba(8,6,4,.82));text-align:center}
+#titleScreen h1{font-size:64px;letter-spacing:2px;margin:0;color:#ffe9b0;text-shadow:0 4px 0 #4a2f16,0 10px 30px #000}
+#titleScreen .sub{font-size:20px;color:#d8c9a3;margin:8px 0 24px}
+.titleBox{width:min(520px,92vw)}
+.hint{font-size:15px;color:#cbbd97;margin-top:14px}
+#hud{position:fixed;inset:0;pointer-events:none;z-index:10}
+#portraits{position:absolute;left:12px;bottom:12px;display:flex;gap:10px;pointer-events:auto}
+.port{width:104px;background:rgba(30,24,17,.92);border:2px solid #6b5a3e;border-radius:10px;padding:6px;text-align:center}
+.port.sel{border-color:var(--focus)}
+.port .face{font-size:30px;line-height:1.1}
+.port .nm{font-size:13px;white-space:nowrap;overflow:hidden}
+.bar{height:9px;background:#171310;border-radius:5px;overflow:hidden;margin:3px 0}
+.bar>i{display:block;height:100%;background:#b5443c}
+.bar.mp>i{background:#3f6fb5}.bar.xp>i{background:#7aa95c}
+.port small{font-size:11px;color:#d8c9a3}
+#abilities{position:absolute;left:50%;transform:translateX(-50%);bottom:12px;display:flex;gap:8px;pointer-events:auto}
+.ab{width:64px;height:64px;border-radius:10px;border:2px solid #6b5a3e;background:#33291d;color:var(--ink);font-size:12px;position:relative}
+.ab.focused{border-color:var(--focus);outline:3px solid var(--focus)}
+.ab .cd{position:absolute;inset:auto 0 0 0;background:rgba(0,0,0,.65);font-size:12px}
+.ab:disabled{opacity:.45}
+#topbar{position:absolute;top:10px;left:50%;transform:translateX(-50%);display:flex;gap:8px;pointer-events:auto}
+.topBtn{background:rgba(30,24,17,.92);color:var(--ink);border:2px solid #6b5a3e;border-radius:8px;padding:10px 14px;font-size:16px}
+.topBtn.focused{border-color:var(--focus);outline:3px solid var(--focus)}
+#questTracker{position:absolute;top:64px;right:12px;width:300px;background:rgba(30,24,17,.88);border:2px solid #6b5a3e;border-radius:10px;padding:10px 12px;font-size:15px}
+#log{position:absolute;right:12px;bottom:12px;width:340px;max-height:190px;overflow:hidden;background:rgba(20,16,11,.85);border:2px solid #6b5a3e;border-radius:10px;padding:8px 10px;font-size:14px;line-height:1.45}
+#zoneName{position:absolute;top:64px;left:12px;background:rgba(30,24,17,.88);border:2px solid #6b5a3e;border-radius:10px;padding:10px 14px;font-size:18px}
+#pausedBadge{position:absolute;top:110px;left:50%;transform:translateX(-50%);background:#7a1f1a;border:2px solid #ffb3ab;color:#fff;padding:8px 18px;border-radius:8px;font-size:20px}
+.modal{position:fixed;inset:0;background:rgba(5,4,3,.72);display:flex;align-items:center;justify-content:center;z-index:30}
+.modalCard{width:min(880px,94vw);max-height:90vh;overflow:auto;padding:22px}
+.modalCard h2{margin:0 0 6px;font-size:32px;color:#ffe9b0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.invGrid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+.slot{min-height:74px;border:2px solid #6b5a3e;border-radius:8px;background:#241c13;padding:6px;font-size:13px;text-align:center}
+.slot.focused{border-color:var(--focus);outline:3px solid var(--focus)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0;font-size:18px}
+input[type=text],select{background:#171310;color:var(--ink);border:2px solid #6b5a3e;border-radius:6px;padding:10px;font-size:18px;font-family:inherit}
+input[type=range]{width:220px}
+#dialogue{position:fixed;left:50%;transform:translateX(-50%);bottom:150px;width:min(860px,94vw);z-index:25;padding:18px}
+#dialogue .who{font-size:15px;color:var(--gold);letter-spacing:1px}
+#dialogue .line{font-size:21px;line-height:1.5;margin:6px 0 10px}
+.choice{display:block;width:100%;text-align:left;font-size:18px;padding:11px 14px;margin:6px 0}
+#toast{position:fixed;top:120px;left:50%;transform:translateX(-50%);z-index:40}
+.toastMsg{background:#33291d;border:2px solid var(--gold);border-radius:8px;padding:10px 18px;font-size:19px;margin:6px auto;width:fit-content}
+#errBox{position:fixed;inset:0;background:#1a0f0d;color:#ffd7d2;z-index:99;padding:40px;font-size:20px;display:none;white-space:pre-wrap}
+#attractTag{position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:26;background:#7a1f1a;color:#fff;border:2px solid #ffb3ab;border-radius:8px;padding:8px 18px;font-size:19px}
+#touchWarn{position:fixed;inset:0;z-index:50;background:rgba(8,6,4,.94);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;text-align:center;padding:24px}
+.big{font-size:26px;line-height:1.5;max-width:640px}
+.kbd{background:#171310;border:1px solid #6b5a3e;border-radius:5px;padding:1px 7px;font-size:14px}
+@media (max-width:760px){#titleScreen h1{font-size:38px}.port{width:78px}.ab{width:52px;height:52px}#log{display:none}#questTracker{width:230px}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="errBox"></div>
+<!-- TITLE -->
+<div id="titleScreen" class="screen">
+  <h1>THE IRONWOOD CONSPIRACY</h1>
+  <div class="sub">An original tale of oaths, embers and the gate that dreams</div>
+  <div class="titleBox panel" style="padding:18px">
+    <button class="menuBtn" data-menu="new">⚔&ensp;New Game</button>
+    <button class="menuBtn" data-menu="continue">📜&ensp;Continue</button>
+    <button class="menuBtn" data-menu="multi">👥&ensp;Multiplayer</button>
+    <button class="menuBtn" data-menu="settings">⚙&ensp;Settings</button>
+    <button class="menuBtn" data-menu="about">✦&ensp;About / Credits</button>
+  </div>
+  <div class="hint">Controller: Left stick / D-pad to choose · <span class="kbd">Cross</span> confirm · Keyboard &amp; mouse fully supported · Idle 10s for Attract Mode</div>
+  <div class="hint" id="hubHint"></div>
+</div>
+<div id="attractTag" class="hidden">ATTRACT MODE — press any key, button or click to play</div>
+
+<!-- HUD -->
+<div id="hud" class="hidden">
+  <div id="topbar">
+    <button class="topBtn" data-hud="pause">⏸ Pause (Space)</button>
+    <button class="topBtn" data-hud="inv">🎒 Pack (I)</button>
+    <button class="topBtn" data-hud="sheet">🧾 Hero (C)</button>
+    <button class="topBtn" data-hud="journal">📖 Journal (J)</button>
+    <button class="topBtn" data-hud="save">💾 Save</button>
+    <button class="topBtn" data-hud="settings">⚙ Settings</button>
+  </div>
+  <div id="zoneName">Thornwall</div>
+  <div id="pausedBadge" class="hidden">❚❚ PAUSED — issue orders, then press Space</div>
+  <div id="questTracker"></div>
+  <div id="portraits"></div>
+  <div id="abilities"></div>
+  <div id="log"></div>
+</div>
+
+<!-- DIALOGUE -->
+<div id="dialogue" class="panel hidden">
+  <div class="who" id="dlgWho"></div>
+  <div class="line" id="dlgLine"></div>
+  <div id="dlgChoices"></div>
+</div>
+<div id="toast"></div>
+
+<!-- GENERIC MODAL -->
+<div id="modal" class="modal hidden"><div class="modalCard panel" id="modalCard"></div></div>
+<div id="touchWarn" class="hidden">
+  <div class="big">Controller or keyboard required<br><span style="font-size:18px">This tale is told with a gamepad or keyboard. Connect one to begin — touch alone cannot guide the party.</span></div>
+  <button class="menuBtn focused" id="touchSettings" style="width:280px">⚙&ensp;Settings</button>
+  <button class="menuBtn" id="touchGo" style="width:280px">I connected one — continue</button>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "rapier": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { WebGPURenderer } from 'three/webgpu';
+import RAPIER from 'rapier';
+/* ============ helpers ============ */
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const d=n=>1+Math.floor(Math.random()*n);
+const mod=s=>Math.floor((s-10)/2);
+function showErr(m){const e=$('#errBox');e.style.display='block';e.textContent='The tale cannot be told here:\n\n'+m+'\n\nThe Ironwood Conspiracy requires WebGPU (Three.js R180, no fallback). Try Chrome/Edge with WebGPU enabled.';try{if(window.AIHub)AIHub.fail(String(m).slice(0,120));}catch(_){}}
+window.addEventListener('error',e=>{if(!window.__booted)showErr(e.message||'error');});
+/* ============ settings ============ */
+const DEFSET={master:.8,music:.55,sfx:.8,voice:.8,invertX:false,invertY:false,diff:'Normal',autoEnemy:true,autoEnd:false,textSpeed:1,camSpeed:1};
+let SET={...DEFSET}; try{Object.assign(SET,JSON.parse(localStorage.getItem('iwc-settings')||'{}'));}catch(_){}
+function saveSet(){try{localStorage.setItem('iwc-settings',JSON.stringify(SET));}catch(_){} applyVol();}
+/* ============ audio: code-written music, sfx, animalese ============ */
+let AC=null,master,musicG,sfxG,voiceG,musicTimer=null,combatMusic=false;
+function initAudio(){ if(AC)return; try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(_){return;}
+ master=AC.createGain();master.connect(AC.destination);
+ musicG=AC.createGain();musicG.connect(master); sfxG=AC.createGain();sfxG.connect(master); voiceG=AC.createGain();voiceG.connect(master); applyVol(); startMusic(); }
+function applyVol(){ if(!AC)return; master.gain.value=SET.master; musicG.gain.value=SET.music*.5; sfxG.gain.value=SET.sfx; voiceG.gain.value=SET.voice; }
+const NOTE={A2:110,C3:130.81,D3:146.83,E3:164.81,F3:174.61,G3:196,A3:220,B3:246.94,C4:261.63,D4:293.66,E4:329.63,F4:349.23,G4:392,A4:440,C5:523.25,E5:659.25};
+function tone(f,t0,dur,type='sine',g=.2,dest){ if(!AC)return; const o=AC.createOscillator(),gn=AC.createGain(); o.type=type;o.frequency.value=f;
+ gn.gain.setValueAtTime(0,t0); gn.gain.linearRampToValueAtTime(g,t0+.015); gn.gain.exponentialRampToValueAtTime(.0001,t0+dur);
+ o.connect(gn);gn.connect(dest||sfxG); o.start(t0);o.stop(t0+dur+.05); }
+function pluck(f,t0,g=.16){ tone(f,t0,.5,'triangle',g,musicG); tone(f*2,t0,.22,'sine',g*.35,musicG); }
+let chordI=0;
+function startMusic(){ if(!AC||musicTimer)return; const explore=[['A2','E3','A3','C4'],['F3','A3','C4','E4'],['C3','G3','C4','E4'],['G3','B3','D4','G4']];
+ const combat=[['D3','A3','D4','F4'],['D3','A3','C4','E4'],['A2','E3','A3','C4'],['E3','B3','D4','G4']];
+ musicTimer=setInterval(()=>{ if(!AC||AC.state!=='running')return; const ch=(combatMusic?combat:explore)[chordI%4]; chordI++;
+  const t=AC.currentTime+.05; ch.forEach((n,i)=>pluck(NOTE[n],t+i*.28,.13));
+  pluck(NOTE[ch[0]],t+.02,.07); tone(NOTE[ch[0]]/2,t,1.6,'sine',.12,musicG);
+  if(chordI%2===0){ const mel=['A4','C5','E5','E4','G4'][(chordI*7)%5]; pluck(NOTE[mel],t+.6,.09); } },1900); }
+function sfx(name){ if(!AC)return; const t=AC.currentTime; if(name==='ui')tone(660,t,.08,'square',.08);
+ if(name==='sword'){tone(180,t,.12,'sawtooth',.15);tone(90,t+.05,.15,'square',.12);}
+ if(name==='hit')tone(120,t,.15,'square',.2);
+ if(name==='spell'){[523,659,784,1046].forEach((f,i)=>tone(f,t+i*.06,.25,'sine',.12));}
+ if(name==='heal'){[392,523,659].forEach((f,i)=>tone(f,t+i*.08,.3,'sine',.12));}
+ if(name==='coin'){tone(988,t,.09,'square',.1);tone(1318,t+.08,.16,'square',.1);}
+ if(name==='level'){[523,659,784,1046,1318].forEach((f,i)=>tone(f,t+i*.09,.35,'triangle',.14));}
+ if(name==='hurt')tone(160,t,.2,'sawtooth',.16);
+ if(name==='door'){tone(80,t,.4,'triangle',.15);} if(name==='chest'){tone(440,t,.12,'triangle',.12);tone(587,t+.1,.2,'triangle',.12);} }
+/* Animalese gibberish: one pitched blip per syllable, pitch set per speaker */
+let voiceTimer=null;
+function speak(text,pitch=1){ if(!AC)return; if(voiceTimer)clearInterval(voiceTimer);
+ const syl=Math.max(2,Math.min(40,text.replace(/[^a-zA-Z ]/g,'').split(/\s+/).join('').length/2|0));
+ let i=0; voiceTimer=setInterval(()=>{ if(i++>=syl){clearInterval(voiceTimer);return;}
+  const f=(160+Math.random()*140)*pitch; tone(f,AC.currentTime,.09,Math.random()<.5?'square':'triangle',.07,voiceG); },95/Math.max(.5,SET.textSpeed)); }
+/* ============ data ============ */
+const CLASSES={
+ Fighter:{hp:12,mp:4,ac:16,icon:'🛡️',desc:'Blade and bulwark. Masters Cleave and Shield Wall.',abilities:['cleave','shield','rally']},
+ Mage:{hp:7,mp:14,ac:12,icon:'🔮',desc:'Weaver of fire and frost. Fragile, devastating.',abilities:['missile','fireball','frost']},
+ Rogue:{hp:9,mp:6,ac:14,icon:'🗡️',desc:'Shadow and silver tongue. Sneak Attack ends arguments.',abilities:['sneak','smoke','lockpick']},
+ Cleric:{hp:10,mp:12,ac:15,icon:'☀️',desc:'Light against the Hollow. Heals, blesses, smites.',abilities:['heal','bless','smite']}};
+const ABIL={
+ attack:{n:'Attack',i:'⚔️',mp:0,cd:0,rng:2.2,dmg:'1d8',desc:'Strike with equipped weapon.'},
+ cleave:{n:'Cleave',i:'🪓',mp:0,cd:3,rng:2.4,dmg:'1d10',desc:'Heavy blow: +2 to hit, 1d10 damage.'},
+ shield:{n:'Shield Wall',i:'🛡️',mp:0,cd:5,rng:0,desc:'+4 AC for 3 rounds (self).'},
+ rally:{n:'Rally',i:'📯',mp:2,cd:6,rng:8,desc:'Party +2 attack for 3 rounds.'},
+ missile:{n:'Magic Missile',i:'✦',mp:2,cd:1,rng:14,dmg:'1d4+2',desc:'Unerring bolt, never misses.'},
+ fireball:{n:'Fireball',i:'🔥',mp:5,cd:4,rng:13,dmg:'3d6',desc:'Blast that splashes nearby foes.'},
+ frost:{n:'Frost Ray',i:'❄️',mp:3,cd:3,rng:12,dmg:'2d6',desc:'Chills: damage and slows the foe.'},
+ sneak:{n:'Sneak Attack',i:'🎯',mp:0,cd:2,rng:10,dmg:'2d6',desc:'Precise strike from the shadows.'},
+ smoke:{n:'Smoke Bomb',i:'💨',mp:2,cd:5,rng:0,desc:'Vanish: enemies lose track of you.'},
+ lockpick:{n:'Deft Hands',i:'🔓',mp:0,cd:2,rng:3,desc:'Open a locked chest or door nearby.'},
+ heal:{n:'Cure Wounds',i:'💚',mp:3,cd:2,rng:10,heal:'2d6+3',desc:'Restore an ally (or yourself).'},
+ bless:{n:'Bless',i:'🌟',mp:2,cd:5,rng:10,desc:'Ally +2 AC and attack for 3 rounds.'},
+ smite:{n:'Smite Hollow',i:'☀️',mp:3,cd:3,rng:11,dmg:'2d8',desc:'Radiant ruin against the Hollow.'},
+ potion:{n:'Potion',i:'🧪',mp:0,cd:1,rng:0,desc:'Drink a healing potion from the pack.'}};
+const ITEMS={
+ sword:{n:'Ironwood Blade',i:'🗡️',slot:'weapon',atk:2,price:80}, bow:{n:'Thorn Bow',i:'🏹',slot:'weapon',atk:2,price:70},
+ staff:{n:'Gate Staff',i:'🪄',slot:'weapon',atk:1,price:75}, dagger:{n:'Whisper Dagger',i:'🔪',slot:'weapon',atk:1,price:45},
+ armor:{n:'Ember Mail',i:'🥋',slot:'armor',ac:2,price:90}, robe:{n:'Star Robe',i:'👘',slot:'armor',ac:1,price:60},
+ potion:{n:'Healing Potion',i:'🧪',price:25,use:'heal'}, greater:{n:'Greater Potion',i:'⚗️',price:60,use:'healbig'},
+ antidote:{n:'Antidote',i:'💊',price:20,use:'cure'}, scroll:{n:'Scroll of Dawn',i:'📜',price:50,use:'scroll'},
+ gem:{n:'Moon Gem',i:'💎',price:120}, herb:{n:'Kingsfoil',i:'🌿',price:15,use:'herb'}, key:{n:'Ironwood Key',i:'🗝️',price:0}};
+function rollExpr(e){ if(!e)return 0; const m=/^(\d+)d(\d+)([+-]\d+)?$/.exec(e); if(!m)return parseInt(e)||0;
+ let s=0; for(let i=0;i<+m[1];i++)s+=d(+m[2]); return s+(m[3]?+m[3]:0); }
+/* ============ game state ============ */
+const ZONES={village:{n:'Thornwall Village',sky:0x87b5d6,fog:0x9db8a4},forest:{n:'The Ironwood',sky:0x6f9e6a,fog:0x5d7d4f},ruins:{n:'Ruins of the Elder Gate',sky:0x4b4360,fog:0x3a3350}};
+let G=null;
+function newGame(heroName,cls,stats){
+ G={zone:'village',paused:false,over:false,won:false,gold:60,day:1,sel:0,turn:0,
+  party:[makeHero(heroName,cls,stats,0),makeHero('Kaelis','Fighter',null,1),makeHero('Mirabel','Mage',null,2),makeHero('Thom','Cleric',null,3)],
+  inv:[{id:'potion',qty:3},{id:'sword',qty:1},{id:'herb',qty:2}],
+  quests:{main:{t:'The Ironwood Conspiracy',stage:0,done:false},rats:{t:'Trouble in the Cellar',stage:0,done:false,active:false},shipment:{t:'The Lost Shipment',stage:0,done:false,active:false}},
+  flags:{},log:[],kills:0,score:0,simTime:0,inCombat:false};
+ logMsg('The road ends at Thornwall, where the ironwood trees lean toward an old gate that no living hand built.'); return G; }
+function makeHero(name,cls,stats,i){ const c=CLASSES[cls];
+ const st=stats||{STR:10+((i*3)%5),DEX:12,CON:12,INT:cls==='Mage'?16:10,WIS:cls==='Cleric'?16:11,CHA:11};
+ const maxhp=c.hp+mod(st.CON)*2+6,maxmp=c.mp+Math.max(0,mod(st.INT))*2;
+ return {name,cls,stats:st,level:1,xp:0,hp:maxhp,maxhp,mp:maxmp,maxmp,ac:c.ac,alive:true,weapon:null,armor:null,
+  cds:{},buffs:{},face:['🧑‍🎤','🛡️','🔮','☀️'][i]||'🧑',pitch:[1,.8,1.35,.9][i]||1,
+  pos:new THREE.Vector3(-4+i*1.6,1,6),target:null,attackTarget:null,mesh:null,body:null,moveVec:new THREE.Vector3()}; }
+const COMPANION_LINES={Kaelis:['Steel first, questions after. That is the whole of my philosophy.','I guarded caravans on this road. The trees were quieter then.'],
+ Mirabel:['The Gate is not sleeping. It is listening. There is a difference, and it matters.','If I say duck, do not ask why. Scholars hate repeating themselves.'],
+ Thom:['The Hollow takes the unburied and the unbelieved. I intend to be neither.','A prayer and a poultice — I carry both, and charge for neither.']};
+/* dialogue trees: node = {who,line,choices:[{t,check?,to,fx?}]} */
+const DLG={
+ elder:{start:{who:'Elder Senn',pitch:.75,line:'You came. Good. The ironwood has stopped growing toward the sun — it grows toward the Gate. Three nights now, the bell rings with no hand upon it.',choices:[
+  {t:'What would you have us do?',to:'ask'},{t:'[Persuasion] Thornwall looks prosperous. Surely you can pay. (CHA 12)',check:{stat:'CHA',dc:12},to:'pay',fail:'payfail'},{t:'We did not come to bury another village.',to:'refuse'}]},
+  ask:{who:'Elder Senn',pitch:.75,line:'Find Forester Bryn in the Ironwood. Learn what the cultists dig for. Then go down, through the Elder Gate, and end whoever rings that bell.',fx:()=>{advQuest('main',1);},choices:[{t:'Consider it done.',to:'end'},{t:'Tell me of this cult.',to:'cult'}]},
+  cult:{who:'Elder Senn',pitch:.75,line:'Hollow men. They were us, once — woodcutters, mothers, priests. Something below offered them silence, and they took it.',choices:[{t:'We will give them a louder answer.',to:'end',fx:()=>advQuest('main',1)}]},
+  pay:{who:'Elder Senn',pitch:.75,line:'Ha! Plainly spoken. Sixty gold now, and the village strongbox when the bell stops. Agreed.',fx:()=>{addGold(60);advQuest('main',1);},choices:[{t:'Agreed.',to:'end'}]},
+  payfail:{who:'Elder Senn',pitch:.75,line:'Prosperous? Child, we burn our dead at noon so the Hollow cannot borrow them. But go — and take our gratitude, which spends poorly.',fx:()=>advQuest('main',1),choices:[{t:'We go.',to:'end'}]},
+  refuse:{who:'Elder Senn',pitch:.75,line:'No. You came because the road brought you, as it brought the others. The difference is whether you leave walking.',choices:[{t:'…Very well. We will look into it.',to:'ask'}]},
+  end:{who:'Elder Senn',pitch:.75,line:'May your blade remember its purpose. Speak with Marta at the inn if you need supplies — and mind the cellar rats. Everything here is connected, even the rats.',choices:[{t:'Leave.',to:null}]}},
+ brynn:{start:{who:'Forester Bryn',pitch:.9,line:'Mind the roots — they mind you. You are the Elder\u2019s new spears? Then hear this: the Hollow dig beneath the Gate for a heart of ironwood, older than the village.',choices:[
+  {t:'Where is the Gate?',to:'gate'},{t:'[Arcana] A heart that old would sing, not ring. (INT 12)',check:{stat:'INT',dc:12},to:'arc',fail:'arcfail'},{t:'We found your lost shipment.',cond:()=>hasItem('gem'),to:'ship'}]},
+  gate:{who:'Forester Bryn',pitch:.9,line:'East, where the trees turn black. Take this key — and take warning: the bell-ringer was a priest once. He will know your names before you speak them.',fx:()=>{addItem('key',1);advQuest('main',2);},choices:[{t:'Then we shall introduce ourselves loudly.',to:'end'}]},
+  arc:{who:'Forester Bryn',pitch:.9,line:'Aye — you hear it too. The bell is a voice, calling the heart home. Cut the voice, and the digging stops. Scholar\u2019s work. I am glad of you.',fx:()=>{addItem('key',1);advQuest('main',2);gainXP(40);},choices:[{t:'We go east.',to:'end'}]},
+  arcfail:{who:'Forester Bryn',pitch:.9,line:'Sing, ring — the trees do not correct my grammar, friend. East. Take the key, and keep your opinions above ground.',fx:()=>{addItem('key',1);advQuest('main',2);},choices:[{t:'East it is.',to:'end'}]},
+  ship:{who:'Forester Bryn',pitch:.9,line:'My moon gem — from the wreck, still bright! Thornwall eats this winter because of you. Take this bow; the wood remembers kindness.',fx:()=>{removeItem('gem',1);addItem('bow',1);completeQuest('shipment');gainXP(60);},choices:[{t:'Spend it well.',to:'end'}]},
+  end:{who:'Forester Bryn',pitch:.9,line:'Walk soft. The wood is listening, and it repeats what it hears to things below.',choices:[{t:'Leave.',to:null}]}},
+ marta:{start:{who:'Marta, Innkeeper',pitch:1.2,line:'Beds, broth, and bandages — the three sacraments of the Thornwall Inn. Sit, heroes. You look like the cellar-rat sort. Five gold a rat-tail, if you are.',choices:[
+  {t:'We will clear your cellar. (Start quest)',to:'rats'},{t:'Show me your wares.',to:'shop'},{t:'What news?',to:'news'},{t:'Rest until morning (20 gold, full heal)',to:'rest'}]},
+  rats:{who:'Marta, Innkeeper',pitch:1.2,line:'Bless you. The cellar door is behind the inn — mind you, those rats bite like tax collectors.',fx:()=>{G.quests.rats.active=true;logMsg('Quest started: Trouble in the Cellar — clear the cellar (behind the inn).');},choices:[{t:'Consider them evicted.',to:'end'}]},
+  news:{who:'Marta, Innkeeper',pitch:1.2,line:'News? The well water tastes of ash, the priest rings a bell that is not there, and Thom\u2019s cousin swears the trees moved. Apart from that — quiet.',choices:[{t:'Show me your wares.',to:'shop'},{t:'Farewell.',to:'end'}]},
+  rest:{who:'Marta, Innkeeper',pitch:1.2,line:'Sleep, then. Whatever dreams the Gate sends, breakfast is at dawn — ash or no ash.',fx:()=>restParty(),choices:[{t:'Sleep.',to:'end'}]},
+  shop:{who:'Marta, Innkeeper',pitch:1.2,line:'Honest goods, honestly priced. Mostly.',fx:()=>openShop(),choices:[{t:'Back.',to:'start'}]},
+  end:{who:'Marta, Innkeeper',pitch:1.2,line:'Mind the bell. If it rings twice, come back inside. If it rings thrice — run.',choices:[{t:'Leave.',to:null}]}},
+ companion:{start:{who:'Companion',pitch:1,line:'',choices:[{t:'How are you holding up?',to:'feel'},{t:'Any counsel?',to:'counsel'},{t:'Never mind.',to:null}]},
+  feel:{who:'Companion',pitch:1,line:'',choices:[{t:'Good. Stay close.',to:null}]},
+  counsel:{who:'Companion',pitch:1,line:'',choices:[{t:'Noted.',to:null}]}}};
+/* quests */
+function advQuest(id,stage){ if(!G)return; const q=G.quests[id]; if(q.done)return; q.stage=Math.max(q.stage,stage); logMsg('Quest updated: '+q.t+' — stage '+stage+'.'); sfx('ui'); reportProgress(); }
+function completeQuest(id){ const q=G.quests[id]; if(!q||q.done)return; q.done=true; logMsg('Quest complete: '+q.t+'!'); gainXP(50); reportProgress(); }
+function questText(){ if(!G)return ''; const m=G.quests.main;
+ if(m.done)return '✦ The Ironwood Conspiracy — complete. Thornwall is safe.';
+ return ['Speak with Elder Senn in Thornwall.','Find Forester Bryn in the Ironwood (north gate).','Enter the Ruins of the Elder Gate (east of the Ironwood).','Defeat the Hollow Lich and silence the bell.','Return to Elder Senn.'][m.stage]||''; }
+/* inventory */
+function invQty(id){ const s=G&&G.inv.find(x=>x.id===id); return s?s.qty:0; }
+function hasItem(id){ return invQty(id)>0; }
+function addItem(id,q=1){ const s=G.inv.find(x=>x.id===id); if(s)s.qty+=q; else G.inv.push({id,qty:q}); logMsg('Gained: '+ITEMS[id].n+' ×'+q); refreshHUD(); }
+function removeItem(id,q=1){ const s=G.inv.find(x=>x.id===id); if(!s)return false; s.qty-=q; if(s.qty<=0)G.inv.splice(G.inv.indexOf(s),1); refreshHUD(); return true; }
+function addGold(n){ G.gold+=n; logMsg((n>=0?'+':'')+n+' gold. Purse: '+G.gold); if(n>0)sfx('coin'); refreshHUD(); }
+function gainXP(n){ if(!G)return; G.party.forEach(h=>{ if(!h.alive)return; h.xp+=n; const need=h.level*100;
+  if(h.xp>=need){ h.xp-=need; h.level++; h.maxhp+=4; h.maxmp+=2; h.hp=h.maxhp; h.mp=h.maxmp; logMsg(h.name+' reaches level '+h.level+'! Choose a reward.'); sfx('level'); pendingLevel=h; } });
+ G.score+=n; logMsg('+'+n+' XP'); refreshHUD(); reportProgress(); }
+let pendingLevel=null;
+function logMsg(t){ if(!G)return; G.log.push(t); if(G.log.length>7)G.log.shift(); const el=$('#log'); if(el)el.innerHTML=G.log.map(x=>'<div>'+x.replace(/</g,'&lt;')+'</div>').join(''); }
+/* ============ three + rapier world ============ */
+let renderer,scene,camera,world3,gradientMap;
+let entities=[]; /* {kind,name,hp,...,mesh,body,hero?} */
+let npcList=[],enemyList=[],interactables=[],floaters=[];
+let camTarget=new THREE.Vector3(0,0,4),camDist=26,camYaw=.7;
+const clock=new THREE.Clock();
+function toon(color,emissive=0x000000,ei=0){ const m=new THREE.MeshToonMaterial({color,gradientMap}); if(ei){m.emissive=new THREE.Color(emissive);m.emissiveIntensity=ei;} return m; }
+function addOutline(mesh,scale=1.06){ const o=new THREE.Mesh(mesh.geometry,new THREE.MeshBasicMaterial({color:0x1a140d,side:THREE.BackSide}));
+ o.scale.setScalar(scale); o.position.copy(mesh.position); mesh.parent?null:0; mesh.add(o); o.position.set(0,0,0); return o; }
+function box(w,h,dep,color,x,y,z,parent,outline=true){ const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,dep),toon(color));
+ m.position.set(x,y,z); m.castShadow=true; m.receiveShadow=true; (parent||scene).add(m); if(outline)addOutline(m,1.045); return m; }
+function cyl(rt,rb,h,color,x,y,z,parent){ const m=new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,10),toon(color));
+ m.position.set(x,y,z); m.castShadow=true; (parent||scene).add(m); addOutline(m,1.05); return m; }
+function staticCollider(x,y,z,hx,hy,hz){ const b=world3.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x,y,z));
+ world3.createCollider(RAPIER.ColliderDesc.cuboid(hx,hy,hz),b); return b; }
+function charBody(x,y,z){ const b=world3.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,y,z)
+ .lockRotations().setLinearDamping(4).setCcdEnabled(true));
+ world3.createCollider(RAPIER.ColliderDesc.capsule(.55,.38).setFriction(.2),b); return b; }
+function makeFigure(robe,skin,hatColor){ const g=new THREE.Group();
+ const body=cyl(.42,.55,1.05,robe,0,.85,0,g); const head=new THREE.Mesh(new THREE.SphereGeometry(.34,14,12),toon(skin));
+ head.position.set(0,1.75,0); head.castShadow=true; g.add(head); addOutline(head,1.08);
+ const hat=cyl(.05,.5,.5,hatColor,0,2.05,0,g);
+ const armL=box(.22,.8,.22,robe,-.62,1.05,0,g),armR=box(.22,.8,.22,robe,.62,1.05,0,g);
+ const legL=box(.24,.5,.24,0x3a2f22,-.2,.25,0,g),legR=box(.24,.5,.24,0x3a2f22,.2,.25,0,g);
+ g.userData={armL,armR,legL,legR,body,head}; scene.add(g); return g; }
+function buildWorld(){
+ scene.background=new THREE.Color(ZONES[G.zone].sky); scene.fog=new THREE.Fog(ZONES[G.zone].fog,34,95);
+ const groundCol=G.zone==='village'?0x7d9b5e:G.zone==='forest'?0x527a44:0x5b5470;
+ const ground=new THREE.Mesh(new THREE.PlaneGeometry(90,90),toon(groundCol)); ground.rotation.x=-Math.PI/2; ground.receiveShadow=true; scene.add(ground);
+ staticCollider(0,-.5,0,45,.5,45);
+ /* perimeter walls */
+ [[0,22,45,1],[0,-22,45,1],[22,0,1,45],[-22,0,1,45]].forEach(([x,z,hx,hz])=>staticCollider(x,1.5,z,hx,1.5,hz));
+ const hemi=new THREE.HemisphereLight(0xfff2d0,0x3a4a2f,1.3); scene.add(hemi);
+ const sun=new THREE.DirectionalLight(0xffe6b0,2.2); sun.position.set(18,30,10); sun.castShadow=true;
+ sun.shadow.mapSize.set(2048,2048); sun.shadow.camera.left=-32;sun.shadow.camera.right=32;sun.shadow.camera.top=32;sun.shadow.camera.bottom=-32; scene.add(sun);
+ /* torches / lights galore */
+ const torchPos=[[-8,4],[8,4],[-8,-8],[8,-8],[0,12]];
+ torchPos.forEach(([x,z])=>{ cyl(.09,.13,2.4,0x5a4028,x,1.2,z,scene);
+  const fl=new THREE.Mesh(new THREE.SphereGeometry(.28,10,8),new THREE.MeshBasicMaterial({color:0xffb84d})); fl.position.set(x,2.6,z); scene.add(fl);
+  const pl=new THREE.PointLight(0xff9a3d,18,13,1.6); pl.position.set(x,2.7,z); scene.add(pl); interactables.push({x,z,r:0,kind:'torch',mesh:fl}); });
+ /* village dressing */
+ if(G.zone==='village'){
+  const house=(x,z,ry,c)=>{ const g=new THREE.Group(); g.position.set(x,0,z); g.rotation.y=ry; scene.add(g);
+   box(4,2.6,3.4,c,0,1.3,0,g); const roof=new THREE.Mesh(new THREE.ConeGeometry(3.2,1.8,4),toon(0x8a4a32));
+   roof.position.set(0,3.5,0); roof.rotation.y=Math.PI/4; roof.castShadow=true; g.add(roof); addOutline(roof,1.04);
+   box(1,1.7,.18,0x4a3421,0,.85,1.75,g); staticCollider(x,1.3,z,2,1.3,1.7); };
+  house(-10,8,.2,0xc9b083); house(10,9,-.3,0xbfae8e); house(-11,-4,1.2,0xd0ba90); house(11,-5,-1,0xc4ab7d);
+  box(3,1.1,3,0x8a6f4d,-14,10,scene); staticCollider(-14,.55,10,1.5,.55,1.5);
+  for(let i=0;i<26;i++){ const x=(Math.random()*36-18),z=(Math.random()*36-18); if(Math.abs(x)<5&&Math.abs(z)<7)continue;
+   cyl(.16,.24,1.6,0x5a4028,x,.8,z,scene); const cr=new THREE.Mesh(new THREE.SphereGeometry(1.15+Math.random()*.5,10,8),toon(0x3f7038));
+   cr.position.set(x,2.3,z); cr.castShadow=true; scene.add(cr); staticCollider(x,1,z,.5,1,.5); }
+  addNPC('elder','Elder Senn',-2,2,0x6a4a7a,'👵',.75);
+  addNPC('marta','Marta, Innkeeper',6,7.4,0xa0522d,'👩‍🍳',1.2);
+  addNPC('guard','Captain Wren',0,15.5,0x4a5d7a,'💂',.85);
+  spawnPortal('forest',0,20.5,'🌲 North Gate — to the Ironwood');
+  /* cellar rats behind inn */
+  addNPC('cellar','Cellar Door (rats within)',9.5,11.5,0x4a3421,'🚪',1);
+ } else if(G.zone==='forest'){
+  for(let i=0;i<70;i++){ const x=(Math.random()*38-19),z=(Math.random()*38-19); if(Math.hypot(x,z-2)<4)continue;
+   cyl(.2,.3,2.2,0x3f3226,x,1.1,z,scene); const cr=new THREE.Mesh(new THREE.SphereGeometry(1.4+Math.random()*.7,9,7),toon(i%5?0x2f5d33:0x1e3d24));
+   cr.position.set(x,3,z); cr.castShadow=true; scene.add(cr); if(i%2===0)staticCollider(x,1,z,.55,1,.55); }
+  for(let i=0;i<10;i++){ const x=Math.random()*30-15,z=Math.random()*30-15; const s=new THREE.Mesh(new THREE.SphereGeometry(.32,8,6),new THREE.MeshBasicMaterial({color:0xbfe8ff}));
+   s.position.set(x,1.6+Math.random(),z); scene.add(s); }
+  addNPC('brynn','Forester Bryn',-6,-4,0x3f6038,'🧙',.9);
+  spawnPortal('village',0,-20.5,'🏘 South Trail — to Thornwall');
+  spawnPortal('ruins',19,0,'⛩ East — Ruins of the Elder Gate (key required)',true);
+  spawnEnemies('forest');
+ } else {
+  for(let i=0;i<14;i++){ const x=(i%5)*7-14,z=((i/5)|0)*8-8; box(1.2,4.5+((i*7)%3),1.2,0x6a6480,x,2.2,z,scene); staticCollider(x,2,z,.6,2.2,.6); }
+  const gate=new THREE.Mesh(new THREE.TorusGeometry(4,0.55,10,22),toon(0x8a80b0)); gate.position.set(14,4.4,-10); scene.add(gate); addOutline(gate,1.05);
+  const gl=new THREE.PointLight(0x9a7bff,30,20,1.4); gl.position.set(14,4.4,-8); scene.add(gl);
+  box(10,.6,8,0x4c4666,14,.3,-10,scene);
+  spawnPortal('forest',-19,0,'🌲 West — back to the Ironwood');
+  spawnEnemies('ruins');
+ }
+ /* party figures */
+ const robeCols=[0x7a3b3b,0x4a5d7a,0x5b3a7a,0x7a6a2f];
+ G.party.forEach((h,i)=>{ h.mesh=makeFigure(robeCols[i],0xe8c39a,[0x8a2f2f,0x3a4a6a,0x4a2f6a,0xb5892f][i]);
+  h.body=charBody(h.pos.x,1,h.pos.z); h.mesh.position.copy(h.pos); });
+ refreshHUD();
+}
+function addNPC(id,name,x,z,color,face,pitch){ const m=makeFigure(color,0xe8c39a,0x333333); m.position.set(x,0,z);
+ const e={kind:'npc',id,name,face,pitch,mesh:m,body:charBody(x,1,z),x,z}; npcList.push(e); entities.push(e); return e; }
+function spawnPortal(zone,x,z,label,locked){ const m=new THREE.Mesh(new THREE.TorusGeometry(1.5,.3,8,18),toon(locked?0x8a2f2f:0xc9a86a));
+ m.position.set(x,1.8,z); scene.add(m); const pl=new THREE.PointLight(locked?0xff5a4d:0xffd97a,16,10,1.5); pl.position.set(x,2,z); scene.add(pl);
+ interactables.push({kind:'portal',zone,x,z,r:2.6,label,locked,mesh:m}); }
+const ENEMY_TYPES={goblin:{n:'Goblin',hp:14,ac:12,dmg:'1d6',xp:35,col:0x5d7d3a,face:'👺',spd:3.4},
+ wolf:{n:'Ironwood Wolf',hp:18,ac:13,dmg:'1d8',xp:45,col:0x5a5a66,face:'🐺',spd:4.6},
+ cultist:{n:'Hollow Cultist',hp:22,ac:13,dmg:'1d8+1',xp:60,col:0x3a3350,face:'🎭',spd:3.1},
+ rat:{n:'Cellar Rat',hp:8,ac:11,dmg:'1d4',xp:20,col:0x6a5a4a,face:'🐀',spd:4.2},
+ lich:{n:'THE HOLLOW LICH',hp:90,ac:16,dmg:'2d8',xp:400,col:0x2a2438,face:'💀',spd:2.7}};
+function spawnEnemy(type,x,z){ const t=ENEMY_TYPES[type]; const m=makeFigure(t.col,0xcfd8c2,0x1a140d); m.position.set(x,0,z);
+ const e={kind:'enemy',type,name:t.n,hp:t.hp,maxhp:t.hp,ac:t.ac,dmg:t.dmg,xp:t.xp,face:t.face,spd:t.spd,mesh:m,body:charBody(x,1,z),
+  atkCd:0,slow:0,state:'idle',target:null}; enemyList.push(e); entities.push(e); return e; }
+function spawnEnemies(zone){ if(zone==='forest'&&!G.flags.forestCleared){ spawnEnemy('goblin',8,-8); spawnEnemy('goblin',11,-5); spawnEnemy('wolf',-10,8); spawnEnemy('wolf',-13,5); spawnEnemy('cultist',6,10); }
+ if(zone==='ruins'&&!G.flags.bossDead){ spawnEnemy('cultist',4,-4); spawnEnemy('cultist',7,3); spawnEnemy('goblin',-4,8); spawnEnemy('lich',14,-9); } }
+function spawnRats(){ spawnEnemy('rat',10.5,12.5); spawnEnemy('rat',12,11); spawnEnemy('rat',8.5,13); logMsg('Rats pour from the cellar shadows!'); }
+function clearZoneEntities(){ entities.forEach(e=>{ if(e.body)world3.removeRigidBody(e.body); if(e.mesh)scene.remove(e.mesh); });
+ entities=[];npcList=[];enemyList=[];interactables=[];
+ G.party.forEach(h=>{ if(h.body){world3.removeRigidBody(h.body);h.body=null;} if(h.mesh){scene.remove(h.mesh);h.mesh=null;} }); }
+function goZone(zone){ clearZoneEntities(); G.zone=zone; scene.clear(); buildWorld();
+ G.party.forEach((h,i)=>{ h.pos.set(-3+i*1.7,1,zone==='village'?6:0); if(h.body)h.body.setTranslation({x:h.pos.x,y:1,z:h.pos.z},true); h.target=null; h.attackTarget=null; });
+ camTarget.set(0,0,2); $('#zoneName').textContent=ZONES[zone].n; logMsg('— '+ZONES[zone].n+' —'); sfx('door'); autosave(); reportProgress(); }
+/* ============ combat & abilities (real-time with pause) ============ */
+function heroAC(h){ let ac=h.ac+(h.armor&&ITEMS[h.armor]?ITEMS[h.armor].ac:0)+(h.buffs.shield?4:0)+(h.buffs.bless?2:0); return ac; }
+function heroAtk(h){ return mod(h.cls==='Mage'?h.stats.INT:h.cls==='Rogue'?h.stats.DEX:h.stats.STR)+h.level+(h.weapon&&ITEMS[h.weapon]?ITEMS[h.weapon].atk:0)+(h.buffs.rally?2:0); }
+function dist(a,b){ return a.distanceTo(b); }
+function floater(pos,text,color='#ffd97a'){ const el=document.createElement('div'); el.textContent=text;
+ el.style.cssText='position:fixed;z-index:15;font-size:22px;font-weight:bold;color:'+color+';pointer-events:none;text-shadow:0 2px 3px #000';
+ document.body.appendChild(el); floaters.push({el,pos:pos.clone(),life:1.2}); }
+function useAbility(hi,abId,target){
+ const h=G.party[hi]; if(!h||!h.alive)return; const ab=ABIL[abId]; if(!ab)return;
+ if((h.cds[abId]||0)>0){ toast(h.name+': '+ab.n+' is recharging.'); return; }
+ if(h.mp<ab.mp){ toast(h.name+' lacks the mana for '+ab.n+'.'); return; }
+ if(abId==='potion'){ if(!removeItem('potion',1)){ toast('No potions left. Buy more from Marta.'); return; }
+  healHero(h,rollExpr('2d6+3')); h.cds[abId]=ab.cd; refreshHUD(); return; }
+ const tp=target?(target.mesh?target.mesh.position:target):h.mesh.position;
+ if(ab.rng>0&&target&&h.mesh&&dist(h.mesh.position,tp)>ab.rng+1.5){ h.target=tp.clone(); h.pendingAb={abId,target}; toast(h.name+' moves into range for '+ab.n+'…'); return; }
+ h.mp-=ab.mp; h.cds[abId]=ab.cd;
+ if(abId==='shield'){ h.buffs.shield=3; sfx('spell'); floater(h.mesh.position,'SHIELDED','#9ecbff'); logMsg(h.name+' raises a Shield Wall.'); }
+ else if(abId==='rally'){ G.party.forEach(a=>a.buffs.rally=3); sfx('spell'); logMsg(h.name+' rallies the party! +2 attack.'); }
+ else if(abId==='smoke'){ h.buffs.smoke=3; sfx('spell'); floater(h.mesh.position,'VANISHED','#ccc'); logMsg(h.name+' vanishes in smoke. Enemies lose the scent.'); }
+ else if(abId==='bless'){ const ally=(target&&G.party.includes(target))?target:h; ally.buffs.bless=3; target=ally; sfx('heal'); floater(target.mesh.position,'BLESSED','#ffe9b0'); logMsg(h.name+' blesses '+(target.name||'ally')+'.'); }
+ else if(ab.heal&&target){ healHero(target,rollExpr(ab.heal)); }
+ else if(ab.heal){ healHero(h,rollExpr(ab.heal)); }
+ else if(abId==='lockpick'){ const ch=interactables.find(x=>x.kind==='chest'&&dist(h.mesh.position,new THREE.Vector3(x.x,0,x.z))<4);
+   if(ch&&ch.locked){ ch.locked=false; sfx('chest'); toast('Lock picked! The chest sighs open.'); openChest(ch); } else toast('No locked chest within reach.'); }
+ else if(target&&target.hp!==undefined){ strike(h,target,ab); }
+ else { toast('Choose a target first (click an enemy or ally).'); h.mp+=ab.mp; h.cds[abId]=0; }
+ refreshHUD(); }
+function healHero(h,n){ h.hp=Math.min(h.maxhp,h.hp+n); sfx('heal'); floater(h.mesh.position,'+'+n+' HP','#7be495'); logMsg(h.name+' recovers '+n+' HP.'); checkParty(); }
+function strike(atk,def,ab){
+ const isHero=!!atk.cls; const tname=def.name||def.n;
+ if(ab&&ab.n==='Magic Missile'){ const dmg=rollExpr(ab.dmg); hurt(def,dmg,atk); logMsg(atk.name+' ▸ Magic Missile never misses: '+dmg+' to '+tname+'.'); sfx('spell'); return; }
+ const roll=d(20), bonus=isHero?heroAtk(atk):4, ac=def.cls?heroAC(def):def.ac;
+ const crit=roll===20;
+ if(crit||roll+bonus>=ac){ let dmg=rollExpr(ab?ab.dmg:(isHero?'1d8':'1d6')); if(atk.weapon)dmg+=ITEMS[atk.weapon].atk; if(crit)dmg*=2;
+  hurt(def,dmg,atk); logMsg(atk.name+' hits '+tname+' ('+roll+'+'+bonus+' vs AC '+ac+') for '+dmg+(crit?' — CRITICAL!':'')+'.'); sfx(isHero?'sword':'hit');
+ } else { logMsg(atk.name+' misses '+tname+' ('+roll+'+'+bonus+' vs AC '+ac+').'); floater(def.mesh.position,'MISS','#bbb'); sfx('ui'); } }
+function hurt(def,dmg,src){ def.hp-=dmg; floater(def.mesh.position,'-'+dmg,'#ff8a7a'); if(def.mesh)flashMesh(def.mesh);
+ if(def.hp<=0&&def.kind==='enemy')killEnemy(def); if(def.cls&&def.hp<=0){ def.alive=false; def.hp=0; floater(def.mesh.position,'DOWN','#ff5a4d'); logMsg(def.name+' has fallen!'); sfx('hurt'); checkParty(); }
+ refreshHUD(); }
+function flashMesh(m){ m.traverse(o=>{ if(o.material&&o.material.emissive){ const e=o.material.emissive.getHex(); o.material.emissive.setHex(0xaa2222); setTimeout(()=>o.material.emissive.setHex(e),120); } }); }
+function killEnemy(e){ e.hp=0; logMsg(e.name+' is defeated! +'+e.xp+' XP'); G.kills++; G.score+=e.xp;
+ if(Math.random()<.55){ const loot=['potion','herb','gem','antidote'][(Math.random()*4)|0]; addItem(loot,1); }
+ if(e.type==='lich'){ G.flags.bossDead=true; gainXP(e.xp); completeQuest('main'); toast('The bell SILENCES. The Hollow Lich is unmade!'); setTimeout(()=>showEnd(true),900); }
+ else gainXP(e.xp);
+ if(e.type==='rat'&&enemyList.every(x=>x.hp<=0)){ completeQuest('rats'); addGold(25); toast('Cellar cleared! Marta owes you 25 gold and eternal broth.'); }
+ if(e.body)world3.removeRigidBody(e.body); if(e.mesh)scene.remove(e.mesh);
+ enemyList=enemyList.filter(x=>x!==e); entities=entities.filter(x=>x!==e); sfx('coin'); reportProgress(); }
+function checkParty(){ if(G.party.every(h=>!h.alive)){ G.over=true; showEnd(false); } }
+function restParty(){ if(G.gold<20){ toast('Rest costs 20 gold. The inn\u2019s broth is not charity.'); return; }
+ addGold(-20); G.day++; G.party.forEach(h=>{ h.alive=true; h.hp=h.maxhp; h.mp=h.maxmp; }); logMsg('You rest until dawn (Day '+G.day+'). The party is restored.'); refreshHUD(); autosave(); }
+function openChest(ch){ if(ch.opened)return; ch.opened=true; const loot=ch.loot||'potion'; addItem(loot,1); addGold(15+((Math.random()*20)|0)); sfx('chest');
+ if(ch.id==='ship'){ addItem('gem',1); if(G.quests.shipment.stage===0){G.quests.shipment.active=true;} advQuest('shipment',1); logMsg('Inside: a Moon Gem — Bryn\u2019s lost shipment!'); } }
+/* chests placed per zone after build (called from buildWorld end via hook) */
+function placeChests(){ if(G.zone==='village'){ addChest('cellarChest',12,13,false,'potion'); }
+ if(G.zone==='forest'){ addChest('ship',14,12,true,'potion'); addChest('herbChest',-14,-12,false,'greater'); }
+ if(G.zone==='ruins'){ addChest('vault',10,-14,true,'scroll'); } }
+function addChest(id,x,z,locked,loot){ const m=box(1.1,.7,.8,locked?0x7a3b2f:0x8a6f3a,x,.35,z,scene); interactables.push({kind:'chest',id,x,z,r:2.2,locked,loot,opened:false,mesh:m,label:locked?'Locked Chest':'Chest'}); }
+/* enemy + party tick */
+let combatCd=0;
+function tickCombat(dt){ if(!G||G.over)return;
+ if(typeof modalOpen!=='undefined'&&modalOpen&&netMode!=='hub')return; /* solo menus pause the world; hub co-op never pauses */
+ const aliveEnemies=enemyList.filter(e=>e.hp>0);
+ G.inCombat=aliveEnemies.length>0; combatMusic=G.inCombat;
+ /* auto-pause on enemy sighted */
+ if(G.inCombat&&!tickCombat.seen&&SET.autoEnemy){ setPaused(true); toast('Enemy sighted — paused. Issue orders, press Space to fight.'); }
+ tickCombat.seen=G.inCombat;
+ G.party.forEach(h=>{ for(const k in h.cds)if(h.cds[k]>0)h.cds[k]=Math.max(0,h.cds[k]-dt);
+  for(const k in h.buffs)if(h.buffs[k]>0){h.buffs[k]-=dt; if(h.buffs[k]<=0)delete h.buffs[k];} });
+ if(G.paused)return;
+ aliveEnemies.forEach(e=>{ e.atkCd-=dt; if(e.slow>0){e.slow-=dt;}
+  const targets=G.party.filter(h=>h.alive&&!h.buffs.smoke); if(!targets.length)return;
+  let best=targets[0],bd=1e9; targets.forEach(h=>{ const dd=dist(e.mesh.position,h.mesh.position); if(dd<bd){bd=dd;best=h;} });
+  if(bd>2.3){ moveEntity(e,best.mesh.position,(e.slow>0?e.spd*.45:e.spd),dt); }
+  else if(e.atkCd<=0){ e.atkCd=1.15; const h=best; const roll=d(20);
+   if(roll+4>=heroAC(h)){ const dmg=Math.max(1,Math.round(rollExpr(e.dmg)*(SET.diff==='Story'?.7:SET.diff==='Tactician'?1.35:1))); h.hp-=dmg; floater(h.mesh.position,'-'+dmg,'#ff8a7a'); logMsg(e.name+' hits '+h.name+' for '+dmg+'.'); sfx('hit');
+    if(h.hp<=0){h.alive=false;h.hp=0;logMsg(h.name+' has fallen!');checkParty();} }
+   else { logMsg(e.name+' misses '+h.name+'.'); floater(h.mesh.position,'MISS','#bbb'); }
+   refreshHUD(); } });
+ /* party auto-attack orders */
+ G.party.forEach((h,hi)=>{ if(!h.alive)return; h.atkCd=(h.atkCd||0)-dt;
+  if(h.pendingAb&&h.attackTarget){ const tp=h.attackTarget.mesh?h.attackTarget.mesh.position:h.attackTarget;
+   if(dist(h.mesh.position,tp)<= (ABIL[h.pendingAb.abId].rng||2)+1.5){ const p=h.pendingAb; h.pendingAb=null; useAbility(hi,p.abId,p.target);} }
+  else if(h.attackTarget&&h.attackTarget.hp>0){ const tp=h.attackTarget.mesh.position;
+   if(dist(h.mesh.position,tp)>2.2) moveEntity(h,tp,4.2,dt);
+   else if(h.atkCd<=0){ h.atkCd=.95; strike(h,h.attackTarget,ABIL.attack); } }
+  else if(h.target){ const tp=h.target; if(dist(h.mesh.position,tp)>.7) moveEntity(h,tp,4.6,dt); else h.target=null; } });
+ /* net sync */
+ netTick(dt); }
+function moveEntity(e,pos,speed,dt){ if(!e.body||!e.mesh)return; const p=e.mesh.position;
+ const dir=new THREE.Vector3(pos.x-p.x,0,pos.z-p.z); const len=dir.length(); if(len<.15){ e.body.setLinvel({x:0,y:e.body.linvel().y,z:0},true); return; }
+ dir.normalize(); const slow=e.slow>0?.45:1; e.body.setLinvel({x:dir.x*speed*slow,y:e.body.linvel().y,z:dir.z*speed*slow},true);
+ e.mesh.rotation.y=Math.atan2(dir.x,dir.z); }
+/* ============ UI ============ */
+let focusList=[],focusIdx=0,modalOpen=null;
+function setFocus(list){ focusList=list; focusIdx=0; applyFocus(); }
+function applyFocus(){ focusList.forEach((el,i)=>el.classList.toggle('focused',i===focusIdx)); if(focusList[focusIdx])focusList[focusIdx].scrollIntoView({block:'nearest'}); }
+function focusMove(dir){ if(!focusList.length)return; focusIdx=(focusIdx+dir+focusList.length)%focusList.length; applyFocus(); sfx('ui'); }
+function toast(t){ const d=document.createElement('div'); d.className='toastMsg'; d.textContent=t; $('#toast').appendChild(d); setTimeout(()=>d.remove(),3400); }
+function refreshHUD(){ if(!G)return;
+ const host=$('#portraits'); if(host){ host.innerHTML='';
+  G.party.forEach((h,i)=>{ const dv=document.createElement('div'); dv.className='port'+(i===G.sel?' sel':'');
+   dv.innerHTML='<div class="face">'+h.face+'</div><div class="nm">'+h.name.split(' ')[0]+' · '+h.cls+' '+h.level+'</div>'
+   +'<div class="bar"><i style="width:'+clamp(h.hp/h.maxhp*100,0,100)+'%"></i></div><small>HP '+Math.ceil(h.hp)+'/'+h.maxhp+' · AC '+heroAC(h)+'</small>'
+   +'<div class="bar mp"><i style="width:'+clamp(h.mp/h.maxmp*100,0,100)+'%"></i></div><small>MP '+Math.floor(h.mp)+'/'+h.maxmp+' · '+(h.alive?'':'💀 DOWN')+'</small>'
+   +'<div class="bar xp"><i style="width:'+clamp(h.xp/(h.level*100)*100,0,100)+'%"></i></div>';
+   dv.addEventListener('click',()=>{ selectHero(i); }); host.appendChild(dv); }); }
+ const ab=$('#abilities'); if(ab){ ab.innerHTML=''; const h=G.party[G.sel]; if(h){ ['attack',...CLASSES[h.cls].abilities,'potion'].slice(0,6).forEach(abId=>{ const a=ABIL[abId];
+   const b=document.createElement('button'); b.className='ab'; b.disabled=!h.alive||(h.cds[abId]||0)>0||h.mp<a.mp;
+   b.innerHTML=a.i+'<br>'+a.n+((h.cds[abId]||0)>0?'<span class="cd">'+Math.ceil(h.cds[abId])+'s</span>':'');
+   b.title=a.desc+' (MP '+a.mp+(abId==='potion'?' · x'+invQty('potion'):'' )+')';
+   b.addEventListener('click',()=>armAbility(abId)); ab.appendChild(b); }); } }
+ const q=$('#questTracker'); if(q)q.innerHTML='<b style="color:#ffd97a">📜 '+G.quests.main.t+'</b><br>'+questText()+(G.quests.rats.active&&!G.quests.rats.done?'<br>• Cellar: rats behind the inn':'')+(G.quests.shipment.active&&!G.quests.shipment.done?'<br>• Bring the Moon Gem to Bryn':'')+'<br><small>Gold: '+G.gold+' · Day '+G.day+' · Zone score '+G.score+'</small>';
+ $('#pausedBadge').classList.toggle('hidden',!G.paused);
+ if(pendingLevel)showLevelUp(); }
+function selectHero(i){ G.sel=i; refreshHUD(); }
+let armed=null;
+function armAbility(abId){ armed=abId; const a=ABIL[abId]; toast(G.party[G.sel].name+': '+a.n+' armed — click a target. '+a.desc);
+ if(a.rng===0||abId==='potion'||abId==='shield'||abId==='rally'||abId==='smoke'||abId==='lockpick')useAbility(G.sel,abId,null); armed=abId==='potion'?null:armed; if(ABIL[abId].rng===0)armed=null; }
+function setPaused(v){ if(!G)return; G.paused=v; $('#pausedBadge').classList.toggle('hidden',!v); refreshHUD(); }
+/* dialogue */
+let dlg=null;
+function openDialogue(treeId,nodeId='start',npcRef=null){ const tree=DLG[treeId]; if(!tree)return;
+ dlg={tree,treeId,node:nodeId,ref:npcRef}; renderDlg(); }
+function renderDlg(){ const n=dlg.tree[dlg.node]; if(!n){closeDialogue();return;}
+ /* companion dynamic lines */
+ let who=n.who,line=n.line,pitch=n.pitch||1;
+ if(dlg.treeId==='companion'&&dlg.ref){ who=dlg.ref.name; pitch=dlg.ref.pitch;
+  if(dlg.node==='start')line='You walk with purpose. I like that in a leader — it saves me deciding where lunch is.';
+  if(dlg.node==='feel')line=COMPANION_LINES[dlg.ref.name]?COMPANION_LINES[dlg.ref.name][0]:'I am well. Let us keep it that way.';
+  if(dlg.node==='counsel')line=COMPANION_LINES[dlg.ref.name]?COMPANION_LINES[dlg.ref.name][1]:'Save often. The Hollow counts on the proud.'; }
+ $('#dialogue').classList.remove('hidden'); $('#dlgWho').textContent=who; $('#dlgLine').textContent=line; speak(line,pitch);
+ const host=$('#dlgChoices'); host.innerHTML='';
+ const choices=n.choices.filter(c=>!c.cond||c.cond());
+ choices.forEach(c=>{ const b=document.createElement('button'); b.className='menuBtn choice'; b.textContent='▸ '+c.t;
+  b.addEventListener('click',()=>pickChoice(c)); host.appendChild(b); });
+ setFocus([...host.querySelectorAll('button')]); }
+function pickChoice(c){ sfx('ui');
+ if(c.check){ const h=G.party[G.sel]; const roll=d(20)+mod(h.stats[c.check.stat]);
+  const ok=roll>=c.check.dc; logMsg('Skill check ['+c.check.stat+' '+c.check.dc+']: rolled '+roll+' — '+(ok?'SUCCESS':'FAILURE')+'.');
+  toast((ok?'✦ Check passed (':'✘ Check failed (')+roll+' vs '+c.check.dc+')');
+  if(c.fx&&ok)c.fx(); const nxt=ok?c.to:c.fail; if(nxt&&dlg.tree[nxt]){dlg.node=nxt; if(dlg.tree[nxt].fx)dlg.tree[nxt].fx(); renderDlg();} else closeDialogue(); return; }
+ if(c.fx)c.fx(); if(!c.to){closeDialogue();return;} dlg.node=c.to; const n=dlg.tree[dlg.node]; if(n&&n.fx)n.fx(); renderDlg(); }
+function closeDialogue(){ dlg=null; $('#dialogue').classList.add('hidden'); setFocus([]); if(G)setPaused(false); }
+/* modals */
+function showModal(html){ $('#modalCard').innerHTML=html; $('#modal').classList.remove('hidden'); modalOpen=true;
+ setFocus([...$('#modalCard').querySelectorAll('button,input,select')]); }
+function closeModal(){ $('#modal').classList.add('hidden'); modalOpen=null; setFocus([]); refreshHUD(); }
+function statsHTML(h){ return Object.entries(h.stats).map(([k,v])=>k+' '+v+' ('+(mod(v)>=0?'+':'')+mod(v)+')').join(' · '); }
+function openSheet(){ const h=G.party[G.sel];
+ showModal('<h2>'+h.face+' '+h.name+' — '+h.cls+' level '+h.level+'</h2><p>'+CLASSES[h.cls].desc+'</p><p>'+statsHTML(h)+'</p>'
+ +'<p>HP '+Math.ceil(h.hp)+'/'+h.maxhp+' · MP '+Math.floor(h.mp)+'/'+h.maxmp+' · AC '+heroAC(h)+' · Attack +'+heroAtk(h)+' · XP '+h.xp+'/'+(h.level*100)+'</p>'
+ +'<p>Weapon: '+(h.weapon?ITEMS[h.weapon].n:'bare hands')+' · Armour: '+(h.armor?ITEMS[h.armor].n:'travel clothes')+'</p>'
+ +'<div class="row"><span>Select hero</span><span>'+G.party.map((p,i)=>'<button class="topBtn" data-h="'+i+'">'+p.name.split(' ')[0]+'</button>').join(' ')+'</span></div>'
+ +'<button class="menuBtn" id="mClose">Close (Circle / Esc)</button>');
+ $$('#modalCard [data-h]').forEach(b=>b.addEventListener('click',()=>{selectHero(+b.dataset.h);openSheet();}));
+ $('#mClose').addEventListener('click',closeModal); setFocus([...$('#modalCard').querySelectorAll('button')]); }
+function openInventory(){ const h=G.party[G.sel];
+ let html='<h2>🎒 Party Pack — '+G.gold+' gold</h2><p>Tap an item to use or equip it for '+h.name+'. Potions heal 2d6+3.</p><div class="invGrid">';
+ if(!G.inv.length)html+='<div class="slot">Empty</div>';
+ G.inv.forEach(s=>{ const it=ITEMS[s.id]; html+='<button class="slot" data-inv="'+s.id+'">'+it.i+'<br>'+it.n+'<br><small>×'+s.qty+(it.price?' · '+it.price+'g':'')+'</small></button>'; });
+ html+='</div><button class="menuBtn" id="mClose">Close (I / Circle)</button>';
+ showModal(html);
+ $$('#modalCard [data-inv]').forEach(b=>b.addEventListener('click',()=>useItem(b.dataset.inv)));
+ $('#mClose').addEventListener('click',closeModal); }
+function useItem(id){ const it=ITEMS[id]; const h=G.party[G.sel];
+ if(it.slot==='weapon'){ G.party.forEach(p=>{if(p.weapon===id)p.weapon=null;}); h.weapon=id; logMsg(h.name+' equips '+it.n+'.'); sfx('ui'); }
+ else if(it.slot==='armor'){ G.party.forEach(p=>{if(p.armor===id)p.armor=null;}); h.armor=id; logMsg(h.name+' dons '+it.n+'.'); sfx('ui'); }
+ else if(it.use==='heal'){ removeItem(id,1); healHero(h,rollExpr('2d6+3')); }
+ else if(it.use==='healbig'){ removeItem(id,1); healHero(h,rollExpr('4d6+6')); }
+ else if(it.use==='cure'){ removeItem(id,1); toast(h.name+' feels purged and minty.'); }
+ else if(it.use==='scroll'){ removeItem(id,1); enemyList.slice().forEach(e=>hurt(e,rollExpr('3d6'),h)); logMsg('The Scroll of Dawn burns the Hollow!'); }
+ else if(it.use==='herb'){ removeItem(id,1); healHero(h,6); }
+ else { toast(it.n+': kept safe. Some treasures are quests, not tools.'); return; }
+ openInventory(); refreshHUD(); }
+function openShop(){ let html='<h2>🏪 Marta\u2019s Wares — '+G.gold+' gold</h2><p>Buy honestly. Sell at half price. The broth is free with any purchase over 50 gold.</p>';
+ ['potion','greater','antidote','scroll','sword','bow','staff','armor','robe'].forEach(id=>{ const it=ITEMS[id];
+  html+='<div class="row"><span>'+it.i+' '+it.n+' — '+it.price+'g</span><span><button class="topBtn" data-buy="'+id+'">Buy</button> <button class="topBtn" data-sell="'+id+'">Sell ('+invQty(id)+')</button></span></div>'; });
+ html+='<button class="menuBtn" id="mClose">Leave shop</button>'; showModal(html);
+ $$('#modalCard [data-buy]').forEach(b=>b.addEventListener('click',()=>{ const id=b.dataset.buy; if(G.gold<ITEMS[id].price){toast('Not enough gold.');return;} addGold(-ITEMS[id].price); addItem(id,1); openShop(); }));
+ $$('#modalCard [data-sell]').forEach(b=>b.addEventListener('click',()=>{ const id=b.dataset.sell; if(!removeItem(id,1)){toast('None to sell.');return;} addGold(Math.floor(ITEMS[id].price/2)); openShop(); }));
+ $('#mClose').addEventListener('click',closeModal); }
+function openJournal(){ const q=G.quests;
+ const row=(t,s,done)=>'<div class="row"><span>'+(done?'✅ ':'📜 ')+t+'</span><small>'+s+'</small></div>';
+ showModal('<h2>📖 Journal — Day '+G.day+'</h2>'+row(q.main.t,questText(),q.main.done)
+ +row(q.rats.t,q.rats.done?'Complete':q.rats.active?'Clear the cellar behind the inn':'Ask Marta about work',q.rats.done)
+ +row(q.shipment.t,q.shipment.done?'Complete':q.shipment.active?'Return the Moon Gem to Bryn':'A wreck glitters in the Ironwood',q.shipment.done)
+ +'<p>Defeated foes: '+G.kills+' · Score: '+G.score+'. The bell has rung '+(G.flags.bossDead?'nevermore':'in the dark')+'.</p>'
+ +'<button class="menuBtn" id="mClose">Close (J / Circle)</button>');
+ $('#mClose').addEventListener('click',closeModal); }
+function showSettings(fromTouch){ const s=SET;
+ showModal('<h2>⚙ Settings</h2>'
+ +'<div class="row"><span>Master volume</span><input type="range" id="sMaster" min="0" max="1" step=".05" value="'+s.master+'"></div>'
+ +'<div class="row"><span>Music</span><input type="range" id="sMusic" min="0" max="1" step=".05" value="'+s.music+'"></div>'
+ +'<div class="row"><span>Sound effects</span><input type="range" id="sSfx" min="0" max="1" step=".05" value="'+s.sfx+'"></div>'
+ +'<div class="row"><span>Voice (gibberish)</span><input type="range" id="sVoice" min="0" max="1" step=".05" value="'+s.voice+'"></div>'
+ +'<div class="row"><span>Invert horizontal axis (gamepad fix)</span><button class="topBtn" id="sInvX">'+(s.invertX?'ON':'OFF')+'</button></div>'
+ +'<div class="row"><span>Invert vertical axis (gamepad fix)</span><button class="topBtn" id="sInvY">'+(s.invertY?'ON':'OFF')+'</button></div>'
+ +'<div class="row"><span>Difficulty</span><select id="sDiff"><option '+(s.diff==='Story'?'selected':'')+'>Story</option><option '+(s.diff==='Normal'?'selected':'')+'>Normal</option><option '+(s.diff==='Tactician'?'selected':'')+'>Tactician</option></select></div>'
+ +'<div class="row"><span>Auto-pause: enemy sighted</span><button class="topBtn" id="sAutoE">'+(s.autoEnemy?'ON':'OFF')+'</button></div>'
+ +'<div class="row"><span>Auto-pause: turn end</span><button class="topBtn" id="sAutoT">'+(s.autoEnd?'ON':'OFF')+'</button></div>'
+ +'<div class="row"><span>Camera speed</span><input type="range" id="sCam" min=".4" max="2" step=".1" value="'+s.camSpeed+'"></div>'
+ +'<div class="row"><span>Text / voice speed</span><input type="range" id="sTxt" min=".5" max="2" step=".1" value="'+s.textSpeed+'"></div>'
+ +'<p><small>Difficulty scales enemy damage: Story ×0.7 · Normal ×1 · Tactician ×1.35. Axis inversion fixes the common intermittent gamepad inversion.</small></p>'
+ +'<button class="menuBtn" id="mClose">Done (Options / Esc)</button>');
+ const bind=(id,key)=>{ const el=$(id); if(el)el.addEventListener('input',()=>{SET[key]=+el.value; saveSet();}); };
+ bind('#sMaster','master'); bind('#sMusic','music'); bind('#sSfx','sfx'); bind('#sVoice','voice'); bind('#sCam','camSpeed'); bind('#sTxt','textSpeed');
+ $('#sDiff').addEventListener('change',e=>{SET.diff=e.target.value; saveSet();});
+ const tog=(id,key)=>{ $(id).addEventListener('click',()=>{ SET[key]=!SET[key]; saveSet(); $(id).textContent=SET[key]?'ON':'OFF'; }); };
+ tog('#sInvX','invertX'); tog('#sInvY','invertY'); tog('#sAutoE','autoEnemy'); tog('#sAutoT','autoEnd');
+ $('#mClose').addEventListener('click',()=>{ closeModal(); if(fromTouch)$('#touchWarn').classList.add('hidden'); }); }
+function showLevelUp(){ const h=pendingLevel; if(!h)return; pendingLevel=null;
+ showModal('<h2>✦ '+h.name+' — Level '+h.level+'!</h2><p>Power answers those who survive. Choose a boon:</p>'
+ +'<button class="menuBtn" data-lv="STR">+1 Strength — hit harder, carry the day</button>'
+ +'<button class="menuBtn" data-lv="VIT">+2 Vitality — +6 max HP, stand longer</button>'
+ +'<button class="menuBtn" data-lv="ARC">+1 Arcana — +4 max MP, deeper reserves</button>');
+ $$('#modalCard [data-lv]').forEach(b=>b.addEventListener('click',()=>{ const k=b.dataset.lv;
+  if(k==='STR'){h.stats.STR++;} if(k==='VIT'){h.stats.CON++;h.maxhp+=6;h.hp+=6;} if(k==='ARC'){h.stats.INT++;h.maxmp+=4;h.mp+=4;}
+  logMsg(h.name+' grows: '+k+'.'); sfx('level'); closeModal(); })); }
+function showAbout(){ showModal('<h2>✦ About — The Ironwood Conspiracy</h2>'
+ +'<p>An original spiritual successor to <b>Baldur\u2019s Gate</b>: real-time-with-pause party combat, dice you can see, companions who opine, and a gate that dreams. Title chosen by random number generator from fifty brainstormed titles.</p>'
+ +'<p><b>Source Information</b><br>Date: 2026-10-29 02:02<br>Source: Baldur\u2019s Gate<br>Tech: Three.js 0.180.0 WebGPU (no fallback), Rapier 0.19.3, Gamepad API, Web Audio, AI Hub Session Protocol v1 (co-op), BroadcastChannel<br>Art Direction: Stylized cel-shaded (toon + inverted-hull outlines)<br>Animation: Procedural code animation<br>Audio: Code-written music/SFX + Animalese gibberish voices<br>Online: AI Hub co-op (1–4) + standalone room-code play<br>Testing: Lightweight load smoke; headless; no FPS targets<br>Environment: Muse Code CLI (headless); Linux; browser unknown<br>Model: Meta, muse-wonder-1.0, reasoning effort max<br>Usage: unknown</p>'
+ +'<p>Built as a complete vertical slice: character creation, three zones, branching dialogue with skill checks, quests, shop, inventory, levels, save/load, attract mode, settings with gamepad axis inversion, and full controller-first 10-foot UI.</p>'
+ +'<button class="menuBtn" id="mClose">Back</button>'); $('#mClose').addEventListener('click',closeModal); }
+function showEnd(wonFlag){ G.won=wonFlag; combatMusic=false;
+ showModal(wonFlag?'<h2>🏆 The Bell Silenced</h2><p>The Hollow Lich unravels like a psalm read backwards. Above Thornwall, the ironwood turns — leaf by leaf — toward the sun. Bryn will sing of this. Marta will charge for the singing. Score: '+G.score+' · Foes defeated: '+G.kills+' · Day '+G.day+'.</p><button class="menuBtn" id="mAgain">Keep exploring</button><button class="menuBtn" id="mTitle">Return to Title</button>'
+ :'<h2>💀 The Hollow Takes Its Due</h2><p>The bell rings once more, and the dark keeps what it caught. Yet every tale in Thornwall begins with someone standing back up. Score: '+G.score+'.</p><button class="menuBtn" id="mLoad">Load last save</button><button class="menuBtn" id="mTitle">Return to Title</button>');
+ reportResult();
+ const a=$('#mAgain'); if(a)a.addEventListener('click',closeModal);
+ const l=$('#mLoad'); if(l)l.addEventListener('click',()=>{ closeModal(); loadGame(+localStorage.getItem('iwc-auto-slot')||0)||toast('No save found.'); });
+ $$('#modalCard #mTitle').forEach(b=>b.addEventListener('click',()=>{ closeModal(); toTitle(); })); }
+/* save / load */
+function serialize(){ return JSON.stringify({zone:G.zone,gold:G.gold,day:G.day,score:G.score,kills:G.kills,flags:G.flags,quests:G.quests,inv:G.inv,
+ party:G.party.map(h=>({name:h.name,cls:h.cls,stats:h.stats,level:h.level,xp:h.xp,hp:h.hp,maxhp:h.maxhp,mp:h.mp,maxmp:h.maxmp,ac:h.ac,alive:h.alive,weapon:h.weapon,armor:h.armor,px:h.mesh?h.mesh.position.x:h.pos.x,pz:h.mesh?h.mesh.position.z:h.pos.z}))}); }
+function saveGame(slot){ try{ localStorage.setItem('iwc-save-'+slot,serialize()); localStorage.setItem('iwc-auto-slot',slot); toast('Saved in slot '+(slot+1)+'.'); sfx('ui'); }catch(e){ toast('Save failed: storage unavailable.'); } }
+function autosave(){ saveGame(0); }
+function loadGame(slot){ try{ const raw=localStorage.getItem('iwc-save-'+slot); if(!raw)return false; const s=JSON.parse(raw);
+ const p0=s.party[0]; G=newGame(p0.name,p0.cls,p0.stats);
+ s.party.forEach((sp,i)=>{ Object.assign(G.party[i],{level:sp.level,xp:sp.xp,hp:sp.hp,maxhp:sp.maxhp,mp:sp.mp,maxmp:sp.maxmp,alive:sp.alive,weapon:sp.weapon,armor:sp.armor}); G.party[i].pos.set(sp.px,1,sp.pz); });
+ G.zone=s.zone; G.gold=s.gold; G.day=s.day; G.score=s.score; G.kills=s.kills; G.flags=s.flags; G.quests=s.quests; G.inv=s.inv;
+ if(scene)goZone(s.zone); logMsg('Loaded slot '+(slot+1)+'.'); refreshHUD(); return true; }catch(e){ return false; } }
+function toTitle(){ $('#hud').classList.add('hidden'); $('#titleScreen').classList.remove('hidden'); G=null; idleTime=0; setFocus($$('#titleScreen .menuBtn')); }
+/* ============ multiplayer: AI Hub co-op + standalone room-code ============ */
+let hubInfo=null,netMode=null,bc=null,remotePlayers={};
+let reportedDone=false;
+function reportProgress(){ try{ if(window.AIHub&&AIHub.active&&G){ AIHub.progress({score:G.score,label:(G.quests.main.done?'Lich defeated':'Stage '+(G.quests.main.stage+1)+' · Lv '+G.party[0].level)}); } }catch(_){} }
+function reportResult(){ try{ if(window.AIHub&&AIHub.active&&G&&!reportedDone){ reportedDone=true;
+  if(AIHub.isHost&&typeof AIHub.finish==='function'){ const ids=(AIHub.players||[]).map(p=>p.id); AIHub.finish({standings:[ids.length?ids:[0]],scores:{0:G.score},won:G.won,stats:{0:{foes:G.kills,score:G.score}},awards:G.won?[{id:AIHub.me,title:'Bell-Silencer',detail:'The Hollow Lich defeated'}]:[]}); }
+  else AIHub.result({score:G.score,stats:{foes:G.kills,'quests done':Object.values(G.quests).filter(q=>q.done).length},awards:G.won?[{title:'Bell-Silencer',detail:'The Hollow Lich defeated'}]:[]}); } }catch(_){} }
+function netTick(dt){ netTick.t=(netTick.t||0)-dt; if(netTick.t>0)return; netTick.t=1/15; if(!G||!G.party[0]||!G.party[0].mesh)return;
+ const p=G.party[0].mesh.position; const payload={t:'me',at:(window.AIHub&&AIHub.active)?AIHub.time():performance.now(),x:+p.x.toFixed(2),y:+p.z.toFixed(2),hp:Math.ceil(G.party[0].hp),z:G.zone,s:G.score};
+ try{ if(netMode==='hub'&&window.AIHub)AIHub.send(payload,{reliable:false});
+  else if(netMode==='bc'&&bc)bc.postMessage(payload); }catch(_){}
+ /* host broadcasts enemy snapshot in hub co-op */
+ try{ if(netMode==='hub'&&window.AIHub&&AIHub.isHost&&enemyList.length){ AIHub.send({t:'snap',at:AIHub.time(),zone:G.zone,e:enemyList.map(e=>[+e.mesh.position.x.toFixed(1),+e.mesh.position.z.toFixed(1),Math.ceil(e.hp)])},{reliable:false}); } }catch(_){} }
+function onNetMessage(data,from){ if(!data||!G)return;
+ if(data.t==='me'){ let rp=remotePlayers[from];
+  if(!rp){ const m=makeFigure(0x2f7a5f,0xe8c39a,0x111111); rp=remotePlayers[from]={mesh:m,tx:data.x,tz:data.y,zone:data.z}; toast('An ally joins the tale!'); }
+  rp.tx=data.x; rp.tz=data.y; rp.zone=data.z; }
+ if(data.t==='snap'&&netMode==='hub'&&window.AIHub&&!AIHub.isHost){ /* clients ease enemies toward host truth */
+  enemyList.forEach((e,i)=>{ const s=data.e&&data.e[i]; if(s){ e.hp=s[2]; } }); } }
+function showMultiplayer(){ showModal('<h2>👥 Multiplayer</h2><p><b>AI Hub sessions:</b> when this game is dealt by the AI Hub, up to four players share one world in co-op — the host runs the Hollow, everyone fights at its side. No setup needed here.</p>'
+ +'<p><b>Play on your own:</b> open this file in two tabs or browsers on this device, pick the same room code, and your heroes appear in each other\u2019s Thornwall (position, health and score shared live).</p>'
+ +'<div class="row"><span>Room code</span><input type="text" id="roomCode" maxlength="6" value="GATE"></div>'
+ +'<button class="menuBtn" id="mHost">Host / Join room</button><button class="menuBtn" id="mSolo">Leave multiplayer (solo)</button><button class="menuBtn" id="mClose2">Back</button>');
+ $('#mHost').addEventListener('click',()=>{ const code=($('#roomCode').value||'GATE').toUpperCase();
+  try{ if(bc)bc.close(); bc=new BroadcastChannel('iwc-room-'+code); bc.onmessage=e=>onNetMessage(e.data,'ally'); netMode='bc'; toast('Room '+code+' joined. Heroes in other tabs will appear here.'); }catch(e){ toast('Multiplayer unavailable in this browser.'); }
+  closeModal(); });
+ $('#mSolo').addEventListener('click',()=>{ if(bc)bc.close(); bc=null; netMode=null; toast('Solo play. The road is yours alone.'); closeModal(); });
+ $('#mClose2').addEventListener('click',closeModal); }
+/* ============ input: controller-first, keyboard+mouse mapped to it ============ */
+let keys={},idleTime=0,attract=false,attractT=0;
+const ray=new THREE.Raycaster(),mouseV=new THREE.Vector2();
+function bumpIdle(){ idleTime=0; if(attract)stopAttract(); }
+window.addEventListener('keydown',e=>{ bumpIdle(); initAudio(); if(AC&&AC.state==='suspended')AC.resume(); keys[e.code]=true;
+ if(modalOpen){ if(e.code==='Escape')closeModal(); return; }
+ if(dlg){ if(e.code==='ArrowDown'||e.code==='KeyS')focusMove(1); if(e.code==='ArrowUp'||e.code==='KeyW')focusMove(-1);
+  if(e.code==='Enter'||e.code==='Space'){ const b=focusList[focusIdx]; if(b)b.click(); } return; }
+ if(!G){ /* title */
+  if(e.code==='Escape'){ showSettings(); return; }
+  if(e.code==='ArrowDown')focusMove(1); if(e.code==='ArrowUp')focusMove(-1);
+  if(e.code==='Enter'){ const b=focusList[focusIdx]; if(b)b.click(); } return; }
+ if(e.code==='Space'){ e.preventDefault(); setPaused(!G.paused); }
+ if(e.code==='KeyI')modalOpen?closeModal():openInventory();
+ if(e.code==='KeyC')modalOpen?closeModal():openSheet();
+ if(e.code==='KeyJ')modalOpen?closeModal():openJournal();
+ if(e.code==='Escape')showSettings();
+ if(e.code==='Tab'){ e.preventDefault(); selectHero((G.sel+1)%G.party.length); }
+ ['Digit1','Digit2','Digit3','Digit4'].forEach((c,i)=>{ if(e.code===c)selectHero(i); }); });
+window.addEventListener('keyup',e=>{ keys[e.code]=false; });
+window.addEventListener('mousedown',e=>{ bumpIdle(); initAudio(); if(AC&&AC.state==='suspended')AC.resume();
+ if(!G||modalOpen||dlg||!renderer)return;
+ /* click to move / attack / interact */
+ const r=$('#c').getBoundingClientRect(); mouseV.x=((e.clientX-r.left)/r.width)*2-1; mouseV.y=-((e.clientY-r.top)/r.height)*2+1;
+ ray.setFromCamera(mouseV,camera);
+ const meshes=[]; entities.forEach(en=>{ if(en.mesh)meshes.push(en.mesh); }); interactables.forEach(x=>{ if(x.mesh)meshes.push(x.mesh); });
+ const hits=ray.intersectObjects(meshes,true);
+ const h=G.party[G.sel]; if(!h||!h.alive)return;
+ if(hits.length){ let o=hits[0].object; while(o.parent&&o.parent.type!=='Scene')o=o.parent;
+  const en=entities.find(x=>x.mesh===o||(x.mesh&&x.mesh.children.includes(o)));
+  if(en&&en.kind==='enemy'){ h.attackTarget=en; h.target=null; if(armed){ useAbility(G.sel,armed,en); armed=null; } return; }
+  if(en&&en.kind==='npc'){ talkTo(en); return; }
+  const ch=interactables.find(x=>x.mesh===o); if(ch){ tryInteract(ch); return; } }
+ const groundHit=ray.intersectObjects(scene.children.filter(o=>o.geometry&&o.geometry.type==='PlaneGeometry'));
+ if(groundHit.length){ const p=groundHit[0].point; h.target=new THREE.Vector3(p.x,1,p.z); h.attackTarget=null; } });
+window.addEventListener('wheel',e=>{ if(G)camDist=clamp(camDist+e.deltaY*.02,12,44); bumpIdle(); },{passive:true});
+window.addEventListener('mousemove',()=>{ idleTime=0; });
+function talkTo(npc){ if(npc.id==='cellar'){ if(G.quests.rats.active&&!G.quests.rats.done){ spawnRats(); G.quests.rats.stage=1; setPaused(false);} else toast('The cellar smells of cheese and consequence.'); return; }
+ if(npc.id==='guard'){ toast('Captain Wren: \u201CThe gate road is closed, by order of nobody alive.\u201D'); speak('The gate road is closed.',.85); return; }
+ const treeId=npc.id==='elder'?'elder':npc.id==='marta'?'marta':npc.id==='brynn'?'brynn':null;
+ if(treeId){ setPaused(true); openDialogue(treeId,'start',npc); }
+ else { setPaused(true); openDialogue('companion','start',G.party.find(p=>p.name===npc.name)||G.party[1]); } }
+function tryInteract(it){ const h=G.party[G.sel]; if(!h||!h.mesh)return;
+ if(it.kind==='portal'){ if(dist(h.mesh.position,new THREE.Vector3(it.x,0,it.z))>4){ h.target=new THREE.Vector3(it.x,1,it.z); toast('Walk to the '+it.label); return; }
+  if(it.locked&&!hasItem('key')){ toast('Sealed. An Ironwood Key is required — Forester Bryn keeps one.'); return; }
+  goZone(it.zone); placeChests(); return; }
+ if(it.kind==='chest'){ if(dist(h.mesh.position,new THREE.Vector3(it.x,0,it.z))>3.5){ h.target=new THREE.Vector3(it.x,1,it.z); return; }
+  if(it.opened){ toast('Empty, save for ambition.'); return; }
+  if(it.locked){ toast('Locked. A Rogue\u2019s Deft Hands (or luck) may open it — arm the ability and click.'); return; }
+  openChest(it); return; }
+ if(it.kind==='torch'){ toast('The torch sputters verses in a language of sparks.'); } }
+/* gamepad: first connected pad, button edge detection, settings invert fix */
+let padPrev=[],padInput={x:0,y:0,fire:false};
+function pollPad(){ const pads=navigator.getGamepads?navigator.getGamepads():[]; let gp=null;
+ for(const p of pads)if(p&&p.connected){gp=p;break;} if(!gp){padInput={x:0,y:0,fire:false};return;}
+ const pressed=i=>!!(gp.buttons[i]&&gp.buttons[i].pressed);
+ const edge=i=>pressed(i)&&!padPrev[i];
+ let ax=gp.axes[0]||0, ay=gp.axes[1]||0; if(SET.invertX)ax=-ax; if(SET.invertY)ay=-ay;
+ if(Math.abs(ax)<.18)ax=0; if(Math.abs(ay)<.18)ay=0;
+ /* dpad overrides */
+ if(pressed(14))ax=-1; if(pressed(15))ax=1; if(pressed(12))ay=-1; if(pressed(13))ay=1;
+ padInput={x:ax,y:ay,fire:pressed(0)};
+ const onTitle=!G&&!modalOpen, inMenu=!!modalOpen||!!dlg||onTitle;
+ if(inMenu){ if(edge(12)||edge(14)||(ay<-.5&&!pollPad.my))focusMove(-1); if(edge(13)||edge(15)||(ay>.5&&!pollPad.my))focusMove(1);
+  pollPad.my=(ay<-.5||ay>.5);
+  if(edge(0)){ bumpIdle(); initAudio(); const b=focusList[focusIdx]; if(b)b.click(); }
+  if(edge(1)){ if(dlg)closeDialogue(); else if(modalOpen)closeModal(); } }
+ else if(G){ if(edge(9))showSettings(); if(edge(1))setPaused(!G.paused);
+  if(edge(2)){ const list=['attack',...CLASSES[G.party[G.sel].cls].abilities]; armAbility(list[0]); }
+  if(edge(3))useAbility(G.sel,'potion',null);
+  if(edge(5))selectHero((G.sel+1)%G.party.length); if(edge(4))selectHero((G.sel+G.party.length-1)%G.party.length);
+  /* right stick camera */ let rx=gp.axes[2]||0, ry=gp.axes[3]||0; if(SET.invertX)rx=-rx; if(SET.invertY)ry=-ry;
+  camYaw+=rx*.03*SET.camSpeed; camDist=clamp(camDist+ry*.35,12,44); }
+ if(edge(9)&&!G&&!modalOpen)showSettings();
+ for(let i=0;i<16;i++)padPrev[i]=pressed(i); if(padInput.x||padInput.y||padInput.fire)bumpIdle(); }
+/* attract mode: AI-played demo after 10s idle on title */
+const ATTRACT_WP=[[0,10],[10,2],[2,-10],[-10,-2],[0,4]];
+function startAttract(){ if(!G)startDemoGame(); attract=true; attractT=0; $('#attractTag').classList.remove('hidden');
+ G.party.forEach(h=>{h.hp=h.maxhp;h.alive=true;}); logMsg('Attract: the tale tells itself…'); }
+function stopAttract(){ attract=false; $('#attractTag').classList.add('hidden'); }
+function startDemoGame(){ const hero=makeHero('Demo Hero','Fighter',null,0); G=newGame(hero.name,hero.cls,hero.stats);
+ $('#titleScreen').classList.add('hidden'); $('#hud').classList.remove('hidden');
+ if(!scene)bootWorld(); else { goZone('village'); placeChests(); } }
+function tickAttract(dt){ attractT+=dt; const wp=ATTRACT_WP[Math.floor(attractT/7)%ATTRACT_WP.length];
+ G.party.forEach((h,i)=>{ h.hp=h.maxhp; h.alive=true; h.target=new THREE.Vector3(wp[0]+i*1.4,1,wp[1]+(i%2)); });
+ camYaw+=dt*.12; if(Math.floor(attractT)%11===0&&attractT%1<dt)speak('Behold Thornwall, where the bell rings itself.',1); }
+/* ============ character creation & menus ============ */
+function showCreate(){ let cls='Fighter'; const rollStats=()=>({STR:8+d(6)+d(6),DEX:8+d(6)+d(6),CON:8+d(6)+d(6),INT:8+d(6)+d(6),WIS:8+d(6)+d(6),CHA:8+d(6)+d(6)});
+ let st=rollStats(); const draw=()=>{ showModal('<h2>🧙 Forge Your Hero</h2>'
+  +'<div class="row"><span>Name</span><input type="text" id="ccName" maxlength="18" value="Ash"></div>'
+  +'<div class="row"><span>Class</span><span>'+Object.keys(CLASSES).map(c=>'<button class="topBtn" data-cls="'+c+'">'+CLASSES[c].i+' '+c+'</button>').join(' ')+'</span></div>'
+  +'<p id="ccDesc">'+CLASSES[cls].i+' <b>'+cls+'</b> — '+CLASSES[cls].desc+'</p><p id="ccStats">'+Object.entries(st).map(([k,v])=>k+' '+v).join(' · ')+'</p>'
+  +'<button class="menuBtn" id="ccRoll">🎲 Re-roll ability scores</button><button class="menuBtn" id="ccGo">Begin — the road to Thornwall</button><button class="menuBtn" id="ccBack">Back</button>');
+  $$('#modalCard [data-cls]').forEach(b=>b.addEventListener('click',()=>{cls=b.dataset.cls; sfx('ui'); draw(); $('#ccDesc').textContent=CLASSES[cls].i+' '+cls+' — '+CLASSES[cls].desc;}));
+  const nm=$('#ccName'); if(nm)nm.addEventListener('click',e=>e.stopPropagation());
+  $('#ccRoll').addEventListener('click',()=>{ st=rollStats(); sfx('ui'); draw(); });
+  $('#ccBack').addEventListener('click',closeModal);
+  $('#ccGo').addEventListener('click',()=>{ const name=($('#ccName').value||'Ash').trim()||'Ash'; closeModal(); beginGame(name,cls,st); }); };
+ draw(); }
+function beginGame(name,cls,st){ initAudio(); G=newGame(name,cls,st);
+ $('#titleScreen').classList.add('hidden'); $('#hud').classList.remove('hidden'); reportedDone=false;
+ if(!scene)bootWorld(); else { goZone('village'); placeChests(); }
+ toast('Welcome to Thornwall, '+name+'. Speak with Elder Senn (click / walk close + Cross).');
+ setTimeout(()=>{ if(G&&G.quests.main.stage===0)toast('Tip: SPACE pauses time. Issue orders, then unpause — Baldur\u2019s Gate style.'); },4500); }
+/* title wiring */
+$$('#titleScreen [data-menu]').forEach(b=>b.addEventListener('click',()=>{ initAudio(); sfx('ui'); const k=b.dataset.menu; bumpIdle();
+ if(k==='new')showCreate();
+ if(k==='continue'){ if(!G){ G=newGame('Ash','Fighter',null); $('#titleScreen').classList.add('hidden'); $('#hud').classList.remove('hidden'); if(!scene)bootWorld(); else{goZone('village');placeChests();} }
+  if(loadGame(0))toast('Continued from autosave.'); else toast('No save yet — begin a New Game.'); }
+ if(k==='multi')showMultiplayer(); if(k==='settings')showSettings(); if(k==='about')showAbout(); }));
+$$('#hud [data-hud]').forEach(b=>b.addEventListener('click',()=>{ const k=b.dataset.hud; initAudio();
+ if(k==='pause')setPaused(!G.paused); if(k==='inv')openInventory(); if(k==='sheet')openSheet(); if(k==='journal')openJournal();
+ if(k==='save'){ showModal('<h2>💾 Save / Load</h2>'+[0,1,2].map(s=>'<div class="row"><span>Slot '+(s+1)+(localStorage.getItem('iwc-save-'+s)?' — a tale is kept here':' — empty')+'</span><span><button class="topBtn" data-sv="'+s+'">Save</button> <button class="topBtn" data-ld="'+s+'">Load</button></span></div>').join('')+'<button class="menuBtn" id="mClose">Close</button>');
+  $$('#modalCard [data-sv]').forEach(b=>b.addEventListener('click',()=>{ saveGame(+b.dataset.sv); closeModal(); }));
+  $$('#modalCard [data-ld]').forEach(b=>b.addEventListener('click',()=>{ closeModal(); if(!loadGame(+b.dataset.ld))toast('That slot is empty.'); }));
+  $('#mClose').addEventListener('click',closeModal); } if(k==='settings')showSettings(); }));
+$('#touchSettings').addEventListener('click',()=>showSettings(true));
+$('#touchGo').addEventListener('click',()=>$('#touchWarn').classList.add('hidden'));
+/* touch-only detection: no keyboard/mouse/gamepad signals, touch present */
+if(('ontouchstart'in window)&&navigator.maxTouchPoints>0){ setTimeout(()=>{ const gp=navigator.getGamepads&&[...navigator.getGamepads()].some(p=>p);
+ if(!gp)$('#touchWarn').classList.remove('hidden'); },1200); }
+/* ============ three boot (WebGPU only, no fallback) ============ */
+async function bootWorld(){ try{
+ if(!navigator.gpu){ showErr('WebGPU is not available in this browser (navigator.gpu missing).'); return; }
+ renderer=new WebGPURenderer({canvas:$('#c'),antialias:true}); renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+ renderer.setSize(innerWidth,innerHeight); renderer.shadowMap.enabled=true; await renderer.init();
+ scene=new THREE.Scene(); camera=new THREE.PerspectiveCamera(46,innerWidth/innerHeight,.1,220);
+ gradientMap=new THREE.DataTexture(new Uint8Array([90,150,205,255]),4,1,THREE.RedFormat); gradientMap.minFilter=THREE.NearestFilter; gradientMap.magFilter=THREE.NearestFilter; gradientMap.needsUpdate=true;
+ await RAPIER.init(); world3=new RAPIER.World({x:0,y:-18,z:0});
+ buildWorld(); placeChests(); window.__booted=true;
+ addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
+ renderer.setAnimationLoop(loop); refreshHUD();
+ }catch(err){ showErr(err&&err.message?err.message:String(err)); } }
+let worldSeconds=0;
+function loop(){ const dt=Math.min(clock.getDelta(),.05); worldSeconds+=dt;
+ pollPad();
+ if(G&&scene){ G.simTime+=dt; idleTime+=dt;
+  if(!G&&false){}
+  /* title idle -> attract */
+  if(!$('#titleScreen').classList.contains('hidden')&&idleTime>10&&!modalOpen&&!attract)startAttract();
+  if(attract)tickAttract(dt);
+  /* keyboard / stick movement for selected hero */
+  const h=G.party[G.sel];
+  if(h&&h.alive&&h.mesh&&!G.paused&&!dlg&&!modalOpen){ let mx=padInput.x,mz=padInput.y;
+   if(keys['KeyA']||keys['ArrowLeft'])mx-=1; if(keys['KeyD']||keys['ArrowRight'])mx+=1;
+   if(keys['KeyW']||keys['ArrowUp'])mz-=1; if(keys['KeyS']||keys['ArrowDown'])mz+=1;
+   if(mx||mz){ h.target=null; const sp=5.2; const c=Math.cos(camYaw),s=Math.sin(camYaw);
+    const wx=mx*c-mz*s, wz=-mx*s-mz*c; h.body.setLinvel({x:wx*sp,y:h.body.linvel().y,z:wz*sp},true);
+    h.mesh.rotation.y=Math.atan2(wx,wz); } }
+  /* followers trail the leader when idle */
+  G.party.forEach((p,i)=>{ if(i===G.sel||!p.alive||!p.mesh||G.paused||dlg)return;
+   const lead=G.party[G.sel]; if(lead&&lead.mesh&&!p.attackTarget){ const off=new THREE.Vector3((i-1.5)*1.3,0,1.6+((i%2)*.8));
+    const tp=lead.mesh.position.clone().add(off); if(dist(p.mesh.position,tp)>1.1)moveEntity(p,tp,4.4,dt); } });
+  tickCombat(dt);
+  /* sync meshes from physics */
+  entities.forEach(e=>{ if(e.body&&e.mesh){ const t=e.body.translation(); e.mesh.position.set(t.x,t.y-.95,t.z); } });
+  G.party.forEach(p=>{ if(p.body&&p.mesh){ const t=p.body.translation(); p.mesh.position.set(t.x,t.y-.95,t.z);
+   const u=p.mesh.userData; const moving=Math.abs(p.body.linvel().x)+Math.abs(p.body.linvel().z)>.4;
+   const sw=moving?Math.sin(worldSeconds*11)*.5:Math.sin(worldSeconds*2)*.06;
+   if(u.armL){u.armL.rotation.x=sw;u.armR.rotation.x=-sw;u.legL.rotation.x=-sw*.8;u.legR.rotation.x=sw*.8;u.body.position.y=.85+Math.abs(Math.sin(worldSeconds*(moving?11:2)))*.04;} } });
+  Object.values(remotePlayers).forEach(rp=>{ if(rp.mesh){ rp.mesh.position.x+=(rp.tx-rp.mesh.position.x)*.12; rp.mesh.position.z+=(rp.tz-rp.mesh.position.z)*.12; } });
+  world3.timestep=dt; world3.step();
+  /* interactions proximity prompt */
+  /* camera: isometric follow */
+  const focus=G.party[G.sel]&&G.party[G.sel].mesh?G.party[G.sel].mesh.position:camTarget;
+  camTarget.lerp(focus,.06);
+  camera.position.set(camTarget.x+Math.sin(camYaw)*camDist*.72,camDist*.78,camTarget.z+Math.cos(camYaw)*camDist*.72);
+  camera.lookAt(camTarget.x,1,camTarget.z);
+  if(keys['KeyQ'])camYaw+=dt*1.4*SET.camSpeed; if(keys['KeyE'])camYaw-=dt*1.4*SET.camSpeed;
+  /* floaters */
+  floaters=floaters.filter(f=>{ f.life-=dt; if(f.life<=0){f.el.remove();return false;}
+   const v=f.pos.clone(); v.y+= (1.2-f.life)*1.4; v.project(camera);
+   f.el.style.left=((v.x*.5+.5)*innerWidth)+'px'; f.el.style.top=((-v.y*.5+.5)*innerHeight)+'px'; return true; });
+  renderer.render(scene,camera); } }
+/* ============ AI Hub session (co-op) ============ */
+(async function hubBoot(){ setFocus($$('#titleScreen .menuBtn'));
+ try{ if(window.AIHub){ AIHub.probe(()=>({scene:modalOpen?'menu':(dlg?'menu':(!G?'title':(G.over||G.won?'over':'play'))),menu:!!modalOpen,world:worldSeconds,input:{x:padInput.x,y:padInput.y,fire:padInput.fire}}));
+  if(AIHub.active){ const info=await AIHub.connect({mode:'co-op',seats:[1,4]});
+   if(info){ hubInfo=info; netMode='hub'; $('#hubHint').textContent='AI Hub session: '+(info.players?info.players.length:1)+' player(s) · you are seat '+info.me+(info.isHost?' (host)':'');
+    AIHub.on('message',(data,from)=>onNetMessage(data,from));
+    AIHub.on('leave',()=>toast('A companion left the tale. The road goes on.'));
+    AIHub.on('time-up',()=>reportResult());
+    AIHub.on('end',()=>{ if(G){G.over=true;} stopAttract(); });
+    G=newGame((info.players&&info.players[info.me]?info.players[info.me].name:'Wanderer'),'Fighter',null);
+    $('#titleScreen').classList.add('hidden'); $('#hud').classList.remove('hidden');
+    bootWorld().then(()=>{ placeChests(); AIHub.ready(); toast('Session tale begun — defeat the Hollow Lich together!'); });
+   } } } }catch(e){ /* play normally */ }
+ /* standalone boot shows live world behind title */
+ if(!window.AIHub||!AIHub.active){ G=newGame('Ash','Fighter',null); bootWorld(); }
+ })();
+</script>
+</body>
+</html>

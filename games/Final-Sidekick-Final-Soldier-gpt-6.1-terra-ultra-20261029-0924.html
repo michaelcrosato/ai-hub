@@ -1,0 +1,819 @@
+<!doctype html>
+<!--
+Source Information
+Date: 2026-10-29 09:24
+Source: Final Soldier
+Tech: Three.js r180 WebGPU; Rapier 0.19.3; Gamepad API; Web Audio API; PeerJS 1.5.4; AI Hub session protocol 1, client 1.3.0.
+Art Direction: Original cel-shaded, neon arcade science fiction.
+Animation: Procedural real-time transforms and particle effects.
+Audio: Original code-generated music, synthesized sound effects and gibberish voice.
+Online: AI Hub parallel score attack; standalone PeerJS WebRTC score race through the public PeerServer.
+Testing: Lightweight browser and syntax checks; performance targets out of scope.
+Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort ultra.
+Usage: unknown.
+Testing Feedback: Two issues caught, one critical: Rapier sensor collisions and short-screen title clipping. Most helpful: real Rapier simulation smoke test. Least helpful: syntax check alone. Headless WebGPU canvas presentation could not be verified.
+Engine Feedback: Three.js makes expressive 3D scenes approachable. The initial Rapier sensor configuration was wrong; gameplay, interface and procedural audio had to be built. Browser WebGPU presentation was hardest to verify. The automatic renderer fallback deserves an overhaul; clearer WebGPU initialization errors would help.
+Prompt Feedback: The source and controller-first direction were useful. Standalone signaling details were unspecified. The hardest part was combining the shooter with online sessions. A real-controller, multi-device network playtest would be valuable.
+-->
+<html lang="en"><head><meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="2"><meta name="hub:session-goal" content="Highest score in the invasion"><meta name="hub:session-howto" content="Move stick; Cross fires; Square releases a pod; R1 changes speed"><meta name="hub:webgpu" content="required">
+<title>Final Sidekick</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800;900&family=Oxanium:wght@500;600;700;800&display=swap');
+:root{--ink:#071321;--white:#f2fbf6;--cyan:#79fbef;--orange:#ffb351;--muted:#99b9c1}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#061321;color:var(--white);font-family:'Barlow Condensed',sans-serif}button{font:inherit}#game{position:absolute;inset:0;width:100%;height:100%;display:block}#vignette{pointer-events:none;position:absolute;inset:0;background:radial-gradient(ellipse at 55% 48%,transparent 25%,#020b17a8 100%),linear-gradient(90deg,#061522dd 0%,transparent 45%,#06152255 100%)}#grain{pointer-events:none;position:absolute;inset:0;opacity:.12;background:repeating-linear-gradient(0deg,transparent 0 3px,#072239 4px)}.screen{position:absolute;inset:0}.hidden{display:none!important}#title{display:flex;align-items:center;padding:5vh 7vw}.title-content{width:min(600px,46vw);z-index:2}.eyebrow,.smallcap{font:700 clamp(11px,1vw,15px) Oxanium,sans-serif;letter-spacing:.22em;color:var(--cyan);text-transform:uppercase}.eyebrow:before{content:'';display:inline-block;width:35px;height:3px;background:var(--cyan);vertical-align:middle;margin-right:12px}h1{font:900 italic clamp(70px,8.8vw,150px)/.78 'Barlow Condensed',sans-serif;letter-spacing:-.045em;text-transform:uppercase;margin:24px 0 22px;text-shadow:0 6px 0 #244b56,0 12px 40px #000}h1 span{display:block;color:var(--orange)}.intro{max-width:430px;font-size:clamp(17px,1.6vw,24px);line-height:1.23;color:#d1e3e2;margin:0 0 25px}.menu{display:flex;flex-direction:column;gap:7px;width:min(370px,100%)}.menu button,.action{position:relative;border:1px solid #79fbef44;background:#091b2bd9;color:#e9faf8;text-align:left;padding:10px 18px;font-weight:800;font-size:clamp(18px,1.65vw,24px);letter-spacing:.04em;text-transform:uppercase;cursor:pointer;clip-path:polygon(0 0,96% 0,100% 25%,100% 100%,0 100%)}.menu button.selected,.menu button:hover,.action:hover,.action.selected{background:var(--cyan);color:#071b29;border-color:var(--cyan)}.menu button.selected:after{content:'➜';float:right}.footer{position:absolute;bottom:3.5vh;left:7vw;color:#aac5c8;font:600 13px Oxanium;letter-spacing:.08em}.footer b{color:var(--cyan)}.hero-label{position:absolute;right:5vw;bottom:6vh;text-align:right;font:700 12px Oxanium;letter-spacing:.2em;color:#b2d2d4}.hero-label strong{font:800 clamp(32px,4vw,58px) 'Barlow Condensed';display:block;color:#fff;letter-spacing:.02em}.panel-wrap{position:absolute;inset:0;display:grid;place-items:center;background:#04101bdc;backdrop-filter:blur(7px)}.panel{width:min(780px,90vw);max-height:88vh;overflow:auto;border:1px solid #69e8df66;background:linear-gradient(135deg,#112e3a,#081624 70%);padding:clamp(24px,4vw,50px);box-shadow:0 25px 100px #0009}.panel h2{font:900 italic clamp(40px,5vw,68px)/.9 'Barlow Condensed';text-transform:uppercase;margin:12px 0 20px}.panel p{font-size:clamp(17px,1.5vw,22px);line-height:1.3;color:#c4d7d9}.panel .menu{width:100%}.row{display:flex;justify-content:space-between;align-items:center;gap:15px;border-bottom:1px solid #ffffff1a;padding:9px 0;font-size:21px}.row b{color:var(--cyan)}.help-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 28px}.pill{color:#061a24;background:var(--cyan);font:800 14px Oxanium;padding:4px 8px;margin-right:8px;display:inline-block}.hint{color:#8eafb7;font:600 13px Oxanium;letter-spacing:.06em;margin-top:24px}.detail{font-size:16px!important;line-height:1.35!important}.detail b{color:var(--cyan)}#hud{pointer-events:none;position:absolute;inset:0;display:flex;justify-content:space-between;padding:3vh 3vw;font-family:Oxanium,sans-serif;text-shadow:0 2px 5px #000}.hudblock{min-width:180px}.hud-label{font-size:11px;letter-spacing:.18em;color:#a8c9ca}.hud-score{font-size:clamp(25px,3vw,42px);font-weight:800;letter-spacing:.04em}.hud-weapon{margin-top:12px;color:var(--cyan);font-weight:800}.hud-right{text-align:right}.bar{width:200px;height:6px;background:#304958;margin:8px 0 0 auto}.bar i{display:block;height:100%;background:#ffb351;width:100%}#announce{position:absolute;top:17%;left:50%;transform:translateX(-50%);text-align:center;pointer-events:none;text-shadow:0 3px 12px #000;transition:opacity .3s}.announce-title{font:900 italic clamp(36px,5vw,70px) 'Barlow Condensed';letter-spacing:.05em;color:#fff}.announce-sub{font:700 12px Oxanium;color:var(--cyan);letter-spacing:.25em}#attractTag{position:absolute;bottom:7%;left:50%;transform:translateX(-50%);font:800 18px Oxanium;letter-spacing:.16em;color:#fff;text-shadow:0 2px 12px #000;white-space:nowrap}#touch{position:absolute;inset:0;background:#061421;display:grid;place-items:center;text-align:center;z-index:10}.touch-inner{padding:30px}#touch h2{font:900 48px 'Barlow Condensed';text-transform:uppercase}.status{min-height:30px;color:var(--orange)!important}#error{z-index:20}#onlineCode{font:800 42px Oxanium;color:var(--cyan);letter-spacing:.15em}#rival{font-size:13px;color:#ffcf84;margin-top:12px}@media(max-width:700px){#title{padding:5vw}.title-content{width:75vw}h1{font-size:65px}.hero-label{display:none}.help-grid{grid-template-columns:1fr}.hudblock{min-width:100px}.bar{width:120px}}
+@media(max-height:650px){#title{padding-top:2vh;padding-bottom:2vh}.title-content{max-height:96vh}.eyebrow{font-size:10px}h1{font-size:clamp(48px,12vh,85px);margin:10px 0}.intro{font-size:15px;line-height:1.15;margin:0 0 10px}.menu{gap:4px}.menu button{font-size:16px;padding:6px 14px}.footer{bottom:1vh;font-size:10px}.hero-label{bottom:3vh}.panel{max-height:94vh;padding:20px}.panel h2{font-size:40px;margin:8px 0}.panel p{font-size:16px;margin:8px 0}.hint{margin-top:10px}}
+</style></head><body>
+<canvas id="game"></canvas><div id="vignette"></div><div id="grain"></div>
+<div id="title" class="screen"><div class="title-content"><div class="eyebrow">A celestial arcade adventure</div><h1>Final <span>Sidekick</span></h1><p class="intro">The stars are under siege. Take your wingmates into the fire and give the invaders a spectacular farewell.</p><div class="menu" id="titleMenu"></div></div><div class="hero-label">SECTOR 01 / THE OUTER REACH<strong>THE SKY IS CALLING</strong>ONE SHIP. TWO FAITHFUL PODS.</div><div class="footer"><b>✕</b> SELECT &nbsp;&nbsp; <b>↑↓</b> NAVIGATE &nbsp;&nbsp; <b>OPTIONS / ESC</b> SETTINGS</div></div>
+<div id="hud" class="hidden"><div class="hudblock"><div class="hud-label">SCORE</div><div id="score" class="hud-score">00000000</div><div id="weapon" class="hud-weapon">VULCAN · LV 1</div><div id="rival"></div></div><div class="hudblock hud-right"><div class="hud-label" id="phase">SECTOR 01</div><div class="hud-score" id="lives">♥ ♥ ♥</div><div class="hud-weapon" id="pods">SIDEKICKS ◇ ◇</div><div id="bossBar" class="bar hidden"><i></i></div></div></div><div id="announce" class="hidden"><div class="announce-title"></div><div class="announce-sub"></div></div><div id="attractTag" class="hidden">DEMONSTRATION · PRESS ANY BUTTON</div>
+<div id="overlay" class="panel-wrap hidden"><div class="panel"><div class="smallcap" id="panelKicker"></div><h2 id="panelTitle"></h2><div id="panelBody"></div><div id="panelMenu" class="menu"></div><div class="hint" id="panelHint">✕ SELECT &nbsp;&nbsp; ○ BACK &nbsp;&nbsp; ↑↓ NAVIGATE</div></div></div>
+<div id="touch" class="hidden"><div class="touch-inner"><div class="smallcap">FINAL SIDEKICK</div><h2>Controller or keyboard required</h2><button class="action" id="touchSettings">Settings</button></div></div>
+<div id="error" class="panel-wrap hidden"><div class="panel"><div class="smallcap">SYSTEM NOTICE</div><h2>WebGPU required</h2><p id="errorText">This game needs a browser with WebGPU enabled. Please try a supported browser on a compatible device.</p></div></div>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+// Arcade simulation. Coordinates are world-space XY; +Y is forward.
+class Shooter {
+  constructor({THREE,RAPIER,scene,onEvent=()=>{}}) {
+    this.T=THREE; this.R=RAPIER; this.scene=scene; this.emit=onEvent;
+    this.root=new THREE.Group(); scene.add(this.root); this.running=false;
+    this.mat={};
+    const colors={ink:0x11172a,white:0xeaf8f7,cyan:0x54f9f1,blue:0x268ed4,red:0xff5d66,orange:0xffa852,yellow:0xffe78a,purple:0xc18aff,ground:0x172f47,ground2:0x254c63,dim:0x386778};
+    for(const [k,c] of Object.entries(colors)) this.mat[k]=new THREE.MeshToonMaterial({color:c});
+    this.geo={box:new THREE.BoxGeometry(1,1,1),ball:new THREE.IcosahedronGeometry(1,1),cone:new THREE.ConeGeometry(1,1,5),cyl:new THREE.CylinderGeometry(1,1,1,8)};
+  }
+  mesh(g,m,x,y,z,sx,sy,sz,parent=this.root) {const o=new this.T.Mesh(this.geo[g],this.mat[m]);o.position.set(x,y,z);o.scale.set(sx,sy,sz);parent.add(o);return o;}
+  piece(parent,g,m,x,y,z,sx,sy,sz,rot=0){const o=this.mesh(g,m,x,y,z,sx,sy,sz,parent);o.rotation.z=rot;return o;}
+  ship(color='cyan') {
+    const g=new this.T.Group();this.root.add(g);
+    this.piece(g,'cone','ink',0,0,0,.82,2.4,.4);this.piece(g,'cone',color,0,.05,.15,.68,2.05,.35);
+    this.piece(g,'box','ink',0,-.35,-.05,2.05,.55,.3);this.piece(g,'box',color,0,-.28,.12,1.85,.4,.3);
+    this.piece(g,'ball','white',0,.1,.36,.24,.39,.18);this.piece(g,'box','orange',-.43,-.87,.15,.19,.48,.17);this.piece(g,'box','orange',.43,-.87,.15,.19,.48,.17);
+    return g;
+  }
+  enemyMesh(kind) {
+    const g=new this.T.Group();this.root.add(g);
+    if(kind==='boss') {
+      this.piece(g,'box','ink',0,0,0,6.5,2.7,.45);this.piece(g,'box','red',0,0,.2,6.15,2.3,.4);
+      this.piece(g,'cone','ink',0,-1.2,.15,2.15,3.4,.5,Math.PI);this.piece(g,'cone','orange',0,-1.05,.4,1.75,2.8,.4,Math.PI);
+      for(const x of [-2.3,2.3]) {this.piece(g,'box','purple',x,-1,.3,1.3,2,.45);this.piece(g,'ball','yellow',x,-1.45,.6,.36,.36,.22);}
+      this.piece(g,'ball','cyan',0,.15,.65,.8,.8,.4);return g;
+    }
+    let c=kind==='tank'?'purple':kind==='carrier'?'orange':kind==='zig'?'red':'blue';
+    this.piece(g,'cone','ink',0,0,0,.85,1.7,.4,Math.PI);this.piece(g,'cone',c,0,0,.18,.72,1.5,.32,Math.PI);
+    this.piece(g,'box',c,0,.25,.1,1.65,.45,.3);this.piece(g,'ball','yellow',0,-.15,.4,.25,.25,.18);
+    if(kind==='tank'||kind==='carrier') g.scale.setScalar(1.35);
+    return g;
+  }
+  addCollider(obj,r){obj.body=this.world.createRigidBody(this.R.RigidBodyDesc.kinematicPositionBased().setTranslation(obj.x,obj.y,0));const cd=this.R.ColliderDesc.ball(r).setSensor(true).setActiveCollisionTypes(this.R.ActiveCollisionTypes.ALL);obj.col=this.world.createCollider(cd,obj.body);}
+  updateCol(o){if(o.body)o.body.setNextKinematicTranslation({x:o.x,y:o.y,z:0});}
+  remove(o){if(o.dead)return;o.dead=true;if(o.mesh){o.mesh.removeFromParent();}if(o.body){this.world.removeRigidBody(o.body);o.body=null;o.col=null;}}
+  clear(){if(this.world){this.world.free();this.world=null;} this.root.clear();this.bullets=[];this.enemies=[];this.drops=[];this.fx=[];this.players=[];}
+  start({attract=false,players=1}={}) {
+    this.clear();this.world=new this.R.World({x:0,y:0,z:0});this.running=true;this.attract=attract;this.elapsed=0;this.spawnClock=0;this.wave=0;this.bossSpawned=false;this.endClock=0;this.fireClock=0;this.msgClock=0;
+    this.state={score:0,lives:3,bombs:2,weapon:'VULCAN',level:1,speed:2,time:0,bossHp:0,bossMax:1,phase:'mission',combo:0,players};
+    this.stars=[];this.terrain=[];
+    for(let i=0;i<55;i++){let star=this.mesh('box',i%5?'dim':'cyan',(Math.random()-.5)*18,(Math.random()-.5)*25,-4,.025+Math.random()*.035,.08+Math.random()*.2,.05);this.stars.push({mesh:star,speed:1+Math.random()*3});}
+    // Scrolling mechanical landscape: layered channels and towers.
+    for(let i=0;i<12;i++){const g=new this.T.Group();this.root.add(g);g.position.set(0,-12+i*2.3,-5);
+      this.piece(g,'box','ground',0,0,0,18,2.18,.1);for(const side of [-1,1]) {this.piece(g,'box','ground2',side*7.7,0,.2,2.1,2.0,.2);this.piece(g,'box','dim',side*6.6,0,.3,.12,2,.1);this.piece(g,'box','ink',side*8,.1,.32,1.3,1.2,.1);this.piece(g,'box','cyan',side*8,.1,.4,.75,.06,.1);}this.terrain.push(g);}
+    for(let i=0;i<players;i++){let p={x:players===1?0:(i?2:-2),y:-7.5,mesh:this.ship(i?'purple':'cyan'),inv:2,cool:0,bombHeld:false,swapHeld:false,speedHeld:false,index:i};p.pods=[];for(const side of [-1,1]){const pod=new this.T.Group();p.mesh.add(pod);this.piece(pod,'ball','ink',0,0,0,.38,.38,.25);this.piece(pod,'ball','yellow',0,0,.25,.28,.28,.2);this.piece(pod,'box','white',0,.03,.48,.12,.28,.08);pod.position.set(side*1.12,-1.08,0);p.pods.push(pod);}this.addCollider(p,.48);this.players.push(p);}
+    this.emit('message',{title:'OPERATION 01',sub:'BREAK THROUGH THE IRON FRONT'});this.emit('voice','launch');
+  }
+  stop(){this.running=false;this.clear();}
+  spawnEnemy(kind,x,y=13) {const boss=kind==='boss';let hp=boss?180:kind==='tank'?12:kind==='carrier'?8:kind==='zig'?4:3;const e={kind,x,y,baseX:x,age:0,hp,max:hp,fire:.9+Math.random()*1.4,mesh:this.enemyMesh(kind),r:boss?2.25:kind==='tank'||kind==='carrier'?.8:.6};e.mesh.position.set(x,y,0);this.addCollider(e,e.r);this.enemies.push(e);return e;}
+  spawnBullet(x,y,vx,vy,friendly,damage=1,color='cyan',size=.22){const b={x,y,vx,vy,friendly,damage,r:size,mesh:this.mesh('ball',color,x,y,.6,size,size*(friendly?2:1),.2)};this.addCollider(b,size);this.bullets.push(b);}
+  spawnDrop(x,y,type){const d={x,y,type,age:0,mesh:new this.T.Group()};this.root.add(d.mesh);this.piece(d.mesh,'ball','ink',0,0,0,.65,.65,.2);this.piece(d.mesh,'ball',type==='bomb'?'yellow':type==='life'?'red':type==='WAVE'?'purple':type==='LASER'?'orange':type==='FLAME'?'red':'cyan',0,0,.2,.5,.5,.2);const glyph={V:[[0,-.12,.07,.35,-.4],[0,-.12,.07,.35,.4]],W:[[-.2,0,.07,.38,-.15],[-.07,-.06,.07,.3,.35],[.07,-.06,.07,.3,-.35],[.2,0,.07,.38,.15]],L:[[-.16,0,.07,.4,0],[0,-.17,.3,.07,0]],F:[[-.16,0,.07,.4,0],[0,.17,.3,.07,0],[-.03,0,.25,.07,0]],B:[[-.16,0,.07,.4,0],[0,.17,.3,.07,0],[0,0,.3,.07,0],[0,-.17,.3,.07,0],[.14,0,.07,.35,0]]};const key=type==='bomb'?'B':type==='life'?'B':type[0];for(const [x,y,w,h,r] of glyph[key]||glyph.V)this.piece(d.mesh,'box','white',x,y,.45,w,h,.08,r);this.addCollider(d,.65);this.drops.push(d);}
+  burst(x,y,color='orange',count=8){for(let i=0;i<count;i++){const a=Math.random()*Math.PI*2,s=1+Math.random()*5;let f={x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,age:0,life:.3+Math.random()*.5,mesh:this.mesh('ball',color,x,y,1,.12+Math.random()*.15,.12+Math.random()*.15,.15)};this.fx.push(f);}}
+  killEnemy(e){if(e.dead)return;this.remove(e);this.state.score+=e.kind==='boss'?10000:e.kind==='tank'?450:e.kind==='carrier'?300:100;this.state.combo++;this.burst(e.x,e.y,e.kind==='boss'?'cyan':'orange',e.kind==='boss'?35:9);this.emit('sfx','explosion');if(e.kind==='carrier'){const types=['VULCAN','WAVE','LASER','FLAME','bomb'];this.spawnDrop(e.x,e.y,types[Math.floor(this.elapsed/12)%types.length]);}if(e.kind==='boss'){this.state.phase='clear';this.endClock=3;this.emit('sfx','victory');this.emit('voice','victory');this.emit('message',{title:'MISSION COMPLETE',sub:'THE FRONT IS BROKEN. GOOD FLYING.'});}}
+  damagePlayer(p){if(p.inv>0||this.attract||this.state.phase!=='mission'&&this.state.phase!=='boss')return;p.inv=2.5;if(this.state.level>1){this.state.level--;this.emit('message',{title:'WEAPON DAMAGED',sub:'POWER LEVEL REDUCED'});}else this.state.lives--;this.state.combo=0;this.burst(p.x,p.y,'red',14);this.emit('sfx','damage');if(this.state.lives<=0){this.state.phase='gameover';this.endClock=2;this.emit('sfx','death');this.emit('message',{title:'MISSION FAILED',sub:'THE STARS ARE STILL WAITING'});}}
+  firePlayer(p){const w=this.state.weapon,lv=this.state.level;const speed=19;if(w==='VULCAN'){for(let i=0;i<Math.min(lv+1,4);i++){const dx=(i-(Math.min(lv+1,4)-1)/2)*.28;this.spawnBullet(p.x+dx,p.y+.8,dx*1.1,speed,true,1,'cyan',.16);}}else if(w==='WAVE'){for(let i=-1;i<=1;i++)this.spawnBullet(p.x+i*.28,p.y+.7,i*(2+lv*.5),15,true,1.3,'purple',.23);}else if(w==='LASER'){this.spawnBullet(p.x,p.y+.8,0,25,true,3+lv,'orange',.25);}else {for(let i=-1;i<=1;i++)this.spawnBullet(p.x+i*.22,p.y+.7,i*(2+lv*.4),11,true,1.3+lv*.3,'red',.3);}for(let i=0;i<this.state.bombs;i++)this.spawnBullet(p.x+(i?1:-1)*1.12,p.y-.25,0,18,true,.65,'yellow',.12);this.emit('sfx','shoot');}
+  bomb(p){if(this.state.bombs<=0&&!this.attract)return;this.state.bombs=Math.max(0,this.state.bombs-1);for(const b of this.bullets)if(!b.friendly)this.remove(b);for(const e of this.enemies){if(!e.dead){e.hp-=e.kind==='boss'?30:20;this.burst(e.x,e.y,'cyan',4);if(e.hp<=0)this.killEnemy(e);}}this.burst(p.x,p.y,'cyan',30);p.inv=Math.max(p.inv,1.2);this.emit('sfx','bomb');this.emit('message',{title:'NOVA BURST',sub:'HOSTILE FIRE NEUTRALIZED'});}
+  pickup(p,d){this.remove(d);if(d.type==='bomb')this.state.bombs=Math.min(2,this.state.bombs+1);else if(d.type==='life')this.state.lives=Math.min(5,this.state.lives+1);else if(this.state.weapon===d.type)this.state.level=Math.min(4,this.state.level+1);else{this.state.weapon=d.type;this.state.level=1;}this.state.score+=250;this.emit('sfx','power');this.emit('message',{title:d.type==='bomb'?'NOVA +1':d.type==='life'?'SHIELD +1':d.type+' ONLINE',sub:'SUPPLY ACQUIRED'});}
+  update(dt,input={}){
+    if(!this.running)return;dt=Math.min(dt,.05);this.elapsed+=dt;this.state.time=this.elapsed;
+    for(const s of this.stars){s.mesh.position.y-=s.speed*dt;if(s.mesh.position.y< -13)s.mesh.position.y=13;}
+    for(const t of this.terrain){t.position.y-=1.6*dt;if(t.position.y< -14)t.position.y+=27.6;}
+    if(this.state.phase==='clear'||this.state.phase==='gameover'){this.endClock-=dt;if(this.endClock<=0){if(this.attract)this.start({attract:true,players:1});else{this.running=false;this.emit('end',{win:this.state.phase==='clear',score:this.state.score});}}}
+    const active=this.state.phase==='mission'||this.state.phase==='boss';
+    if(active){
+      if(this.state.phase==='mission'){
+        this.spawnClock-=dt;if(this.spawnClock<=0&&this.elapsed<77){this.wave++;this.spawnClock=this.wave%4===0?3.5:2.1;const pattern=this.wave%5;if(pattern===0){this.spawnEnemy('carrier',Math.sin(this.wave)*5);this.spawnEnemy('tank',-Math.sin(this.wave)*4,15);}else if(pattern===1){for(let i=0;i<5;i++)this.spawnEnemy('drone',-6+i*3,13+i*.9);}else if(pattern===2){for(let i=0;i<4;i++)this.spawnEnemy('zig',-5+i*3.3,13+i*1.1);}else if(pattern===3){this.spawnEnemy('tank',-4);this.spawnEnemy('tank',4,15);}else {for(let i=0;i<5;i++)this.spawnEnemy('drone',(i-2)*2.4,13+Math.abs(i-2));}}
+        if(this.elapsed>77&&!this.bossSpawned){this.bossSpawned=true;this.state.phase='boss';const b=this.spawnEnemy('boss',0,15);this.state.bossHp=b.hp;this.state.bossMax=b.hp;this.emit('sfx','warning');this.emit('voice','warning');this.emit('message',{title:'WARNING',sub:'FORTRESS CLASS SIGNATURE APPROACHING'});}
+      }
+      for(const p of this.players){let inp=p.index?input.p2||{}:input;if(this.attract){let target=this.enemies.find(e=>e.kind==='boss')||this.enemies.find(e=>!e.dead&&e.y<10);inp={x:target?Math.max(-1,Math.min(1,(target.x-p.x)*.7)):Math.sin(this.elapsed*.8),y:Math.sin(this.elapsed*.55)*.4,fire:true,bomb:Math.floor(this.elapsed)%19===0};}p.x=Math.max(-7.3,Math.min(7.3,p.x+(inp.x||0)*(4+this.state.speed*2)*dt));p.y=Math.max(-10,Math.min(9,p.y+(inp.y||0)*(4+this.state.speed*2)*dt));p.inv=Math.max(0,p.inv-dt);p.mesh.position.set(p.x,p.y,.4);p.mesh.rotation.z=-(inp.x||0)*.18;p.pods.forEach((pod,i)=>{pod.visible=i<this.state.bombs;pod.position.y=-1.08+Math.sin(this.elapsed*5+i)*.1;});p.mesh.visible=p.inv===0||Math.floor(p.inv*12)%2===0;this.updateCol(p);p.cool-=dt;if(inp.fire&&p.cool<=0){this.firePlayer(p);p.cool=this.state.weapon==='LASER'?.22:.14;}if(inp.bomb&&!p.bombHeld)this.bomb(p);if(inp.swap&&!p.swapHeld){let ws=['VULCAN','WAVE','LASER','FLAME'];this.state.weapon=ws[(ws.indexOf(this.state.weapon)+1)%ws.length];this.state.level=1;this.emit('sfx','power');}if(inp.speed&&!p.speedHeld){this.state.speed=this.state.speed%3+1;this.emit('sfx','select');}p.bombHeld=!!inp.bomb;p.swapHeld=!!inp.swap;p.speedHeld=!!inp.speed;}
+      for(const e of this.enemies){if(e.dead)continue;e.age+=dt;if(e.kind==='boss'){e.y=Math.max(7,e.y-dt*2);e.x=Math.sin(e.age*.65)*4;this.state.bossHp=Math.max(0,e.hp);}else {e.y-=dt*(e.kind==='drone'?3.6:e.kind==='zig'?2.6:1.6);if(e.kind==='zig')e.x=e.baseX+Math.sin(e.age*2.8)*2;if(e.kind==='carrier')e.x=e.baseX+Math.sin(e.age)*2;}e.mesh.position.set(e.x,e.y,0);e.mesh.rotation.z=e.kind==='zig'?Math.sin(e.age*2.8)*.25:0;this.updateCol(e);e.fire-=dt;if(e.fire<=0&&e.y<10){const p=this.players[0];if(e.kind==='boss'){for(let i=-3;i<=3;i++)this.spawnBullet(e.x+i*.55,e.y-1.5,i*1.1,-5,false,1,'red',.25);e.fire=1.1;}else {const dx=p.x-e.x,dy=p.y-e.y,l=Math.hypot(dx,dy)||1;this.spawnBullet(e.x,e.y-.6,dx/l*4.5,dy/l*4.5,false,1,'red',.2);e.fire=e.kind==='tank'?1.5:2.6;}}if(e.y< -14)this.remove(e);}
+      for(const b of this.bullets){if(b.dead)continue;b.x+=b.vx*dt;b.y+=b.vy*dt;b.mesh.position.set(b.x,b.y,.6);this.updateCol(b);if(Math.abs(b.y)>14||Math.abs(b.x)>10)this.remove(b);}
+      for(const d of this.drops){if(d.dead)continue;d.age+=dt;d.y-=dt*2;d.mesh.position.set(d.x,d.y,.5);d.mesh.rotation.z+=dt;this.updateCol(d);if(d.y< -13)this.remove(d);}
+      // Rapier's narrow phase resolves the proximity of every active sensor.
+      this.world.timestep=dt;this.world.step();
+      for(const b of this.bullets){if(b.dead)continue;if(b.friendly){for(const e of this.enemies){if(!e.dead&&this.world.intersectionPair(b.col,e.col)){e.hp-=b.damage;this.remove(b);this.burst(b.x,b.y,'yellow',2);if(e.hp<=0)this.killEnemy(e);break;}}}else{for(const p of this.players){if(!b.dead&&this.world.intersectionPair(b.col,p.col)){this.remove(b);this.damagePlayer(p);}}}}
+      for(const p of this.players){for(const e of this.enemies)if(!e.dead&&this.world.intersectionPair(p.col,e.col))this.damagePlayer(p);for(const d of this.drops)if(!d.dead&&this.world.intersectionPair(p.col,d.col))this.pickup(p,d);}
+    }
+    for(const f of this.fx){f.age+=dt;f.x+=f.vx*dt;f.y+=f.vy*dt;f.mesh.position.set(f.x,f.y,1);f.mesh.scale.multiplyScalar(.97);if(f.age>f.life)this.remove(f);}
+    this.bullets=this.bullets.filter(o=>!o.dead);this.enemies=this.enemies.filter(o=>!o.dead);this.drops=this.drops.filter(o=>!o.dead);this.fx=this.fx.filter(o=>!o.dead);
+  }
+}
+
+/* Original procedural arcade score, effects and radio chatter. */
+class ArcadeAudio {
+  constructor() {
+    this.context = null;
+    this.master = null;
+    this.musicBus = null;
+    this.effectBus = null;
+    this.muted = false;
+    this.musicOn = true;
+    this.step = 0;
+    this.nextBeat = 0;
+    this.mode = 'menu';
+    this.lastEffect = Object.create(null);
+  }
+  start() {
+    if (!this.context) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      this.context = new AudioContextClass();
+      this.master = this.context.createGain();
+      this.master.gain.value = 0.38;
+      this.master.connect(this.context.destination);
+      this.musicBus = this.context.createGain();
+      this.musicBus.gain.value = 0.32;
+      this.musicBus.connect(this.master);
+      this.effectBus = this.context.createGain();
+      this.effectBus.gain.value = this.muted ? 0 : 0.58;
+      this.effectBus.connect(this.master);
+      this.nextBeat = this.context.currentTime + 0.05;
+    }
+    if (this.context.state === 'suspended') this.context.resume().catch(() => {});
+  }
+  setMuted(value) {
+    this.muted = !!value;
+    if (this.effectBus) this.effectBus.gain.setTargetAtTime(this.muted ? 0 : 0.58, this.context.currentTime, 0.03);
+  }
+  setMusic(value) { this.musicOn = !!value; }
+  tone(freq, duration, type = 'square', volume = 0.12, when = 0, endFreq = freq, bus = this.effectBus) {
+    if (!this.context || !bus || !Number.isFinite(freq)) return;
+    const c = this.context, t = Math.max(c.currentTime, when || c.currentTime);
+    const oscillator = c.createOscillator(), envelope = c.createGain();
+    oscillator.type = type;
+    oscillator.frequency.setValueAtTime(Math.max(20, freq), t);
+    oscillator.frequency.exponentialRampToValueAtTime(Math.max(20, endFreq), t + duration);
+    envelope.gain.setValueAtTime(0.0001, t);
+    envelope.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), t + Math.min(0.012, duration / 4));
+    envelope.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+    oscillator.connect(envelope); envelope.connect(bus);
+    oscillator.start(t); oscillator.stop(t + duration + 0.01);
+  }
+  noise(duration, volume, when = 0, lowpass = 3000) {
+    if (!this.context) return;
+    const c = this.context, t = Math.max(c.currentTime, when || c.currentTime);
+    const buffer = c.createBuffer(1, Math.ceil(c.sampleRate * duration), c.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const source = c.createBufferSource(), filter = c.createBiquadFilter(), envelope = c.createGain();
+    source.buffer = buffer; filter.type = 'lowpass'; filter.frequency.value = lowpass;
+    envelope.gain.setValueAtTime(volume, t);
+    envelope.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+    source.connect(filter); filter.connect(envelope); envelope.connect(this.effectBus);
+    source.start(t); source.stop(t + duration);
+  }
+  sfx(name) {
+    if (!this.context || this.context.state !== 'running') return;
+    const t = this.context.currentTime;
+    // Rapid fire and impact sounds are intentionally rate limited.
+    const cooldown = name === 'shoot' ? 0.075 : name === 'hit' ? 0.06 : 0;
+    if (t - (this.lastEffect[name] || -10) < cooldown) return;
+    this.lastEffect[name] = t;
+    switch (name) {
+      case 'shoot': this.tone(750, .09, 'square', .09, t, 250); break;
+      case 'hit': this.tone(550, .07, 'triangle', .1, t, 170); break;
+      case 'explosion': this.noise(.32, .30, t, 950); this.tone(135, .32, 'sawtooth', .20, t, 42); break;
+      case 'power': [660, 880, 1320].forEach((n,i) => this.tone(n,.12,'square',.13,t+i*.08,n)); break;
+      case 'bomb': this.noise(.7, .42, t, 1800); this.tone(240,.8,'sawtooth',.22,t,35); break;
+      case 'damage': this.noise(.19,.26,t,1200); this.tone(230,.24,'square',.17,t,65); break;
+      case 'select': this.tone(520,.065,'triangle',.16,t,690); break;
+      case 'confirm': this.tone(660,.1,'square',.13,t,880); this.tone(990,.15,'triangle',.12,t+.07,1200); break;
+      case 'warning': this.tone(420,.18,'square',.14,t,420); this.tone(420,.18,'square',.14,t+.24,420); break;
+      case 'victory': [523,659,784,1047].forEach((n,i) => this.tone(n,.28,'square',.13,t+i*.14,n)); break;
+      case 'death': this.tone(520,.55,'sawtooth',.15,t,55); this.noise(.35,.18,t,900); break;
+      default: this.tone(650,.08,'triangle',.10,t,850);
+    }
+  }
+  voice(phrase = '') {
+    if (!this.context || this.context.state !== 'running') return;
+    const t = this.context.currentTime;
+    // Short invented syllables; the filtered pitched chirps evoke a radio operator.
+    const count = Math.min(7, Math.max(3, Math.ceil(phrase.length / 5)));
+    for (let i = 0; i < count; i++) {
+      const pitch = 230 + ((i * 73 + phrase.length * 37) % 180);
+      this.tone(pitch, .075, 'sawtooth', .08, t + i * .085, pitch * (i % 2 ? 1.32 : .82));
+      this.tone(pitch * 2.03, .065, 'sine', .045, t + i * .085, pitch * 2.4);
+    }
+  }
+  update(dt, mode = 'play') {
+    if (!this.context || this.context.state !== 'running') return;
+    this.mode = mode;
+    const c = this.context;
+    if (this.nextBeat < c.currentTime - 0.5) this.nextBeat = c.currentTime + 0.03;
+    const boss = mode === 'boss';
+    const interval = boss ? .115 : mode === 'menu' ? .155 : .13;
+    while (this.nextBeat < c.currentTime + .12) {
+      if (this.musicOn && mode !== 'pause') this.musicStep(this.step, this.nextBeat, boss, mode === 'menu');
+      this.nextBeat += interval;
+      this.step++;
+    }
+  }
+  musicStep(step, t, boss, menu) {
+    const chords = boss ? [[45,48,52],[41,45,48],[43,47,50],[40,43,47]] : [[45,48,52],[41,45,48],[48,52,55],[43,47,50]];
+    const chord = chords[Math.floor(step / 16) % chords.length];
+    const midi = n => 440 * Math.pow(2, (n - 69) / 12);
+    const pattern = [0,2,1,2,0,2,1,2,0,2,1,2,0,1,2,1];
+    const lead = chord[pattern[step % 16]] + 12 + (step % 16 === 14 ? 12 : 0);
+    this.tone(midi(lead), menu ? .12 : .095, 'square', menu ? .07 : .09, t, midi(lead), this.musicBus);
+    if (step % 4 === 0) this.tone(midi(chord[0] - 12), .22, 'triangle', .22, t, midi(chord[0] - 12), this.musicBus);
+    if (step % 8 === 4) this.tone(midi(chord[1] - 12), .15, 'triangle', .12, t, midi(chord[1] - 12), this.musicBus);
+    if (step % 4 === 0) this.tone(115, .08, 'sine', .22, t, 42, this.musicBus);
+    if (step % 4 === 2) this.tone(2400, .025, 'square', .025, t, 1100, this.musicBus);
+  }
+}
+
+const $=id=>document.getElementById(id);
+const title=$('title'),overlay=$('overlay'),hud=$('hud'),announce=$('announce');
+let renderer, scene, camera, game, audio=new ArcadeAudio(), screen='title', previous='title', menuIndex=0, entries=[], idle=0, now=0, world=0, last=performance.now(), input={x:0,y:0,fire:false}, key={}, padOld=[], navDelay=0, msgTimer=0, runMode='mission', hubReady=false, hubEnded=false, reported=false, wasAttract=false;
+let settings={invertX:false,invertY:false,music:true,sound:true};
+try{Object.assign(settings,JSON.parse(localStorage.getItem('finalSidekickSettings')||'{}'))}catch{}
+audio.setMuted(!settings.sound);audio.setMusic(settings.music);
+let peer=null, connections=[], rivalScores={}, roomCode=String(1000+Math.floor(Math.random()*9000)), onlineRole='', onlineStarted=false;
+function saveSettings(){try{localStorage.setItem('finalSidekickSettings',JSON.stringify(settings))}catch{} audio.setMuted(!settings.sound);audio.setMusic(settings.music)}
+function menu(el,items){entries=items; menuIndex=Math.min(menuIndex,items.length-1);el.innerHTML='';items.forEach((item,i)=>{let b=document.createElement('button');b.textContent=item.label;b.className=i===menuIndex?'selected':'';b.addEventListener('mouseenter',()=>{menuIndex=i;paintMenu()});b.addEventListener('click',()=>{gesture();menuIndex=i;activate()});el.appendChild(b)})}
+function paintMenu(){let root=screen==='title'?$('titleMenu'):$('panelMenu');[...root.children].forEach((x,i)=>x.classList.toggle('selected',i===menuIndex))}
+function gesture(){idle=0;audio.start()}
+function activate(){if(entries[menuIndex]){audio.sfx('confirm');entries[menuIndex].action()}}
+function showTitle(){if(game)game.stop();screen='title';previous='title';idle=0;title.classList.remove('hidden');overlay.classList.add('hidden');hud.classList.add('hidden');$('attractTag').classList.add('hidden');announce.classList.add('hidden');menuIndex=0;menu($('titleMenu'),[{label:'Launch mission',action:()=>launch('mission')},{label:'Caravan · 2 minutes',action:()=>launch('caravan')},{label:'Online score race',action:showOnline},{label:'How to play',action:showHelp},{label:'Settings',action:()=>showSettings('title')},{label:'About / credits',action:showAbout}])}
+function panel(kicker,name,body,items){title.classList.add('hidden');overlay.classList.remove('hidden');$('panelKicker').textContent=kicker;$('panelTitle').textContent=name;$('panelBody').innerHTML=body;menuIndex=0;menu($('panelMenu'),items)}
+function showHelp(){screen='help';panel('FLIGHT MANUAL / 01','Ready, pilot?',`<div class="help-grid"><p><span class="pill">STICK / ARROWS</span> Move your ship. The small glowing core is your vulnerable point.</p><p><span class="pill">✕ / Z / SPACE</span> Hold to fire. Your sidekicks add their firepower.</p><p><span class="pill">□ / X</span> Sacrifice a sidekick for a screen-clearing burst.</p><p><span class="pill">R1 / C</span> Change flight speed. Choose the pace that fits the danger.</p></div><p>Collect colored weapon capsules to change your shot; collect the same weapon again to power it up. A hit strips a power level before it costs a life. Gather pods to replenish your sidekicks.</p><p>Destroy formations, survive the guardian and chase a high score. Caravan is a two-minute score sprint.</p>`,[{label:'Back to title',action:showTitle}])}
+function showSettings(from=screen){previous=from;screen='settings';renderSettings()}
+function renderSettings(){panel('PILOT PREFERENCES','Settings',`<p>Fine-tune your cockpit. Settings are saved on this device.</p>`,[{label:`Horizontal axis: ${settings.invertX?'INVERTED':'NORMAL'}`,action:()=>{settings.invertX=!settings.invertX;saveSettings();renderSettings()}},{label:`Vertical axis: ${settings.invertY?'INVERTED':'NORMAL'}`,action:()=>{settings.invertY=!settings.invertY;saveSettings();renderSettings()}},{label:`Music: ${settings.music?'ON':'OFF'}`,action:()=>{settings.music=!settings.music;saveSettings();renderSettings()}},{label:`Sound: ${settings.sound?'ON':'OFF'}`,action:()=>{settings.sound=!settings.sound;saveSettings();renderSettings()}},{label:'Back',action:closeSettings}]);}
+function closeSettings(){if(previous==='play'||previous==='attract'||previous==='ready'){screen=previous;overlay.classList.add('hidden')}else if(previous==='touch'){screen='title';overlay.classList.add('hidden');$('touch').classList.remove('hidden')}else showTitle()}
+function showAbout(){screen='about';panel('TRANSMISSION ARCHIVE','About / credits',`<p class="detail"><b>FINAL SIDEKICK</b> · An original arcade tribute to Final Soldier (1991). Source information: 2026-10-29 09:24; source Final Soldier; Three.js r180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio, PeerJS 1.5.4 and AI Hub protocol 1. Cel-shaded procedural 3D; procedural animation, original synthesized music, effects and gibberish voices. Online: AI Hub parallel score attack and standalone WebRTC score races. Environment: Codex CLI (headless), Linux, browser unknown. Model: OpenAI gpt-6.1-terra, ultra. Usage: unknown.</p><p class="detail"><b>TESTING FEEDBACK</b> Lightweight syntax and headless browser checks. Two issues caught; one critical (sensor collisions). Most helpful: the Rapier simulation smoke test. Least helpful: syntax check alone. Headless WebGPU presentation could not be verified.</p><p class="detail"><b>ENGINE FEEDBACK</b> Three.js makes expressive scenes approachable. The initial Rapier sensor configuration was wrong. The arcade systems, interface and audio had to be built. WebGPU presentation was hardest to verify. The automatic renderer fallback deserves an overhaul; clearer initialization errors would help.</p><p class="detail"><b>PROMPT FEEDBACK</b> The source and controller-first direction were useful. Standalone signaling details were unspecified. The hardest part was combining a complete shooter with online sessions. A real-controller, multi-device network playtest would be valuable.</p>`,[{label:'Back to title',action:showTitle}])}
+function showOnline(){screen='online';panel('MULTIPLAYER / SCORE RACE','Online race',`<p>Race a friend on your own screen. Host a room and share its four-digit code; your friend joins with the same code. Fly for up to two minutes. The higher score wins.</p><p class="detail">Uses a public PeerJS signaling service and WebRTC. A network connection is required.</p>`,[{label:'Host a room',action:hostRoom},{label:'Join a room',action:joinMenu},{label:'Back',action:()=>{disconnect();showTitle()}}])}
+function disconnect(){connections.forEach(c=>{try{c.close()}catch{}});connections=[];if(peer){peer.destroy();peer=null}rivalScores={};onlineRole='';onlineStarted=false}
+function lobby(status){screen='lobby';panel('STANDALONE / ONLINE','Score race',`<p>ROOM CODE</p><div id="onlineCode">${roomCode}</div><p class="status" id="netStatus">${status}</p><p class="detail">Share this code outside the game. Up to four pilots can fly side by side.</p>`,onlineRole==='host'?[{label:'Start race',action:()=>{if(!connections.some(c=>c.open)){ $('netStatus').textContent='Waiting for another pilot to connect.';return} connections.forEach(c=>c.send({t:'start'}));onlineStarted=true;launch('online')}},{label:'Cancel',action:()=>{disconnect();showOnline()}}]:[{label:'Cancel',action:()=>{disconnect();showOnline()}}])}
+function wire(c){connections.push(c);c.on('open',()=>{if($('netStatus'))$('netStatus').textContent=onlineRole==='host'?`${connections.filter(x=>x.open).length} pilot(s) connected. Ready to launch.`:'Connected. Waiting for host to launch.'});c.on('data',d=>{if(!d||typeof d!=='object')return;if(d.t==='start'&&onlineRole==='guest'){onlineStarted=true;launch('online')}if(d.t==='score'){rivalScores[d.id||c.peer]=Number(d.score)||0;updateRival();if(onlineRole==='host')connections.forEach(other=>{if(other!==c&&other.open)other.send({t:'score',score:d.score,id:d.id||c.peer})})}});c.on('close',()=>{if($('netStatus'))$('netStatus').textContent='A pilot disconnected.'});c.on('error',()=>{if($('netStatus'))$('netStatus').textContent='Connection lost.'})}
+function hostRoom(){disconnect();onlineRole='host';roomCode=String(1000+Math.floor(Math.random()*9000));lobby('Opening channel…');if(!window.Peer){$('netStatus').textContent='Online service unavailable.';return}peer=new Peer('final-sidekick-'+roomCode);peer.on('open',()=>{$('netStatus').textContent='Waiting for pilots…'});peer.on('connection',c=>{if(connections.length<3)wire(c);else c.close()});peer.on('error',()=>{if($('netStatus'))$('netStatus').textContent='Could not open room. Try hosting again.'})}
+function joinMenu(){disconnect();screen='join';roomCode='1000';joinRender()}
+function joinRender(){panel('STANDALONE / ONLINE','Enter room code',`<p>Change each digit with the buttons, then connect.</p><div id="onlineCode">${roomCode}</div>`,[...Array.from({length:4},(_,i)=>({label:`Digit ${i+1}: ${roomCode[i]}  +`,action:()=>{let a=roomCode.split('');a[i]=String((+a[i]+1)%10);roomCode=a.join('');let old=menuIndex;joinRender();menuIndex=old;paintMenu()}})),{label:'Connect',action:joinRoom},{label:'Back',action:showOnline}])}
+function joinRoom(){onlineRole='guest';lobby('Connecting…');if(!window.Peer){$('netStatus').textContent='Online service unavailable.';return}peer=new Peer();peer.on('open',()=>wire(peer.connect('final-sidekick-'+roomCode,{reliable:true})));peer.on('error',()=>{if($('netStatus'))$('netStatus').textContent='Could not connect. Check the code and try again.'})}
+function launch(mode,attract=false){if(!game)return;runMode=mode;reported=false;wasAttract=attract;screen=attract?'attract':'play';title.classList.add('hidden');overlay.classList.add('hidden');hud.classList.remove('hidden');$('attractTag').classList.toggle('hidden',!attract);game.start({attract,players:1});world=0;flash('SECTOR 01','THE OUTER REACH');if(!attract)audio.voice('launch');}
+function updateRival(){let scores=Object.values(rivalScores);let el=$('finalRival');if(el&&scores.length)el.textContent=(game.state.score>=Math.max(...scores)?'YOU LEAD THE RACE':'RIVAL IN THE LEAD')+' · RIVAL '+Math.max(...scores).toLocaleString();}
+function finish(win,score){if(screen==='attract'){showTitle();return}if(reported)return;reported=true;if(AIHub.active)AIHub.result({score});if(onlineStarted)connections.forEach(c=>{if(c.open)c.send({t:'score',score,id:peer?.id})});screen='over';let rivals=Object.values(rivalScores);let result=rivals.length?(score>=Math.max(...rivals)?'YOU LEAD THE RACE':'RIVAL IN THE LEAD'):'';panel(win?'MISSION COMPLETE':'FLIGHT COMPLETE',win?'Stars secured':'Until next flight',`<p>Your final score</p><div class="hud-score">${String(score).padStart(8,'0')}</div><p id="finalRival">${result}</p><p>Every star needs a sidekick. Thanks for flying.</p>`,AIHub.active?[]:[{label:'Fly again',action:()=>launch(runMode==='online'?'caravan':runMode)},{label:'Return to title',action:()=>{disconnect();showTitle()}}]);}
+function flash(a,b){announce.querySelector('.announce-title').textContent=a;announce.querySelector('.announce-sub').textContent=b||'';announce.classList.remove('hidden');announce.style.opacity='1';msgTimer=2.7}
+function event(type,data){if(type==='sfx')audio.sfx(data);if(type==='voice')audio.voice(data);if(type==='message')flash(data.title,data.sub);if(type==='end')finish(data.win,data.score)}
+function navigate(dir){if(!entries.length)return;menuIndex=(menuIndex+dir+entries.length)%entries.length;paintMenu();audio.sfx('select')}
+function back(){if(screen==='settings')closeSettings();else if(screen==='play'||screen==='ready')showSettings(screen);else if(screen==='attract')showTitle();else if(screen==='title')showSettings('title');else if(screen==='lobby'){disconnect();showOnline()}else showTitle()}
+window.addEventListener('keydown',e=>{if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Escape'].includes(e.key))e.preventDefault();if(e.repeat)return;gesture();if(screen==='attract'){showTitle();return}key[e.code]=true;if(e.code==='Escape'){back();return}if(screen!=='play'&&screen!=='ready'){if(e.code==='ArrowUp'||e.code==='KeyW')navigate(-1);else if(e.code==='ArrowDown'||e.code==='KeyS')navigate(1);else if(e.code==='Enter'||e.code==='Space'||e.code==='KeyZ')activate();else if(e.code==='Backspace'||e.code==='KeyX')back()}});
+window.addEventListener('keyup',e=>key[e.code]=false);window.addEventListener('blur',()=>{key={}});window.addEventListener('pointerdown',()=>{gesture();if(screen==='attract')showTitle()});window.addEventListener('pointermove',()=>{idle=0;if(screen==='attract')showTitle()});$('touchSettings').onclick=()=>{gesture();$('touch').classList.add('hidden');showSettings('touch')};
+function pollPad(dt){let p=[...(navigator.getGamepads?.()||[])].find(Boolean);if(!p){padOld=[];return null}let b=p.buttons.map(x=>x.pressed),edge=i=>b[i]&&!padOld[i];let ax=Math.abs(p.axes[0])>.2?p.axes[0]:0,ay=Math.abs(p.axes[1])>.2?p.axes[1]:0;let activity=b.some(Boolean)||Math.abs(ax)>.3||Math.abs(ay)>.3;if(activity){idle=0;if(screen==='attract'){showTitle();padOld=b;return null}if(!audio.context)audio.start()}if(edge(9)&&!b[8]){back();padOld=b;return p}if(screen!=='play'&&screen!=='ready'){navDelay-=dt;if(edge(12)||edge(13)||((Math.abs(ay)>.5)&&navDelay<=0)){navigate((b[12]||ay<-.5)?-1:1);navDelay=.22}if(edge(0))activate();if(edge(1))back()}p.edges={bomb:edge(2),speed:edge(5)};padOld=b;return p}
+AIHub.probe(()=>({scene:screen==='settings'?(previous==='play'?'play':'menu'):screen==='attract'?'play':screen==='help'||screen==='about'||screen==='online'||screen==='join'||screen==='lobby'?'menu':screen,menu:screen==='settings',world,input}));
+let hero,backdrop,sendTimer=0;
+async function init(){try{
+ if(!navigator.gpu)throw new Error('WebGPU is unavailable. Enable WebGPU in a supported browser and reload.');
+ await RAPIER.init();
+ scene=new THREE.Scene();scene.background=new THREE.Color(0x071a2c);
+ camera=new THREE.OrthographicCamera(-20,20,12.5,-12.5,.1,100);camera.position.set(0,0,35);camera.lookAt(0,0,0);
+ renderer=new THREE.WebGPURenderer({canvas:$('game'),antialias:true});await renderer.init();if(!renderer.backend.isWebGPUBackend)throw new Error('A WebGPU device could not be initialized.');renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+ scene.add(new THREE.AmbientLight(0x8dbdcc,2));let sun=new THREE.DirectionalLight(0xffffff,2.5);sun.position.set(-5,8,15);scene.add(sun);
+ backdrop=new THREE.Group();scene.add(backdrop);
+ const material=(c)=>new THREE.MeshToonMaterial({color:c});const white=material(0xdaf8ef),teal=material(0x51d8d5),dark=material(0x183548),orange=material(0xffab56);
+ const make=(geo,mat,x,y,z,sx,sy,sz,parent=backdrop)=>{let m=new THREE.Mesh(geo,mat);m.position.set(x,y,z);m.scale.set(sx,sy,sz);parent.add(m);return m};
+ let sphere=new THREE.IcosahedronGeometry(1,2), box=new THREE.BoxGeometry(1,1,1),cone=new THREE.ConeGeometry(1,1,5);
+ make(sphere,material(0x173c53),10,0,-8,8,8,1);make(sphere,material(0x21546a),11,1,-7,6.8,6.8,.5);
+ for(let i=0;i<100;i++)make(box,i%4?white:teal,(Math.random()-.5)*43,(Math.random()-.5)*25,-6,.025,.025,.03);
+ hero=new THREE.Group();backdrop.add(hero);hero.position.set(10,-1,0);hero.rotation.z=-.32;hero.scale.setScalar(2.4);
+ make(cone,dark,0,0,0,1.1,4,.55,hero);make(cone,white,0,.15,.2,.9,3.7,.45,hero);make(box,dark,0,-.5,0,3.7,.9,.3,hero);make(box,teal,0,-.4,.2,3.4,.6,.32,hero);make(sphere,teal,0,.2,.5,.36,.7,.25,hero);make(box,orange,-.55,-1.5,.2,.25,.9,.2,hero);make(box,orange,.55,-1.5,.2,.25,.9,.2,hero);
+ game=new Shooter({THREE,RAPIER,scene,onEvent:event});
+ resize();window.addEventListener('resize',resize);showTitle();
+ if(AIHub.active){screen='ready';title.classList.add('hidden');let info=await AIHub.connect({mode:'parallel',seats:[1,4]});if(info){launch('caravan');screen='ready';AIHub.on('time-up',()=>finish(false,game.state.score));AIHub.on('end',()=>{hubEnded=true;game.running=false;audio.setMuted(true);audio.setMusic(false)});AIHub.ready();hubReady=true}else showTitle()}
+ if(matchMedia('(pointer: coarse)').matches&&!matchMedia('(any-pointer: fine)').matches&&!AIHub.active){$('touch').classList.remove('hidden')}
+ requestAnimationFrame(frame);
+ }catch(e){console.error(e);$('errorText').textContent='Unable to start the WebGPU renderer: '+(e?.message||e);$('error').classList.remove('hidden');if(window.AIHub)AIHub.fail('WebGPU initialization failed: '+e.message)}}
+function resize(){if(!renderer)return;let w=innerWidth,h=innerHeight,aspect=w/h;camera.left=-12.5*aspect;camera.right=12.5*aspect;camera.top=12.5;camera.bottom=-12.5;camera.updateProjectionMatrix();renderer.setSize(w,h,false)}
+function frame(t){let dt=Math.min((t-last)/1000,.05);last=t;now+=dt;idle+=dt;let p=pollPad(dt);let active=screen==='play'||screen==='attract'||screen==='ready';backdrop.visible=!active&&screen!=='over';hero.rotation.z=-.32+Math.sin(now*.5)*.035;hero.position.y=-1+Math.sin(now*.7)*.35;
+ if(screen==='title'&&idle>=10&&!AIHub.active&&!$('touch').matches(':not(.hidden)'))launch('mission',true);
+ if(screen==='ready'&&hubReady&&AIHub.time()>=0)screen='play';
+ if((screen==='play'||screen==='attract')&&!hubEnded){let x=(key.ArrowRight||key.KeyD?1:0)-(key.ArrowLeft||key.KeyA?1:0),y=(key.ArrowUp||key.KeyW?1:0)-(key.ArrowDown||key.KeyS?1:0);if(p){x+=(Math.abs(p.axes[0])>.2?p.axes[0]:0)+(p.buttons[15]?.pressed?1:0)-(p.buttons[14]?.pressed?1:0);y-=(Math.abs(p.axes[1])>.2?p.axes[1]:0)+(p.buttons[13]?.pressed?1:0)-(p.buttons[12]?.pressed?1:0)}x=Math.max(-1,Math.min(1,x))*(settings.invertX?-1:1);y=Math.max(-1,Math.min(1,y))*(settings.invertY?-1:1);input={x,y,fire:!!(key.Space||key.KeyZ||p?.buttons[0]?.pressed),bomb:!!(key.KeyX||p?.buttons[2]?.pressed),speed:!!(key.KeyC||p?.buttons[5]?.pressed)};game.update(dt,input);world+=dt;let s=game.state;$('score').textContent=String(s.score).padStart(8,'0');$('weapon').textContent=`${s.weapon} · LV ${s.level}  /  SPEED ${s.speed}`;$('lives').textContent='♥ '.repeat(Math.max(0,s.lives)).trim();$('pods').textContent='SIDEKICKS '+ '◆ '.repeat(s.bombs)+'◇ '.repeat(Math.max(0,2-s.bombs));$('phase').textContent=s.phase==='boss'?'GUARDIAN APPROACH':runMode==='caravan'||runMode==='online'?`CARAVAN · ${Math.max(0,Math.ceil(120-s.time))} SEC`:'SECTOR 01';$('bossBar').classList.toggle('hidden',s.phase!=='boss');$('bossBar').firstElementChild.style.width=(100*s.bossHp/s.bossMax)+'%';if(AIHub.active)AIHub.progress({score:s.score,label:s.phase==='boss'?'Guardian':'Sector 01'});sendTimer-=dt;if(onlineStarted&&sendTimer<=0){connections.forEach(c=>{if(c.open)c.send({t:'score',score:s.score,id:peer?.id})});sendTimer=1}$('rival').textContent=Object.keys(rivalScores).length?'RIVAL '+Math.max(...Object.values(rivalScores)).toLocaleString():'';if((runMode==='caravan'||runMode==='online')&&s.time>=120&&!reported)finish(true,s.score)}
+ if(msgTimer>0){msgTimer-=dt;if(msgTimer<=0)announce.style.opacity='0'}audio.update(dt,screen==='settings'?'pause':screen==='play'||screen==='attract'?(game.state.phase==='boss'?'boss':'play'):'menu');renderer.render(scene,camera);requestAnimationFrame(frame)}
+init();
+</script></body></html>

@@ -1,0 +1,866 @@
+<!--
+CRIMSON CIRCUIT — a spiritual successor to Red Alarm
+Source Information
+- Date: 2026-10-29 02:02
+- Source: Red Alarm (Virtual Boy, 1995, Nintendo / T&E Soft) — wireframe vector tank combat, KAIOS defence computer narrative
+- Tech: Three.js 0.180.0 (R180) WebGPURenderer (WebGPU only, no WebGL fallback), @dimforge/rapier3d-compat 0.19.3 physics, Gamepad API (DualSense standard mapping), Web Audio API, AI Hub Session Protocol v1 (session.js 1.3.0, parallel mode)
+- Art Direction: stylized cel-shaded (MeshToonMaterial + inverted-hull outlines), crimson/black/cyan vector palette honouring the Virtual Boy original
+- Animation: procedural code animation (hover bob, turret recoil, track/leg articulation, explosion scaling, camera shake) — no skeletal assets
+- Audio: fully code-written music (Web Audio chiptune sequencer), synthesized SFX, Animalese-style gibberish voice (formant blip speech)
+- Online: AI Hub parallel sessions (1-4 players, score race) via pasted session.js; standalone local 2P split-screen duel
+- Testing: lightweight smoke (static checks + headless load where available)
+- Environment: Muse Code CLI (headless); Linux; browser unknown
+- Model: Meta, muse-wonder-1.0, reasoning effort max
+- Usage: unknown
+Testing Feedback
+- Issues caught by testing: 2 (1 duplicate closing script tag, 1 deprecated Rapier init warning). Critical/game-breaking: 1 (duplicate tag would have blocked the module if extraction had matched it in a browser parser path; caught before delivery).
+- Most helpful test: headless Chromium WebGPU run (check_page) plus a scripted Playwright playthrough (START, drive, fire, missile) that scored a kill.
+- Least helpful test: static keyword grep (passed trivially, caught nothing).
+Engine Feedback / Prompt Feedback: see final chat reply and in-game About screen.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="4">
+<meta name="hub:session-goal" content="Highest score when time runs out">
+<meta name="hub:session-howto" content="Left stick move, right stick aim, R2 fire, Cross dash">
+<meta name="hub:webgpu" content="required">
+<title>CRIMSON CIRCUIT</title>
+<style>
+:root{--red:#ff2a3c;--red2:#ff6b5e;--cyan:#39e6ff;--ink:#0b0508;--panel:rgba(16,4,10,.92);--text:#ffe9e6}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:#070308;color:var(--text);font-family:"Segoe UI",system-ui,sans-serif}
+#app{position:fixed;inset:0}canvas{display:block}
+.screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:radial-gradient(ellipse at 50% 35%,rgba(120,8,24,.55),rgba(4,1,3,.94) 70%);z-index:20;text-align:center;padding:24px}
+.hidden{display:none!important}
+h1.logo{font-size:min(11vw,92px);margin:0;letter-spacing:.06em;color:#fff;text-shadow:0 0 0 #000,4px 4px 0 var(--red),-2px -2px 0 #3a0008;line-height:.95;font-weight:900;font-style:italic}
+.sub{font-size:min(4vw,22px);letter-spacing:.35em;color:var(--cyan);text-transform:uppercase}
+.menu{display:flex;flex-direction:column;gap:10px;min-width:min(520px,86vw)}
+button{font:inherit;font-size:22px;font-weight:700;letter-spacing:.04em;padding:14px 28px;border:3px solid #000;border-radius:6px;background:#ffe9e6;color:#16040a;cursor:pointer;box-shadow:4px 4px 0 #000}
+button.sel,button:hover,button:focus-visible{background:var(--red);color:#fff;outline:3px solid var(--cyan);outline-offset:2px}
+button.small{font-size:17px;padding:9px 16px}
+.hint{font-size:16px;opacity:.85;max-width:640px;line-height:1.5}
+#hud{position:absolute;inset:0;pointer-events:none;z-index:10;font-weight:700}
+.barwrap{width:280px;height:22px;border:3px solid #000;background:#2a0208;box-shadow:3px 3px 0 rgba(0,0,0,.6)}
+.bar{height:100%;background:var(--red);transition:width .15s}.bar.boost{background:var(--cyan)}.bar.boss{background:#ff9f1c}
+#hudTL{position:absolute;top:16px;left:18px;display:flex;flex-direction:column;gap:7px;text-shadow:2px 2px 0 #000}
+#hudTR{position:absolute;top:16px;right:18px;text-align:right;font-size:22px;text-shadow:2px 2px 0 #000}
+#hudBC{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);text-align:center;font-size:17px;text-shadow:2px 2px 0 #000}
+#radar{position:absolute;right:18px;bottom:18px;border:3px solid #000;background:rgba(10,0,4,.8);box-shadow:3px 3px 0 rgba(0,0,0,.6)}
+#bossWrap{position:absolute;top:64px;left:50%;transform:translateX(-50%);text-align:center}
+#dialogue{position:absolute;left:50%;bottom:96px;transform:translateX(-50%);width:min(760px,92vw);background:var(--panel);border:3px solid #000;box-shadow:5px 5px 0 #000;padding:14px 18px;font-size:19px;line-height:1.45}
+#dialogue b{color:var(--cyan)}
+#centerMsg{position:absolute;top:34%;left:50%;transform:translate(-50%,-50%);font-size:min(8vw,56px);font-weight:900;font-style:italic;color:#fff;text-shadow:3px 3px 0 var(--red),-1px -1px 0 #000;text-align:center}
+.row{display:flex;gap:14px;align-items:center;justify-content:space-between;width:min(620px,92vw);font-size:19px;background:var(--panel);border:3px solid #000;padding:10px 16px}
+input[type=range]{width:220px;accent-color:var(--red);height:28px}
+.kbd{background:#fff;color:#000;border:2px solid #000;border-radius:4px;padding:1px 8px;font-weight:800}
+#err{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:50;background:#160208;color:#fff;font-size:20px;padding:32px;text-align:center;line-height:1.6}
+#touchWarn{position:absolute;inset:0;z-index:40;display:flex;flex-direction:column;gap:18px;align-items:center;justify-content:center;background:rgba(5,1,3,.96);text-align:center;padding:24px;font-size:22px}
+#fps{position:absolute;left:18px;bottom:18px;font-size:14px;opacity:.8;text-shadow:1px 1px 0 #000}
+table.score{border-collapse:collapse;font-size:20px}table.score td,table.score th{border:3px solid #000;background:var(--panel);padding:8px 18px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud" class="hidden">
+  <div id="hudTL"><div>ARMOR</div><div class="barwrap"><div id="hpBar" class="bar" style="width:100%"></div></div><div>BOOST</div><div class="barwrap"><div id="boostBar" class="bar boost" style="width:100%"></div></div><div id="weaponLbl">CANNON · READY</div></div>
+  <div id="hudTR"><div id="scoreLbl">SCORE 0</div><div id="waveLbl">SECTOR 1</div><div id="timerLbl">04:00</div><div id="comboLbl"></div></div>
+  <div id="bossWrap" class="hidden"><div>KAIOS CORE</div><div class="barwrap" style="width:min(560px,80vw)"><div id="bossBar" class="bar boss" style="width:100%"></div></div></div>
+  <canvas id="radar" width="168" height="168"></canvas>
+  <div id="hudBC">LEFT STICK move · RIGHT STICK aim · R2 fire · CROSS dash · SQUARE missile · CIRCLE shield</div>
+  <div id="fps"></div><div id="centerMsg"></div>
+  <div id="dialogue" class="hidden"><b id="dlgName">CMDR. VEX</b> — <span id="dlgText"></span></div>
+</div>
+
+<div id="titleScr" class="screen">
+  <div class="sub">Red Alarm · Spiritual Successor</div><h1 class="logo">CRIMSON<br>CIRCUIT</h1>
+  <div class="hint">The defence computer KAIOS has painted the whole world red and locked the sky inside a wireframe cage. You are the last hover-tank with a working trigger. Roll out, pilot — make it panic.</div>
+  <div class="menu" id="titleMenu">
+    <button data-act="start">▶ START MISSION</button>
+    <button data-act="duel">LOCAL DUEL — 2P SPLIT SCREEN</button>
+    <button data-act="howto">HOW TO PLAY</button>
+    <button data-act="settings">SETTINGS</button>
+    <button data-act="about">ABOUT / CREDITS</button>
+  </div>
+  <div class="hint">Controller-first · PS5 DualSense or keyboard/mouse · <span id="padState">No gamepad yet — press any pad button</span></div>
+  <div id="attractLbl" class="sub hidden">— ATTRACT MODE · PRESS ANY KEY / BUTTON —</div>
+</div>
+
+<div id="howtoScr" class="screen hidden">
+  <h1 style="font-size:44px;margin:0">HOW TO PLAY</h1>
+  <div class="hint" style="text-align:left">
+    <p><span class="kbd">Left stick / WASD</span> drive hover-tank &nbsp; <span class="kbd">Right stick / Mouse</span> swing turret &nbsp; <span class="kbd">R2 / Click / Space</span> cannon (hold for charge shot)</p>
+    <p><span class="kbd">Cross / Shift</span> boost dash &nbsp; <span class="kbd">Square / E</span> homing missile (locks the nearest foe) &nbsp; <span class="kbd">Circle / Q</span> aegis shield (drains boost)</p>
+    <p><span class="kbd">Options / Esc</span> settings &amp; pause &nbsp; <span class="kbd">D-pad / ↑↓</span> menus &nbsp; <span class="kbd">Cross / Enter</span> confirm &nbsp; <span class="kbd">Circle / Esc</span> back</p>
+    <p>Clear 3 sectors, then break the KAIOS CORE. Grab <b style="color:var(--cyan)">cyan cells</b> for armor, <b style="color:#ff9f1c">amber cells</b> for boost. Chain kills for combo score. In LOCAL DUEL, Player 2 uses Arrow keys + <span class="kbd">Enter</span> fire / <span class="kbd">R-Shift</span> dash on a second pad if present. First to 5 takedowns wins.</p>
+  </div><button data-back>BACK</button>
+</div>
+
+<div id="settingsScr" class="screen hidden">
+  <h1 style="font-size:44px;margin:0">SETTINGS</h1>
+  <div class="row"><span>Master volume</span><input id="volMaster" type="range" min="0" max="100" value="80"></div>
+  <div class="row"><span>Music volume</span><input id="volMusic" type="range" min="0" max="100" value="70"></div>
+  <div class="row"><span>Effects volume</span><input id="volSfx" type="range" min="0" max="100" value="90"></div>
+  <div class="row"><span>Invert horizontal (gamepad fix)</span><button id="invXBtn" class="small">OFF</button></div>
+  <div class="row"><span>Invert vertical (gamepad fix)</span><button id="invYBtn" class="small">OFF</button></div>
+  <div class="row"><span>Screen shake</span><button id="shakeBtn" class="small">ON</button></div>
+  <div class="row"><span>Shadows</span><button id="shadowBtn" class="small">ON</button></div>
+  <div class="row"><span>Voice gibberish</span><button id="voiceBtn" class="small">ON</button></div>
+  <button data-back>DONE</button>
+</div>
+
+<div id="aboutScr" class="screen hidden">
+  <h1 style="font-size:44px;margin:0">ABOUT / CREDITS</h1>
+  <div class="hint" style="text-align:left;max-height:52vh;overflow:auto">
+    <p><b>CRIMSON CIRCUIT</b> — an original spiritual successor to <b>Red Alarm</b> (Virtual Boy, 1995). Not affiliated with Nintendo or T&amp;E Soft. All art, code, music and voices are generated in this file.</p>
+    <p>Date: 2026-10-29 02:02 · Tech: Three.js 0.180.0 R180 WebGPURenderer (WebGPU only, no fallback), Rapier 0.19.3 physics, Gamepad API, Web Audio. Art: cel-shaded toon materials with inverted-hull outlines in the Virtual Boy crimson palette. Animation: procedural (hover, recoil, articulation, particles). Audio: code-written chiptune music, synthesized SFX, Animalese-style gibberish voice. Online: AI Hub Session Protocol v1 parallel sessions (1–4P score race) + local 2P split-screen duel. Environment: Muse Code CLI (headless); Linux; browser unknown. Model: Meta muse-wonder-1.0, reasoning max. Usage: unknown.</p>
+    <p>Story &amp; dialogue in the cheerfully alarming Red Alarm register: a defence computer that insists it is helping, a commander who shouts encouragement through a kazoo-grade radio, and one small tank between them and total gridlock.</p>
+  </div><button data-back>BACK</button>
+</div>
+
+<div id="overScr" class="screen hidden">
+  <h1 id="overTitle" style="font-size:56px;margin:0">MISSION COMPLETE</h1><div id="overStats"></div>
+  <div class="menu"><button data-act="again">PLAY AGAIN</button><button data-act="title">TITLE SCREEN</button></div>
+</div>
+
+<div id="touchWarn" class="hidden"><div style="font-size:40px;font-weight:900">Controller or keyboard required</div><div>This mission needs a PS5-style controller or a keyboard. Touch controls are not provided.</div><button id="touchSettings">SETTINGS</button></div>
+<div id="err" class="hidden"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "@dimforge/rapier3d-compat": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import RAPIER from '@dimforge/rapier3d-compat';
+const $=id=>document.getElementById(id);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v)), lerp=(a,b,t)=>a+(b-a)*t;
+let settings={master:.8,music:.7,sfx:.9,invX:false,invY:false,shake:true,shadows:true,voice:true};
+try{Object.assign(settings,JSON.parse(localStorage.getItem('crimsonSettings')||'{}'))}catch(e){}
+const saveSettings=()=>{try{localStorage.setItem('crimsonSettings',JSON.stringify(settings))}catch(e){}};
+// ---------- Audio: code-written music, synth SFX, Animalese gibberish ----------
+let AC=null,musicGain,sfxGain,musicTimer=null,noteIdx=0;
+function audio(){ if(AC) return AC; AC=new (window.AudioContext||window.webkitAudioContext)(); musicGain=AC.createGain(); sfxGain=AC.createGain(); const comp=AC.createDynamicsCompressor(); musicGain.connect(comp); sfxGain.connect(comp); comp.connect(AC.destination); applyVol(); startMusic(); return AC; }
+function applyVol(){ if(!AC)return; musicGain.gain.value=settings.master*settings.music*.5; sfxGain.gain.value=settings.master*settings.sfx; }
+function tone(freq,dur,type='square',vol=.2,when=0,slide=0,dest){ if(!AC)return; const t=AC.currentTime+when,o=AC.createOscillator(),g=AC.createGain(); o.type=type;o.frequency.setValueAtTime(freq,t); if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(20,freq+slide),t+dur); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.001,t+dur); o.connect(g); g.connect(dest||sfxGain); o.start(t);o.stop(t+dur+.02); }
+function noiseBurst(dur=.3,vol=.4,when=0){ if(!AC)return; const t=AC.currentTime+when,len=Math.floor(AC.sampleRate*dur),buf=AC.createBuffer(1,len,AC.sampleRate),d=buf.getChannelData(0); for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len); const s=AC.createBufferSource();s.buffer=buf; const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=900; const g=AC.createGain();g.gain.value=vol; s.connect(f);f.connect(g);g.connect(sfxGain);s.start(t); }
+const sfx={ shoot(){tone(720,.09,'square',.15,0,-500)}, charge(v){tone(200+v*600,.08,'sawtooth',.08)}, boom(){noiseBurst(.45,.5);tone(90,.4,'sine',.5,0,-50)}, hit(){tone(180,.08,'square',.2,0,-80)}, hurt(){tone(120,.2,'sawtooth',.3,0,-60);noiseBurst(.15,.25)}, pickup(){tone(660,.09,'square',.2);tone(990,.12,'square',.2,.08)}, lock(){tone(1200,.07,'square',.15);tone(1200,.07,'square',.15,.12)}, ui(){tone(520,.06,'square',.12)}, dash(){noiseBurst(.2,.2);tone(300,.2,'sawtooth',.12,0,400)}, shield(){tone(240,.15,'sine',.2,0,240)} };
+const SCALE=[0,3,5,7,10,12,15], BASE=110;
+function startMusic(){ if(musicTimer||!AC)return; musicTimer=setInterval(()=>{ if(document.hidden)return; const bar=Math.floor(noteIdx/8), step=noteIdx%8; const root=BASE*[1,0.89,1.19,0.75][bar%4]; if(step%2===0) tone(root,.22,'triangle',.20,0,0,musicGain); tone(root*2*Math.pow(2,SCALE[(noteIdx*3)%SCALE.length]/12),.14,'square',.07,0,0,musicGain); if(step===4)tone(root*4,.3,'sine',.05,0,0,musicGain); noteIdx++; },170); }
+let speaking=false;
+function speak(text,name){ $('dlgName').textContent=name||'CMDR. VEX'; $('dlgText').textContent=text; $('dialogue').classList.remove('hidden'); if(settings.voice&&AC&&!speaking){ speaking=true; let i=0; const iv=setInterval(()=>{ if(i>=text.length){clearInterval(iv);speaking=false;return;} const c=text[i++]; if(c!==' '){ const f=300+((c.charCodeAt(0)*37)%500); tone(f,.07,'sawtooth',.10); tone(f*2.1,.05,'sine',.05);} },55); } setTimeout(()=>$('dialogue').classList.add('hidden'), Math.max(2600,text.length*62)); }
+// ---------- Input ----------
+const keys={}, pressed={}; let lastInputAt=performance.now(), anyInputCb=null;
+addEventListener('keydown',e=>{ if(!keys[e.code])pressed[e.code]=true; keys[e.code]=true; lastInputAt=performance.now(); if(anyInputCb)anyInputCb(); if(['ArrowUp','ArrowDown','Space'].includes(e.code))e.preventDefault(); });
+addEventListener('keyup',e=>{keys[e.code]=false});
+addEventListener('pointermove',e=>{mouse.x=(e.clientX/innerWidth)*2-1; mouse.y=(e.clientY/innerHeight)*2-1; lastInputAt=performance.now();});
+addEventListener('pointerdown',()=>{audio(); if(AC&&AC.state==='suspended')AC.resume(); lastInputAt=performance.now(); if(anyInputCb)anyInputCb(); mouse.down=true;});
+addEventListener('pointerup',()=>mouse.down=false);
+const mouse={x:0,y:0,down:false};
+let padPrev=[], padEdge={};
+function pollPad(idx=0){ const pads=navigator.getGamepads?navigator.getGamepads():[]; const p=pads&&pads[idx]; if(!p)return null; const edge={}; p.buttons.forEach((b,i)=>{ edge[i]=b.pressed&&!padPrev[i]; if(b.pressed)lastInputAt=performance.now(); }); padPrev=p.buttons.map(b=>b.pressed); padEdge=edge; if(p.axes.some(a=>Math.abs(a)>.3))lastInputAt=performance.now(); $('padState').textContent='Gamepad: '+p.id.slice(0,42); return p; }
+const dz=v=>Math.abs(v)<.14?0:v;
+function readControl(p2=false){
+  const c={x:0,y:0,ax:0,ay:0,fire:false,fireEdge:false,dash:false,missile:false,shield:false};
+  if(!p2){
+    if(keys.KeyA)c.x-=1; if(keys.KeyD)c.x+=1; if(keys.KeyW)c.y-=1; if(keys.KeyS)c.y+=1;
+    c.ax=mouse.x; c.ay=mouse.y; c.fire=mouse.down||!!keys.Space; c.fireEdge=!!pressed.Space; c.dash=!!keys.ShiftLeft||!!keys.ShiftRight; c.missile=!!pressed.KeyE; c.shield=!!keys.KeyQ;
+    const p=pollPad(0); if(p){ const ix=settings.invX?-1:1, iy=settings.invY?-1:1; c.x+=dz(p.axes[0])*ix; c.y+=dz(p.axes[1])*iy; c.ax+=dz(p.axes[2]||0)*ix; c.ay+=dz(p.axes[3]||0)*iy; c.fire=c.fire||p.buttons[7]?.pressed||p.buttons[0]?.pressed&&false; if(p.buttons[7]?.pressed)c.fire=true; c.dash=c.dash||!!padEdge[0]; c.missile=c.missile||!!padEdge[2]; c.shield=c.shield||!!p.buttons[1]?.pressed; if(padEdge[9])toggleSettings(); }
+  } else {
+    if(keys.ArrowLeft)c.x-=1; if(keys.ArrowRight)c.x+=1; if(keys.ArrowUp)c.y-=1; if(keys.ArrowDown)c.y+=1;
+    c.ax=c.x; c.ay=c.y; c.fire=!!keys.Enter; c.dash=!!keys.ShiftRight;
+    const p=pollPad(1); if(p){ c.x+=dz(p.axes[0]); c.y+=dz(p.axes[1]); c.ax+=dz(p.axes[2]||0); c.ay+=dz(p.axes[3]||0); c.fire=c.fire||!!p.buttons[7]?.pressed; c.dash=c.dash||!!padEdge[0]; }
+  }
+  c.x=clamp(c.x,-1,1); c.y=clamp(c.y,-1,1); return c;
+}
+// ---------- Three WebGPU + Rapier setup ----------
+let renderer,scene,camera,camera2,world,gradientMap;
+const ARENA=56, clock=new THREE.Clock();
+const toon=(color,emissive=0)=>new THREE.MeshToonMaterial({color,gradientMap,emissive,emissiveIntensity:emissive?1:0});
+function outlined(mesh,scale=1.05){ const o=new THREE.Mesh(mesh.geometry,new THREE.MeshBasicMaterial({color:0x050102,side:THREE.BackSide})); o.scale.setScalar(scale); mesh.add(o); return mesh; }
+function box(w,h,d,color,x=0,y=0,z=0,outline=true){ const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),toon(color)); m.position.set(x,y,z); m.castShadow=true;m.receiveShadow=true; if(outline)outlined(m); return m; }
+function buildTank(color){ const g=new THREE.Group();
+  const hull=box(2.6,0.9,3.4,color,0,0.7,0); g.add(hull);
+  const nose=box(1.8,0.6,1.0,0xffd23f,0,0.65,2.0); g.add(nose);
+  const tur=new THREE.Group(); tur.position.set(0,1.35,0); const dome=new THREE.Mesh(new THREE.CylinderGeometry(0.95,1.1,0.7,8),toon(color)); dome.castShadow=true; outlined(dome); tur.add(dome);
+  const barrel=new THREE.Mesh(new THREE.CylinderGeometry(0.16,0.2,2.4,8),toon(0x2b2b36)); barrel.rotation.x=Math.PI/2; barrel.position.set(0,0.1,1.5); outlined(barrel,1.15); tur.add(barrel);
+  const eye=box(0.5,0.22,0.1,0x39e6ff,0,0.15,1.02,false); tur.add(eye);
+  g.add(tur); g.userData.turret=tur; g.userData.barrel=barrel;
+  [-1.25,1.25].forEach(x=>{ const skirt=box(0.5,0.55,3.2,0x2b2b36,x,0.42,0); g.add(skirt); });
+  const glow=new THREE.Mesh(new THREE.PlaneGeometry(2.2,2.8),new THREE.MeshBasicMaterial({color:0xff2a3c,transparent:true,opacity:.28,depthWrite:false})); glow.rotation.x=-Math.PI/2; glow.position.y=0.06; g.add(glow);
+  return g; }
+function buildDrone(){ const g=new THREE.Group(); const core=new THREE.Mesh(new THREE.OctahedronGeometry(0.9),toon(0xff9f1c)); core.castShadow=true; outlined(core,1.12); g.add(core); const eye=box(0.4,0.4,0.4,0x39e6ff,0,0,0.8,false); g.add(eye); return g; }
+function buildTurret(){ const g=new THREE.Group(); g.add(box(1.6,1.6,1.6,0x8d99ae,0,0.8,0)); const t=new THREE.Group(); t.position.y=1.9; const h=box(1.1,0.6,1.1,0xff2a3c); t.add(h); const b=new THREE.Mesh(new THREE.CylinderGeometry(.12,.14,1.8,8),toon(0x2b2b36)); b.rotation.x=Math.PI/2;b.position.z=1.0;t.add(b); g.add(t); g.userData.turret=t; return g; }
+function buildBoss(){ const g=new THREE.Group(); const core=new THREE.Mesh(new THREE.OctahedronGeometry(4.2),toon(0xff2a3c,0x550000)); core.castShadow=true; outlined(core,1.06); g.add(core); const ring=new THREE.Mesh(new THREE.TorusGeometry(6,0.45,8,28),toon(0xff9f1c)); ring.rotation.x=Math.PI/2; outlined(ring,1.05); g.add(ring); g.userData.ring=ring; g.userData.core=core;
+  for(let i=0;i<4;i++){ const s=box(1.4,2.6,0.4,0x39e6ff,Math.cos(i*Math.PI/2)*6,0,Math.sin(i*Math.PI/2)*6); s.lookAt(0,0,0); g.add(s);} return g; }
+// ---------- Game state ----------
+let state='title', settingsOpen=false, attract=false, duel=false, hubSession=false, simTime=0, shake=0;
+let player=null, player2=null, enemies=[], shots=[], eshots=[], parts=[], pickups=[], boss=null;
+let score=0, combo=0, comboT=0, wave=0, kills=0, shotsFired=0, hits=0, missionT=240, p2Score=0, resultSent=false;
+const WAVE_LINES=[["CMDR. VEX","Sector One! KAIOS drones incoming. Rude little geometry, the lot of them!"],["CMDR. VEX","Sector Two! Tanks and turrets. KAIOS says it is only tidying up. With cannons."],["CMDR. VEX","Sector Three! Everything it has left. Hold together, pilot!"],["KAIOS","GREETINGS, SMALL TANK. I HAVE OPTIMISED YOUR DELETION. YOU ARE WELCOME."]];
+function dynBody(x,z,half){ const b=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,1,z).setLinearDamping(2.2).setAngularDamping(8).lockRotations()); world.createCollider(RAPIER.ColliderDesc.cuboid(half,0.7,half).setDensity(1).setFriction(0.2).setRestitution(0.25),b); return b; }
+function fixedBox(x,z,w,d,h=3){ const b=world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x,h/2,z)); world.createCollider(RAPIER.ColliderDesc.cuboid(w/2,h/2,d/2),b); }
+function makePlayer(color,x,z,isP2=false){ const mesh=buildTank(color); scene.add(mesh); const body=dynBody(x,z,1.3); return {mesh,body,hp:100,boost:100,cool:0,charge:0,missileCd:0,dashCd:0,shield:false,aim:0,face:isP2?Math.PI:0,isP2,alive:true,recoil:0}; }
+function spawnEnemy(kind,x,z){ let mesh,hp,body=null,speed=6,scoreV=100;
+  if(kind==='drone'){mesh=buildDrone();hp=30;speed=9;scoreV=100} else if(kind==='tank'){mesh=buildTank(0xb3001b);hp=80;speed=5;scoreV=250} else if(kind==='turret'){mesh=buildTurret();hp=60;speed=0;scoreV=200} else {mesh=buildBoss();hp=900;speed=2.2;scoreV=5000}
+  mesh.position.set(x, kind==='drone'?2.2:0, z); scene.add(mesh);
+  if(kind!=='turret'&&kind!=='boss') body=dynBody(x,z,kind==='drone'?0.9:1.3);
+  if(kind==='boss'){ boss={mesh,body:null,hp,maxHp:hp,kind,x,z,cool:2,phase:1,t:0}; enemies.push(boss); $('bossWrap').classList.remove('hidden'); return boss; }
+  const e={mesh,body,hp,maxHp:hp,kind,cool:1+Math.random()*1.5,t:Math.random()*10,speed,scoreV,strafe:Math.random()>.5?1:-1}; enemies.push(e); return e; }
+function spawnWave(n){ wave=n; $('waveLbl').textContent = n<3?('SECTOR '+(n+1)):'KAIOS CORE'; const L=WAVE_LINES[n]; if(L)speak(L[1],L[0]); centerMsg(n<3?('SECTOR '+(n+1)):'KAIOS CORE',1600);
+  if(n===0){ spawnEnemy('drone',-18,-22);spawnEnemy('drone',18,-22);spawnEnemy('drone',-24,8);spawnEnemy('drone',24,8); }
+  if(n===1){ spawnEnemy('tank',-20,-24);spawnEnemy('tank',20,-24);spawnEnemy('turret',-30,0);spawnEnemy('turret',30,0);spawnEnemy('drone',0,-32); }
+  if(n===2){ spawnEnemy('tank',-22,-20);spawnEnemy('tank',22,-20);spawnEnemy('tank',0,26);spawnEnemy('drone',-14,18);spawnEnemy('drone',14,18);spawnEnemy('turret',0,-34); }
+  if(n===3){ spawnEnemy('boss',0,-30); }
+  dropPickup(); dropPickup(); }
+function dropPickup(){ const kind=Math.random()<.5?'hp':'boost'; const m=new THREE.Mesh(new THREE.OctahedronGeometry(0.75),toon(kind==='hp'?0x39e6ff:0xff9f1c,0x222222)); m.castShadow=true; outlined(m,1.12); m.position.set((Math.random()*80-40),1.2,(Math.random()*80-40)); scene.add(m); pickups.push({mesh:m,kind,t:0}); }
+function centerMsg(t,ms=1400){ $('centerMsg').textContent=t; setTimeout(()=>{if($('centerMsg').textContent===t)$('centerMsg').textContent=''},ms); }
+function burst(pos,color,n=16,speed=9){ for(let i=0;i<n;i++){ const m=new THREE.Mesh(new THREE.BoxGeometry(.28,.28,.28),new THREE.MeshBasicMaterial({color})); m.position.copy(pos); scene.add(m); parts.push({mesh:m,vx:(Math.random()-.5)*speed,vy:Math.random()*speed*.8+2,vz:(Math.random()-.5)*speed,life:.7+Math.random()*.4,t:0,spin:Math.random()*8}); } if(AC)sfx.boom(); }
+function fireShot(owner,pos,dir,enemyShot=false,charged=false){ const geo=new THREE.SphereGeometry(charged?0.42:0.24,10,10); const m=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({color:enemyShot?0xff9f1c:(charged?0x39e6ff:0xffe66d)})); m.position.copy(pos); scene.add(m); (enemyShot?eshots:shots).push({mesh:m,vx:dir.x*(charged?38:46),vz:dir.z*(charged?38:46),life:1.6,dmg:charged?55:16,owner}); if(owner===player)shotsFired++; }
+function damagePlayer(d){ if(!player||!player.alive||attract)return; if(player.shield){ player.boost=Math.max(0,player.boost-8); return; } player.hp-=d; shake=Math.min(1,shake+.45); if(AC)sfx.hurt(); burst(player.mesh.position,0xff2a3c,6,5); if(player.hp<=0){ player.alive=false; burst(player.mesh.position,0xff6b5e,42,14); setTimeout(()=>endGame(false),900); } }
+function damageEnemy(e,d,byP2=false){ e.hp-=d; hits++; if(AC)sfx.hit(); burst(e.mesh.position,0xffd23f,5,6);
+  if(e.hp<=0){ burst(e.mesh.position,0xff2a3c,30,12); scene.remove(e.mesh); if(e.body)world.removeRigidBody(e.body); enemies=enemies.filter(x=>x!==e); if(e===boss){boss=null;$('bossWrap').classList.add('hidden'); addScore(5000,byP2); endGame(true); return;} kills++; combo++; comboT=3; addScore(e.scoreV*(1+Math.floor(combo/4)),byP2); if(Math.random()<.4)dropPickup(); if(!duel&&enemies.length===0&&state==='play'){ if(wave<3) setTimeout(()=>{if(state==='play')spawnWave(wave+1)},1200); } } }
+function addScore(v,byP2=false){ if(byP2){p2Score++; $('centerMsg').textContent='P2 TAKEDOWN · '+p2Score+' / 5'; if(p2Score>=5)endGame(false,true); return;} score+=v; if(hubSession&&window.AIHub)AIHub.progress({score,label:'Sector '+(wave+1)+' · '+kills+' kills'}); }
+function buildWorld(){
+  scene=new THREE.Scene(); scene.background=new THREE.Color(0x0a0206); scene.fog=new THREE.Fog(0x0a0206,60,150);
+  camera=new THREE.PerspectiveCamera(62,innerWidth/innerHeight,.1,300); camera2=new THREE.PerspectiveCamera(62,innerWidth/innerHeight,.1,300);
+  gradientMap=new THREE.DataTexture(new Uint8Array([90,160,220,255]),4,1,THREE.RedFormat); gradientMap.minFilter=THREE.NearestFilter; gradientMap.magFilter=THREE.NearestFilter; gradientMap.needsUpdate=true;
+  const cv=document.createElement('canvas'); cv.width=cv.height=256; const cx=cv.getContext('2d'); cx.fillStyle='#18030a';cx.fillRect(0,0,256,256); cx.strokeStyle='#ff2a3c';cx.lineWidth=3; for(let i=0;i<=256;i+=32){cx.beginPath();cx.moveTo(i,0);cx.lineTo(i,256);cx.stroke();cx.beginPath();cx.moveTo(0,i);cx.lineTo(256,i);cx.stroke();}
+  const gridTex=new THREE.CanvasTexture(cv); gridTex.wrapS=gridTex.wrapT=THREE.RepeatWrapping; gridTex.repeat.set(14,14);
+  const floor=new THREE.Mesh(new THREE.PlaneGeometry(ARENA*2+30,ARENA*2+30),new THREE.MeshToonMaterial({map:gridTex,gradientMap,color:0xffffff})); floor.rotation.x=-Math.PI/2; floor.receiveShadow=true; scene.add(floor);
+  scene.add(new THREE.AmbientLight(0xffc9c2,.85)); const sun=new THREE.DirectionalLight(0xffffff,2.4); sun.position.set(28,44,18); sun.castShadow=settings.shadows; sun.shadow.mapSize.set(2048,2048); sun.shadow.camera.left=-70;sun.shadow.camera.right=70;sun.shadow.camera.top=70;sun.shadow.camera.bottom=-70; scene.add(sun); scene.userData.sun=sun;
+  const p1=new THREE.PointLight(0x39e6ff,120,70); p1.position.set(-30,10,-30); scene.add(p1); const p2=new THREE.PointLight(0xff2a3c,120,70); p2.position.set(30,10,30); scene.add(p2);
+  // border walls + pillars (visual + Rapier fixed colliders)
+  const wallMat=[[0,-ARENA,ARENA*2+4,2],[0,ARENA,ARENA*2+4,2],[-ARENA,0,2,ARENA*2+4],[ARENA,0,2,ARENA*2+4]];
+  wallMat.forEach(([x,z,w,d])=>{ const m=box(w,4,d,0x5c0a18,x,2,z); scene.add(m); fixedBox(x,z,w,d,4); });
+  [[-28,-28],[28,-28],[-28,28],[28,28],[0,0],[-38,4],[38,4]].forEach(([x,z])=>{ const m=box(5,7,5,0x334155,x,3.5,z); scene.add(m); const cap=box(5.6,0.7,5.6,0x39e6ff,x,7.3,z,false); scene.add(cap); fixedBox(x,z,5,5,7); });
+  // distant wireframe city silhouettes + stars (moving layer: drifting particles)
+  for(let i=0;i<26;i++){ const a=i/26*Math.PI*2, r=95+Math.random()*30, h=8+Math.random()*22; const m=new THREE.Mesh(new THREE.BoxGeometry(6,h,6),new THREE.MeshBasicMaterial({color:0x3d0712,wireframe:true})); m.position.set(Math.cos(a)*r,h/2,Math.sin(a)*r); scene.add(m); }
+  const starGeo=new THREE.BufferGeometry(); const sp=new Float32Array(600*3); for(let i=0;i<600;i++){sp[i*3]=(Math.random()-.5)*260;sp[i*3+1]=Math.random()*70+8;sp[i*3+2]=(Math.random()-.5)*260;} starGeo.setAttribute('position',new THREE.BufferAttribute(sp,3));
+  const stars=new THREE.Points(starGeo,new THREE.PointsMaterial({color:0xff8f9a,size:.55})); scene.add(stars); scene.userData.stars=stars;
+}
+async function initThree(){ if(!navigator.gpu){ $('err').textContent='CRIMSON CIRCUIT needs WebGPU. Please open it in a current Chrome or Edge with WebGPU enabled. (WebGPU only by design — no fallback renderer.)'; $('err').classList.remove('hidden'); throw new Error('WebGPU unavailable'); }
+  renderer=new THREE.WebGPURenderer({antialias:true}); renderer.setSize(innerWidth,innerHeight); renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.shadowMap.enabled=true; renderer.toneMapping=THREE.NeutralToneMapping; $('app').appendChild(renderer.domElement); await renderer.init();
+  await RAPIER.init({}); world=new RAPIER.World({x:0,y:0,z:0}); world.timestep=1/60; buildWorld(); player=makePlayer(0xe63946,0,34); player.mesh.visible=false;
+  addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix(); camera2.aspect=camera.aspect;camera2.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
+}
+// ---------- Flow ----------
+function clearField(){ enemies.forEach(e=>{scene.remove(e.mesh); if(e.body)world.removeRigidBody(e.body)}); enemies=[]; boss=null; $('bossWrap').classList.add('hidden'); [...shots,...eshots].forEach(s=>scene.remove(s.mesh)); shots=[];eshots=[]; pickups.forEach(p=>scene.remove(p.mesh)); pickups=[]; parts.forEach(p=>scene.remove(p.mesh)); parts=[]; if(player2){scene.remove(player2.mesh); world.removeRigidBody(player2.body); player2=null;} }
+function resetPlayer(p,x,z){ p.hp=100;p.boost=100;p.alive=true;p.cool=0;p.charge=0;p.shield=false; p.body.setTranslation({x,y:1,z},true); p.body.setLinvel({x:0,y:0,z:0},true); p.mesh.visible=true; }
+function startGame(isDuel=false){ audio(); duel=isDuel; attract=false; clearField(); score=0;combo=0;kills=0;shotsFired=0;hits=0;p2Score=0;missionT=240;resultSent=false; state='play'; $('titleScr').classList.add('hidden'); $('overScr').classList.add('hidden'); $('hud').classList.remove('hidden'); resetPlayer(player,0,34);
+  if(duel){ player2=makePlayer(0x39e6ff,0,-34,true); centerMsg('LOCAL DUEL — FIRST TO 5 TAKEDOWNS',2000); speak('Duel mode! Player Two, try not to scratch the paint. Player One, scratch everything.','CMDR. VEX'); spawnEnemy('drone',-16,0); spawnEnemy('drone',16,0); }
+  else { wave=0; spawnWave(0); speak('There it is, pilot! KAIOS has turned the whole grid red. Politely return it. With explosives.','CMDR. VEX'); }
+  if(hubSession&&window.AIHub)AIHub.progress({score:0,label:'Sector 1'}); }
+function endGame(won,p2Won=false){ if(state!=='play')return; state='over'; $('hud').classList.add('hidden');
+  if(hubSession&&window.AIHub&&!resultSent){ resultSent=true; AIHub.result({score}); }
+  $('overTitle').textContent = p2Won?'PLAYER 2 WINS THE DUEL':(won?'KAIOS CORE DELETED — YOU BEAUTIFUL MENACE':'TANK DOWN — KAIOS SENDS A FRUIT BASKET');
+  const acc=shotsFired?Math.round(hits/Math.max(1,shotsFired)*100):0;
+  $('overStats').innerHTML='<table class="score"><tr><th>SCORE</th><th>KILLS</th><th>ACCURACY</th><th>SECTOR</th></tr><tr><td>'+score+'</td><td>'+kills+'</td><td>'+acc+'%</td><td>'+(wave+1)+' / 4</td></tr></table><p class="hint">'+(won?'The grid breathes again. Somewhere, a defence computer is filing a complaint.':'KAIOS repaints your wreckage red and calls it modern art. Rude. Run it back.')+'</p>';
+  $('overScr').classList.remove('hidden'); speak(won?'Core deleted! I never doubted you. Out loud.':'Tank down! Shake it off, pilot. The grid needs you.','CMDR. VEX'); }
+function toTitle(){ state='title'; duel=false; attract=false; clearField(); if(player)player.mesh.visible=false; $('hud').classList.add('hidden'); $('overScr').classList.add('hidden'); showScreen('titleScr'); lastInputAt=performance.now(); }
+let curScreen='titleScr';
+function showScreen(id){ ['titleScr','howtoScr','settingsScr','aboutScr'].forEach(s=>$(s).classList.toggle('hidden',s!==id)); curScreen=id; refreshMenuSel(); }
+function toggleSettings(){ if(state==='title'||curScreen!=='titleScr'){ if(!settingsOpen){settingsOpen=true; $('settingsScr').classList.remove('hidden');} else {settingsOpen=false; $('settingsScr').classList.add('hidden'); if(state==='title')showScreen('titleScr');} } else { settingsOpen=!settingsOpen; $('settingsScr').classList.toggle('hidden',!settingsOpen); } if(AC)sfx.ui(); }
+// menu navigation (controller-first)
+let menuSel=0;
+function menuButtons(){ const scr=$(curScreen); if(!scr||settingsOpen)return [...$('titleMenu').querySelectorAll('button')]; return [...scr.querySelectorAll('.menu button, .screen > button')]; }
+function refreshMenuSel(){ document.querySelectorAll('button.sel').forEach(b=>b.classList.remove('sel')); const bs=menuButtons(); if(bs[menuSel])bs[menuSel].classList.add('sel'); }
+document.querySelectorAll('#titleMenu button').forEach(b=>b.addEventListener('click',()=>{audio();sfx.ui(); const a=b.dataset.act; if(a==='start')startGame(false); if(a==='duel')startGame(true); if(a==='howto')showScreen('howtoScr'); if(a==='settings'){settingsOpen=true;$('settingsScr').classList.remove('hidden');} if(a==='about')showScreen('aboutScr'); }));
+document.querySelectorAll('[data-back]').forEach(b=>b.addEventListener('click',()=>{sfx.ui(); settingsOpen=false; $('settingsScr').classList.add('hidden'); showScreen('titleScr');}));
+document.querySelectorAll('#overScr button').forEach(b=>b.addEventListener('click',()=>{sfx.ui(); if(b.dataset.act==='again')startGame(duel); else toTitle();}));
+$('touchSettings').addEventListener('click',()=>{settingsOpen=true;$('settingsScr').classList.remove('hidden');});
+// settings wiring
+function bindToggle(id,key,fn){ const el=$(id); const paint=()=>el.textContent=settings[key]?'ON':'OFF'; paint(); el.addEventListener('click',()=>{audio(); settings[key]=!settings[key]; paint(); saveSettings(); if(fn)fn(); sfx.ui();}); }
+bindToggle('invXBtn','invX'); bindToggle('invYBtn','invY'); bindToggle('shakeBtn','shake'); bindToggle('voiceBtn','voice');
+bindToggle('shadowBtn','shadows',()=>{ if(scene&&scene.userData.sun)scene.userData.sun.castShadow=settings.shadows; });
+[['volMaster','master'],['volMusic','music'],['volSfx','sfx']].forEach(([id,k])=>{ const el=$(id); el.value=Math.round(settings[k]*100); el.addEventListener('input',()=>{audio(); settings[k]=el.value/100; saveSettings(); applyVol();}); });
+if(matchMedia('(pointer: coarse)').matches && !matchMedia('(pointer: fine)').matches) $('touchWarn').classList.remove('hidden');
+// ---------- Per-frame updates ----------
+function controlTank(p,c,dt,isAttract=false){ if(!p||!p.alive)return; const t=p.body.translation();
+  // aim: right stick / mouse sets turret yaw; movement is world-relative for a 10-foot readable feel
+  if(Math.abs(c.ax)>.05||Math.abs(c.ay)>.05||!p.isP2) p.aim=Math.atan2(c.ax, -(c.ay)) + (p.isP2?0:0);
+  if(p.isP2&&(Math.abs(c.ax)>.1||Math.abs(c.ay)>.1)) p.aim=Math.atan2(c.ax,-c.ay);
+  if(!p.isP2&&!isAttract){ /* mouse aim: turret faces mouse ray direction on ground plane */ const ndx=mouse.x, ndy=mouse.y; if(Math.abs(c.ax)>.02||Math.abs(c.ay)>.02) p.aim=Math.atan2(ndx, ndy*0.6+0.4); const pad=navigator.getGamepads?.()[0]; if(pad&&(Math.abs(pad.axes[2])>.15||Math.abs(pad.axes[3])>.15)) p.aim=Math.atan2(dz(pad.axes[2])*(settings.invX?-1:1), dz(pad.axes[3])*(settings.invY?-1:1)); }
+  const speed=c.dash&&p.boost>4?26:13; const dashing=c.dash&&p.boost>4;
+  if(dashing){ p.boost=Math.max(0,p.boost-38*dt); if(AC&&Math.random()<.3)sfx.dash(); }
+  p.body.setLinvel({x:c.x*speed,y:0,z:c.y*speed},true); p.body.setTranslation({x:t.x,y:1,z:t.z},true);
+  if(Math.abs(c.x)>.05||Math.abs(c.y)>.05) p.face=Math.atan2(c.x,-c.y);
+  p.mesh.position.set(t.x, Math.sin(simTime*3+(p.isP2?2:0))*.08, t.z); p.mesh.rotation.y=lerp(p.mesh.rotation.y,p.face,.25);
+  const tur=p.mesh.userData.turret; if(tur)tur.rotation.y=p.aim-p.mesh.rotation.y;
+  p.shield=!!c.shield&&p.boost>2; if(p.shield){p.boost=Math.max(0,p.boost-16*dt); if(AC&&Math.random()<.06)sfx.shield();}
+  else if(!dashing) p.boost=Math.min(100,p.boost+9*dt);
+  p.cool-=dt; p.missileCd-=dt; p.dashCd-=dt; p.recoil=Math.max(0,p.recoil-dt*6);
+  if(tur)tur.position.z=-p.recoil*.35;
+  if(c.fire){ p.charge=Math.min(1,p.charge+dt*1.4); if(AC&&p.charge>.3&&Math.random()<.4)sfx.charge(p.charge); if(p.cool<=0&&p.charge<.25){ const dir={x:Math.sin(p.aim),z:-Math.cos(p.aim)}; const pos=p.mesh.position.clone(); pos.y=1.6; pos.x+=dir.x*2.2; pos.z+=dir.z*2.2; fireShot(p,pos,dir,false,false); p.cool=.16; p.recoil=1; if(AC)sfx.shoot(); } }
+  else if(p.charge>=.25){ const dir={x:Math.sin(p.aim),z:-Math.cos(p.aim)}; const pos=p.mesh.position.clone(); pos.y=1.6; pos.x+=dir.x*2.2; pos.z+=dir.z*2.2; fireShot(p,pos,dir,false,true); p.recoil=1; shake=Math.min(1,shake+.2); if(AC)sfx.shoot(); p.charge=0; p.cool=.3; }
+  else p.charge=0;
+  if(c.missile&&p.missileCd<=0){ p.missileCd=2.2; let best=null,bd=1e9; enemies.forEach(e=>{const d=e.mesh.position.distanceTo(p.mesh.position); if(d<bd){bd=d;best=e}}); if(best){ const dir=best.mesh.position.clone().sub(p.mesh.position).normalize(); const pos=p.mesh.position.clone(); pos.y=2; fireShot(p,pos,{x:dir.x,z:dir.z},false,true); shots[shots.length-1].homing=best; shots[shots.length-1].dmg=45; if(AC)sfx.lock(); centerMsg('MISSILE AWAY — LOCKED',700);} }
+}
+function updateEnemies(dt){ const pp=player?player.mesh.position:null; enemies.forEach(e=>{ e.t+=dt; e.cool-=dt; const pos=e.mesh.position;
+  if(e.kind==='boss'){ e.mesh.position.y=Math.sin(e.t*1.4)*.5+2.5; e.mesh.rotation.y+=dt*.5; if(e.mesh.userData.ring)e.mesh.userData.ring.rotation.z+=dt*1.8; const hpFrac=e.hp/e.maxHp; e.phase=hpFrac<.33?3:(hpFrac<.66?2:1); if(pp){ const mv=pp.clone().sub(pos); mv.y=0; if(mv.length()>16){mv.normalize(); e.mesh.position.x+=mv.x*dt*e.speed; e.mesh.position.z+=mv.z*dt*e.speed;} }
+    if(e.cool<=0&&pp){ e.cool=e.phase===3?.7:(e.phase===2?1.1:1.6); const n=e.phase+1; for(let i=0;i<n;i++){ const a=Math.atan2(pp.x-pos.x,pp.z-pos.z)+(i-(n-1)/2)*.25; const dir={x:Math.sin(a),z:Math.cos(a)}; const sp=pos.clone(); sp.y=2.2; fireShot(e,sp,dir,true,false);} if(AC)sfx.shoot(); } return; }
+  if(e.kind==='turret'){ if(pp&&e.mesh.userData.turret){ const a=Math.atan2(pp.x-pos.x,pp.z-pos.z); e.mesh.userData.turret.rotation.y=a; if(e.cool<=0&&pos.distanceTo(pp)<52){ e.cool=1.9; const dir={x:Math.sin(a),z:Math.cos(a)}; const sp=pos.clone(); sp.y=2; fireShot(e,sp,dir,true,false); if(AC)sfx.shoot(); } } return; }
+  // drones & tanks chase via Rapier velocity, hover-bob visually
+  if(e.body&&pp){ const t=e.body.translation(); const dx=pp.x-t.x, dz2=pp.z-t.z, d=Math.hypot(dx,dz2)||1; const want=e.kind==='drone'?11:20; let vx=dx/d*e.speed, vz=dz2/d*e.speed; if(d<want){ vx=-dz2/d*e.speed*.7*e.strafe; vz=dx/d*e.speed*.7*e.strafe; } e.body.setLinvel({x:vx,y:0,z:vz},true); e.body.setTranslation({x:t.x,y:1,z:t.z},true); e.mesh.position.set(t.x, e.kind==='drone'?2.2+Math.sin(e.t*5)*.35:Math.sin(e.t*3)*.07, t.z); e.mesh.rotation.y=Math.atan2(dx,-dz2)+Math.PI; const tur=e.mesh.userData.turret; if(tur)tur.rotation.y=0;
+    if(e.cool<=0&&d<44){ e.cool=e.kind==='drone'?1.4:1.1; const dir={x:dx/d,z:dz2/d}; const sp=e.mesh.position.clone(); sp.y=1.6; fireShot(e,sp,dir,true,false); if(AC)sfx.shoot(); } }
+ }); }
+function updateShots(dt){ const step=(arr,vsPlayer)=>{ for(let i=arr.length-1;i>=0;i--){ const s=arr[i]; if(s.homing&&enemies.includes(s.homing)){ const tp=s.homing.mesh.position, dx=tp.x-s.mesh.position.x, dz2=tp.z-s.mesh.position.z, d=Math.hypot(dx,dz2)||1, sp=44; s.vx=lerp(s.vx,dx/d*sp,.12); s.vz=lerp(s.vz,dz2/d*sp,.12);} s.mesh.position.x+=s.vx*dt; s.mesh.position.z+=s.vz*dt; s.life-=dt; let dead=s.life<=0||Math.abs(s.mesh.position.x)>ARENA+3||Math.abs(s.mesh.position.z)>ARENA+3;
+  if(!dead&&vsPlayer){ if(player&&player.alive&&s.mesh.position.distanceTo(player.mesh.position)<2.1){ damagePlayer(s.dmg); dead=true; } if(duel&&player2&&player2.alive&&s.owner!==player2&&s.mesh.position.distanceTo(player2.mesh.position)<2.1){ player2.hp-=s.dmg; burst(player2.mesh.position,0x39e6ff,8,6); if(player2.hp<=0){ addScore(0,true); player2.hp=100; player2.body.setTranslation({x:0,y:1,z:-34},true); centerMsg('P2 DOWN — RESPAWNED · P1 LEADS',900);} dead=true; } }
+  if(!dead&&!vsPlayer){ for(const e of enemies){ const r=e.kind==='boss'?5.2:2.0; if(s.mesh.position.distanceTo(e.mesh.position)<r){ damageEnemy(e,s.dmg,s.owner===player2); dead=true; break; } } if(!dead&&duel&&player2&&s.owner===player&&s.mesh.position.distanceTo(player2.mesh.position)<2.1){ player2.hp-=s.dmg; if(player2.hp<=0){ p2Score=0; score+=500; centerMsg('P1 TAKEDOWN! +500',900); player2.hp=100; player2.body.setTranslation({x:0,y:1,z:-34},true);} dead=true; } }
+  if(dead){ scene.remove(s.mesh); arr.splice(i,1);} } }; step(shots,false); step(eshots,true); }
+function updateFx(dt){ for(let i=parts.length-1;i>=0;i--){ const p=parts[i]; p.t+=dt; p.vy-=18*dt; p.mesh.position.x+=p.vx*dt; p.mesh.position.y=Math.max(.15,p.mesh.position.y+p.vy*dt); p.mesh.position.z+=p.vz*dt; p.mesh.rotation.x+=p.spin*dt; p.mesh.rotation.y+=p.spin*dt; const s=1-p.t/p.life; p.mesh.scale.setScalar(Math.max(.01,s)); if(p.t>=p.life){scene.remove(p.mesh); parts.splice(i,1);} }
+  pickups.forEach(p=>{p.t+=dt; p.mesh.rotation.y+=dt*2; p.mesh.position.y=1.2+Math.sin(p.t*3)*.3;}); if(player&&player.alive){ for(let i=pickups.length-1;i>=0;i--){ if(pickups[i].mesh.position.distanceTo(player.mesh.position)<2.6){ if(pickups[i].kind==='hp')player.hp=Math.min(100,player.hp+35); else player.boost=100; if(AC)sfx.pickup(); centerMsg(pickups[i].kind==='hp'?'+ ARMOR CELL':'+ BOOST CELL',700); scene.remove(pickups[i].mesh); pickups.splice(i,1); } } }
+  if(scene&&scene.userData.stars)scene.userData.stars.rotation.y+=dt*.006; }
+function drawRadar(){ const c=$('radar').getContext('2d'); c.fillStyle='rgba(10,0,4,.9)'; c.fillRect(0,0,168,168); c.strokeStyle='#ff2a3c'; c.strokeRect(4,4,160,160); const map=(x,z)=>[84+x/(ARENA*2)*160,84+z/(ARENA*2)*160]; const dot=(x,z,col,r=4)=>{const [a,b]=map(x,z); c.fillStyle=col; c.beginPath();c.arc(a,b,r,0,7);c.fill();};
+  enemies.forEach(e=>dot(e.mesh.position.x,e.mesh.position.z, e.kind==='boss'?'#ff9f1c':'#ff2a3c', e.kind==='boss'?7:4)); pickups.forEach(p=>dot(p.mesh.position.x,p.mesh.position.z,'#39e6ff',3)); if(player)dot(player.mesh.position.x,player.mesh.position.z,'#ffffff',5); if(player2)dot(player2.mesh.position.x,player2.mesh.position.z,'#39e6ff',5); }
+let fpsAcc=0,fpsN=0,fpsT=0;
+function updateHUD(dt){ $('hpBar').style.width=clamp(player?player.hp:0,0,100)+'%'; $('boostBar').style.width=clamp(player?player.boost:0,0,100)+'%'; $('scoreLbl').textContent='SCORE '+score+(duel?' · P2 '+p2Score+'/5':''); $('comboLbl').textContent=combo>1?('COMBO x'+combo):''; const mm=String(Math.floor(Math.max(0,missionT)/60)).padStart(2,'0'), ss=String(Math.floor(Math.max(0,missionT)%60)).padStart(2,'0'); $('timerLbl').textContent=mm+':'+ss; $('weaponLbl').textContent=(player&&player.charge>.25)?'CHARGED SHOT READY':(player&&player.shield?'AEGIS SHIELD UP':'CANNON · R2 FIRE · HOLD = CHARGE'); if(boss)$('bossBar').style.width=clamp(boss.hp/boss.maxHp*100,0,100)+'%'; drawRadar(); fpsAcc+=dt;fpsN++;fpsT+=dt; if(fpsT>.5){ $('fps').textContent=Math.round(fpsN/fpsAcc)+' FPS · '+enemies.length+' HOSTILES'; fpsAcc=0;fpsN=0;fpsT=0; } }
+// attract AI: cheats freely, infinite health (damagePlayer is a no-op in attract)
+function attractControl(dt){ if(!player)return null; const t=simTime; const c={x:Math.sin(t*.45),y:-Math.cos(t*.3),ax:Math.sin(t*.8),ay:Math.cos(t*.6),fire:Math.sin(t*2.1)>-.2,dash:Math.sin(t*1.3)>.92,missile:false,shield:Math.sin(t)>.95}; return c; }
+function startAttract(){ if(state!=='title'||settingsOpen||hubSession)return; attract=true; duel=false; clearField(); resetPlayer(player,0,34); player.hp=100; $('titleScr').classList.remove('hidden'); $('attractLbl').classList.remove('hidden'); $('hud').classList.remove('hidden'); if(enemies.length===0){spawnEnemy('drone',-16,-18);spawnEnemy('drone',16,-18);spawnEnemy('tank',0,-30);} $('waveLbl').textContent='ATTRACT MODE'; }
+function stopAttract(){ if(!attract)return; attract=false; $('attractLbl').classList.add('hidden'); $('hud').classList.add('hidden'); if(player)player.mesh.visible=false; clearField(); }
+let worldSec=0, lastInput={x:0,y:0,fire:false};
+function animate(){ requestAnimationFrame(animate); const dt=Math.min(clock.getDelta(),.05); if(!renderer||!scene)return;
+  // menu gamepad/keyboard nav
+  if(state==='title'&&!settingsOpen){ if(pressed.ArrowDown||padEdge[13]){menuSel=(menuSel+1); refreshMenuSel(); sfx.ui&&AC&&sfx.ui();} if(pressed.ArrowUp||padEdge[12]){menuSel=Math.max(0,menuSel-1); refreshMenuSel();} if(pressed.Enter||padEdge[0]){ const bs=menuButtons(); if(bs[menuSel])bs[menuSel].click(); } }
+  if((pressed.Escape||padEdge[9])&&state==='play')toggleSettings();
+  if(pressed.Escape&&settingsOpen&&state!=='play'){settingsOpen=false;$('settingsScr').classList.add('hidden');showScreen('titleScr');}
+  const paused=settingsOpen&&(state==='play'||state==='title');
+  if(!paused){
+    if(state==='title'&&!hubSession&&performance.now()-lastInputAt>10000&&!attract) startAttract();
+    if(attract){ const c=attractControl(dt); if(c){controlTank(player,c,dt,true); lastInput={x:c.x,y:c.y,fire:c.fire};} updateEnemies(dt); updateShots(dt); }
+    else if(state==='play'){ simTime+=dt; worldSec+=dt; if(hubSession&&window.AIHub&&AIHub.time&&AIHub.time()<0){ /* countdown: hold */ } else { missionT-=dt; if(missionT<=0){ if(hubSession)endGame(score>0); else endGame(wave>=3); } const c=readControl(false); controlTank(player,c,dt); lastInput={x:c.x,y:c.y,fire:c.fire}; if(duel&&player2){ const c2=readControl(true); controlTank(player2,c2,dt); if(player2.hp<=0){player2.hp=100;} } updateEnemies(dt); updateShots(dt); comboT-=dt; if(comboT<=0)combo=0; } }
+    updateFx(dt); if(world)world.step();
+    // sync enemy meshes already done; sync player2 handled in controlTank via body translation read next frame
+    if(player2&&player2.mesh){ const t=player2.body.translation(); player2.mesh.position.set(t.x,Math.sin(simTime*3+2)*.08,t.z); }
+    if(state==='play'||attract)updateHUD(dt);
+  }
+  // camera: chase behind player, shake, attract sweeps wide
+  if(player&&(state==='play'||attract)){ const p=player.mesh.position; const back=attract?20:15, h=attract?10:8.5; const cx=p.x-Math.sin(player.face)*back*.4 + (attract?Math.sin(simTime*.2)*10:0); const cz=p.z+18; camera.position.set(lerp(camera.position.x,p.x+Math.sin(simTime*.15)*(attract?14:0),.06), h, lerp(camera.position.z,p.z+back,.06)); camera.lookAt(p.x,1,p.z-6); if(settings.shake&&shake>0){ camera.position.x+=(Math.random()-.5)*shake*.7; camera.position.y+=(Math.random()-.5)*shake*.7; shake=Math.max(0,shake-dt*2.2); }
+    if(duel&&player2){ camera2.position.set(player2.mesh.position.x,8.5,player2.mesh.position.z+15); camera2.lookAt(player2.mesh.position.x,1,player2.mesh.position.z-6); } }
+  else if(scene){ camera.position.set(Math.sin(performance.now()*.00012)*34,16,42); camera.lookAt(0,1,0); }
+  if(renderer&&scene){ if(duel&&state==='play'&&player2){ const w=innerWidth,h=innerHeight; renderer.setScissorTest(true); renderer.setViewport(0,h/2,w,h/2); renderer.setScissor(0,h/2,w,h/2); renderer.render(scene,camera); renderer.setViewport(0,0,w,h/2); renderer.setScissor(0,0,w,h/2); renderer.render(scene,camera2); renderer.setScissorTest(false); } else renderer.render(scene,camera); }
+  for(const k in pressed)delete pressed[k];
+}
+// ---------- AI Hub (parallel) + probe + boot ----------
+let hubInfo=null;
+if(window.AIHub){ AIHub.probe(()=>({scene:settingsOpen?'menu':(state==='play'?'play':(state==='over'?'over':'title')), menu:settingsOpen, world:worldSec, input:{x:lastInput.x,y:lastInput.y,fire:!!lastInput.fire}})); }
+async function boot(){ try{ await initThree(); }catch(e){ console.error(e); return; }
+  animate();
+  if(window.AIHub&&AIHub.active){ hubSession=true; try{ hubInfo=await AIHub.connect({mode:'parallel',seats:[1,4]}); }catch(e){ hubInfo=null; }
+    if(hubInfo){ $('titleScr').classList.add('hidden'); AIHub.on('time-up',()=>{ if(state==='play')endGame(score>0); }); AIHub.on('end',()=>{ state='over'; if(AC){/* keep final screen quiet */} }); startGame(false); AIHub.ready(); } else { hubSession=false; } }
+  anyInputCb=()=>{ if(attract){ stopAttract(); lastInputAt=performance.now(); } };
+}
+addEventListener('error',e=>{ const el=$('err'); if(el&&state==='title'){ /* keep title usable; log only */ console.error(e.message);} });
+boot();
+</script>
+</body>
+</html>

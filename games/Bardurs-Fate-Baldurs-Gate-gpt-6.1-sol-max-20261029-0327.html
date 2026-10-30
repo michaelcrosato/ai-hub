@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<!-- 
+BARDUR’S FATE — THE HOLLOW BELL
+SOURCE
+Date: 2026-10-29 04:12 America/Vancouver; project stamp 20261029-0327.
+Source: Baldur’s Gate. An original spiritual successor; no source assets or characters.
+Tech: Three.js r180 (0.180.0), WebGPURenderer with WebGPU required and fallback disabled; Rapier 0.19.3; HTML/CSS/JavaScript; Gamepad API; Web Audio API; localStorage.
+Art Direction: Stylized cel shading using MeshToonNodeMaterial, four-band lighting, faceted procedural models, ink outlines and a muted copper/teal palette.
+Animation: Procedural hierarchical character rigs, locomotion, attacks, breathing, cloth sway, floating damage and timed particle effects.
+Audio: Code-written adaptive fantasy score, synthesized sound effects and formant-filtered Animalese-style gibberish voices; no recorded audio.
+Online: AI Hub Session Protocol v1 co-op, embedded unmodified client 1.3.0 at commit dfd421ce67f15aa38541635cb87835adb1fc0111. Host authority, local movement prediction, snapshots, disconnect handling and results. Standalone 1–4 controller couch co-op; online play requires AI Hub.
+Testing parameters: Efficient, lightweight testing. Static syntax check, browser smoke test, focused quest/combat/save checks and AI Hub conformance. See Testing page for actual results.
+Environment: Codex CLI (headless); Linux / WSL2. Player browser unknown. Test browser results are listed separately.
+Model: OpenAI, gpt-6.1-sol, reasoning effort max.
+Usage: Estimated API cost: unknown. Total tokens and breakdown: unknown. Session time: approximately 45 minutes at final packaging (measured from first tool timestamp).
+
+TESTING
+Issues caught: 8 application issues found and fixed across visual, gameplay and session checks: inward roof faces; title focus contrast; HUD contrast; Escape/back navigation; shared effect geometry disposal; battle-audio routing; draw-coupled controller polling; and pending menu input lost on focus changes. A separate headless WebGPU capture configuration issue was also resolved.
+Critical / game breaking: 1: effect cleanup disposed shared world geometry, causing invalid GPU buffers. Fixed by sharing effect geometry safely and deferring material disposal until submitted GPU work completes.
+Results: 23/23 chapter checks passed with no JavaScript errors. AI Hub automatic conformance: 24/24 player-hosted checks and 25/25 dedicated-server checks passed.
+Parameters: Efficient, focused testing in Playwright Chromium 153.0.8010.12 under Xvfb/software Vulkan. Chapter fixtures shorten encounters. Hub tests use two emulated players, plus a separate host in server mode, 60 ms latency, 20 ms jitter and 0% packet loss. No FPS target or optimization testing. Physical controllers and four separate real devices are unverified.
+Most helpful test: The quest-to-ending browser fixture exposed the shared-geometry lifetime error and battle-audio error while proving the whole chapter can finish. The hub harness caught short-input timing failures.
+Least helpful test: The initial syntax-only check passed despite the rendering and audio bugs. It was useful as a quick gate, but could not assess the game’s behavior.
+
+ENGINE
+What worked best: Three.js toon node materials, procedural geometry and shadows made the cel-shaded world expressive without downloaded art. Rapier provided dependable movement and physical props.
+Stuck or guessed wrong: I initially treated a spell beam’s geometry as disposable even though it was shared with scenery. That invalidated GPU buffers. Headless canvas capture also required a virtual display and the correct software-Vulkan launch configuration.
+Most important custom system: The party RPG layer: quest consequences, dialogue choices, companion AI, queued tactical orders, progression, saves, and shared-world authority.
+Hardest part: Coordinating GPU-resource lifetimes while keeping controller sampling, physics and networking independent of drawing.
+What to remove or overhaul: Automatic graphics-backend fallback should be an explicit opt-in for applications that require WebGPU. This build disables it.
+One engine change: Add a public strict-WebGPU option and clearer diagnostics when resources still referenced by GPU work are disposed.
+
+PROMPT
+What worked best: The cel-shaded art direction, controller-first requirement, attract mode and single-file delivery made the desired experience concrete.
+What was confusing: “All features” of a full-scale party RPG is unbounded. This demo defines a complete chapter with its mechanics explained in the guide, journal and companion records. Standalone multiplayer is couch co-op; online co-op uses AI Hub.
+Hardest part: Combining a coherent quest-driven party RPG, a complete ending and authoritative multiplayer into one portable HTML file.
+One further test: Four physical DualSense controllers on four separate machines, including a dedicated host, with 250 ms latency and packet loss.
+ -->
+<html lang="en"><head><meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="co-op"><meta name="hub:session-minutes" content="8"><meta name="hub:session-goal" content="Unseal the abbey and silence the Hollow Bell together"><meta name="hub:session-howto" content="Stick/WASD move; Cross/E interact; R2/J strike; Triangle/K skill"><meta name="hub:webgpu" content="required">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Crect width=%2764%27 height=%2764%27 rx=%2714%27 fill=%27%23172e31%27/%3E%3Ctext x=%2732%27 y=%2750%27 text-anchor=%27middle%27 font-size=%2750%27 fill=%27%23e7bb73%27%3E♜%3C/text%3E%3C/svg%3E"><meta name="theme-color" content="#172e31"><title>Bardur’s Fate · The Hollow Bell</title>
+<style>@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+:root{--ink:#10272b;--panel:#10272bf2;--gold:#e7bb73;--paper:#f3e7cc;--muted:#afbfba;--line:#baaa7545;--green:#86b991;--red:#d67569}*{box-sizing:border-box}body{margin:0;overflow:hidden;background:#132c30;color:var(--paper);font:16px 'Manrope',sans-serif}button{font:inherit;color:inherit;cursor:pointer}button:disabled{opacity:.38;cursor:default}button:focus-visible,button.focus{outline:2px solid var(--gold);outline-offset:4px}button:hover{filter:brightness(1.18)}button,.card{transition:background .16s,transform .16s}h1,h2,h3,p{margin:0}h1,h2,h3{font-family:'Cormorant Garamond',Georgia,serif;font-weight:600}h2{font-size:42px;line-height:1.12}h3{font-size:27px}small{font-size:12px}.hidden{display:none!important}#world,#world canvas,#vignette,#floaters,#loading,#title,#hud,#modal,#dialogue{position:absolute;inset:0}#world canvas{width:100%;height:100%;display:block}#vignette{pointer-events:none;box-shadow:inset 0 0 170px #0b222b60;background:linear-gradient(0deg,#071e2be0,transparent 30%);z-index:1}#floaters{pointer-events:none;z-index:5;overflow:hidden}.floater{position:absolute;font:bold 24px 'Cormorant Garamond',serif;text-shadow:0 2px 3px #10272b;white-space:nowrap;animation:rise 1.3s ease-out forwards}.floater.crit{font-size:32px;color:var(--gold)}@keyframes rise{0%{opacity:1;translate:-50% 0}100%{opacity:0;translate:-50% -65px}}#loading{z-index:50;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#132c30;gap:24px}#loading h1{letter-spacing:9px;font-size:46px}.rune{font-size:58px;color:var(--gold)}.loadline{height:2px;width:180px;background:var(--gold);animation:pulse 1s infinite alternate}#loadText{max-width:600px;text-align:center;padding:0 24px;line-height:1.6;color:var(--muted)}@keyframes pulse{to{opacity:.25;transform:scaleX(.5)}}#title{z-index:10;background:linear-gradient(90deg,#0c242dfc 0%,#102a30e8 23%,#102a3088 45%,transparent 70%)}.mast{position:absolute;top:36px;left:4.5%;font-size:11px;letter-spacing:3px;color:#c6d4cc;display:flex;align-items:center;gap:16px}.diamond{font-size:32px;color:var(--gold)}.titlecopy{position:absolute;left:7.5%;top:19%;width:440px}.eyebrow{font-size:11px;font-weight:800;letter-spacing:2.6px;color:var(--gold);line-height:1.6}.titlecopy h1{font-size:78px;line-height:.85;letter-spacing:4px;margin:20px 0 12px;color:#f2e3bd;text-shadow:0 4px 22px #0005}.titlecopy h1 span{display:block;font-size:132px;letter-spacing:16px}.ornament{color:var(--gold);letter-spacing:5px;margin:15px 0 10px;font-size:13px}.subtitle{font:italic 31px 'Cormorant Garamond',serif;letter-spacing:1px}.pitch{font-size:14px;line-height:1.9;color:#c4d0c4;margin:22px 0 28px}#titleButtons{display:flex;flex-direction:column;gap:9px;width:310px}#titleButtons button{padding:11px 19px;border:1px solid var(--line);background:#152d31d0;font-size:14px;letter-spacing:.4px;text-align:left}#titleButtons button:first-child{background:var(--gold);color:#172e31;font-weight:800;border-color:var(--gold)}#titleButtons button small{float:right;opacity:.6}.titlefoot{margin-top:24px;font-size:9px;letter-spacing:2px;color:#8ca6a4}.titlefoot i{color:var(--gold);padding:0 10px}.chapterstamp{position:absolute;bottom:46px;right:5%;display:flex;gap:20px;align-items:center;text-shadow:0 2px 5px #000}.chapterstamp b{font:72px 'Cormorant Garamond',serif;color:var(--gold)}.chapterstamp span{font-size:12px;letter-spacing:3px;line-height:2}.chapterstamp small{font:italic 18px 'Cormorant Garamond',serif;letter-spacing:0}.gear{position:absolute;right:32px;top:28px;border:1px solid var(--line);border-radius:50%;background:#10272bcc;width:46px;height:46px;font-size:23px}#touchNotice{position:absolute;bottom:12px;width:100%;text-align:center;font-size:14px;color:var(--gold)}#hud{pointer-events:none;z-index:3}#hud button{pointer-events:auto}.questpanel{background:linear-gradient(90deg,#112e32dc,#112e3270,transparent);padding:14px 22px 15px 16px;border-left:2px solid #dab67e90;position:absolute;top:33px;left:34px;max-width:360px;text-shadow:0 2px 6px #12292b}.questpanel h2{font-size:31px;margin:5px 0 8px}.questpanel #objective{font-size:14px;line-height:1.6;color:#f2e8ce}.questpanel #contextHelp{font-size:11px;line-height:1.65;margin-top:12px;color:#c5d9cf;max-width:290px}.topright{position:absolute;right:28px;top:25px}.maprim{width:154px;height:154px;border:1px solid #d4b77599;border-radius:50%;padding:6px;background:#0d252cd9;position:relative;box-shadow:0 3px 16px #0d252c66}#minimap{width:140px;height:140px;display:block;border-radius:50%}.north{position:absolute;top:-12px;left:67px;font:14px 'Cormorant Garamond',serif;color:var(--gold);background:#142f32;padding:0 5px}.purse{text-align:center;margin-top:12px;font-size:14px;letter-spacing:1px}.purse span{color:var(--gold);margin-right:5px}.purse small{font-size:8px;color:var(--muted);margin-left:5px}#encounter{position:absolute;top:28px;left:38%;width:24%;text-align:center;text-shadow:0 2px 4px #000}#encounter b{display:block;font:28px 'Cormorant Garamond',serif;margin:4px}.bar{height:5px;background:#0b2026;border:1px solid #0b2026}.bar i{display:block;height:100%;background:var(--red);transition:width .15s}#pauseBanner{position:absolute;top:125px;left:25%;width:50%;text-align:center;color:var(--gold)}#pauseBanner span{letter-spacing:5px;font-size:17px;font-weight:800;text-shadow:0 2px 5px #000}#pauseBanner small{display:block;margin-top:9px;font-size:12px;color:var(--paper)}.bottom{position:absolute;bottom:16px;left:3%;right:3%;display:flex;flex-direction:column;align-items:center;gap:14px}#party{display:flex;gap:9px;align-self:flex-start} .partycard{display:grid;grid-template-columns:49px 1fr;width:177px;gap:10px;padding:9px 12px 9px 8px;border:1px solid var(--line);border-radius:2px;background:#10272be8;text-align:left;position:relative;box-shadow:0 4px 15px #0003}.partycard.selected{border-color:var(--gold);transform:translateY(-4px);background:#203d3ff2}.partycard svg{width:47px;height:55px}.partycard .pname{font:20px 'Cormorant Garamond',serif}.partycard .role{font-size:8px;letter-spacing:1.4px;color:var(--muted);margin:2px 0 7px}.partycard .bar{height:4px;margin-bottom:4px}.partycard .bar i{background:#90b897}.partycard .mana i{background:#75afc1}.partycard .hptext{font-size:9px;color:#d6ddce}.partycard .seat{position:absolute;top:-7px;right:5px;background:var(--gold);color:var(--ink);font-size:8px;padding:1px 4px}.partycard.downed{filter:grayscale(1);opacity:.7}#abilities{position:absolute;right:0;bottom:40px;display:flex;gap:8px}.ability{width:74px;height:76px;border:1px solid var(--line);background:#10272be8;position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px}.ability .icon{font:28px Georgia;color:var(--gold)}.ability .abname{font-size:8px;color:#e9e2ca}.ability .key{position:absolute;top:-9px;left:4px;font-size:9px;background:#213c3f;color:#d9ccb1;padding:1px 4px}.ability .cd{position:absolute;inset:0;display:grid;place-items:center;background:#10272bc9;font-size:23px;color:var(--gold)}.controls{width:100%;display:flex;justify-content:center;gap:24px;font-size:10px;color:#cad6cf;letter-spacing:.2px}.controls kbd{font:9px 'Manrope',sans-serif;border:1px solid #c4c9b455;border-radius:3px;padding:2px 5px;margin-right:5px;color:var(--gold)}#log{position:absolute;left:3%;bottom:172px;max-width:390px;font-size:10px;line-height:1.8;color:#d6dfcc;text-shadow:0 1px 4px #000}#log .new{color:var(--gold)}#interact{position:absolute;left:50%;top:58%;transform:translate(-50%,-50%);padding:10px 19px;background:#112b32e8;border:1px solid var(--line);font-size:13px;white-space:nowrap;box-shadow:0 4px 20px #0003}#interact b{color:var(--gold);margin-right:10px}#toast{position:absolute;z-index:30;top:22%;left:50%;transform:translate(-50%,-12px);background:#10272bef;border:1px solid var(--line);padding:15px 27px;text-align:center;max-width:580px;font-size:14px;opacity:0;transition:.25s;pointer-events:none}#toast.show{opacity:1;transform:translate(-50%,0)}#zoneTitle{position:absolute;top:34%;left:0;right:0;text-align:center;font:46px 'Cormorant Garamond',serif;letter-spacing:5px;color:#f6e6bd;text-shadow:0 2px 8px #122a2e;z-index:3;pointer-events:none;opacity:0;transition:opacity 1s}#zoneTitle.show{opacity:1}#attract{position:absolute;inset:0;z-index:8;pointer-events:none;border-top:38px solid #0c252be6;border-bottom:76px solid #0c252be6;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;padding-bottom:30px;background:linear-gradient(0deg,#10272b88,transparent 30%)}#attract h2{font-size:46px;margin:6px 0 14px;text-shadow:0 2px 8px #000}#attract p{font-size:11px;letter-spacing:1px}#modal{z-index:20;display:grid;place-items:center}.modalshade{position:absolute;inset:0;background:#061c23b8;backdrop-filter:blur(6px)}.modalcard{position:relative;background:linear-gradient(135deg,#1b3538,#0c262e);width:min(900px,88vw);max-height:88vh;border:1px solid #d1b77577;padding:36px 42px;box-shadow:0 30px 100px #001019aa;overflow:auto;scrollbar-color:#9d905e #162e31}.modaltop{display:flex;justify-content:space-between;align-items:center;margin-bottom:25px;padding-bottom:16px;border-bottom:1px solid var(--line)}.modaltop .eyebrow{margin-bottom:6px}.close{border:1px solid var(--line);background:transparent;padding:9px 15px;font-size:12px;color:var(--gold)}.modalfoot{margin-top:22px;font-size:11px;color:var(--muted)}.btn{display:block;width:100%;text-align:left;padding:13px 18px;background:#d9b57509;border:1px solid var(--line);margin:10px 0;font-size:14px}.btn strong{color:var(--gold)}.btn small{float:right;color:var(--muted);font-size:11px}.btn.primary{background:#d6b272;color:#162e31;font-weight:800}.prose{font-size:15px;line-height:1.85;color:#d1d9cd}.prose p{margin-bottom:13px}.quote{font:italic 25px/1.4 'Cormorant Garamond',serif;color:var(--gold);margin-bottom:23px}.twocol{display:grid;grid-template-columns:1fr 1fr;gap:30px}.statrow{display:flex;justify-content:space-between;gap:18px;margin:10px 0;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px}.statrow b{color:var(--gold)}.tabs{display:flex;gap:8px;margin-bottom:22px}.tabs button{border:1px solid var(--line);padding:8px 16px;background:transparent;font-size:12px}.tabs .active{color:var(--gold);background:#e7bb7310}.journalentry{margin:16px 0;padding:0 0 17px 19px;border-left:2px solid var(--gold)}.journalentry p{font-size:13px;line-height:1.65;color:#b7c8bd;margin-top:7px}.journalentry.done{border-color:#70a9a1;opacity:.7}.inventorygear{font-size:15px;line-height:1.7;color:#c8d6c9}.inventorygear .portraitlarge svg{width:100px;height:120px}.inventorygear h3{margin-top:12px;color:var(--gold)}.inventorygear .quote{font-size:19px;margin-top:10px}#bigmap{width:100%;height:350px;background:#152d30;border:1px solid var(--line)}#dialogue{z-index:18;background:linear-gradient(0deg,#071f2af2,transparent 70%);display:flex;align-items:flex-end;padding:0 7% 4%}.dialogbox{width:100%;display:grid;grid-template-columns:155px 1fr;gap:35px;padding:30px;border-top:1px solid #d1b77599;background:#102b32ee;box-shadow:0 10px 80px #06182180}.dialogportrait{align-self:start;text-align:center}.dialogportrait svg{width:110px;height:135px}.dialogportrait .eyebrow{font-size:9px;letter-spacing:1.5px}.dialogtext{font:24px/1.4 'Cormorant Garamond',serif;margin:9px 0 19px;max-width:900px}.dialogchoices{display:grid;gap:8px}.dialogchoices button{background:#e7bb7308;border:1px solid var(--line);text-align:left;padding:11px 17px;font-size:13px;line-height:1.45}.dialogchoices button em{color:var(--gold);font-style:normal}.dialogspeaker{font-size:11px;letter-spacing:2px;color:var(--gold)}.dialoghint{color:#9fb8ae;font-size:9px;margin-top:12px}.ending{text-align:center;padding:20px 35px}.ending .rune{margin-bottom:20px}.ending h2{font-size:58px}.ending .prose{margin:25px auto;max-width:650px}.settingsrow{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center;padding:11px 15px;margin:7px 0;border:1px solid var(--line);background:#ebca7f08}.settingsrow span{font-size:14px}.settingsrow b{font-size:13px;color:var(--gold)}.aboutcontent{font-size:14px;line-height:1.9;color:#c0cec2}.aboutcontent b{color:var(--gold)}.aboutcontent a{color:var(--gold)}.binds{display:grid;grid-template-columns:1fr 1fr;gap:8px 30px}.binds div{display:flex;justify-content:space-between;font-size:12px;border-bottom:1px solid var(--line);padding:10px 0}.binds b{color:var(--gold);font-weight:500}.tag{display:inline-block;font-size:9px;letter-spacing:1px;color:var(--gold);padding:4px 7px;background:#e4c47d12;border:1px solid var(--line);margin:6px 4px 6px 0}.lootline{display:flex;justify-content:space-between;font-size:13px;padding:12px 0;border-bottom:1px solid var(--line)}@media(max-height:760px){.titlecopy{top:15%;transform:scale(.84);transform-origin:top left}.mast{top:20px}.bottom{gap:8px}.partycard{width:160px}.partycard .role{font-size:7px}#abilities{bottom:33px}.modalcard{padding:25px 34px}.dialogbox{padding:22px}.dialogtext{font-size:21px}.btn{padding:10px 15px}.questpanel{top:23px}}@media(max-width:1100px){.partycard{width:143px;grid-template-columns:38px 1fr;padding:7px;gap:7px}.partycard svg{width:37px;height:49px}.partycard .pname{font-size:18px}.partycard .role{font-size:7px}#abilities{gap:5px}.ability{width:61px;height:68px}.controls{gap:12px}.controls span{font-size:9px}.questpanel{max-width:280px}.maprim{transform:scale(.8);transform-origin:top right}.purse{margin-top:-15px}.titlecopy{left:6%}.dialogbox{grid-template-columns:100px 1fr;gap:20px}.dialogportrait svg{width:85px;height:105px}}@media(max-width:750px){.titlecopy{transform:scale(.7);transform-origin:top left}.mast{font-size:8px}.chapterstamp{right:4%;bottom:20px}.chapterstamp b{font-size:44px}.chapterstamp small{font-size:14px}.chapterstamp span{font-size:9px}.questpanel #contextHelp{display:none}.bottom{bottom:9px;left:2%;right:2%}#party{gap:4px}.partycard{width:114px;grid-template-columns:27px 1fr;padding:5px;gap:4px}.partycard svg{width:27px;height:39px}.partycard .pname{font-size:15px}.partycard .role{font-size:6px}.partycard .hptext{font-size:7px}#abilities{bottom:80px;right:0}.ability{width:50px;height:51px}.ability .icon{font-size:21px}.ability .abname{font-size:6px}.controls{gap:8px}.controls span{font-size:7px}#log{display:none}.modalcard{width:94vw;padding:20px}.modalcard h2{font-size:32px}.twocol{gap:18px}.prose{font-size:13px}.dialogbox{grid-template-columns:65px 1fr;padding:14px;gap:14px}.dialogportrait svg{width:60px;height:75px}.dialogtext{font-size:18px}.dialogchoices button{font-size:11px;padding:9px}#dialogue{padding:0 3% 3%}}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "rapier": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head><body>
+<div id="world"></div><div id="vignette"></div><div id="floaters"></div>
+<div id="loading"><div class="rune">♜</div><h1>BARDUR’S FATE</h1><p id="loadText">Lighting the last lantern…</p><div class="loadline"></div></div>
+<div id="title" class="hidden">
+ <div class="mast"><span class="diamond">◇</span> A PARTY RPG OF DEBTS & DEAD GODS</div>
+ <div class="titlecopy"><div class="eyebrow">AN ORIGINAL FANTASY ADVENTURE</div><h1>BARDUR’S<span>FATE</span></h1><div class="ornament">───── ◇ ─────</div><p class="subtitle">The Hollow Bell</p><p class="pitch">Every soul owes a debt.<br>Some creditors refuse to stay buried.</p>
+ <nav id="titleButtons"></nav><div class="titlefoot">1–4 PLAYERS <i>·</i> CONTROLLER RECOMMENDED</div></div>
+ <div class="chapterstamp"><b>I</b><span>EMBER QUAY<br><small>On the eve of the thirteenth toll</small></span></div>
+ <button class="gear" data-action="settings" aria-label="Settings">⚙</button><div id="touchNotice" class="hidden">Controller or keyboard required</div>
+</div>
+<div id="hud" class="hidden">
+ <div class="questpanel"><div class="eyebrow" id="zone">THE RIVER WARD</div><h2 id="questName">The Hollow Bell</h2><div id="objective">Speak with Magistrate Oriel</div><div id="contextHelp"></div></div>
+ <div class="topright"><div class="maprim"><canvas id="minimap" width="228" height="228"></canvas><span class="north">N</span></div><div class="purse"><span>◈</span> <b id="gold">60</b> <small>GOLD</small></div></div>
+ <div id="encounter" class="hidden"><span class="eyebrow">ENCOUNTER</span><b id="enemyName"></b><div class="bar"><i id="enemyHealth"></i></div></div>
+ <div id="pauseBanner" class="hidden"><span>❚❚ TACTICAL PAUSE</span><small>Switch companions · queue abilities · resume together</small></div>
+ <div id="log"></div><div id="interact" class="hidden"></div>
+ <div class="bottom"><div id="party"></div><div id="abilities"></div><div class="controls"><span><kbd>LS</kbd> Move</span><span><kbd>R2</kbd> Strike</span><span><kbd>□</kbd> Pause</span><span><kbd>L1</kbd> Companion</span><span><kbd>↑</kbd> Journal</span><span><kbd>OPTIONS</kbd> Settings</span></div></div>
+</div>
+<div id="attract" class="hidden"><div class="eyebrow">THE CHRONICLE PLAYS ITSELF</div><h2 id="attractText">A city worth saving.</h2><p>Press any button to begin your own story</p></div>
+<div id="toast" role="status"></div><div id="zoneTitle"></div>
+<div id="dialogue" class="hidden"></div>
+<div id="modal" class="hidden"><div class="modalshade"></div><section class="modalcard" role="dialog" aria-modal="true"><div id="modalContent"></div></section></div>
+<script type="module">import * as THREE from 'three/webgpu';
+import RAPIER from 'rapier';
+
+const $=id=>document.getElementById(id), clamp=(v,a,b)=>Math.max(a,Math.min(b,v)), dist=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z);
+const TAU=Math.PI*2, V=THREE.Vector3;
+let renderer,scene,camera,physics,controller,sun,water,gateMesh,gateCollider,bellMesh,worldBuilt=false;
+const retiredMaterials=[];const mats=new Map(), props=[], wind=[], effects=[], hazards=[], interactables=[], enemies=[], heroes=[], obstacles=[];
+let scenery=new THREE.Group(),actors=new THREE.Group(),fxGroup=new THREE.Group();
+let seed=826314;function rnd(){seed=(Math.imul(1664525,seed)+1013904223)>>>0;return seed/4294967296}function rand(a,b){return a+(b-a)*rnd()}
+const palette={stone:0xb8b6a0,light:0xd9cfad,dark:0x526e6b,wood:0x66553f,roof:0xb87549,roof2:0x537e7a,grass:0x7d9b79,leaf:0x61917a,leaf2:0xaeb57a,gold:0xe6ba65,cyan:0x73d9c1,red:0x9f5348};
+let gradient;function mat(color,emissive=false){const key=color+'-'+emissive;if(mats.has(key))return mats.get(key);let m=emissive?new THREE.MeshBasicNodeMaterial({color}):new THREE.MeshToonNodeMaterial({color,gradientMap:gradient});mats.set(key,m);return m}
+const geo={box:new THREE.BoxGeometry(1,1,1),sphere:new THREE.IcosahedronGeometry(1,1),rock:new THREE.DodecahedronGeometry(1,0),cyl:new THREE.CylinderGeometry(1,1,1,10),cone:new THREE.ConeGeometry(1,1,7),ring:new THREE.RingGeometry(.92,1,48)};
+function mesh(g,m,parent=scenery,x=0,y=0,z=0,sx=1,sy=1,sz=1){const o=new THREE.Mesh(g,m);o.position.set(x,y,z);o.scale.set(sx,sy,sz);o.castShadow=true;o.receiveShadow=true;parent.add(o);return o}
+function box(x,y,z,w,h,d,col,parent=scenery){return mesh(geo.box,mat(col),parent,x,y,z,w,h,d)}
+function rock(x,y,z,s,col=palette.dark,parent=scenery){let o=mesh(geo.rock,mat(col),parent,x,y,z,s,s*rand(.55,.95),s);o.rotation.set(rnd(),rnd()*TAU,rnd());return o}
+function cylinder(x,y,z,r,h,col,parent=scenery){return mesh(geo.cyl,mat(col),parent,x,y,z,r,h,r)}
+function line3(a,b,r,col,parent=scenery){let av=new V(...a),bv=new V(...b),d=bv.clone().sub(av);let o=cylinder(0,0,0,r,d.length(),col,parent);o.position.copy(av.add(bv).multiplyScalar(.5));o.quaternion.setFromUnitVectors(new V(0,1,0),d.normalize());return o}
+function outline(o,scale=1.055){const shell=new THREE.Mesh(o.geometry,new THREE.MeshBasicNodeMaterial({color:0x173237,side:THREE.BackSide}));shell.scale.setScalar(scale);o.add(shell);return o}
+function solid(x,z,w,d,h=4,y=h/2){const c=physics.createCollider(RAPIER.ColliderDesc.cuboid(w/2,h/2,d/2).setTranslation(x,y,z));obstacles.push({x,z,w,d,c});return c}
+function textSign(text,w=5,h=1.5,col='#e7ce96'){const c=document.createElement('canvas');c.width=512;c.height=128;const ctx=c.getContext('2d');ctx.fillStyle='#203b3c';ctx.fillRect(0,0,512,128);ctx.strokeStyle='#aa955d';ctx.lineWidth=5;ctx.strokeRect(10,10,492,108);ctx.fillStyle=col;ctx.textAlign='center';ctx.font='600 46px Georgia';ctx.fillText(text,256,80);const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return new THREE.Mesh(new THREE.PlaneGeometry(w,h),new THREE.MeshBasicNodeMaterial({map:t,side:THREE.DoubleSide}))}
+function roof(x,y,z,w,h,d,col,parent=scenery){const v=new Float32Array([-w/2,0,-d/2,w/2,0,-d/2,0,h,-d/2,-w/2,0,d/2,0,h,d/2,w/2,0,d/2,-w/2,0,-d/2,0,h,-d/2,0,h,d/2,-w/2,0,-d/2,0,h,d/2,-w/2,0,d/2,w/2,0,-d/2,w/2,0,d/2,0,h,d/2,w/2,0,-d/2,0,h,d/2,0,h,-d/2]);for(let i=0;i<v.length;i+=9){for(let k=0;k<3;k++){let tmp=v[i+3+k];v[i+3+k]=v[i+6+k];v[i+6+k]=tmp}}const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(v,3));g.computeVertexNormals();let o=mesh(g,mat(col),parent,x,y,z);return o}
+function house(x,z,w=7,h=6,d=6,col=palette.roof){let g=new THREE.Group();g.position.set(x,0,z);scenery.add(g);box(0,.3,0,w+.5,.6,d+.5,palette.dark,g);box(0,h/2+.4,0,w,h,d,palette.light,g);for(let a of [-1,1]){box(a*(w/2-.1),h/2+.3,d/2+.05,.2,h,.22,palette.wood,g);box(0,h/2,d/2+.07,w,.22,.22,palette.wood,g);for(let j of [-.28,.28]){box(j*w,h*.64,d/2+.09,1.2,1.5,.12,palette.dark,g);box(j*w,h*.64,d/2+.18,.95,1.22,.09,0xdfb964,g);box(j*w,h*.64,d/2+.25,.1,1.3,.05,palette.wood,g)}line3([-w/2,.5,d/2+.16],[w/2,h/2,d/2+.16],.085,palette.wood,g)}box(0,1.5,d/2+.12,1.5,2.5,.18,0x40565a,g);box(0,2.9,d/2+.2,1.7,.18,.3,palette.wood,g);roof(0,h+.4,0,w+1.1,h*.5,d+1.1,col,g);for(let i=0;i<7;i++){let zz=-d/2-.5+i*(d+1)/6;line3([-w/2-.55,h+.42,zz],[0,h*1.5+.4,zz],.045,palette.dark,g);line3([0,h*1.5+.4,zz],[w/2+.55,h+.42,zz],.045,palette.dark,g)}box(w*.28,h+1,-d*.2,.85,3,.9,palette.stone,g);solid(x,z,w,d,h);return g}
+function arch(x,z,width=8,height=8,col=palette.stone,parent=scenery){const g=new THREE.Group();g.position.set(x,0,z);parent.add(g);for(let s of [-1,1]){box(s*(width/2+1),height/2,0,2,height,2.3,col,g);box(s*(width/2+1),.4,0,2.5,.8,2.7,palette.dark,g);box(s*(width/2+1),height-.2,0,2.6,.5,2.8,palette.light,g)}for(let i=0;i<11;i++){let a=i/10*Math.PI;const o=box(Math.cos(a)*(width/2+1),height+Math.sin(a)*(width/2+1),0,1.55,2,2.3,i%2?col:palette.light,g);o.rotation.z=a-Math.PI/2}return g}
+function tree(x,z,s=1,autumn=false){let g=new THREE.Group();g.position.set(x,0,z);g.scale.setScalar(s);scenery.add(g);cylinder(0,2.5,0,.25,5,0x5c6551,g);line3([0,3,0],[1.6,5,0],.13,0x5c6551,g);line3([0,3.7,0],[-1.3,5.8,.6],.15,0x5c6551,g);for(let i=0;i<4;i++){let o=mesh(geo.rock,mat(autumn?[0xc39b58,0xd5b770,0x987a4e][i%3]:[0x528578,0x699b82,0x8ba982][i%3]),g,Math.cos(i*2)*1.2,5.3+i*.65,Math.sin(i*2)*.8,2.2,1.9,2);o.rotation.y=i;wind.push({o,phase:rnd()*6,base:o.rotation.z,amp:.025})}solid(x,z,.8*s,.8*s,5*s);return g}
+function lantern(x,z,y=0){box(x,y+2.2,z,.12,4.4,.12,palette.wood);line3([x,y+4.3,z],[x+.6,y+4.3,z],.07,palette.wood);box(x+.6,y+3.9,z,.5,.7,.5,palette.wood);mesh(geo.box,mat(0xffd18b,true),scenery,x+.6,y+3.9,z,.35,.5,.35);roof(x+.6,y+4.25,z,.8,.35,.8,palette.dark);const l=new THREE.PointLight(0xffd493,9,7,2);l.position.set(x+.6,y+3.8,z);scenery.add(l)}
+function banner(x,z,col=0x8b5254){box(x,4,z,.13,8,.13,palette.dark);const o=box(x+1.1,6,z,2.1,3,.06,col);const c=mesh(new THREE.ConeGeometry(1.05,1,3),mat(col),scenery,x+1.1,4.1,z,1,1,.03);c.rotation.z=Math.PI;wind.push({o,phase:rnd()*6,base:0,amp:.07});box(x+1.1,6,z+.05,.18,2,.05,palette.gold);box(x+1.1,6.5,z+.05,1.1,.15,.05,palette.gold)}
+function flowers(x,z,count=8){for(let i=0;i<count;i++){let xx=x+rand(-1.2,1.2),zz=z+rand(-1.2,1.2);let o=mesh(geo.cone,mat(0x658967),scenery,xx,.25,zz,.065,.5,.065);o.rotation.z=rand(-.3,.3);mesh(geo.sphere,mat(i%2?0xd9bd76:0xc2a2a1),scenery,xx,.55,zz,.13,.1,.13)}}
+function barrel(x,z,explosive=false){const b=physics.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.65,z).setLinearDamping(1).setAngularDamping(2));physics.createCollider(RAPIER.ColliderDesc.cylinder(.65,.55).setMass(6),b);const g=new THREE.Group();actors.add(g);cylinder(0,0,0,.55,1.25,explosive?0x9c5644:0x826e4e,g);for(let yy of [-.42,.42])cylinder(0,yy,0,.58,.1,palette.dark,g);if(explosive){box(0,.05,.56,.4,.55,.06,0xeac171,g);box(0,.05,.61,.1,.4,.03,palette.red,g)}const p={g,b,x,z,hp:12,explosive,dead:false};props.push(p);return p}
+function buildWorld(){
+ scene=new THREE.Scene();scene.background=new THREE.Color(0xb6ccc0);scene.fog=new THREE.Fog(0xb6ccc0,65,165);scene.add(scenery,actors,fxGroup);scene.add(new THREE.HemisphereLight(0xd2e7d9,0x405b68,2));sun=new THREE.DirectionalLight(0xffd69e,3.1);sun.position.set(-32,55,24);sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);Object.assign(sun.shadow.camera,{left:-65,right:65,top:65,bottom:-65,near:1,far:160});sun.shadow.bias=-.0009;sun.shadow.normalBias=.04;scene.add(sun,sun.target);
+ const a=innerWidth/innerHeight;camera=new THREE.OrthographicCamera(-24*a,24*a,24,-24,.1,240);camera.position.set(29,38,40);camera.lookAt(0,0,10);
+ gradient=new THREE.DataTexture(new Uint8Array([68,130,205,255]),4,1,THREE.RedFormat);gradient.minFilter=gradient.magFilter=THREE.NearestFilter;gradient.needsUpdate=true;
+ box(0,-1.2,-15,116,2.4,150,0x7f9c7b);solid(0,-15,116,150,2,-1);for(let [x,z,w,d] of [[-58,-15,2,150],[58,-15,2,150],[0,60,116,2],[0,-90,116,2]])solid(x,z,w,d,8);
+ // An inlaid old road, carried across a living canal.
+ box(0,-.03,23,41,.25,38,0xa9ac8e);box(0,.02,-26,9,.18,72,0x9ba98b);box(15,.015,-15,29,.13,6,0x95a084);
+ const tileGeo=new THREE.BoxGeometry(1,.12,1),tileMat=mat(0xc4bea1);const tiles=new THREE.InstancedMesh(tileGeo,tileMat,1200);let ti=0,tmp=new THREE.Object3D();for(let z=-68;z<40;z+=1.4){for(let x=-3.2;x<3.5;x+=1.5){if(z>-2&&z<9)continue;tmp.position.set(x+rand(-.12,.12),.1,z+rand(-.12,.12));tmp.scale.set(rand(.9,1.25),1,rand(.85,1.2));tmp.rotation.y=rand(-.09,.09);tmp.updateMatrix();tiles.setMatrixAt(ti++,tmp.matrix)}}for(let i=0;i<430;i++){let x=rand(-20,20),z=rand(11,40);tmp.position.set(x,.11,z);tmp.scale.set(rand(.5,1.2),1,rand(.4,.8));tmp.rotation.y=rnd()*6;tmp.updateMatrix();tiles.setMatrixAt(ti++,tmp.matrix)}tiles.count=ti;tiles.receiveShadow=true;scenery.add(tiles);
+ solid(-32,4,52,9,3);solid(32,4,52,9,3);water=box(0,-.24,4,114,.18,9,0x468c8c);water.material=new THREE.MeshToonNodeMaterial({color:0x4a9192,gradientMap:gradient,transparent:true,opacity:.88});for(let side of [-1,1]){box(0,.25,4+side*5,114,.9,1,palette.dark);for(let x=-53;x<55;x+=3){if(Math.abs(x)<6)continue;box(x,.8,4+side*5,2.8,.5,1.1,palette.stone)}}for(let x of [-29,24,40]){let boat=new THREE.Group();scenery.add(boat);boat.position.set(x,-.1,rand(1,7));box(0,0,0,5,.6,1.6,palette.wood,boat);box(0,.35,-.75,5,.45,.15,palette.wood,boat);box(0,.35,.75,5,.45,.15,palette.wood,boat);roof(0,.5,0,2,.5,1.5,0xa69066,boat);wind.push({o:boat,phase:rnd()*6,base:0,amp:.035})}for(let i=0;i<90;i++){let o=box(rand(-55,55),-.1,rand(.2,7.8),rand(.7,3),.02,.04,0x87b8ad);o.castShadow=false;wind.push({o,phase:rnd()*6,base:0,amp:.01,water:true})}
+ box(0,.35,4,10,.9,13,palette.stone);for(let x of [-5,5]){box(x,1,4,.55,1.6,12,palette.dark);for(let z=-1;z<=9;z+=2.5)box(x,1.9,z,.8,.5,.8,palette.light)}arch(0,10,9,6);solid(-6,10,2,2.3,8);solid(6,10,2,2.3,8);let sign=textSign('EMBER QUAY',6,.9);sign.position.set(0,8.1,11.3);scenery.add(sign);
+ for(let [x,z,w,h,d,c] of [[-14,37,8,7,7,palette.roof],[-25,25,7,5.5,8,palette.roof2],[15,34,8,8,7,palette.roof],[17,17,6,6,6,palette.roof2],[-15,14,6,7,5,palette.roof],[-32,39,7,8,6,palette.roof2],[30,33,7,9,7,palette.roof],[37,18,8,6,6,palette.roof]])house(x,z,w,h,d,c);
+ // Fountain, market, pennants and little household stories.
+ cylinder(-7,.3,27,3.2,.6,palette.dark);cylinder(-7,.64,27,2.8,.25,palette.light);cylinder(-7,.79,27,2.4,.08,0x69a5a0);cylinder(-7,1.8,27,.4,2.5,palette.stone);cylinder(-7,3,27,1.4,.25,palette.light);cylinder(-7,3.5,27,.15,1,palette.gold);solid(-7,27,5,5,2);for(let i=0;i<6;i++){let a=i/6*TAU;line3([-7+Math.cos(a)*.9,3,27+Math.sin(a)*.9],[-7+Math.cos(a)*1.8,.9,27+Math.sin(a)*1.8],.035,0x9ed3c7)}
+ for(let [x,z,c]of [[-16,24,0xb38352],[9,26,0x779c94]]){box(x,1,z,4,2,2,palette.wood);for(let s of [-1,1]){box(x+s*2,2.1,z-1,.12,4.2,.12,palette.wood);box(x+s*2,2.1,z+1,.12,4.2,.12,palette.wood)}roof(x,4,z,5,1,3,c);for(let i=0;i<12;i++)mesh(geo.sphere,mat(i%3?0xc9ac61:0xb2634e),scenery,x+rand(-1.6,1.6),2.1,z+rand(-.6,.6),.22,.2,.22)}
+ for(let zz of [17,30]){line3([-17,7,zz],[14,9,zz+2],.03,palette.wood);for(let i=0;i<14;i++){let x=-17+i*2.25;let o=mesh(new THREE.ConeGeometry(.5,1,3),mat([0xc09a60,0x77968b,0x9b6456][i%3]),scenery,x,6.5+(x+17)/31*2,zz+(x+17)/31*2);o.rotation.z=Math.PI;wind.push({o,phase:i,base:Math.PI,amp:.06})}}
+ for(let [x,z]of [[-10,12],[10,12],[-18,32],[7,32],[10,-3],[-10,-3],[-21,25]])lantern(x,z);banner(9,16);banner(-10,35,0x5f8983);
+ let innSign=textSign('THE LAST PENNY',4,1);innSign.position.set(-14,4,41);scenery.add(innSign);barrel(-11,35);barrel(-10,35);barrel(14,23);barrel(12,23,true);
+ // A sheltered camp under the old ash.
+ tree(-24,34,1.5,true);cylinder(-21,.12,34,1.1,.2,palette.dark);for(let i=0;i<7;i++){let a=i*TAU/7;rock(-21+Math.cos(a),.3,34+Math.sin(a),.4)}let flame=mesh(geo.cone,mat(0xffb95b,true),scenery,-21,.8,34,.5,1.5,.5);wind.push({o:flame,phase:0,base:0,amp:.1,flame:true});let fire=new THREE.PointLight(0xffad5d,20,11);fire.position.set(-21,2,34);scenery.add(fire);for(let zz of [31,37]){box(-19,.15,zz,3,.25,1,0x9d795b);box(-20,.35,zz,.55,.2,.8,palette.light)}
+ // Meadows open into a copper-leaf glade and the drowned abbey.
+ for(let i=0;i<100;i++){let x=rand(-52,52),z=rand(-79,45);if(Math.abs(x)<10||z>10&&Math.abs(x)<41||dist({x,z},{x:28,z:-25})<10||Math.abs(x)<19&&z<-41||dist({x,z},{x:-25,z:-31})<8)continue;tree(x,z,rand(.65,1.3),x>13);if(i%2===0)flowers(x+1,z+1,5)}
+ for(let i=0;i<130;i++){let x=rand(-54,54),z=rand(-80,48);if(Math.abs(x)<7||z>10&&Math.abs(x)<38)continue;let o=mesh(geo.cone,mat(i%4?0x7f9c70:0xadc18b),scenery,x,.35,z,.25,.7,.25);o.rotation.z=rand(-.35,.35);if(i%7===0)rock(x,.2,z,.7)}
+ // Tollhouse and broken wagons.
+ house(-21,-9,6,5,5,0x586f6c);box(-13,.7,-11,4,.4,2,palette.wood);for(let x of [-14.5,-11.5])for(let z of [-12,-10]){let o=cylinder(x,.5,z,.65,.16,palette.dark);o.rotation.x=Math.PI/2}barrel(-9,-13,true);barrel(-16,-13,true);banner(-17,-4,0x946354);
+ // The oath garden, with a ghost who remembers more than his gravestone.
+ for(let i=0;i<8;i++){let x=-30+(i%4)*3,z=-34+Math.floor(i/4)*5;box(x,.9,z,1.1,1.8,.35,palette.stone);box(x,1.9,z,1.7,.3,.35,palette.light);box(x,.2,z+1.2,1.2,.3,2.3,palette.dark)}arch(-25,-36,5,4);flowers(-25,-30,18);
+ // The glass orchard: roots, fallen shelves and captive knowledge.
+ for(let i=0;i<6;i++){let a=i*TAU/6;box(28+Math.cos(a)*7,1.6,-26+Math.sin(a)*7,1.5,3.2,1.5,palette.stone);rock(28+Math.cos(a)*9,.6,-26+Math.sin(a)*9,1.3)}cylinder(28,.2,-26,5,.4,palette.dark);cylinder(28,.45,-26,3.8,.12,0x8caca0);for(let x of [24,32]){box(x,1.2,-29,2.5,2.4,.5,palette.wood);for(let j=0;j<5;j++)box(x-1+j*.45,1.6,-28.7,.3,1.1,.3,[0xb48d60,0x668580,0x9b6a5a][j%3])}for(let i=0;i<3;i++)hazards.push({x:20+i*3,z:-20+i*1.6,armed:true,cool:0,mesh:box(20+i*3,.13,-20+i*1.6,1.6,.2,1.6,0x796c4a)});
+ // Processional court and the monumental broken westwork.
+ for(let z=-38;z>-75;z-=9)for(let x of [-13,13]){box(x,.4,z,3,.8,3,palette.dark);cylinder(x,3.7,z,.85,6,palette.stone);cylinder(x,7,z,1.2,.6,palette.light);if(z>-65)cylinder(x,8,z,.4,1.6,palette.gold)}
+ for(let x of [-22,22]){box(x,7,-55,8,14,29,palette.dark);box(x,14.5,-55,8.7,1,30,palette.stone);for(let z=-68;z<-40;z+=4)box(x,15.5,z,2,1.5,2,palette.light);for(let z=-64;z<-42;z+=7){box(x-(x>0?4.1:-4.1),8,z,.2,6,2,0x3f696a);box(x-(x>0?4.2:-4.2),8,z,.1,4,1,0x8eb8a1)}solid(x,-55,8,29,15)}
+ const ag=arch(0,-44,14,9);solid(-8,-44,2,2.3,10);solid(8,-44,2,2.3,10);gateMesh=new THREE.Group();gateMesh.position.z=-44;scenery.add(gateMesh);for(let x=-6;x<=6;x+=1.5){box(x,5.3,0,.18,10.5,.25,palette.dark,gateMesh);mesh(geo.cone,mat(palette.gold),gateMesh,x,10.6,0,.28,.8,.28)}box(0,3,0,14,.2,.25,palette.gold,gateMesh);box(0,7,0,14,.2,.25,palette.gold,gateMesh);gateCollider=solid(0,-44,14,1,11);banner(-11,-42,0x587e7a);banner(11,-42,0x587e7a);
+ box(0,.1,-62,30,.3,28,0x829a8d);for(let i=0;i<3;i++){let r=4+i*2.2;let ring=new THREE.Mesh(new THREE.TorusGeometry(r,.045,4,64),mat(0xc1ba88));ring.rotation.x=Math.PI/2;ring.position.set(0,.29,-60);scenery.add(ring)}
+ arch(0,-72,12,16);for(let s of [-1,1]){box(s*9,12,-73,5,24,6,palette.stone);box(s*9,24,-73,6,1.2,7,palette.light);roof(s*9,24.6,-73,6,7,7,palette.roof2);for(let y=7;y<23;y+=7)box(s*9,y,-69.9,1.2,3,.15,0x486a69)}
+ bellMesh=new THREE.Group();bellMesh.position.set(0,11,-70);scenery.add(bellMesh);mesh(new THREE.CylinderGeometry(1.4,2.9,4.1,16,1,true),mat(palette.gold),bellMesh,0,0,0);cylinder(0,-2.1,0,3,.25,palette.gold,bellMesh);cylinder(0,2.1,0,1.6,.25,palette.gold,bellMesh);cylinder(0,-2.5,0,.4,1.5,palette.dark,bellMesh);line3([0,2.2,0],[0,7,0],.12,palette.dark,bellMesh);for(let i=0;i<8;i++){let a=i*TAU/8;box(Math.cos(a)*2.4,-1,Math.sin(a)*2.4,.15,1.2,.15,0x80724f,bellMesh)}
+ for(let i=0;i<35;i++){let x=rand(-17,17),z=rand(-76,-37);if(Math.abs(x)<8)continue;rock(x,.4,z,rand(.4,1.1),palette.stone)}
+ // Far silhouettes make a city beyond the playable ward.
+ for(let i=0;i<13;i++){let x=-55+i*9;box(x,rand(3,9),56,rand(5,8),rand(11,20),8,0x698a82);roof(x,17,56,7,5,9,0x66877d)}
+ worldBuilt=true;
+}
+function humanoid(color,kind='sword',enemy=false){const g=new THREE.Group(),rig=new THREE.Group();g.add(rig);const dark=0x253e40,skin=enemy?0xa2b69b:0xc9ac87;
+ const torso=outline(mesh(new THREE.CylinderGeometry(.42,.32,.78,7),mat(color),rig,0,1.25,0));const belt=cylinder(0,.95,0,.38,.13,dark,rig);box(0,.96,.36,.18,.15,.09,palette.gold,rig);
+ const head=outline(mesh(geo.sphere,mat(skin),rig,0,1.94,0,.3,.36,.3));mesh(geo.sphere,mat(enemy?0x5d7567:0x484f45),rig,0,2.13,-.04,.32,.23,.3);for(let s of [-1,1]){box(s*.11,1.98,.265,.055,.055,.045,dark,rig);box(s*.43,1.5,0,.22,.25,.36,kind==='sword'?0xa9b2a2:color,rig)}
+ const la=new THREE.Group(),ra=new THREE.Group(),ll=new THREE.Group(),rl=new THREE.Group();la.position.set(-.43,1.49,0);ra.position.set(.43,1.49,0);ll.position.set(-.18,.91,0);rl.position.set(.18,.91,0);rig.add(la,ra,ll,rl);for(let limb of [la,ra]){box(0,-.28,0,.2,.56,.22,color,limb);mesh(geo.sphere,mat(skin),limb,0,-.57,.02,.12,.13,.12)}for(let limb of [ll,rl]){box(0,-.32,0,.23,.62,.25,dark,limb);box(0,-.67,.08,.27,.22,.42,0x394944,limb)}
+ let cape=mesh(new THREE.ConeGeometry(.54,1.18,5,1,true),mat(color),rig,0,1.12,-.14,.9,1,.6);cape.rotation.x=.08;
+ if(kind==='mage'){mesh(geo.cone,mat(color),rig,0,2.55,0,.43,.95,.43);cylinder(0,2.2,0,.54,.08,color,rig);line3([.1,-.7,0],[.1,1.15,0],.045,palette.wood,ra);mesh(geo.rock,mat(0x95ddcf,true),ra,.1,1.2,0,.18,.26,.18)}
+ else if(kind==='rogue'){mesh(new THREE.SphereGeometry(.36,8,6,0,TAU,0,Math.PI*.66),mat(color),rig,0,2,0,1,1.2,1);box(0,1.83,.26,.37,.15,.1,color,rig);for(let a of [ra,la]){box(0,-.78,.06,.08,.55,.08,0xd9d9b9,a);box(0,-.51,.06,.3,.07,.13,palette.gold,a)}}
+ else if(kind==='healer'){cylinder(0,2.17,0,.39,.06,palette.gold,rig);line3([0,-.65,0],[0,.75,0],.055,palette.gold,ra);mesh(geo.sphere,mat(0xe0cc8a),ra,0,.78,0,.18,.25,.18);box(0,1.25,.42,.13,.45,.05,palette.gold,rig)}
+ else{box(0,-.91,.05,.12,.9,.1,0xd6d6be,ra);box(0,-.46,.05,.5,.09,.15,palette.gold,ra);const sh=outline(mesh(new THREE.CylinderGeometry(.42,.42,.13,6),mat(0x899c8f),la,0,-.27,.15));sh.rotation.x=Math.PI/2;box(0,-.27,.24,.1,.6,.05,palette.gold,la)}
+ const ring=new THREE.Mesh(new THREE.RingGeometry(.65,.71,40),new THREE.MeshBasicNodeMaterial({color:enemy?0xd17c63:0xe9ca7f,side:THREE.DoubleSide,transparent:true,opacity:.85}));ring.rotation.x=-Math.PI/2;ring.position.y=.06;g.add(ring);ring.visible=false;return{g,rig,la,ra,ll,rl,cape,ring,phase:rnd()*6};
+}
+function animateActor(a,dt,t){let v=a.visual;if(!v)return;v.g.position.set(a.x,a.downed?.15:0,a.z);v.g.rotation.y=a.facing||0;const speed=a.moving?1:0,phase=t*9+v.phase;v.ll.rotation.x=Math.sin(phase)*.65*speed;v.rl.rotation.x=-Math.sin(phase)*.65*speed;v.la.rotation.x=-Math.sin(phase)*.45*speed;v.ra.rotation.x=Math.sin(phase)*.45*speed;v.rig.position.y=Math.abs(Math.sin(phase))*.07*speed+Math.sin(t*2+v.phase)*.025;v.cape.rotation.x=.08+speed*.2+Math.sin(t*3+v.phase)*.06;v.rig.rotation.z=a.downed?1.3:0;if(a.swing>0){v.ra.rotation.x=-1.8+Math.sin(a.swing*14)*1.5;v.rig.rotation.y=Math.sin(a.swing*14)*.16}v.ring.visible=a===heroes[selected]||a===targetEnemy;v.ring.rotation.z=t*.35;v.g.visible=!a.dead;}
+function burst(x,z,color=0xe4c07a,n=12,size=.15){for(let i=0;i<n;i++){let o=mesh(geo.rock,mat(color,true),fxGroup,x,.8,z,size,size,size);let a=Math.random()*TAU;effects.push({o,life:.6+Math.random()*.35,total:1,vx:Math.cos(a)*(1+Math.random()*4),vy:2+Math.random()*4,vz:Math.sin(a)*(1+Math.random()*4),type:'spark'})}}
+function ringFX(x,z,color=0x8cdac5,r=3,duration=.5){const o=new THREE.Mesh(geo.ring,new THREE.MeshBasicNodeMaterial({color,side:THREE.DoubleSide,transparent:true,opacity:.8,depthWrite:false}));o.userData.radius=r;o.scale.setScalar(r);o.rotation.x=-Math.PI/2;o.position.set(x,.16,z);fxGroup.add(o);effects.push({o,life:duration,total:duration,type:'ring'});return o}
+function beam(a,b,color=0xa0d6c3){let o=line3([a.x,1.3,a.z],[b.x,1,b.z],.06,color,fxGroup);effects.push({o,life:.17,total:.17,type:'beam'})}
+function stepVisuals(dt,t){for(let e of effects){e.life-=dt;if(e.type==='spark'){e.o.position.x+=e.vx*dt;e.o.position.y+=e.vy*dt;e.o.position.z+=e.vz*dt;e.vy-=14*dt;e.o.scale.multiplyScalar(Math.max(.1,1-dt*1.5))}else if(e.type==='ring'){e.o.scale.setScalar(e.o.userData.radius*(.7+(1-e.life/e.total)*.5));e.o.material.opacity=e.life/e.total*.75}if(e.life<=0){fxGroup.remove(e.o);if(e.o.material.transparent)retiredMaterials.push(e.o.material)}}for(let i=effects.length-1;i>=0;i--)if(effects[i].life<=0)effects.splice(i,1);for(let w of wind){if(w.flame){w.o.scale.y=1.5+Math.sin(t*8)*.23;w.o.rotation.y=t}else if(w.water){w.o.position.x+=Math.sin(t*.2+w.phase)*dt*.05;w.o.position.y=-.095+Math.sin(t+w.phase)*.012}else w.o.rotation.z=w.base+Math.sin(t*1.6+w.phase)*w.amp}for(let p of props)if(!p.dead){const q=p.b.translation();p.g.position.set(q.x,q.y,q.z);p.g.quaternion.copy(p.b.rotation());p.x=q.x;p.z=q.z}for(let a of [...heroes,...enemies])animateActor(a,dt,t);if(bellMesh)bellMesh.rotation.z=Math.sin(t*.8)*.025; if(gateMesh)gateMesh.position.y=THREE.MathUtils.damp(gateMesh.position.y,flags.gate?12:0,3,dt)}
+
+const HERO_DATA=[
+ {name:'Vale',full:'Vale Ashford',role:'OATHBOUND WARDEN',kind:'sword',color:0x527d87,hp:150,damage:13,armor:14,range:2.5,power:'Sundering arc',utility:'Iron oath',icon:'⚔',bio:'An oath is merely a debt with better handwriting.',skills:['A sweeping strike hits every foe within 4 paces.','Brace for 6 seconds. Incoming damage is reduced by 65%.']},
+ {name:'Ilex',full:'Ilex of the Cinders',role:'CINDER WITCH',kind:'mage',color:0xb27c51,hp:94,damage:12,armor:11,range:10,power:'Cinder bloom',utility:'Ashen step',icon:'✦',bio:'The academy called it arson. I called it peer review.',skills:['Fire bursts around your target. Burning oil barrels spread the blast.','Blink 5 paces forward, freezing nearby foes for 3 seconds.']},
+ {name:'Pip',full:'Pip Underbough',role:'VEIL KNIFE',kind:'rogue',color:0x749575,hp:110,damage:11,armor:13,range:6.8,power:'Nightglass',utility:'Vanish',icon:'♠',bio:'I have never picked a pocket that did not deserve it.',skills:['A poisoned knife deals double damage and weakens its target for 6 seconds.','Vanish in smoke. Evade all damage for 4 seconds and strike with advantage.']},
+ {name:'Sera',full:'Sera Vesper',role:'DAWN CANTOR',kind:'healer',color:0xbbad79,hp:115,damage:9,armor:12,range:8.5,power:'Daybreak hymn',utility:'Sun verdict',icon:'☀',bio:'Faith is what remains when the gods stop answering.',skills:['Restore 42 health to every nearby companion and raise the fallen.','A radiant verdict deals 38 damage, or 57 against the risen.']}
+];
+let mode='loading',selected=0,paused=false,modal=null,dialog=null,targetEnemy=null,nearest=null,combat=false,worldTime=0,realTime=0,lastInput=performance.now(),lastSave=0,attractTime=0,attractPhase=-1,zoneCurrent='',finished=false,stopped=false,net=null,netClock=0,snapshotStamp=-Infinity;
+let gold=60,potions=6,ash=0,lockpicks=3,level=1,xp=0,talentPoints=0,stats={kills:0,damage:0,healing:0,mercy:0,deaths:0};
+let flags={accepted:false,paid:false,name:false,mercy:false,gate:false,boss:false,cured:false,herb:false,rescued:false,ghost:false,ending:'',read:false,rested:false};
+let settings={volume:65,music:55,invertX:false,invertY:false,shake:true,story:false,autoAttack:false,subtitles:true};
+let discovered=new Set(['town']),opened=new Set(),journal=[],logLines=[],gear=['steel','cinder','veil','dawn'],upgrades=[0,0,0,0],ownedGear=new Set(['steel','cinder','veil','dawn']);
+const SAVE_KEY='bardurs-fate-chronicle-v1',SETTINGS_KEY='bardurs-fate-settings-v1';
+try{settings={...settings,...JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}')}}catch{}
+const telegraphs=[],remotePositions=new Map(),padsJoined=new Map();let checkpoint=null;
+function addLog(s){logLines.push(s);if(logLines.length>5)logLines.shift();renderLog()}
+function addJournal(title,text,done=false){let e=journal.find(x=>x.title===title);if(e){e.text=text;e.done=done}else journal.push({title,text,done});if(mode==='play')toast((done?'Quest complete · ':'Journal updated · ')+title);dirtyHUD=true;}
+function objective(){if(flags.ending)return'Your chronicle is written.';if(!flags.accepted)return'Speak with Magistrate Oriel in the square.';if(!flags.name&&!flags.mercy)return'Find the Name in the abbey court and Mercy in the glass orchard.';if(!flags.name)return'Recover the Seal of Name from the abbey court.';if(!flags.mercy)return'Free the archivist in the glass orchard.';if(!flags.gate)return'Bring both seals to the abbey gate.';if(!flags.boss)return'Confront the Hollow Prior beneath the bell.';return'Approach the bell. Decide what the city will owe.'}
+function makeHero(i){let d=HERO_DATA[i],v=humanoid(d.color,d.kind);actors.add(v.g);let b=physics.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(i*1.2-1.8,1.2,22+i%2));let c=physics.createCollider(RAPIER.ColliderDesc.capsule(.6,.32),b);let h={...d,id:i,x:i*1.2-1.8,z:22+i%2,hp:d.hp,maxHp:d.hp,mana:100,cd:0,powerCd:0,utilityCd:0,dodgeCd:0,swing:0,facing:Math.PI,status:{},queue:[],visual:v,body:b,collider:c,owner:null,dead:false,downed:false,moving:false};heroes.push(h)}
+function spawnEnemy(id,x,z,type='risen',elite=false){let names={risen:'Hollow penitent',brigand:'Toll collector',wolf:'Briar hound',thorn:'Glassbound thorn',warden:'The Oathless Warden',boss:'The Hollow Prior'};let hp=type==='boss'?1000:elite?130:type==='wolf'?42:56;let v=humanoid(type==='brigand'?0x9a6d54:type==='thorn'?0x547b72:0x657d79,type==='thorn'||type==='boss'?'mage':'sword',true);if(type==='wolf'){v.g.scale.set(1.1,.65,1.3)}if(elite||type==='boss')v.g.scale.setScalar(type==='boss'?1.65:1.25);actors.add(v.g);let body=physics.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x,1.2,z));let collider=physics.createCollider(RAPIER.ColliderDesc.capsule(.5,.4),body);enemies.push({id,x,z,spawnX:x,spawnZ:z,type,name:names[type],hp,maxHp:hp,armor:elite?13:11,damage:type==='boss'?18:8,elite,cd:rand(.3,1.7),swing:0,facing:0,status:{},aggro:false,dead:false,downed:false,visual:v,body,collider,windup:0,moving:false})}
+function setupActors(){for(let i=0;i<4;i++)makeHero(i);let id=0;for(let [x,z,t,n]of [[-11,-8,'brigand',4],[17,-11,'wolf',3],[1,-27,'risen',4],[28,-25,'thorn',4],[-28,-51,'risen',3]]){for(let j=0;j<n;j++)spawnEnemy(id++,x+Math.cos(j*TAU/n)*3,z+Math.sin(j*TAU/n)*2,t)}spawnEnemy(id++,0,-31,'warden',true);spawnEnemy(id++,0,-59,'boss',true);
+ const items=[
+ {id:'oriel',name:'Magistrate Oriel',x:-4,z:18,type:'npc',kind:'healer',color:0x9e866b,action:'Speak'},
+ {id:'merchant',name:'Tamsin · oddments & necessities',x:-17,z:21,type:'npc',kind:'rogue',color:0xa27555,action:'Trade'},
+ {id:'camp',name:'The last warm fire',x:-21,z:34,type:'camp',action:'Make camp'},
+ {id:'child',name:'Nell & her father',x:9,z:18,type:'npc',kind:'healer',color:0x788c89,action:'Speak'},
+ {id:'ghost',name:'Sir Halwen · an unpaid oath',x:-25,z:-30,type:'npc',kind:'sword',color:0x83b2a4,action:'Speak'},
+ {id:'archivist',name:'Archivist Edda',x:28,z:-27,type:'npc',kind:'healer',color:0xaa9c78,action:'Speak'},
+ {id:'name',name:'Seal of Name',x:0,z:-33,type:'relic',action:'Recover'},
+ {id:'gate',name:'The twofold abbey gate',x:0,z:-41,type:'gate',action:'Unseal'},
+ {id:'bell',name:'The Hollow Bell',x:0,z:-67,type:'bell',action:'Decide its fate'},
+ {id:'herb',name:'Silver rue',x:38,z:-14,type:'herb',action:'Gather'},
+ {id:'chest1',name:'Tollhouse strongbox',x:-16,z:-17,type:'chest',locked:true,action:'Open'},
+ {id:'chest2',name:'An old pilgrim’s cache',x:34,z:-39,type:'chest',locked:false,action:'Open'},
+ {id:'chest3',name:'The cantor’s reliquary',x:-9,z:-60,type:'chest',locked:true,action:'Open'},
+ {id:'notice',name:'A notice in a trembling hand',x:6,z:20,type:'note',action:'Read'},
+ {id:'shrineTown',name:'Waystone · Ember Quay',x:5,z:33,type:'shrine',action:'Attune'},
+ {id:'shrineAbbey',name:'Waystone · Old Procession',x:9,z:-35,type:'shrine',action:'Attune'},
+ ];
+ for(let o of items){interactables.push(o);if(o.type==='npc'){let v=humanoid(o.color,o.kind);v.g.position.set(o.x,0,o.z);v.g.rotation.y=.3;scenery.add(v.g);o.visual=v;if(o.id==='ghost'){v.g.traverse(m=>{if(m.isMesh){m.material=m.material.clone();m.material.transparent=true;m.material.opacity=.58}})}}else if(o.type==='chest'){box(o.x,.45,o.z,1.4,.9,.9,palette.wood);box(o.x,.94,o.z,1.5,.15,1,palette.gold);for(let a of [-.45,.45])box(o.x+a,.5,o.z+.46,.1,.8,.05,palette.dark)}else if(o.type==='shrine'){cylinder(o.x,.2,o.z,1.1,.4,palette.dark);mesh(geo.rock,mat(0x91d4c3,true),scenery,o.x,1.4,o.z,.4,1,.4);ringFX(o.x,o.z,0xa5c8ac,1,8)}else if(o.type==='relic'){cylinder(o.x,.5,o.z,1,1,palette.stone);o.mesh=mesh(geo.rock,mat(palette.gold,true),scenery,o.x,1.5,o.z,.3,.5,.3)}else if(o.type==='herb')flowers(o.x,o.z,22);else if(o.type==='note'){box(o.x,1,o.z,.15,2,.15,palette.wood);box(o.x,1.8,o.z,.8,.65,.05,palette.light)}}
+}
+function resetRun(session=false){for(let i=0;i<heroes.length;i++){let h=heroes[i];h.maxHp=HERO_DATA[i].hp;h.hp=h.maxHp;h.mana=100;h.downed=false;h.status={};h.cd=h.powerCd=h.utilityCd=0;h.queue=[];h.owner=null;teleport(h,i*1.2-1.8,22+i%2)}for(let e of enemies){e.dead=false;e.hp=e.maxHp;e.aggro=false;e.status={};e.cd=1;teleport(e,e.spawnX,e.spawnZ)}for(let p of props){p.dead=false;p.g.visible=true;p.b.setEnabled(true)}gold=60;potions=6;ash=0;lockpicks=3;level=1;xp=0;talentPoints=0;upgrades=[0,0,0,0];gear=['steel','cinder','veil','dawn'];ownedGear=new Set(gear);discovered=new Set(['town']);opened=new Set();journal=[];logLines=[];stats={kills:0,damage:0,healing:0,mercy:0,deaths:0};flags={accepted:session,paid:false,name:false,mercy:false,gate:false,boss:false,cured:false,herb:false,rescued:false,ghost:false,ending:'',read:false,rested:false};if(!gateCollider){gateCollider=solid(0,-44,14,1,11)}gateMesh.position.y=0;selected=0;finished=false;stopped=false;paused=false;combat=false;targetEnemy=null;worldTime=0;zoneCurrent='';telegraphs.length=0;for(let e of effects){fxGroup.remove(e.o)}effects.length=0;for(let h of hazards){h.armed=true;h.cool=0;h.mesh.material=mat(0x796c4a)}if(session){addJournal('The Hollow Bell','The seals lie in the abbey court and glass orchard. Bring both to the gate, defeat the Prior, and silence the bell.');for(let i=0;i<heroes.length;i++)heroes[i].owner=net?.players.some(p=>p.id===i)?i:null;selected=net?.me>=0?net.me%4:0}else addJournal('The Hollow Bell','The thirteenth bell tolls for the living. Magistrate Oriel has asked for witnesses at the river square.');dirtyHUD=true;
+}
+function teleport(a,x,z){a.x=x;a.z=z;a.body.setTranslation({x,y:1.2,z},true);a.body.setNextKinematicTranslation({x,y:1.2,z});a.moving=false}
+function newGame(){closeModal();closeDialogue();resetRun(!!net);mode='play';$('title').classList.add('hidden');$('hud').classList.remove('hidden');$('attract').classList.add('hidden');audio.start();addLog('Ember Quay · The thirteenth toll.');if(!net){toast('Left stick / WASD to move · Cross / E to speak');checkpoint=serialize();saveGame(true)}renderHUD(true)}
+function serialize(){return{v:1,gold,potions,ash,lockpicks,level,xp,talentPoints,stats,flags:{...flags},discovered:[...discovered],opened:[...opened],journal,gear,ownedGear:[...ownedGear],upgrades,selected,worldTime,heroes:heroes.map(h=>({x:h.x,z:h.z,hp:h.hp,mana:h.mana,maxHp:h.maxHp,downed:h.downed})),enemies:enemies.map(e=>({id:e.id,hp:e.hp,dead:e.dead,x:e.x,z:e.z})),hazards:hazards.map(h=>h.armed)}}
+function applySave(s){if(s.v!==1)throw Error('This chronicle belongs to another edition.');({gold,potions,ash,lockpicks,level,xp,talentPoints,stats,flags,journal,gear,upgrades,selected,worldTime}=s);discovered=new Set(s.discovered);opened=new Set(s.opened);ownedGear=new Set(s.ownedGear);s.heroes.forEach((d,i)=>{Object.assign(heroes[i],d);heroes[i].status={};heroes[i].queue=[];teleport(heroes[i],d.x,d.z)});s.enemies.forEach(d=>{Object.assign(enemies[d.id],d);enemies[d.id].status={};teleport(enemies[d.id],d.x,d.z)});s.hazards?.forEach((b,i)=>hazards[i].armed=b);updateGate();finished=!!flags.ending;dirtyHUD=true}
+function saveGame(quiet=false){if(net||mode!=='play'||flags.ending)return;try{localStorage.setItem(SAVE_KEY,JSON.stringify(serialize()));lastSave=worldTime;if(!quiet)toast('Chronicle saved.')}catch{if(!quiet)toast('This browser cannot store a chronicle. Keep this page open.')}}
+function loadGame(){try{let s=JSON.parse(localStorage.getItem(SAVE_KEY));if(!s)return;newGame();applySave(s);checkpoint=serialize();toast('Your chronicle continues.');renderHUD(true)}catch(e){toast('The chronicle could not be read. A new journey is ready.')}}
+function updateGate(){if(flags.gate&&gateCollider){physics.removeCollider(gateCollider,true);gateCollider=null}let rel=interactables.find(o=>o.id==='name');if(rel?.mesh)rel.mesh.visible=!flags.name;}
+function isAuthority(){return !net||net.isHost}function sharedPlay(){return!!net||padsJoined.size>1}function activeHero(){return heroes[selected]}function leader(){let h=net?heroes.find(h=>h.owner!==null&&!h.downed):heroes[selected];return h&&!h.downed?h:heroes.find(x=>!x.downed)||heroes[0]}
+function moveActor(a,dx,dz,dt,speed=4.6){if(a.downed||a.dead)return;a.moving=Math.hypot(dx,dz)>.05;if(!a.moving){a.body.setNextKinematicTranslation(a.body.translation());return}let len=Math.hypot(dx,dz);dx/=Math.max(1,len);dz/=Math.max(1,len);a.facing=Math.atan2(dx,dz);let p=a.body.translation();controller.computeColliderMovement(a.collider,{x:dx*speed*dt,y:-10*dt,z:dz*speed*dt},RAPIER.QueryFilterFlags.EXCLUDE_KINEMATIC);let v=controller.computedMovement();if(Math.hypot(v.x,v.z)<speed*dt*.15&&speed<7){let side=Math.sin(worldTime*1.3+a.id)>0?1:-1;controller.computeColliderMovement(a.collider,{x:-dz*speed*dt*side,y:-10*dt,z:dx*speed*dt*side},RAPIER.QueryFilterFlags.EXCLUDE_KINEMATIC);v=controller.computedMovement()}a.x=clamp(p.x+v.x,-56,56);a.z=clamp(p.z+v.z,-87,57);a.body.setNextKinematicTranslation({x:a.x,y:p.y+v.y,z:a.z})}
+function nearestFoe(h,range=30){let best=null,d=range;for(let e of enemies){if(e.dead||e.type==='boss'&&!flags.gate)continue;let dd=dist(h,e);if(dd<d){best=e;d=dd}}return best}
+function getTarget(h){if(h.orderTarget&&!h.orderTarget.dead&&dist(h,h.orderTarget)<16)return h.orderTarget;return h===activeHero()&&targetEnemy&&!targetEnemy.dead&&dist(h,targetEnemy)<15?targetEnemy:nearestFoe(h,13)}
+function attack(h,power=false){if(h.downed||h.cd>0||finished)return false;let e=getTarget(h);if(!e||dist(h,e)>h.range+.5){if(h===activeHero()&&!e)toast('No threat in reach.');return false}h.cd=gear[h.id]==='swift'?.62:h.id===2?.7:1;h.swing=.38;h.facing=Math.atan2(e.x-h.x,e.z-h.z);if(h.range>3)beam(h,e,h.id===1?0xf3b16e:h.id===3?0xf6dc9c:0x9ccaad);let roll=1+Math.floor(Math.random()*20);if(h.status.vanish>0)roll=Math.max(roll,1+Math.floor(Math.random()*20));let bonus=5+level+(gear[h.id]==='oath'?2:0);if(roll===1||roll+bonus<e.armor){floatText(e,'miss','#bdcbbd');return true}let crit=roll===20,damage=Math.round((h.damage+(level-1)*3+(gear[h.id]==='oath'?5:0))*(crit?1.8:1)*(h.status.vanish>0?1.6:1));hitEnemy(e,damage,h,crit);if(h.status.vanish>0)h.status.vanish=0;if(gear[h.id]==='sun')h.mana=Math.min(100,h.mana+2);audio.sfx(h.range>3?'spell':'hit');for(let p of props)if(!p.dead&&p.explosive&&dist(p,e)<2.3)hitProp(p,20);return true}
+function hitEnemy(e,damage,h,crit=false){if(e.dead)return;if(e.status.weaken>0)damage=Math.round(damage*1.3);e.hp-=damage;e.aggro=true;stats.damage+=damage;burst(e.x,e.z,crit?0xf6d691:0xbacb9d,crit?16:7);floatText(e,String(damage)+(crit?'!':''),crit?'#f8d584':'#f0e6c8',crit);if(e.hp<=0)killEnemy(e,h);dirtyHUD=true}
+function killEnemy(e,h){e.dead=true;e.hp=0;stats.kills++;gold+=e.elite?35:7;gainXP(e.type==='boss'?250:e.elite?90:24);burst(e.x,e.z,0x8fb4a0,22);audio.sfx('death');if(stats.kills%5===0)potions++;if(e.type==='warden'){ownedGear.add('oath');toast('Oathless Warden defeated · Oathbreaker blade recovered');addJournal('The nameless court','The Warden has fallen. The Seal of Name can be taken from the altar.',true);addLog('Loot · Oathbreaker blade, +35 gold.')}if(e.type==='boss'){flags.boss=true;ownedGear.add('sun');addJournal('The Hollow Bell','The Prior is dust. The bell waits for your judgment.');toast('The Hollow Prior falls. The bell is yours to judge.');checkpoint=serialize();if(net)broadcastState(true)}if(enemies.filter(x=>x.type==='thorn').every(x=>x.dead)){flags.rescued=true;addJournal('The glass archivist','The thorns lie still. Speak to Archivist Edda in the orchard.')}if(targetEnemy===e)targetEnemy=null;dirtyHUD=true}
+function gainXP(n){xp+=n;let goal=[0,180,420,760,1200][level];if(level<4&&xp>=goal){level++;talentPoints++;for(let h of heroes){h.maxHp+=15;h.hp=Math.min(h.maxHp,h.hp+35);h.mana=100}toast('LEVEL '+level+' · A new talent awaits in your pack');audio.sfx('level');addLog('Party reached level '+level+'. One talent point gained.')}dirtyHUD=true}
+function usePower(h,which=0,queued=false){if(h.downed||finished)return;if(paused&&!queued){if(h.queue.length>=3){toast('Three orders already queued for '+h.name+'.');return}h.queue.push({kind:which,target:getTarget(h)?.id});toast(h.name+' queues '+(which?h.utility:h.power));dirtyHUD=true;return}let cdKey=which?'utilityCd':'powerCd',cost=which?25:30;if(h[cdKey]>0||h.mana<cost){if(h===activeHero()&&!queued)toast(h[cdKey]>0?'Ability is recovering.':'Not enough focus.');return}let e=getTarget(h);if((h.id!==3||which)&&!(which&&h.id!==3)&&!e)return;if(h.id===3&&which&&!e)return;h.mana-=cost;h[cdKey]=Math.max(3,(which?9:7)-(upgrades[h.id]===1?2:0));h.swing=.6;h.cd=Math.max(h.cd,.45);const extra=upgrades[h.id]===2?1.35:1;
+ if(!which){if(h.id===0){ringFX(h.x,h.z,0xe8c981,4);for(let q of enemies)if(!q.dead&&dist(h,q)<4.3)hitEnemy(q,Math.round((28+level*3)*extra),h)}if(h.id===1&&e){ringFX(e.x,e.z,0xeaa56b,4);for(let q of enemies)if(!q.dead&&dist(e,q)<4)hitEnemy(q,Math.round((30+level*3)*extra),h);for(let p of props)if(!p.dead&&dist(e,p)<4)hitProp(p,30)}if(h.id===2&&e){beam(h,e,0x98c995);e.status.poison=7;e.status.poisonTick=0;e.status.weaken=7;hitEnemy(e,Math.round(28*extra),h)}if(h.id===3){ringFX(h.x,h.z,0xcde2a0,9,1);for(let a of heroes)if(dist(h,a)<13){let amount=Math.round(42*extra);healHero(a,amount);a.downed=false;stats.healing+=amount}addLog('Sera’s hymn knits flesh and courage.')}}else{if(h.id===0){h.status.ward=6;ringFX(h.x,h.z,0x96bdc5,2,1);toast('Iron oath · damage reduced')}if(h.id===1){let xx=h.x+Math.sin(h.facing)*5,zz=h.z+Math.cos(h.facing)*5;burst(h.x,h.z,0xb1cdd1,20);moveActor(h,Math.sin(h.facing),Math.cos(h.facing),.2,25);for(let q of enemies)if(!q.dead&&dist(h,q)<5)q.status.freeze=3;burst(h.x,h.z,0xc4dfd4,20)}if(h.id===2){h.status.vanish=4;burst(h.x,h.z,0x7ca995,24);ringFX(h.x,h.z,0xa5c8bc,3)}if(h.id===3&&e){beam(h,e,0xf6e3a1);hitEnemy(e,Math.round((e.type==='risen'||e.type==='boss'?57:38)*extra),h);ringFX(e.x,e.z,0xe1d29b,2)}}
+ if(gear[h.id]==='sun')h.mana=Math.min(100,h.mana+2);audio.sfx('spell');if(settings.shake)shake=.16;dirtyHUD=true;return true}
+function healHero(h,amount){h.hp=Math.min(h.maxHp,h.hp+amount);if(h.hp>0)h.downed=false;floatText(h,'+'+amount,'#abdba2');ringFX(h.x,h.z,0xa6d6ad,1,.6);dirtyHUD=true}
+function potion(h){if(potions<1){toast('No draughts remain. Visit Tamsin or make camp.');return}if(h.hp>=h.maxHp){toast(h.name+' is already unhurt.');return}potions--;healHero(h,65);audio.sfx('heal')}
+function damageHero(h,amount){if(h.downed||h.status.vanish>0||h.status.dodge>0||mode==='attract')return;amount=Math.round(amount*(h.status.ward>0?.35:1)*(settings.story?.55:1));stats.wounds=(stats.wounds||0)+amount;h.hp-=amount;floatText(h,'−'+amount,'#ed9b80');audio.sfx('hurt');if(h.hp<=0){h.hp=0;h.downed=true;h.queue=[];addLog(h.name+' is down. Approach and use Cross / E to revive.');if(heroes.every(x=>x.downed)){stats.deaths++;if(net){for(let a of heroes){healHero(a,a.maxHp*.65);teleport(a,(a.id-1.5)*1.5,22)}net.send({t:'warp',p:heroes.map(a=>[a.x,a.z])});toast('The waystone recalls the party. The bell still waits.')}else{paused=true;showDefeat()}}}dirtyHUD=true}
+function dodge(h){if(h.downed||h.dodgeCd>0)return;h.status.dodge=.24;h.dodgeCd=2;audio.sfx('dodge');ringFX(h.x,h.z,0xb8d5bd,1)}
+function hitProp(p,n){if(p.dead)return;p.hp-=n;if(p.hp>0)return;p.dead=true;p.g.visible=false;p.b.setEnabled(false);burst(p.x,p.z,p.explosive?0xf2ae65:0xaa8b5c,30);if(p.explosive){ringFX(p.x,p.z,0xf0a160,4);for(let e of enemies)if(!e.dead&&dist(p,e)<4.5)hitEnemy(e,40,activeHero());for(let h of heroes)if(dist(p,h)<4)damageHero(h,12);audio.sfx('boom')}else{gold+=5;addLog('A barrel yields five very damp coins.')}}
+function stepEnemy(e,dt){if(e.dead||e.type==='boss'&&!flags.gate)return;e.cd=Math.max(0,e.cd-dt);e.swing=Math.max(0,e.swing-dt);for(let k of ['weaken','freeze','poison'])e.status[k]=Math.max(0,(e.status[k]||0)-dt);if(e.status.poison>0){e.status.poisonTick=(e.status.poisonTick||0)+dt;if(e.status.poisonTick>1){e.status.poisonTick=0;hitEnemy(e,4,heroes[2])}}if(e.status.freeze>0){e.moving=false;return}let h=heroes.filter(a=>!a.downed).sort((a,b)=>dist(e,a)-dist(e,b))[0];if(!h)return;let d=dist(e,h);if(d<(e.type==='boss'?19:10))e.aggro=true;if(!e.aggro){e.moving=false;return}if(d>27){e.aggro=false;return}if(e.type==='boss'){e.aoe=(e.aoe||6)-dt;}let range=e.type==='thorn'?6.5:e.type==='boss'?3.5:1.8;if(d>range)moveActor(e,h.x-e.x,h.z-e.z,dt,e.type==='wolf'?4.2:e.type==='boss'?2.5:3.1);else{e.moving=false;e.facing=Math.atan2(h.x-e.x,h.z-e.z);if(e.cd<=0){e.cd=e.type==='boss'?2.1:1.6;e.swing=.4;if(e.type==='thorn')beam(e,h,0xc79979);damageHero(h,e.damage)}}if(e.type==='boss'&&e.aoe<=0&&d<15){e.aoe=6;e.cd=2.1;e.windup=1.5;let o=ringFX(h.x,h.z,0xdb775f,4.6,1.6);telegraphs.push({x:h.x,z:h.z,r:4.6,time:1.5,o});toast('THE PRIOR · Hollow toll — leave the red circle!');audio.sfx('warn')} }
+function stepCompanion(h,dt){if(h.downed)return;let l=leader(),e=nearestFoe(h,11);if(e&&combat){let d=dist(h,e),range=h.range*.85;if(d>range)moveActor(h,e.x-h.x,e.z-h.z,dt,4.3);else{h.moving=false;attack(h)}if(h.powerCd<=0&&h.mana>40){if(h.id===3){if(heroes.some(q=>q.hp<q.maxHp*.65))usePower(h)}else if(h.id===0&&d<4||h.id!==0)usePower(h)}}else{let slot=h.id-l.id,tx=l.x+Math.sin(slot*2.1)*2.8,tz=l.z+Math.cos(slot*2.1)*2.8,d=Math.hypot(tx-h.x,tz-h.z);if(d>2.3)moveActor(h,tx-h.x,tz-h.z,dt,d>7?6:4.7);else h.moving=false;if(dist(l,h)>20&&!combat){teleport(h,l.x+(h.id-1.5),l.z+2)}}}
+function stepGame(dt){worldTime+=dt;combat=enemies.some(e=>!e.dead&&e.aggro&&dist(e,leader())<24);for(let h of heroes){for(let k of ['cd','powerCd','utilityCd','dodgeCd','swing'])h[k]=Math.max(0,h[k]-dt);for(let k in h.status)h.status[k]=Math.max(0,h.status[k]-dt);h.mana=Math.min(100,h.mana+dt*(combat?3:8));if(!combat&&!h.downed)h.hp=Math.min(h.maxHp,h.hp+dt*.7);if(h.queue.length&&h.cd<=0){let order=h.queue[0],kind=typeof order==='number'?order:order.kind;if(kind===2||h[kind?'utilityCd':'powerCd']<=0&&h.mana>=(kind?25:30)){h.queue.shift();h.orderTarget=typeof order==='object'?enemies.find(e=>e.id===order.target):null;if(kind===2)attack(h);else usePower(h,kind,true);h.orderTarget=null;}}if(isAuthority()&&h.owner===null&&h!==activeHero()||isAuthority()&&net?.server&&h.owner===null)stepCompanion(h,dt)}
+ if(isAuthority()){for(let e of enemies)stepEnemy(e,dt);for(let t of telegraphs){t.time-=dt;if(t.time<=0){ringFX(t.x,t.z,0xe89972,t.r,.5);burst(t.x,t.z,0xe6b079,25);for(let h of heroes)if(dist(t,h)<t.r)damageHero(h,28);audio.sfx('boom')}}for(let i=telegraphs.length-1;i>=0;i--)if(telegraphs[i].time<=0)telegraphs.splice(i,1);
+ for(let t of hazards){t.cool=Math.max(0,t.cool-dt);if(t.armed&&t.cool<=0){let h=heroes.find(a=>!a.downed&&dist(a,t)<.95);if(h){damageHero(h,18);t.cool=3;burst(t.x,t.z,0xabc8a3,15);toast('Briar snare! Pip can disarm these with Cross / E.')}}} }
+ physics.timestep=dt;physics.step();for(let l of (net?heroes.filter(h=>h.owner!==null):[leader()])){if(l.z<-43)discover('abbey');else if(l.x>15&&l.z<0)discover('orchard');else if(l.x<-16&&l.z<-20)discover('garden');else if(l.z<0)discover('procession');}if(!net&&worldTime-lastSave>45&&!combat)saveGame(true);updateNearest();dirtyHUD=true;
+}
+function discover(id){if(discovered.has(id))return;discovered.add(id);const names={abbey:'The Hollow Abbey',orchard:'The Glass Orchard',garden:'The Oath Garden',procession:'The Old Procession'};zoneFlash(names[id]);gainXP(20);if(id==='orchard')addJournal('The glass archivist','A scholar is trapped beneath living thorns in the glass orchard. Break the thorns and learn why the bell knows her name.');if(id==='garden')addLog('Pip: “A graveyard. At least the rent is reasonable.”');if(!net)checkpoint=serialize();}
+function updateNearest(){let h=activeHero(),best=null,d=3.3;for(let o of interactables){if(o.id==='name'&&flags.name||o.id==='herb'&&flags.herb||o.type==='chest'&&opened.has(o.id))continue;let dd=dist(h,o);if(dd<d){best=o;d=dd}}for(let a of heroes)if(a.downed&&dist(a,h)<3){best={id:'revive'+a.id,name:'Revive '+a.name,type:'revive',hero:a,action:'Help'};d=dist(a,h)}for(let t of hazards)if(t.armed&&dist(t,h)<2.5&&dist(t,h)<d){best={id:'trap'+hazards.indexOf(t),name:'Briar snare',type:'trap',trap:t,action:h.id===2?'Disarm':'Inspect'};d=dist(t,h)}nearest=best}
+function interact(h=activeHero(),id=null){if(h.downed||finished)return;let o=id?interactables.find(x=>x.id===id):nearest;if(id?.startsWith('revive'))o={type:'revive',hero:heroes[+id.slice(6)]};if(id?.startsWith('trap'))o={type:'trap',trap:hazards[+id.slice(4)]};if(!o){attack(h);return}if(net&&!net.isHost){net.send({t:'action',kind:'interact',actor:h.id,id:o.id});return}if(net&&o.type==='npc'){if(o.id==='oriel'){flags.accepted=true;toast('Recover both seals. The bell has little patience.')}else if(o.id==='archivist'){if(flags.rescued){flags.mercy=true;toast('Edda entrusts the Seal of Mercy to the party.');gainXP(80)}}else if(o.id==='ghost'){flags.ghost=true;flags.name=true;toast('Halwen yields the Seal of Name.')}else if(o.id==='merchant'){if(gold>=20){gold-=20;potions+=2;toast('Two healing draughts purchased for 20 gold.')}}else if(o.id==='child')toast('Nell sleeps. The bell whispers.');updateGate();broadcastState(true);return}
+ if(o.type==='revive'){healHero(o.hero,Math.round(o.hero.maxHp*.35));addLog(h.name+' raises '+o.hero.name+'.');return}if(o.type==='trap'){if(h.id===2||level>=2){o.trap.armed=false;o.trap.mesh.material=mat(0x6e8b7e);gainXP(12);gold+=4;toast('Snare disarmed · +12 experience')}else toast('A cruel little snare. Switch to Pip, or return at level 2.');return}
+ if(o.type==='npc'){talk(o.id);return}if(o.type==='camp'){openCamp();return}if(o.type==='chest'){openChest(o,h);return}if(o.type==='note'){flags.read=true;addJournal('Thirteen names','“It takes a Name to bind a soul, and Mercy to release one. The court kept the first. Edda carried the second into the orchard.”');showText('A notice in a trembling hand','If the bell speaks your name, do not answer. If it speaks in your mother’s voice, remember: she never called you darling. Not once.','Pinned beneath it, a smaller hand has added: “Does anyone know if this applies to stepmothers?”');gainXP(10);return}
+ if(o.type==='herb'){flags.herb=true;toast('Silver rue gathered · a cure for Nell');addJournal('A small mercy','You found silver rue in the eastern meadow. Return it to Nell’s father in Ember Quay.');gainXP(15);return}if(o.type==='relic'){if(enemies.some(e=>e.type==='warden'&&!e.dead)&&!flags.ghost){toast('The Oathless Warden guards the seal. Defeat him, or seek Halwen in the western grave garden.');return}flags.name=true;gainXP(80);toast('SEAL OF NAME · one half of the abbey’s oath');addJournal('The nameless court','The Seal of Name is yours. Edda carried its twin, Mercy, into the glass orchard.',true);updateGate();saveGame(true);if(net)broadcastState(true);return}
+ if(o.type==='gate'){if(flags.gate){toast('The old gate remembers its promise.');return}if(!flags.name||!flags.mercy){toast('Two hollows. Two seals: Name from the court; Mercy from the orchard.');return}flags.gate=true;updateGate();gainXP(50);audio.sfx('gate');zoneFlash('The debt comes due');addJournal('The Hollow Bell','The abbey gate has opened. Confront the Hollow Prior beneath the bell.');checkpoint=serialize();saveGame(true);if(net)broadcastState(true);return}
+ if(o.type==='bell'){if(!flags.boss){toast('The Prior’s oath still binds the bell. Defeat him first.');return}if(net){finishStory('free');return}talk('bell');return}if(o.type==='shrine'){let where=o.id==='shrineTown'?'town':'procession';discovered.add(where);toast('Waystone attuned · travel from your map outside combat');for(let a of heroes)a.mana=100;if(!net){checkpoint=serialize();saveGame(true)}}
+}
+function openChest(o,h){if(opened.has(o.id))return;if(o.locked){if(h.id===2){if(lockpicks>0)lockpicks--;toast('Pip turns the lock as though greeting an old friend.')}else{if(lockpicks<1){toast('No picks. Pip can open this without them.');return}lockpicks--;let roll=1+Math.floor(Math.random()*20)+level+3;addLog('Lock check · d20 + '+(level+3)+' = '+roll);if(roll<11){toast('The pick snaps. Try Pip, or another pick.');return}}}opened.add(o.id);let reward=o.id==='chest1'?'swift':o.id==='chest3'?'sun':'ember';gold+=o.id==='chest3'?70:35;potions+=2;ash+=2;ownedGear.add(reward);gainXP(30);audio.sfx('loot');toast('Cache opened · '+GEAR_DATA[reward].name+', 2 draughts & gold');addLog('Loot · '+GEAR_DATA[reward].name);if(net)broadcastState(true)}
+const GEAR_DATA={steel:{name:'River steel',desc:'A dependable sword. No history worth dying over.',for:0},cinder:{name:'Cinderbranch',desc:'Ilex’s staff. Warm even in rain.',for:1},veil:{name:'Twin whispers',desc:'Pip’s knives have never agreed on a name.',for:2},dawn:{name:'Morning’s answer',desc:'A cantor’s focus. The light within is stubborn.',for:3},oath:{name:'Oathbreaker',desc:'+5 damage, +2 accuracy. A blade freed from a dead promise.',for:0},swift:{name:'Quickhands',desc:'Basic strikes recover 38% faster. Any companion can equip.',for:-1},sun:{name:'Last sunrise',desc:'Spells and strikes restore 2 focus. A relic for any companion.',for:-1},ember:{name:'Emberheart',desc:'+25 maximum health while equipped. Any companion can equip.',for:-1}};
+function rest(){if(combat){toast('Too many uninvited guests nearby. Leave combat first.');return}if(flags.rested&&gold<20){toast('Camp supplies cost 20 gold. Tamsin buys cinder ash.');return}if(flags.rested)gold-=20;flags.rested=true;for(let h of heroes){healHero(h,h.maxHp);h.mana=100;h.cd=h.powerCd=h.utilityCd=0;h.status={}}potions=Math.max(3,potions);audio.sfx('heal');closeModal();toast('Camp made · wounds mended, focus restored');addLog('Ilex: “Wake me if we are about to become a cautionary tale.”');checkpoint=serialize();saveGame(true)}
+function travel(to){if(combat){toast('You cannot travel while enemies pursue you.');return}if(!discovered.has(to))return;let p={town:[2,28],procession:[8,-34],orchard:[23,-17],garden:[-24,-27],abbey:[0,-49]}[to];for(let h of heroes)teleport(h,p[0]+(h.id-1.5)*1.2,p[1]+h.id%2);closeModal();zoneFlash({town:'Ember Quay',procession:'The Old Procession',orchard:'The Glass Orchard',garden:'The Oath Garden',abbey:'The Hollow Abbey'}[to]);audio.sfx('spell')}
+function buy(kind){if(kind==='sell'){if(ash<1){toast('No cinder ash to sell.');return}gold+=ash*12;toast('Sold '+ash+' cinder ash for '+ash*12+' gold');ash=0}else{const costs={potion:18,picks:12,ember:65};let c=costs[kind];if(gold<c){toast('Not enough gold.');return}gold-=c;if(kind==='potion')potions+=2;if(kind==='picks')lockpicks+=3;if(kind==='ember')ownedGear.add('ember');audio.sfx('loot')}openShop();dirtyHUD=true}
+function equip(id){let h=activeHero();if(!ownedGear.has(id)||GEAR_DATA[id].for!==-1&&GEAR_DATA[id].for!==h.id)return;if(gear[h.id]==='ember')h.maxHp-=25;gear[h.id]=id;if(id==='ember')h.maxHp+=25;h.hp=Math.min(h.hp,h.maxHp);toast(h.name+' equips '+GEAR_DATA[id].name);openInventory();dirtyHUD=true}
+function chooseTalent(which){if(talentPoints<1)return;if(upgrades[selected]){toast('This companion already has a talent. Choose another.');return}talentPoints--;upgrades[selected]=which;toast(activeHero().name+' learns '+(which===1?'Measured cadence':'Unbridled gift'));openInventory()}
+function finishStory(ending){if(finished)return;finished=true;flags.ending=ending;paused=false;stats.mercy+=ending==='free'?2:0;gainXP(200);audio.sfx('level');ringFX(0,-67,ending==='free'?0xd1e1b4:0xe1ab6e,14,2);burst(0,-67,0xf6dc96,75);closeDialogue();showEnding();if(net&&net.isHost){net.send({t:'finish',ending,stats});netFinish(true)}}
+function netFinish(won){if(!net?.isHost)return;AIHub.finish({standings:[net.players.map(p=>p.id)],won,scores:Object.fromEntries(net.players.map(p=>[p.id,stats.kills*10+(flags.name?150:0)+(flags.mercy?150:0)+(flags.boss?400:0)])),stats:Object.fromEntries(net.players.map(p=>[p.id,{'Foes fallen':stats.kills,'Party level':level,'Seals':Number(flags.name)+Number(flags.mercy)}]))});}
+function sharedCommand(kind,id,actor){let h=heroes[actor];if(!h)return'Companion unavailable.';if(kind==='equip'){let d=GEAR_DATA[id];if(!d||!ownedGear.has(id)||d.for!==-1&&d.for!==actor)return'Choose equipment suited to this companion.';if(gear[actor]==='ember')h.maxHp-=25;gear[actor]=id;if(id==='ember')h.maxHp+=25;h.hp=Math.min(h.hp,h.maxHp);return h.name+' equips '+d.name+'.'}
+ if(kind==='talent'){if(talentPoints<1||upgrades[actor])return'No talent is available for this companion.';talentPoints--;upgrades[actor]=+id;return h.name+' learns a new talent.'}
+ if(kind==='buy'){if(id==='sell'){let amount=ash*12;gold+=amount;ash=0;return'Sold cinder ash for '+amount+' gold.'}let cost={potion:18,picks:12,ember:65}[id];if(!cost||gold<cost)return'Not enough gold.';if(id==='ember'&&ownedGear.has('ember'))return'Emberheart is already in the pack.';gold-=cost;if(id==='potion')potions+=2;if(id==='picks')lockpicks+=3;if(id==='ember')ownedGear.add('ember');return'Purchase added to the company’s pack.'}
+ if(kind==='rest'){if(combat)return'Leave combat before making camp.';if(flags.rested&&gold<20)return'Camp supplies cost 20 gold.';if(flags.rested)gold-=20;flags.rested=true;for(let a of heroes){healHero(a,a.maxHp);a.mana=100;a.cd=a.powerCd=a.utilityCd=0}potions=Math.max(3,potions);return'The company rests. Wounds and focus restored.'}
+ if(kind==='travel'){if(combat)return'The company cannot travel during combat.';if(!discovered.has(id))return'That waystone has not been discovered.';let p={town:[2,28],procession:[8,-34],orchard:[23,-17],garden:[-24,-27],abbey:[0,-49]}[id];for(let a of heroes)teleport(a,p[0]+(a.id-1.5)*1.2,p[1]+a.id%2);net.send({t:'warp',p:heroes.map(a=>[a.x,a.z])});return'The company travels by waystone.'}return'The company waits.'}
+
+const BUILD_INFO={"source": [["Date", "2026-10-29 04:12 America/Vancouver; project stamp 20261029-0327."], ["Source", "Baldur’s Gate. An original spiritual successor; no source assets or characters."], ["Tech", "Three.js r180 (0.180.0), WebGPURenderer with WebGPU required and fallback disabled; Rapier 0.19.3; HTML/CSS/JavaScript; Gamepad API; Web Audio API; localStorage."], ["Art Direction", "Stylized cel shading using MeshToonNodeMaterial, four-band lighting, faceted procedural models, ink outlines and a muted copper/teal palette."], ["Animation", "Procedural hierarchical character rigs, locomotion, attacks, breathing, cloth sway, floating damage and timed particle effects."], ["Audio", "Code-written adaptive fantasy score, synthesized sound effects and formant-filtered Animalese-style gibberish voices; no recorded audio."], ["Online", "AI Hub Session Protocol v1 co-op, embedded unmodified client 1.3.0 at commit dfd421ce67f15aa38541635cb87835adb1fc0111. Host authority, local movement prediction, snapshots, disconnect handling and results. Standalone 1–4 controller couch co-op; online play requires AI Hub."], ["Testing parameters", "Efficient, lightweight testing. Static syntax check, browser smoke test, focused quest/combat/save checks and AI Hub conformance. See Testing page for actual results."], ["Environment", "Codex CLI (headless); Linux / WSL2. Player browser unknown. Test browser results are listed separately."], ["Model", "OpenAI, gpt-6.1-sol, reasoning effort max."], ["Usage", "Estimated API cost: unknown. Total tokens and breakdown: unknown. Session time: approximately 45 minutes at final packaging (measured from first tool timestamp)."]], "testing": [["Issues caught", "8 application issues found and fixed across visual, gameplay and session checks: inward roof faces; title focus contrast; HUD contrast; Escape/back navigation; shared effect geometry disposal; battle-audio routing; draw-coupled controller polling; and pending menu input lost on focus changes. A separate headless WebGPU capture configuration issue was also resolved."], ["Critical / game breaking", "1: effect cleanup disposed shared world geometry, causing invalid GPU buffers. Fixed by sharing effect geometry safely and deferring material disposal until submitted GPU work completes."], ["Results", "23/23 chapter checks passed with no JavaScript errors. AI Hub automatic conformance: 24/24 player-hosted checks and 25/25 dedicated-server checks passed."], ["Parameters", "Efficient, focused testing in Playwright Chromium 153.0.8010.12 under Xvfb/software Vulkan. Chapter fixtures shorten encounters. Hub tests use two emulated players, plus a separate host in server mode, 60 ms latency, 20 ms jitter and 0% packet loss. No FPS target or optimization testing. Physical controllers and four separate real devices are unverified."], ["Most helpful test", "The quest-to-ending browser fixture exposed the shared-geometry lifetime error and battle-audio error while proving the whole chapter can finish. The hub harness caught short-input timing failures."], ["Least helpful test", "The initial syntax-only check passed despite the rendering and audio bugs. It was useful as a quick gate, but could not assess the game’s behavior."]], "engine": [["What worked best", "Three.js toon node materials, procedural geometry and shadows made the cel-shaded world expressive without downloaded art. Rapier provided dependable movement and physical props."], ["Stuck or guessed wrong", "I initially treated a spell beam’s geometry as disposable even though it was shared with scenery. That invalidated GPU buffers. Headless canvas capture also required a virtual display and the correct software-Vulkan launch configuration."], ["Most important custom system", "The party RPG layer: quest consequences, dialogue choices, companion AI, queued tactical orders, progression, saves, and shared-world authority."], ["Hardest part", "Coordinating GPU-resource lifetimes while keeping controller sampling, physics and networking independent of drawing."], ["What to remove or overhaul", "Automatic graphics-backend fallback should be an explicit opt-in for applications that require WebGPU. This build disables it."], ["One engine change", "Add a public strict-WebGPU option and clearer diagnostics when resources still referenced by GPU work are disposed."]], "prompt": [["What worked best", "The cel-shaded art direction, controller-first requirement, attract mode and single-file delivery made the desired experience concrete."], ["What was confusing", "“All features” of a full-scale party RPG is unbounded. This demo defines a complete chapter with its mechanics explained in the guide, journal and companion records. Standalone multiplayer is couch co-op; online co-op uses AI Hub."], ["Hardest part", "Combining a coherent quest-driven party RPG, a complete ending and authoritative multiplayer into one portable HTML file."], ["One further test", "Four physical DualSense controllers on four separate machines, including a dedicated host, with 250 ms latency and packet loss."]]};
+let dirtyHUD=true,hudTimer=0,toastTimer,zoneTimer,focusIndex=0,menuPauseBefore=false,aboutPage=0;
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function portrait(id=0){let d=HERO_DATA[id]||HERO_DATA[0],c='#'+d.color.toString(16).padStart(6,'0');return `<svg viewBox="0 0 80 100" aria-hidden="true"><defs><linearGradient id="p${id}" x2="0" y2="1"><stop stop-color="#48615c"/><stop offset="1" stop-color="#172d35"/></linearGradient></defs><path d="M1 1h78v98H1z" fill="url(#p${id})" stroke="#8f996f"/><path d="M3 100V77l22-15h30l22 15v23" fill="${c}"/><path d="M30 55h20v20H30" fill="#ac997a"/><path d="M20 27l18-10 23 15-5 29-16 12-17-13z" fill="#ccb795"/><path d="M18 40l1-17 17-12 21 8 8 22-14-13-16-3z" fill="${id===3?'#b8b6a0':'#46534b'}"/><path d="M25 43h10m11 0h10" stroke="#324b49" stroke-width="3"/><path d="M39 43l-3 12 7 1m-12 5l9 2 9-3" fill="none" stroke="#927c65" stroke-width="2"/>${id===1?`<path d="M12 31L33 0l24 30z" fill="${c}"/><path d="M8 31h57" stroke="#d0b578" stroke-width="4"/>`:id===2?`<path d="M19 44l-4-16L40 5l25 25-7 15-9-18-15-4z" fill="${c}"/><path d="M21 54l18 9 19-9v12L40 76 22 65z" fill="${c}"/>`:id===0?'<path d="M17 31l8-17 16-5 17 11 4 13-22-7z" fill="#a5b7ac"/><path d="M17 32h45" stroke="#d1bd80" stroke-width="3"/>':'<path d="M18 27l22-12 22 12" fill="none" stroke="#e2c785" stroke-width="4"/>'}<path d="M11 98l10-23 18 13 20-13 10 23" fill="none" stroke="#d8c68e" stroke-width="2"/></svg>`}
+function toast(s){$('toast').textContent=s;$('toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').classList.remove('show'),3400)}
+function zoneFlash(s){$('zoneTitle').textContent=s;$('zoneTitle').classList.add('show');clearTimeout(zoneTimer);zoneTimer=setTimeout(()=>$('zoneTitle').classList.remove('show'),2700)}
+function floatText(a,text,color='#f0e4c4',crit=false){if(!camera||!renderer)return;let p=new V(a.x,2.8,a.z).project(camera);if(p.z>1)return;let el=document.createElement('div');el.className='floater'+(crit?' crit':'');el.textContent=text;el.style.color=color;el.style.left=(p.x*.5+.5)*innerWidth+'px';el.style.top=(-p.y*.5+.5)*innerHeight+'px';$('floaters').append(el);setTimeout(()=>el.remove(),1400)}
+function renderLog(){$('log').innerHTML=logLines.slice(-3).map((s,i)=>`<div class="${i===logLines.slice(-3).length-1?'new':''}">${esc(s)}</div>`).join('')}
+function button(label,action,extra='',cls='btn'){return `<button class="${cls}" data-action="${action}" ${extra}>${label}</button>`}
+function focusFirst(){focusIndex=0;requestAnimationFrame(()=>{let buttons=focusables();buttons[0]?.focus({preventScroll:true})})}
+function focusables(){let root=!$('modal').classList.contains('hidden')?$('modal'):!$('dialogue').classList.contains('hidden')?$('dialogue'):mode==='title'?$('title'):null;return root?[...root.querySelectorAll('button:not(:disabled)')].filter(e=>e.getClientRects().length):[]}
+function focusMove(d){let bs=focusables();if(!bs.length)return;let idx=bs.indexOf(document.activeElement);focusIndex=(Math.max(0,idx)+d+bs.length)%bs.length;bs[focusIndex].focus({preventScroll:true});bs[focusIndex].scrollIntoView({block:'nearest'});audio.sfx('ui')}
+function openModal(type,content){if(!modal)menuPauseBefore=paused;modal=type;$('modalContent').innerHTML=content;$('modal').classList.remove('hidden');if(mode==='play'&&!sharedPlay())paused=true;focusFirst()}
+function closeModal(){if(!modal)return;if($('modal').contains(document.activeElement))document.activeElement.blur();modal=null;$('modal').classList.add('hidden');paused=menuPauseBefore&&!sharedPlay();lastInput=performance.now();if(dialog)focusFirst()}
+function heading(k,title){return `<div class="modaltop"><div><div class="eyebrow">${k}</div><h2>${title}</h2></div>${button('○ Back','back','','close')}</div>`}
+function showTitle(){closeModal();closeDialogue();mode='title';paused=false;stopped=false;finished=false;$('title').classList.remove('hidden');$('hud').classList.add('hidden');$('attract').classList.add('hidden');$('pauseBanner').classList.add('hidden');$('zoneTitle').classList.remove('show');$('toast').classList.remove('show');let hasSave=false;try{hasSave=!!localStorage.getItem(SAVE_KEY)}catch{}$('titleButtons').innerHTML=button('Begin your chronicle <small>× / ENTER</small>','new','','')+(hasSave?button('Continue the chronicle','load','',''):'')+button('How to play <small>1–4 PLAYERS</small>','howto','','')+button('About the chronicle','about','','');lastInput=performance.now();audio.setMood('title');focusFirst()}
+function showText(title,text,extra=''){showDialogue({speaker:title,portrait:0,line:text,aside:extra,choices:[{text:'Continue.',run:closeDialogue}]})}
+function showDialogue(d){dialog=d;if(!sharedPlay())paused=true;$('dialogue').classList.remove('hidden');$('dialogue').innerHTML=`<div class="dialogbox"><div class="dialogportrait">${portrait(d.portrait??0)}<div class="eyebrow">${d.tag||'THE HOLLOW BELL'}</div></div><div><div class="dialogspeaker">${esc(d.speaker)}</div><div class="dialogtext">${esc(d.line)}</div>${d.aside?`<p class="prose" style="margin-bottom:14px;font-size:12px;font-style:italic">${esc(d.aside)}</p>`:''}<div class="dialogchoices">${d.choices.map((c,i)=>`<button data-choice="${i}"><em>${i+1}.</em> ${c.text}</button>`).join('')}</div><div class="dialoghint">↑ ↓ Choose · × / Enter Confirm · ○ / Escape Back</div></div></div>`;focusFirst();audio.voice(d.line,d.portrait??0)}
+function closeDialogue(){dialog=null;$('dialogue').classList.add('hidden');if(!modal)paused=false;audio.stopVoice()}
+function acceptQuest(mercy=false){flags.accepted=true;if(mercy)stats.mercy++;addJournal('The Hollow Bell','Find the Seal of Name in the abbey court and the Seal of Mercy with Edda in the glass orchard. Halwen’s ghost in the west may know another way.');closeDialogue();toast('QUEST ACCEPTED · The Hollow Bell');gainXP(20);saveGame(true)}
+function talk(id){if(id==='oriel'){if(flags.accepted){showDialogue({speaker:'Magistrate Oriel',portrait:3,line:flags.gate?'The gates have opened. I had hoped to hear those words before my funeral. Preferably by a comfortable margin.':'The court to the north holds Name. Edda took Mercy east, into the glass orchard. And Halwen’s ghost has been seen among the western graves. A city’s secrets do tend to outlive its citizens.',choices:[{text:'I will return when the bell is silent.',run:closeDialogue},{text:'Tell me what the bell wants.',run:()=>showText('Magistrate Oriel','Names. Once it rang for the dead, so that no soul was lost between worlds. Now it has begun collecting the living. The Prior calls it an overdue payment. I call it an administrative disagreement.')} ]});return}showDialogue({speaker:'Magistrate Oriel',portrait:3,tag:'MAGISTRATE OF EMBER QUAY',line:'Thirteen tolls. Twelve missing souls. If arithmetic offered any comfort, I should have married an accountant. The abbey’s bell has begun calling the living by name — and tonight it learned mine.',aside:'Her fingers fold a letter until the paper gives way.',choices:[{text:'We will stop it. Tell us how.',run:()=>showDialogue({speaker:'Magistrate Oriel',portrait:3,line:'The abbey gate answers two seals: Name, kept in its outer court, and Mercy, carried by Archivist Edda into the eastern orchard. Bring them together. Then find what remains of the Prior, and persuade him to stay dead.',choices:[{text:'Then we have work to do.',run:()=>acceptQuest(true)},{text:'And if this Prior cannot be persuaded?',run:()=>showDialogue({speaker:'Magistrate Oriel',portrait:3,line:'I believe you carry several convincing arguments on your belt. Use whichever is most eloquent.',choices:[{text:'An excellent command of diplomacy, Magistrate.',run:()=>acceptQuest(false)}]})}]})},{text:'<em>[Bargain]</em> A city’s gratitude is difficult to spend.',run:()=>{flags.paid=true;gold+=40;addLog('Oriel advances 40 gold. Pip approves.');acceptQuest(false)}},{text:'Who are these companions of mine?',run:()=>showText('Magistrate Oriel','Vale has an oath, Ilex has a warrant, Pip has someone else’s purse, and Sera has the patience to tolerate all three. If you require further qualifications, you may be in the wrong profession.')},{text:'We need a moment.',run:closeDialogue}]});return}
+ if(id==='merchant'){openShop();return}if(id==='child'){if(flags.cured){showText('Nell’s father','She woke asking for plum cake. I have never loved a demand so much. If the bell calls for you, tell it we have already paid.');return}showDialogue({speaker:'Nell’s father',portrait:0,line:'She answers the bell in her sleep. Each toll takes another word from her. The healers say silver rue grows east of the canal — past the orchard path. I would go, but she is afraid to wake alone.',choices:[...(flags.herb?[{text:'<em>[Give silver rue]</em> No child should owe a debt to the dead.',run:()=>{flags.cured=true;potions+=3;stats.mercy++;gainXP(90);addJournal('A small mercy','Nell has woken. Her father has given you three healing draughts, and a reason to see the night through.',true);closeDialogue();toast('Nell is safe · +3 healing draughts')}}]:[{text:'We will find the silver rue.',run:()=>{addJournal('A small mercy','Nell is losing her voice to the bell. Find silver rue in the eastern meadow, beyond the orchard path.');closeDialogue()}}]),{text:'Keep her warm. We will return.',run:closeDialogue}]});return}
+ if(id==='ghost'){if(flags.ghost){showText('Sir Halwen','I had forgotten the sound of a promise freely kept. Do not spend yours carelessly.');return}showDialogue({speaker:'Sir Halwen',portrait:0,tag:'A KNIGHT WITHOUT A TOMORROW',line:'They carved “faithful” upon my stone. A tidy word for a man who watched a city drown and called it duty. The Warden holds the seal, but I know the name that unlocks it. What would you have me buy with my last secret?',choices:[{text:'<em>[Mercy]</em> Your rest. We will carry the names you could not save.',run:()=>{flags.ghost=true;flags.name=true;stats.mercy++;gainXP(80);updateGate();addJournal('An unpaid oath','You promised Halwen that the drowned would be remembered. He entrusted the Seal of Name to you, sparing a battle with the Warden.',true);closeDialogue();toast('SEAL OF NAME · a promise freely given');saveGame(true)}},{text:'<em>[Offer 35 gold]</em> A memorial, with every name written plainly.',run:()=>{if(gold<35){toast('You need 35 gold for the memorial.');return}gold-=35;flags.ghost=true;flags.name=true;stats.mercy++;gainXP(90);updateGate();addJournal('An unpaid oath','A memorial will bear the names of Halwen’s drowned. The ghost has finally laid down his watch.',true);closeDialogue();saveGame(true)}},{text:'Keep your secret. We will face the Warden.',run:closeDialogue}]});return}
+ if(id==='archivist'){if(!flags.rescued){showText('Archivist Edda','An orchard of glass. How poetical. How utterly inconvenient. Break the thorns outside this circle, would you? They object to my leaving, and I object to becoming a footnote.');return}if(flags.mercy){showText('Archivist Edda','Mercy is the only debt that diminishes when it is shared. The Prior understood the words. It is the practice that gave him trouble.');return}showDialogue({speaker:'Archivist Edda',portrait:3,tag:'KEEPER OF THE SECOND SEAL',line:'I found the abbey’s first ledger. Every soul was lent a name, to be returned at death. The Prior has begun charging interest. I brought Mercy here to hide it. Then the trees developed opinions.',choices:[{text:'Give us the seal. Keep your life. We have no use for another debt.',run:()=>{flags.mercy=true;stats.mercy++;gainXP(100);addJournal('The glass archivist','Edda is free, and the Seal of Mercy is yours. She will preserve the ledger as witness to the Prior’s betrayal.',true);closeDialogue();toast('SEAL OF MERCY · the second oath is yours');saveGame(true)}},{text:'<em>[Demand payment]</em> Our rescue service is regrettably expensive.',run:()=>{flags.mercy=true;gold+=55;gainXP(80);addJournal('The glass archivist','Edda gave you the Seal of Mercy, and 55 gold. Pip has offered to prepare an invoice.',true);closeDialogue();toast('Seal of Mercy & 55 gold');saveGame(true)}},{text:'What happens if we ring the bell ourselves?',run:()=>showText('Archivist Edda','Then someone must hold the ledger. You would inherit every debt, and the power to collect it. Kings have done worse for less. If you break it, the souls go free — and no god will remember who paid.')},{text:'We will return.',run:closeDialogue}]});return}
+ if(id==='bell'){showDialogue({speaker:'The Hollow Bell',portrait:1,tag:'A FINAL ACCOUNTING',line:'The bell speaks in a voice you almost recognise. “No soul without a name. No name without a debt. Take the ledger, and the city shall kneel. Break the bell, and nothing shall be owed to you. Not even gratitude.”',aside:stats.mercy>1?'Somewhere beyond the river, a child begins to sing.':'The city’s lanterns tremble like stars in a blackened sea.',choices:[{text:'<em>[Break the bell]</em> Let the living belong to themselves.',run:()=>finishStory('free')},{text:'<em>[Claim the ledger]</em> Someone must decide what is owed.',run:()=>finishStory('keeper')},{text:'Not yet. There are still things we must put right.',run:closeDialogue}]})}
+}
+function openSettings(){openModal('settings',heading('YOUR DEVICE','Settings')+`<p class="prose" style="margin-bottom:18px">${sharedPlay()?'Your companions keep moving while this menu is open.':'The chronicle waits while you adjust your settings.'}</p>`+[
+ ['volume','Master volume',settings.volume+'%'],['music','Music volume',settings.music+'%'],['invertX','Invert horizontal axis',settings.invertX?'ON':'OFF'],['invertY','Invert vertical axis',settings.invertY?'ON':'OFF'],['shake','Camera motion',settings.shake?'ON':'OFF'],['story','Story difficulty',settings.story?'ON · gentler damage':'OFF · standard'],['autoAttack','Auto strike when in range',settings.autoAttack?'ON':'OFF']
+ ].filter(([key])=>!net||key!=='story').map(([key,label,value])=>`<button class="settingsrow" style="width:100%;text-align:left" data-setting="${key}"><span>${label}</span><b>${value}</b></button>`).join('')+button('Controller & keyboard guide','howto')+button('About & credits','about')+(!net&&mode==='play'?button('Save chronicle','save')+button('Return to title','title'):'')+`<p class="modalfoot">← → Adjust · × / Enter Toggle · ○ / Esc Close</p>`)}
+function changeSetting(key,d=1){if(key==='volume'||key==='music'){settings[key]=(settings[key]+d*10+110)%110;settings[key]=Math.min(100,settings[key]);audio.updateVolume()}else settings[key]=!settings[key];try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(settings))}catch{}let idx=focusables().indexOf(document.activeElement);openSettings();requestAnimationFrame(()=>focusables()[idx]?.focus({preventScroll:true}))}
+function openHowto(){openModal('howto',heading('A CHRONICLE FOR YOUR SOFA','How to play')+`<p class="quote">Gather your companions. Give your orders. Live with the consequences.</p><div class="binds">${[['Move','Left stick / WASD'],['Interact / revive','× / E'],['Basic strike (hold)','R2 / J'],['Signature ability','△ / K'],['Utility ability','R1 / L'],['Dodge / back','○ / Shift'],['Tactical pause','□ / Space'],['Next companion','L1 / Q'],['Change target','L2 / T'],['Healing draught','R3 / H'],['Camera / zoom','Right stick / Z X, − +'],['Journal / pack','D-pad ↑ ↓ / Tab, I'],['Map / camp','D-pad ← → / M, C'],['Settings','Options / Esc']].map(([a,b])=>`<div><span>${a}</span><b>${b}</b></div>`).join('')}</div><p class="prose" style="margin-top:20px;font-size:13px">In solo play, pause to queue up to three abilities per companion. Switch with L1, issue orders, then resume. Empty party seats fight automatically. Downed companions can be revived nearby. Explore for alternate quest solutions, equipment, and talents.</p><p class="prose" style="margin-top:12px;font-size:13px">For couch co-op, connect 2–4 controllers. Each extra player presses Options during play to claim a companion. Stay together: the camera follows your party. Disconnecting returns that companion to the computer. Online co-op runs through AI Hub’s session lobby. The hub chapter starts with the bell quest accepted, and ends when the team silences it or time expires.</p><p class="modalfoot">The world continues during co-op menus. Touch-only devices require a controller or keyboard.</p>`)}
+function openJournal(){openModal('journal',heading('THE COMPANY’S RECORD','Journal')+journal.map(j=>`<div class="journalentry ${j.done?'done':''}"><h3>${j.done?'✓ ':''}${esc(j.title)}</h3><p>${esc(j.text)}</p></div>`).join('')+`<p class="modalfoot">Current aim · ${objective()}</p>`+button('View the map','map')+button('Companion records','camp'))}
+function openInventory(){let h=activeHero();openModal('inventory',heading('PACK & PROGRESSION',h.name+'’s equipment')+`<div class="twocol"><div class="inventorygear"><div class="portraitlarge">${portrait(selected)}</div><h3>${h.full}</h3><div class="eyebrow">${h.role}</div><p class="quote">“${h.bio}”</p><div class="statrow"><span>Level ${level} · Experience</span><b>${xp} / ${level>=4?'MAX':[0,180,420,760][level]}</b></div><div class="statrow"><span>Health / Focus</span><b>${Math.ceil(h.hp)} / ${Math.ceil(h.mana)}</b></div><div class="statrow"><span>Armor / Strike</span><b>${h.armor} / ${h.damage+(level-1)*3}</b></div><div class="statrow"><span>Gold / Draughts / Picks</span><b>${gold} / ${potions} / ${lockpicks}</b></div><p style="font-size:12px;margin-top:10px">${h.skills[0]}<br><br>${h.skills[1]}</p>${button('Next companion','switchPack')}</div><div><div class="eyebrow">EQUIPMENT · SELECT TO EQUIP</div>${[...ownedGear].filter(k=>GEAR_DATA[k].for===-1||GEAR_DATA[k].for===selected).map(k=>button(`${gear[selected]===k?'✓ ':''}<strong>${GEAR_DATA[k].name}</strong><br><span style="font-size:11px;color:#b8cabf">${GEAR_DATA[k].desc}</span>`,'equip',`data-id="${k}"`)).join('')}<div class="eyebrow" style="margin-top:25px">TALENTS · ${talentPoints} AVAILABLE</div>${upgrades[selected]?`<p class="prose" style="font-size:13px;margin-top:10px">${upgrades[selected]===1?'Measured cadence · skills recover 2 seconds sooner.':'Unbridled gift · signature abilities are 35% stronger.'}</p>`:button('Measured cadence<br><small>Abilities recover 2 seconds sooner.</small>','talent',`data-which="1" ${!talentPoints?'disabled':''}`)+button('Unbridled gift<br><small>Signature abilities are 35% stronger.</small>','talent',`data-which="2" ${!talentPoints?'disabled':''}`)}</div></div>`)}
+function openMap(){openModal('map',heading('THE RIVER WARD','Chart of Ember Quay')+`<canvas id="bigmap" width="800" height="420"></canvas><div class="eyebrow" style="margin-top:16px">WAYSTONES · TRAVEL OUTSIDE COMBAT</div><div class="tabs" style="margin-top:12px;flex-wrap:wrap">${[['town','Ember Quay'],['procession','Procession'],['orchard','Orchard'],['garden','Oath garden'],['abbey','Abbey']].filter(([id])=>discovered.has(id)).map(([id,label])=>button(label,'travel',`data-id="${id}"`,'')).join('')}</div><p class="modalfoot">Gold diamonds · people & discoveries. Red · threats. Cyan · waystones. Your party is ivory.</p>`);drawMap($('bigmap'),true)}
+function openCamp(){openModal('camp',heading('BETWEEN THE TOLLS','The company')+`<p class="quote">“We may yet see the morning. Try not to sound so surprised.”</p><p class="prose">${combat?'Enemies are close. Rest and travel become available when the company is safe.':'Companions remember your choices. Rest at a warm fire to mend wounds, restore focus, and replenish your healing draughts to three.'}</p>`+button(`Rest the company <small>${flags.rested?'20 GOLD':'FIRST NIGHT FREE'}</small>`,'rest',`${combat?'disabled':''}`)+HERO_DATA.map((h,i)=>button(`<strong>${h.name}</strong> · ${h.role.toLowerCase()} <small>${flags['bond'+i]?'STORY HEARD':'A WORD BY THE FIRE'}</small>`,'bond',`data-id="${i}"`)).join('')+(!net?button('Save chronicle','save'):''))}
+function companionStory(i){closeModal();let stories=[['The price of an oath','I swore to serve the abbey before I learned who kept its books. The oath was simple: no soul forgotten. It seems they took that as an instruction to keep them all. I would like to believe a promise can be mended. Failing that, I have brought a sword.'],['Academic differences','They expelled me for setting the dean’s desk alight. An overreaction, considering he was sitting behind someone else’s desk at the time. The important part is that the ledger survived. Not the school’s ledger. His. Every name had a price beside it. I did not like mine.'],['Honour among inconveniences','My mother said a stolen loaf made a thief, and a stolen kingdom made a king. I asked where the dividing line was. “About three hundred men with spears,” she said. I prefer small thefts. The gratitude is more honest.'],['An unanswered prayer','I spent seven years asking the dawn for a sign. Then one morning a woman came to the temple carrying a child, and I realised I had been facing the wrong direction. Gods can wait. People seldom have the luxury.']];showDialogue({speaker:HERO_DATA[i].full,portrait:i,tag:stories[i][0].toUpperCase(),line:stories[i][1],choices:[{text:'I am glad you are here.',run:()=>{if(!flags['bond'+i]){flags['bond'+i]=true;gainXP(20);heroes[i].mana=100;toast(HERO_DATA[i].name+'’s resolve strengthened · focus restored')}closeDialogue()}},{text:'We should be moving.',run:closeDialogue}]})}
+function openShop(){closeDialogue();openModal('shop',heading('TAMSIN’S ODDMENTS','The asking price')+`<p class="quote">“Nothing cursed. Nothing recently cursed, at any rate.”</p><p class="prose">Gold: <b style="color:var(--gold)">${gold}</b> · Healing draughts: ${potions} · Lockpicks: ${lockpicks}</p>`+button('Two healing draughts <small>18 GOLD</small>','buy','data-id="potion"')+button('Three lockpicks <small>12 GOLD</small>','buy','data-id="picks"')+button('Emberheart · +25 health when equipped <small>65 GOLD</small>','buy',`data-id="ember" ${ownedGear.has('ember')?'disabled':''}`)+button(`Sell cinder ash <small>${ash} × 12 GOLD</small>`,'buy','data-id="sell"')+`<p class="modalfoot">All purchases are shared by the company. Change equipment in the pack.</p>`)}
+function showDefeat(){openModal('defeat',`<div class="ending"><div class="eyebrow">THE COMPANY HAS FALLEN</div><h2>A debt unfinished.</h2><p class="prose">The bell keeps ringing. Somewhere, a page waits to be turned.</p>${button('Return to the last waystone','retry','','btn primary')}${button('Return to title','title')}</div>`)}
+function showEnding(){$('toast').classList.remove('show');$('zoneTitle').classList.remove('show');let free=flags.ending==='free';openModal('ending',`<div class="ending"><div class="eyebrow">CHAPTER I · COMPLETE</div><div class="rune">${free?'☀':'♜'}</div><h2>${free?'A dawn freely given.':'The keeper of accounts.'}</h2><p class="prose">${free?'The bell breaks with a sound like a thousand people remembering how to breathe. Across Ember Quay, names return to empty rooms. No song records your price. For once, that is enough.':'You take the ledger. The city’s debts unfurl beneath your fingers, each name a thread of light. By dawn, every door bears your mark. You promise yourself you will be a kinder creditor. The old Prior made that promise, too.'}</p><p class="quote">${flags.cured?'Nell wakes asking for plum cake. Her father weeps into the breakfast.':flags.ghost?'In the western garden, a nameless grave is finally quiet.':'Beyond the canal, the living light their own lanterns.'}</p><div><span class="tag">${stats.kills} FOES FALLEN</span><span class="tag">LEVEL ${level}</span><span class="tag">${stats.mercy} ACTS OF MERCY</span><span class="tag">${Math.floor(worldTime/60)} MINUTES</span></div>${net?'<p class="modalfoot">Your company’s result has been sent to AI Hub.</p>':button('Explore the ward after the ending','epilogue','','btn primary')+button('Begin another chronicle','new')+button('About & credits','about')+button('Return to title','title')}</div>`)}
+function openAbout(page=0){aboutPage=page;const titles=['Source information','Testing feedback','Engine feedback','Prompt feedback'];let keys=['source','testing','engine','prompt'];let body=BUILD_INFO[keys[page]];openModal('about',heading('BARDUR’S FATE · THE HOLLOW BELL',titles[page])+`<div class="tabs">${titles.map((t,i)=>button(t.split(' ')[0],'aboutPage',`data-id="${i}"`,i===page?'active':'')).join('')}</div><p class="modalfoot" style="margin:0 0 18px">Right stick / Page Up & Down · Scroll the chronicle</p><div class="aboutcontent">${body.map(([k,v])=>`<p><b>${esc(k)}</b><br>${esc(v)}</p><br>`).join('')}<p>Original world, writing, procedural models, music, sound and interface created for this demo. Inspired by the party exploration, companion banter and tactical combat of Baldur’s Gate. No source game assets are used.</p><br><p>Three.js: MIT · Rapier: Apache-2.0 · AI Hub client: repository license unknown · Fonts: Cormorant Garamond and Manrope, SIL Open Font License.</p><p>AI Hub protocol: github.com/michaelcrosato/ai-hub · lib/hub</p></div>`)}
+function renderHUD(force=false){if(!force&&!dirtyHUD)return;dirtyHUD=false;let h=activeHero();if(!h)return;let z=h.z<-43?'THE HOLLOW ABBEY':h.x>16&&h.z<0?'THE GLASS ORCHARD':h.x<-15&&h.z<-20?'THE OATH GARDEN':h.z<0?'THE OLD PROCESSION':'EMBER QUAY';$('zone').textContent=z;$('objective').textContent=objective();$('gold').textContent=gold;$('contextHelp').textContent=worldTime<35?'Cross / E to interact. R2 / J to strike. Your companions follow and fight beside you.':talentPoints>0?'A talent is ready. Open your pack with D-pad ↓ / I.':combat?'Hold R2 / J to strike. Square / Space pauses solo combat. Circle / Shift dodges.':'';
+ $('party').innerHTML=heroes.map((a,i)=>`<button class="partycard ${selected===i?'selected':''} ${a.downed?'downed':''}" data-action="select" data-id="${i}" aria-label="Select ${a.name}">${portrait(i)}<div><div class="pname">${a.name}</div><div class="role">${a.role}</div><div class="bar"><i style="width:${100*a.hp/a.maxHp}%"></i></div><div class="bar mana"><i style="width:${a.mana}%"></i></div><div class="hptext">${a.downed?'DOWNED · REVIVE':Math.ceil(a.hp)+' / '+a.maxHp}${a.queue.length?' · '+a.queue.length+' ORDERS':''}</div></div>${a.owner!==null?`<span class="seat">P${a.owner+1}</span>`:''}</button>`).join('');if(net)for(let p of net.players){let el=$('party').querySelector('[data-id="'+p.id%4+'"] .pname');if(el){el.textContent=p.name;el.title=p.name}}let abs=[['⚔','Strike','R2','strike',h.cd],['✦',h.power,'△','power',h.powerCd],['◈',h.utility,'R1','utility',h.utilityCd],['✚',potions+' draughts','R3','potion',0]];$('abilities').innerHTML=abs.map(([icon,name,key,action,cd])=>`<button class="ability" data-action="${action}" aria-label="${name}"><span class="key">${key}</span><span class="icon">${icon}</span><span class="abname">${name}</span>${cd>.1?`<span class="cd">${cd.toFixed(1)}</span>`:''}</button>`).join('');$('pauseBanner').classList.toggle('hidden',!paused||modal!==null||dialog!==null||sharedPlay());$('interact').classList.toggle('hidden',!nearest||!!modal||!!dialog);if(nearest)$('interact').innerHTML='<b>× / E</b> '+esc(nearest.action+' · '+nearest.name);let e=targetEnemy&&!targetEnemy.dead?targetEnemy:nearestFoe(h,10);$('encounter').classList.toggle('hidden',!e||!combat);if(e){$('enemyName').textContent=e.name;$('enemyHealth').style.width=Math.max(0,e.hp/e.maxHp*100)+'%'}renderLog();drawMap($('minimap'));
+}
+function drawMap(c,big=false){if(!c)return;let ctx=c.getContext('2d'),w=c.width,h=c.height;ctx.clearRect(0,0,w,h);ctx.fillStyle='#19383a';ctx.fillRect(0,0,w,h);let scale=big?Math.min(w/120,h/145):2.9,center=big?{x:0,z:-15}:activeHero()||{x:0,z:20};const p=(x,z)=>[w/2+(x-center.x)*scale,h/2+(z-center.z)*scale];ctx.fillStyle='#32625e';let a=p(-58,-.5);ctx.fillRect(a[0],a[1],116*scale,9*scale);ctx.strokeStyle='#aeac8560';ctx.lineWidth=big?7:8;ctx.beginPath();let p1=p(0,42),p2=p(0,-70);ctx.moveTo(...p1);ctx.lineTo(...p2);ctx.stroke();ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(...p(0,-15));ctx.lineTo(...p(29,-26));ctx.moveTo(...p(0,-23));ctx.lineTo(...p(-25,-30));ctx.stroke();ctx.fillStyle='#788d7655';for(let ob of obstacles){if(ob.w>20||ob.d>35)continue;let pp=p(ob.x-ob.w/2,ob.z-ob.d/2);ctx.fillRect(pp[0],pp[1],ob.w*scale,ob.d*scale)}
+ for(let o of interactables){if(o.id==='herb'&&flags.herb||o.id==='name'&&flags.name)continue;let pp=p(o.x,o.z);ctx.fillStyle=o.type==='shrine'?'#92d4c5':o.type==='npc'||o.type==='bell'||o.type==='relic'?'#e0bd78':'#b5baa1';ctx.beginPath();ctx.arc(pp[0],pp[1],big?3:2.2,0,TAU);ctx.fill()}for(let e of enemies)if(!e.dead&&(big||dist(e,center)<18)){ctx.fillStyle='#c87c67';let pp=p(e.x,e.z);ctx.beginPath();ctx.arc(pp[0],pp[1],big?2.5:2.1,0,TAU);ctx.fill()}for(let a of heroes){let pp=p(a.x,a.z);ctx.fillStyle=a.id===selected?'#f3e7c7':'#a8c6b3';ctx.beginPath();ctx.arc(pp[0],pp[1],a.id===selected?4:2.7,0,TAU);ctx.fill()}if(big){ctx.font='600 13px Georgia';ctx.textAlign='center';for(let [name,x,z]of [['EMBER QUAY',0,48],['GLASS ORCHARD',34,-35],['OATH GARDEN',-31,-38],['HOLLOW ABBEY',0,-82]]){ctx.fillStyle='#d8c68f';ctx.fillText(name,...p(x,z))}ctx.font='italic 11px Georgia';ctx.fillStyle='#96b9b2';ctx.fillText('The Rivermere',...p(-33,4));ctx.fillStyle='#a1b69e';ctx.fillText('N',w-22,22)}}
+function selectHero(i){if(net&&i!==net.me%4)return;if(heroes[i].owner!==null&&heroes[i].owner!==0)return;let old=selected;if(padsJoined.has(primaryPad)){heroes[old].owner=null;heroes[i].owner=0;padsJoined.set(primaryPad,i)}selected=i;dirtyHUD=true;audio.sfx('ui')}
+function switchHero(){if(net)return;for(let n=1;n<=4;n++){let i=(selected+n)%4;if(!heroes[i].downed&&(heroes[i].owner===null||heroes[i].owner===0)){let old=selected;if(padsJoined.size){heroes[old].owner=null;heroes[i].owner=0;padsJoined.set(0,i)}selected=i;dirtyHUD=true;return}}}
+function handleAction(a,el){audio.start();audio.sfx('ui');if(net&&['equip','talent','buy','rest','travel'].includes(a)){let id=a==='talent'?el.dataset.which:el.dataset.id;if(net.isHost){toast(sharedCommand(a,id,selected));broadcastState(true);if(modal==='inventory')openInventory();else if(modal==='shop')openShop();else closeModal()}else net.send({t:'command',kind:a,id});return}switch(a){case'new':newGame();break;case'load':loadGame();break;case'howto':openHowto();break;case'about':openAbout();break;case'aboutPage':openAbout(+el.dataset.id);break;case'settings':openSettings();break;case'back':if(modal)closeModal();else closeDialogue();break;case'title':saveGame(true);showTitle();break;case'journal':openJournal();break;case'pack':openInventory();break;case'camp':openCamp();break;case'map':openMap();break;case'rest':rest();break;case'save':saveGame();break;case'select':selectHero(+el.dataset.id);break;case'switchPack':switchHero();openInventory();break;case'equip':equip(el.dataset.id);break;case'talent':chooseTalent(+el.dataset.which);break;case'buy':buy(el.dataset.id);break;case'travel':travel(el.dataset.id);break;case'bond':companionStory(+el.dataset.id);break;case'retry':closeModal();applySave(checkpoint||serialize());for(let h of heroes){h.downed=false;h.hp=h.maxHp*.75;h.mana=100}paused=false;finished=false;mode='play';toast('A fresh page. The bell remembers.');break;case'epilogue':closeModal();finished=false;mode='play';break;case'strike':act('attack');break;case'power':act('power');break;case'utility':act('utility');break;case'potion':act('potion');break}}
+
+class Soundscape{
+ constructor(){this.ctx=null;this.voices=[];this.mood='title';this.note=0;this.next=0;this.running=false;this.voiceTimer=null}
+ start(){if(!this.ctx){try{this.ctx=new AudioContext();this.master=this.ctx.createGain();this.music=this.ctx.createGain();this.sounds=this.ctx.createGain();this.master.connect(this.ctx.destination);this.music.connect(this.master);this.sounds.connect(this.master);let reverb=this.ctx.createConvolver(),len=this.ctx.sampleRate*1.8,imp=this.ctx.createBuffer(2,len,this.ctx.sampleRate);for(let ch=0;ch<2;ch++){let a=imp.getChannelData(ch);for(let i=0;i<len;i++)a[i]=(Math.random()*2-1)*Math.pow(1-i/len,2.7)*.5}reverb.buffer=imp;let wet=this.ctx.createGain();wet.gain.value=.16;this.music.connect(reverb);reverb.connect(wet);wet.connect(this.master);this.updateVolume();this.running=true;this.next=this.ctx.currentTime+.1}catch{return}}if(this.ctx.state==='suspended')this.ctx.resume().catch(()=>{})}
+ updateVolume(){if(!this.ctx)return;this.master.gain.setTargetAtTime(settings.volume/100*.6,this.ctx.currentTime,.08);this.music.gain.setTargetAtTime(settings.music/100*.38,this.ctx.currentTime,.1);this.sounds.gain.value=.45}
+ tone(freq,time,dur=.2,type='triangle',gain=.15,dest=this.music,slide=0){if(!this.ctx||stopped)return;let o=this.ctx.createOscillator(),g=this.ctx.createGain();o.type=type;o.frequency.setValueAtTime(freq,time);if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(20,freq+slide),time+dur);g.gain.setValueAtTime(.0001,time);g.gain.exponentialRampToValueAtTime(gain,time+.012);g.gain.exponentialRampToValueAtTime(.0001,time+dur);o.connect(g);g.connect(dest);o.start(time);o.stop(time+dur+.03);return o}
+ noise(dur=.15,gain=.1,freq=800){if(!this.ctx)return;let n=this.ctx.createBufferSource(),b=this.ctx.createBuffer(1,Math.ceil(this.ctx.sampleRate*dur),this.ctx.sampleRate),a=b.getChannelData(0);for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1)*Math.pow(1-i/a.length,2);n.buffer=b;let f=this.ctx.createBiquadFilter();f.type='lowpass';f.frequency.value=freq;let g=this.ctx.createGain();g.gain.value=gain;n.connect(f);f.connect(g);g.connect(this.sounds);n.start()}
+ setMood(m){this.mood=m}
+ step(){if(!this.ctx||stopped||!this.running)return;while(this.next<this.ctx.currentTime+.15){let n=this.note++,battle=this.mood==='battle',bpm=battle?112:78,beat=60/bpm/2,t=this.next,root=[146.83,116.54,174.61,130.81][Math.floor(n/16)%4],mel=[0,7,12,10,7,3,5,7,12,14,15,14,12,7,5,3];if(n%4===0){this.tone(root/2,t,beat*5,'sine',.16);this.tone(root,t,beat*2.6,'triangle',.055);this.tone(root*1.498,t+.02,beat*3,'triangle',.045)}if(n%2===0||battle){let sem=mel[n%16];this.tone(root*Math.pow(2,sem/12),t,beat*1.5,'triangle',.13);this.tone(root*Math.pow(2,sem/12)*2,t+.006,beat*.75,'sine',.04)}if(battle&&n%2===0){this.tone(n%4===0?63:105,t,.16,'sine',.2,this.music,-35);this.noise(.08,.03,1700)}if(n%16===12&&!battle)this.tone(root*2,t,beat*4,'sine',.065);this.next+=beat;if(this.next<this.ctx.currentTime-2)this.next=this.ctx.currentTime+.05}}
+ sfx(kind){if(!this.ctx||stopped)return;let t=this.ctx.currentTime,d=this.sounds;const tone=(f,dur=.2,type='triangle',g=.2,slide=0)=>this.tone(f,t,dur,type,g,d,slide);if(kind==='ui')tone(520,.06,'sine',.08,90);if(kind==='hit'){this.noise(.09,.23,1200);tone(170,.09,'triangle',.22,-90)}if(kind==='hurt')tone(120,.16,'sawtooth',.09,-60);if(kind==='spell'){tone(430,.25,'triangle',.15,430);tone(645,.4,'sine',.1,215)}if(kind==='heal'){[392,494,587].forEach((f,i)=>this.tone(f,t+i*.08,.5,'sine',.13,d))}if(kind==='loot'||kind==='level'){[293.7,370,440,587.3].forEach((f,i)=>this.tone(f,t+i*.11,.8,'triangle',.12,d))}if(kind==='death'){tone(190,.3,'triangle',.1,-150);this.noise(.25,.13,1100)}if(kind==='dodge'){this.noise(.15,.08,2000)}if(kind==='boom'){tone(85,.6,'sine',.4,-55);this.noise(.5,.4,950)}if(kind==='warn'){tone(220,.7,'sine',.22);tone(333,.8,'triangle',.12)}if(kind==='gate'){tone(73,.9,'sawtooth',.07,-30);this.noise(.8,.22,400)}}
+ voice(text,id){this.stopVoice();if(!this.ctx)return;const syllables=text.slice(0,160).replace(/[^aeiouy]/gi,'').length;let total=Math.min(26,Math.max(7,syllables)),i=0,base=[136,230,180,195][id];this.voiceTimer=setInterval(()=>{if(i++>=total){this.stopVoice();return}let t=this.ctx.currentTime;let o=this.ctx.createOscillator(),f=this.ctx.createBiquadFilter(),g=this.ctx.createGain();o.type='sawtooth';o.frequency.setValueAtTime(base*(.8+Math.random()*.7),t);o.frequency.exponentialRampToValueAtTime(base*(.8+Math.random()*.7),t+.085);f.type='bandpass';f.frequency.value=[650,1000,1400,1800][i%4];f.Q.value=4;g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.075,t+.014);g.gain.exponentialRampToValueAtTime(.0001,t+.09);o.connect(f);f.connect(g);g.connect(this.sounds);o.start();o.stop(t+.1)},100)}
+ stopVoice(){clearInterval(this.voiceTimer);this.voiceTimer=null}
+ silence(){this.stopVoice();if(this.master)this.master.gain.setTargetAtTime(0,this.ctx.currentTime,.2)}
+}
+const audio=new Soundscape();
+let keys=new Set(),justKeys=new Set(),padPrev=new Map(),menuRepeat=0,lastPadActivity=0,keyboardSeen=false,shake=0,camYaw=Math.PI/4,camZoom=21,camCenter=new V(0,0,19),inputProbe={x:0,y:0,fire:false},primaryPad=null;
+function noteInput(){lastInput=performance.now();if(mode==='attract'){showTitle();return true}return false}
+function keyOf(e){let k=e.key?.toLowerCase();return k===' '?'space':k||e.code.toLowerCase()}
+window.addEventListener('keydown',e=>{let k=keyOf(e);if(['arrowup','arrowdown','arrowleft','arrowright','space','tab','enter'].includes(k))e.preventDefault();keyboardSeen=true;if(noteInput())return;audio.start();if(k==='escape'){if(!keys.has(k)){if(modal)closeModal();else if(dialog)closeDialogue();else openSettings()}keys.add(k);return}if(!keys.has(k))justKeys.add(k);keys.add(k)});
+window.addEventListener('keyup',e=>keys.delete(keyOf(e)));window.addEventListener('blur',()=>{keys.clear()});
+window.addEventListener('pointermove',()=>{if(mode==='title'||mode==='attract')noteInput()});
+document.addEventListener('click',e=>{if(noteInput())return;let el=e.target.closest('button');if(!el)return;audio.start();if(el.dataset.choice!==undefined){let choice=dialog?.choices[+el.dataset.choice];if(choice){audio.stopVoice();choice.run()}}else if(el.dataset.setting)changeSetting(el.dataset.setting);else if(el.dataset.action)handleAction(el.dataset.action,el)});
+$('world').addEventListener('pointerdown',e=>{if(e.pointerType==='touch')return;if(noteInput())return;audio.start();if(mode==='play'&&!modal&&!dialog)act(e.button===2?'attack':'interact')});
+window.addEventListener('contextmenu',e=>e.preventDefault());window.addEventListener('wheel',e=>{if(mode==='play'&&!modal&&!dialog){camZoom=clamp(camZoom+e.deltaY*.01,13,32);noteInput()}},{passive:true});
+function act(kind,h=activeHero()){if(mode!=='play'||net?.server||stopped||finished||net&&AIHub.time()<0)return;if(kind==='pause'){if(sharedPlay()){toast('The shared world keeps moving. Your abilities work in real time.');return}paused=!paused;if(!paused){audio.sfx('ui')}dirtyHUD=true;return}if(net&&!net.isHost){if(kind==='interact'){interact(h);return}if(kind==='attack'&&h.cd>0||kind==='power'&&h.powerCd>0||kind==='utility'&&h.utilityCd>0)return;net.send({t:'action',actor:h.id,kind});if(kind==='attack'){h.cd=.8;h.swing=.3;let e=getTarget(h);if(e)beam(h,e,0xd2dcb0)}else if(kind==='power'||kind==='utility'){h[kind==='power'?'powerCd':'utilityCd']=7;ringFX(h.x,h.z,0xc1d2a5,3)}else if(kind==='dodge')dodge(h);return}
+ if(kind==='interact')interact(h);else if(kind==='attack'){if(paused){let e=getTarget(h);if(e){if(h.queue.length>=3){toast('Three orders are already queued.');return}h.queue.push({kind:2,target:e.id});toast(h.name+' queues a strike');dirtyHUD=true}}else attack(h)}else if(kind==='power')usePower(h,0);else if(kind==='utility')usePower(h,1);else if(kind==='potion')potion(h);else if(kind==='dodge')dodge(h);else if(kind==='target'){let candidates=enemies.filter(e=>!e.dead&&dist(h,e)<17&&!(e.type==='boss'&&!flags.gate));let i=candidates.indexOf(targetEnemy);targetEnemy=candidates[(i+1)%candidates.length]||null;dirtyHUD=true}}
+function processMenuKey(k){if(modal&&(k==='pagedown'||k==='pageup')){$('modal').querySelector('.modalcard').scrollTop+=(k==='pagedown'?1:-1)*350;return}if(k==='escape'){if(modal)closeModal();else if(dialog)closeDialogue();else openSettings();return}if(k==='arrowup'||k==='w')focusMove(-1);if(k==='arrowdown'||k==='s'||k==='tab')focusMove(1);if((k==='arrowleft'||k==='arrowright')&&document.activeElement?.dataset.setting)changeSetting(document.activeElement.dataset.setting,k==='arrowleft'?-1:1);if(k==='enter'||k==='space')document.activeElement?.click();if(k==='backspace'){if(modal)closeModal();else if(dialog)closeDialogue()}}
+function inputFrame(dt){inputProbe={x:0,y:0,fire:false};let menu=!!modal||!!dialog||mode==='title';for(let k of justKeys){menu=!!modal||!!dialog||mode==='title';if(menu){processMenuKey(k);continue}if(mode!=='play')continue;let binds={e:'interact',j:'attack',k:'power',l:'utility',h:'potion','shift':'dodge','space':'pause',t:'target'};if(binds[k])act(binds[k]);if(k==='q')switchHero();if(k==='escape')openSettings();if(k==='tab')openJournal();if(k==='i')openInventory();if(k==='m')openMap();if(k==='c')openCamp();if(k==='1'||k==='2'||k==='3'||k==='4')selectHero(+k-1)}justKeys.clear();
+ menu=!!modal||!!dialog||mode==='title';if(mode==='play'&&!menu&&!net?.server&&!stopped&&(!net||AIHub.time()>=0)){let x=Number(keys.has('d')||keys.has('arrowright'))-Number(keys.has('a')||keys.has('arrowleft')),y=Number(keys.has('s')||keys.has('arrowdown'))-Number(keys.has('w')||keys.has('arrowup'));inputProbe={x,y,fire:keys.has('j')};let h=activeHero();if(!paused)moveInput(h,x,y,dt);if(keys.has('j')&&!paused)act('attack');if(keys.has('z'))camYaw-=dt*.8;if(keys.has('x'))camYaw+=dt*.8;if(keys.has('-'))camZoom=clamp(camZoom+dt*8,13,32);if(keys.has('=')||keys.has('+'))camZoom=clamp(camZoom-dt*8,13,32);if(settings.autoAttack&&!paused)act('attack',h)}
+ let pads=[];try{pads=[...navigator.getGamepads()].filter(Boolean)}catch{}if(primaryPad===null&&pads.length){primaryPad=pads[0].index;if(!net){padsJoined.set(primaryPad,selected);heroes[selected].owner=0}}let connected=new Set(pads.map(p=>p.index));for(let [idx,hero]of padsJoined)if(!connected.has(idx)){heroes[hero].owner=null;padsJoined.delete(idx);if(idx===primaryPad)primaryPad=null}
+ for(let p of pads){let prev=padPrev.get(p.index)||[],press=i=>p.buttons[i]?.pressed&&!prev[i],held=i=>!!p.buttons[i]?.pressed;let ax=i=>Math.abs(p.axes[i]||0)>.18?p.axes[i]:0;let x=ax(0)*(settings.invertX?-1:1),y=ax(1)*(settings.invertY?-1:1),any=Object.values(p.buttons).some((b,i)=>b.pressed&&!prev[i])||Math.hypot(x,y)>.2||Math.abs(ax(2))+Math.abs(ax(3))>.3;if(any){lastPadActivity=realTime;if(noteInput()){padPrev.set(p.index,p.buttons.map(b=>b.pressed));continue}audio.start()}if(mode==='play'&&!net&&!padsJoined.has(p.index)&&press(9)){let idx=heroes.findIndex((h,i)=>i!==selected&&h.owner===null);if(idx>=0){padsJoined.set(p.index,idx);heroes[idx].owner=padsJoined.size-1;toast('Player '+padsJoined.size+' joins as '+heroes[idx].name);paused=false;dirtyHUD=true}}
+ const primary=p.index===primaryPad,hasMenu=!!modal||!!dialog||mode==='title';if(primary&&press(9)&&!held(8)){if(modal)closeModal();else openSettings()}else if(primary&&hasMenu){if(modal)$('modal').querySelector('.modalcard').scrollTop+=ax(3)*dt*450;let nav=held(12)||y<-.5?-1:held(13)||y>.5?1:0;if(nav&&realTime>menuRepeat){focusMove(nav);menuRepeat=realTime+.22}if(press(0))document.activeElement?.click();if(press(1)){if(modal)closeModal();else if(dialog)closeDialogue()}if((press(14)||press(15))&&document.activeElement?.dataset.setting)changeSetting(document.activeElement.dataset.setting,press(14)?-1:1)}else if(mode==='play'&&!stopped&&!net?.server&&(!net||AIHub.time()>=0)&&(!primary||!hasMenu)){let hi=net?net.me%4:padsJoined.get(p.index),h=heroes[hi];if(h){if(primary){x=x||inputProbe.x;y=y||inputProbe.y;inputProbe={x,y,fire:held(7)||keys.has('j')}}if(!paused)moveInput(h,x,y,dt);if(press(0))act('interact',h);if(press(1))act('dodge',h);if(press(2)&&primary)act('pause',h);if(press(3))act('power',h);if(press(5))act('utility',h);if(held(7)&&!paused)act('attack',h);if(press(6))act('target',h);if(press(11))act('potion',h);if(primary){if(press(4))switchHero();if(press(12))openJournal();if(press(13))openInventory();if(press(14))openMap();if(press(15))openCamp();camYaw+=ax(2)*(settings.invertX?-1:1)*dt*.9;camZoom=clamp(camZoom+ax(3)*(settings.invertY?-1:1)*dt*9,13,32)}}}padPrev.set(p.index,p.buttons.map(b=>b.pressed))}
+ const touchOnly=navigator.maxTouchPoints>0&&!matchMedia('(pointer:fine)').matches&&!keyboardSeen&&!pads.length;$('touchNotice').classList.toggle('hidden',!touchOnly);if(touchOnly&&mode==='title')for(let b of $('titleButtons').querySelectorAll('button'))b.disabled=true;else if(mode==='title')for(let b of $('titleButtons').querySelectorAll('button'))b.disabled=false;
+}
+function moveInput(h,x,y,dt){if(h.status.dodge>0){if(Math.hypot(x,y)<.1){x=Math.sin(h.facing-camYaw);y=Math.cos(h.facing-camYaw)}moveActor(h,x*Math.cos(camYaw)+y*Math.sin(camYaw),-x*Math.sin(camYaw)+y*Math.cos(camYaw),dt,14)}else moveActor(h,x*Math.cos(camYaw)+y*Math.sin(camYaw),-x*Math.sin(camYaw)+y*Math.cos(camYaw),dt,4.9)}
+function beginAttract(){resetRun();mode='attract';attractTime=0;attractPhase=-1;flags.accepted=true;$('title').classList.add('hidden');$('hud').classList.add('hidden');$('attract').classList.remove('hidden');closeDialogue();closeModal();}
+function stepAttract(dt){attractTime+=dt;if(attractTime>105){beginAttract();return}let phase=Math.floor(attractTime/21);if(phase!==attractPhase){attractPhase=phase;let locations=[[0,22],[1,-18],[27,-24],[0,-50],[0,-59]],titles=['A city worth saving.','Four companions. One questionable plan.','Mercy is a choice, not a weakness.','Old oaths. New consequences.','Every debt has its reckoning.'];let p=locations[phase];for(let h of heroes)teleport(h,p[0]+(h.id-1.5)*2,p[1]+h.id%2*2);if(phase>=3){flags.name=flags.mercy=flags.gate=true;updateGate()}$('attractText').textContent=titles[phase];zoneFlash(['Ember Quay','The Old Procession','The Glass Orchard','The Hollow Abbey','The Hollow Prior'][phase]);}
+ const h=heroes[0];for(let a of heroes){a.hp=a.maxHp;a.mana=100;a.downed=false;a.owner=null}let e=nearestFoe(h,18);if(e){moveActor(h,e.x-h.x,e.z-h.z,dt,dist(h,e)>2?4:0);attack(h);if(Math.floor(attractTime*2)%5===0)usePower(h)}else{let p=[[0,22],[0,-25],[28,-26],[0,-55],[0,-62]][phase],a=attractTime*.2;moveActor(h,p[0]+Math.cos(a)*4-h.x,p[1]+Math.sin(a)*3-h.z,dt,2.5)}stepGame(dt);if(phase===4&&attractTime%21>15)ringFX(0,-65,0xe4d28e,8,.7)}
+function hubNet(info){return{me:info.me,isHost:info.isHost,server:info.server,players:info.players,send:(d,o)=>AIHub.send(d,o)}}
+function snapshot(){return{t:'state',at:AIHub.time(),h:heroes.map(h=>[+h.x.toFixed(2),+h.z.toFixed(2),Math.ceil(h.hp),Math.round(h.mana),h.downed?1:0,+h.cd.toFixed(2),+h.powerCd.toFixed(2),+h.utilityCd.toFixed(2),+h.facing.toFixed(2),h.maxHp,+h.swing.toFixed(2)]),e:enemies.map(e=>[+e.x.toFixed(2),+e.z.toFixed(2),Math.max(0,Math.ceil(e.hp)),e.dead?1:0,+e.facing.toFixed(2),e.aggro?1:0,+e.swing.toFixed(2)]),f:flags,g:gold,p:potions,l:level,x:xp,k:stats.kills,o:[...opened],a:ash,lp:lockpicks,tp:talentPoints,u:upgrades,ge:gear,og:[...ownedGear],di:[...discovered],v:worldTime}}
+function broadcastState(reliable=false){if(net?.isHost)net.send(snapshot(),{reliable})}
+function receiveSnapshot(s){if(s.at<=snapshotStamp)return;snapshotStamp=s.at;s.h.forEach((d,i)=>{let h=heroes[i];if(i!==net.me%4||net.server)remotePositions.set('h'+i,{x:d[0],z:d[1]});h.hp=d[2];h.mana=d[3];h.downed=!!d[4];h.cd=d[5];h.powerCd=d[6];h.utilityCd=d[7];if(i!==net.me%4)h.facing=d[8];h.maxHp=d[9];h.swing=d[10]});s.e.forEach((d,i)=>{let e=enemies[i];remotePositions.set('e'+i,{x:d[0],z:d[1]});if(d[2]<e.hp&&!e.dead){burst(d[0],d[1],0xd5c89a,4);floatText(e,String(e.hp-d[2]));}e.hp=d[2];e.dead=!!d[3];e.facing=d[4];e.aggro=!!d[5];e.swing=d[6]});flags={...s.f};gold=s.g;potions=s.p;level=s.l;xp=s.x;stats.kills=s.k;opened=new Set(s.o);ash=s.a;lockpicks=s.lp;talentPoints=s.tp;upgrades=s.u;gear=s.ge;ownedGear=new Set(s.og);discovered=new Set(s.di);updateGate();dirtyHUD=true}
+function netFrame(dt){if(!net||stopped)return;netClock+=dt;if(!net.isHost){for(let [key,p]of remotePositions){let a=key[0]==='h'?heroes[+key.slice(1)]:enemies[+key.slice(1)];if(!a)continue;let d=dist(a,p),f=d>10?1:1-Math.exp(-dt*12);a.x+= (p.x-a.x)*f;a.z+=(p.z-a.z)*f;a.moving=d>.08;a.body.setTranslation({x:a.x,y:1.2,z:a.z},false)}}if(netClock>.085){netClock=0;if(net.isHost)broadcastState();else{let h=heroes[net.me%4];net.send({t:'me',at:AIHub.time(),x:+h.x.toFixed(3),z:+h.z.toFixed(3),f:+h.facing.toFixed(3)},{to:AIHub.host,reliable:false})}AIHub.progress({score:stats.kills*10+(flags.name?150:0)+(flags.mercy?150:0)+(flags.boss?400:0),label:flags.boss?'The bell awaits':flags.gate?'Confront the Prior':'Seals '+(Number(flags.name)+Number(flags.mercy))+'/2'})}}
+async function setupHub(info){net=hubNet(info);newGame();for(let p of net.players){let h=heroes[p.id%4];h.owner=p.id;h.visual.ring.material.color.set(p.color);let badge=document.createElement('span');badge.className='tag';badge.textContent=p.name;}
+ AIHub.on('message',(d,from)=>{if(stopped||!d)return;if(d.t==='me'&&net.isHost){let h=heroes[from%4];if(!h||h.owner!==from||d.at<=(h.netAt||-Infinity))return;h.netAt=d.at;h.x=clamp(Number(d.x)||0,-56,56);h.z=clamp(Number(d.z)||0,-87,57);h.facing=Number(d.f)||0;h.moving=true;h.body.setTranslation({x:h.x,y:1.2,z:h.z},false);h.body.setNextKinematicTranslation({x:h.x,y:1.2,z:h.z})}else if(d.t==='action'&&net.isHost){let h=heroes[from%4];if(!h||h.owner!==from||d.actor!==from%4)return;if(d.kind==='interact')interact(h,d.id);else if(d.kind==='attack')attack(h);else if(d.kind==='power')usePower(h,0);else if(d.kind==='utility')usePower(h,1);else if(d.kind==='potion')potion(h);else if(d.kind==='dodge')dodge(h)}else if(d.t==='command'&&net.isHost&&net.players.some(p=>p.id===from)){const text=sharedCommand(d.kind,d.id,from%4);net.send({t:'notice',text},{to:from});broadcastState(true)}else if(d.t==='notice'&&from===AIHub.host){toast(d.text);if(modal==='inventory')openInventory();if(modal==='shop')openShop()}else if(d.t==='warp'&&from===AIHub.host){d.p.forEach((p,i)=>teleport(heroes[i],p[0],p[1]));closeModal()}else if(d.t==='state'&&!net.isHost&&from===AIHub.host)receiveSnapshot(d);else if(d.t==='finish'&&from===AIHub.host){flags.ending=d.ending;finished=true;stats=d.stats;if(d.ending==='unfinished')showRoundEnd();else showEnding()}});
+ AIHub.on('leave',({id})=>{net.players=net.players.filter(p=>p.id!==id);heroes[id%4].owner=null;toast('A companion returns to the company’s command.');dirtyHUD=true});AIHub.on('time-up',()=>{if(net.isHost&&!finished){finished=true;netFinish(false);net.send({t:'finish',ending:'unfinished',stats});flags.ending='unfinished';showRoundEnd()} });AIHub.on('end',()=>{stopped=true;keys.clear();audio.silence();closeDialogue();if(!modal)showRoundEnd()});AIHub.ready();}
+function showRoundEnd(){openModal('roundEnd',`<div class="ending"><div class="eyebrow">AI HUB · ROUND COMPLETE</div><h2>${flags.boss?'The bell falls silent.':'The chronicle rests.'}</h2><p class="prose">${stats.kills} foes defeated · ${Number(flags.name)+Number(flags.mercy)} seals recovered · party level ${level}.</p><p class="modalfoot">Your company’s result is with the hub.</p></div>`)}
+let previousFrame=performance.now(),renderBusy=false;
+function frame(now){let dt=clamp((now-previousFrame)/1000,.001,.05);previousFrame=now;realTime+=dt;inputFrame(dt);if(mode==='title'){if(!modal&&now-lastInput>10000&&!AIHub.active)beginAttract()}else if(mode==='attract')stepAttract(dt);else if(mode==='play'&&!stopped&&(!net||AIHub.time()>=0)){if(!paused||sharedPlay()){if(!finished)stepGame(dt);netFrame(dt)}}
+ const visualDt=paused&&!sharedPlay()?0:dt;stepVisuals(visualDt,realTime);if(mode==='title'){let t=realTime*.07;camCenter.lerp(new V(1+Math.sin(t)*3,0,15),1-Math.exp(-dt*2));let yaw=.65+Math.sin(t)*.08,zoom=22;positionCamera(yaw,zoom,dt)}else{let h=activeHero(),target=new V(h.x,0,h.z);if(sharedPlay()&&!net){let controlled=[...padsJoined.values()].map(i=>heroes[i]);if(controlled.length){target.set(0,0,0);for(let a of controlled)target.add(new V(a.x,0,a.z));target.multiplyScalar(1/controlled.length)}}camCenter.lerp(target,1-Math.exp(-dt*5));positionCamera(camYaw,camZoom,dt)}
+ hudTimer+=dt;if(hudTimer>.12){hudTimer=0;if(mode==='play')renderHUD();if(net&&AIHub.time()<0&&!stopped){$('objective').textContent=Number.isFinite(AIHub.time())?'The bell tolls in '+Math.ceil(-AIHub.time()/1000)+'…':'Waiting for the company…'}}audio.setMood(combat?'battle':mode==='title'?'title':'explore');audio.step();if(!renderBusy)retireMaterials();
+}
+function retireMaterials(){for(let m of retiredMaterials)m.dispose();retiredMaterials.length=0}
+function drawFrame(){requestAnimationFrame(drawFrame);if(renderer&&!renderBusy&&!net?.server&&mode!=='error'){renderBusy=true;renderer.renderAsync(scene,camera).then(()=>renderer.backend.device.queue.onSubmittedWorkDone()).catch(fatal).finally(()=>{renderBusy=false;retireMaterials()})}}
+function positionCamera(yaw,zoom,dt){let a=innerWidth/innerHeight;camera.left=-zoom*a;camera.right=zoom*a;camera.top=zoom;camera.bottom=-zoom;camera.updateProjectionMatrix();let offset=new V(Math.sin(yaw)*35,39,Math.cos(yaw)*35);camera.position.copy(camCenter).add(offset);if(shake>0&&settings.shake){shake-=dt;camera.position.x+=(Math.random()-.5)*shake*.7;camera.position.z+=(Math.random()-.5)*shake*.7}camera.lookAt(camCenter);sun.position.set(camCenter.x-32,55,camCenter.z+24);sun.target.position.set(camCenter.x,0,camCenter.z);sun.target.updateMatrixWorld();camera.updateMatrixWorld()}
+function fatal(e){console.error(e);if(mode==='error')return;mode='error';stopped=true;$('loading').classList.remove('hidden');$('loadText').textContent='The lantern could not be lit. '+(e?.message||String(e))+' · This adventure requires WebGPU in a secure browser context (HTTPS or localhost).';$('loading').querySelector('.loadline').style.display='none';AIHub.fail(e?.message||String(e))}
+window.addEventListener('resize',()=>{renderer?.setSize(innerWidth,innerHeight);if(camera)camera.updateProjectionMatrix()});
+AIHub.probe(()=>({scene:stopped||finished?'over':mode==='title'||mode==='attract'?'title':mode==='play'?'play':mode==='loading'?'ready':'menu',menu:!!modal,world:worldTime,input:inputProbe}));
+window.__chronicle={get state(){return{mode,flags,heroes:heroes.map(({name,x,z,hp,mana,powerCd,downed,queue,owner})=>({name,x,z,hp,mana,powerCd,downed,queue,owner})),enemies:enemies.map(({id,type,x,z,hp,dead})=>({id,type,x,z,hp,dead})),gold,potions,level,xp,paused,modal,dialog:dialog?.speaker,stats}},newGame,interact,travel,serialize,applySave,showTitle,beginAttract,act,advance:(seconds)=>{for(let t=0;t<seconds;t+=.05){stepGame(.05);stepVisuals(.05,realTime+t)}},teleportHero:(i,x,z)=>teleport(heroes[i],x,z),get renderer(){return renderer},get world(){return physics}};
+async function bootstrap(){try{let hubPromise=AIHub.active?AIHub.connect({mode:'co-op',seats:[1,4]}):Promise.resolve(null);if(!navigator.gpu)throw Error('WebGPU is unavailable in this browser');const adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!adapter)throw Error('No WebGPU adapter was found');const device=await adapter.requestDevice({requiredFeatures:[...adapter.features]});device.addEventListener('uncapturederror',ev=>console.error('WebGPU validation:',ev.error.message));device.lost.then(info=>{if(!stopped)fatal(Error('Graphics device lost: '+info.message))});renderer=new THREE.WebGPURenderer({antialias:true,device,alpha:false});renderer._getFallback=null;renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));renderer.setSize(innerWidth,innerHeight);renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFShadowMap;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.15;await renderer.init();if(!renderer.backend.isWebGPUBackend)throw Error('A WebGPU backend is required');$('world').appendChild(renderer.domElement);$('loadText').textContent='Remembering the names of the drowned…';await RAPIER.init();physics=new RAPIER.World({x:0,y:-9.81,z:0});controller=physics.createCharacterController(.025);controller.enableAutostep(.35,.3,true);controller.enableSnapToGround(.4);buildWorld();setupActors();physics.step();resetRun();renderHUD(true);await renderer.renderAsync(scene,camera);await device.queue.onSubmittedWorkDone();const info=await hubPromise;if(info)await setupHub(info);else showTitle();$('loading').classList.add('hidden');previousFrame=performance.now();setInterval(()=>frame(performance.now()),1000/60);requestAnimationFrame(drawFrame)}catch(e){fatal(e)}}
+bootstrap();
+</script>
+</body></html>

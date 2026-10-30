@@ -1,0 +1,1094 @@
+<!--
+SOURCE INFORMATION
+Date: 2026-10-29 09:29
+Source: Alien Soldier
+Tech: Three.js R180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio, PeerJS 1.5.5 / WebRTC, AI Hub Session 1.3.0.
+Art Direction: Procedural cel-shaded geometry. Animation: Procedural articulated motion.
+Audio: Synthesized music and sound effects; no spoken voice. Online: AI Hub parallel score attack and standalone WebRTC score race.
+Testing: lightweight headless checks. Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort ultra. Usage: unknown.
+TESTING FEEDBACK: Three issues caught, one critical: Rapier descriptor API mismatch, hub session settings, and hub inspection data. Most helpful: real Rapier simulation. Least helpful: syntax checking alone.
+ENGINE FEEDBACK: Three.js makes procedural scenes approachable. WebGPU initialization and compatibility were hardest. Combat, animation and game flow were built from scratch. A clearer WebGPU-only initialization option would help. Wrong guesses: Rapier descriptor names. Overhaul: WebGPU fallback behavior.
+PROMPT FEEDBACK: Clear creative and controller-first direction was helpful. The exact scope of a complete vertical slice was ambiguous. Hardest: integrating all systems and multiplayer. Most useful additional test: live multiplayer with physical controllers.
+-->
+<!doctype html><html lang="en"><head>
+<script type="importmap">
+{
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><meta name="theme-color" content="#101725"><meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="4"><meta name="hub:session-goal" content="Earn the highest score against the invasion."><meta name="hub:session-howto" content="Move: left stick; fire: square; jump: cross; dash: circle; counter: triangle."><meta name="hub:webgpu" content="required"><title>Soulflare Soldier</title><style>@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=Space+Mono:wght@400;700&display=swap');
+:root{color-scheme:dark;--cream:#f4eddb;--orange:#ff6d3a;--cyan:#81f4ec;--ink:#101b2d}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#101725;color:var(--cream);font-family:'Barlow Condensed',Impact,sans-serif}button{font:inherit;color:inherit;cursor:pointer}canvas{position:absolute;inset:0;width:100%;height:100%}#app{position:absolute;inset:0;pointer-events:none;overflow:hidden}#app:before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(7,13,27,.25),transparent 50%),linear-gradient(0deg,rgba(7,13,27,.3),transparent 35%);pointer-events:none}.screen{position:absolute;inset:0;display:none;pointer-events:auto}.screen.active{display:flex}.title{align-items:center;padding:5vw 7vw}.title:before,.panel:before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,rgba(9,17,32,.98) 0%,rgba(9,17,32,.88) 34%,rgba(9,17,32,.15) 78%);z-index:-1}.title-content{width:min(660px,52vw)}.eyebrow,.micro{font-family:'Space Mono',monospace;letter-spacing:.19em;text-transform:uppercase;font-size:clamp(10px,1vw,14px);color:var(--cyan)}.eyebrow:before{content:'◆';color:var(--orange);margin-right:12px}h1{font-size:clamp(72px,10vw,160px);font-weight:900;line-height:.72;letter-spacing:-.055em;text-transform:uppercase;margin:.32em 0 .24em;text-shadow:5px 5px 0 #e75a35}h1 span{display:block;color:var(--orange);text-shadow:5px 5px 0 #512943}.tagline{font-size:clamp(16px,1.5vw,23px);letter-spacing:.13em;text-transform:uppercase;border-left:3px solid var(--cyan);padding-left:16px;margin:25px 0 30px;color:#d4dce1}.menu{display:grid;gap:6px;width:min(360px,100%)}.menu button,.action{border:0;text-align:left;background:rgba(29,45,63,.76);padding:10px 18px;font-size:clamp(19px,1.8vw,27px);font-weight:800;text-transform:uppercase;letter-spacing:.08em;clip-path:polygon(0 0,96% 0,100% 50%,96% 100%,0 100%);transition:background .15s,transform .15s}.menu button.selected,.menu button:hover,.action:hover{background:var(--orange);color:#101725;transform:translateX(8px)}.menu button small{font:10px 'Space Mono',monospace;float:right;opacity:.7;margin-top:8px}.foot{position:absolute;bottom:3%;left:7%;font:11px 'Space Mono',monospace;letter-spacing:.12em;color:#c3cbd0}.corner{display:none;position:absolute;right:4%;top:5%;text-align:right;font:11px 'Space Mono',monospace;letter-spacing:.2em;color:#c6d6dd}#app:has(#title.active) .corner{display:block}.corner b{display:block;color:var(--orange);font:900 clamp(28px,3vw,46px) 'Barlow Condensed',sans-serif;letter-spacing:0}.panel{align-items:center;justify-content:center;background:rgba(6,12,23,.78);backdrop-filter:blur(8px)}.panel-box{width:min(850px,88vw);max-height:86vh;overflow:auto;border-top:5px solid var(--orange);background:#132237;padding:clamp(24px,3vw,50px);box-shadow:20px 20px 0 rgba(3,8,15,.35)}.panel-box h2{font-size:clamp(40px,5vw,68px);line-height:.9;text-transform:uppercase;margin:0 0 24px}.panel-box p{font-size:clamp(17px,1.55vw,22px);line-height:1.25;color:#d6dce0;margin:10px 0}.panel-box .menu{width:100%;margin-top:22px}.panel-box .menu button{clip-path:none;border-left:3px solid transparent}.panel-box .menu button.selected{border-color:var(--cyan)}.row{display:flex;justify-content:space-between;gap:20px;align-items:center;border-bottom:1px solid #3a4e5c;padding:10px 0;font-size:clamp(19px,1.7vw,25px)}.row b{color:var(--cyan)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:5px 30px}.hint{font:11px 'Space Mono',monospace!important;letter-spacing:.12em;color:#91a9b5!important;text-transform:uppercase;margin-top:22px!important}#hud{position:absolute;inset:0;display:none;pointer-events:none;padding:3vh 3vw}.hudtop{display:flex;justify-content:space-between;align-items:flex-start}.hud-left{width:min(310px,30vw)}.hud-label{font:700 11px 'Space Mono',monospace;letter-spacing:.18em;color:#c8d8dd}.bar{height:15px;background:#24364a;border:2px solid #e6f3e8;transform:skewX(-16deg);margin:6px 0 8px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,#ffb34d,#ff633c);width:100%;transition:width .1s}.meter{height:6px;background:#263b4d;margin-top:5px}.meter i{display:block;background:var(--cyan);height:100%;width:0}.score{text-align:right;font:700 clamp(20px,2vw,30px) 'Space Mono',monospace;color:white}.score small{display:block;font-size:10px;color:#9cb1bd;letter-spacing:.2em}.weapon{font-size:clamp(22px,2.2vw,32px);font-weight:900;letter-spacing:.05em}.weapon em{font-style:normal;color:var(--cyan)}#bossHud{position:absolute;top:4%;left:34%;width:32%;text-align:center;display:none}#bossHud .bar{height:10px;border-width:1px}#bossHud .bar i{background:#ff4f53}#stageBanner{position:absolute;top:23%;left:50%;transform:translate(-50%,-50%);text-align:center;opacity:0;transition:opacity .3s;text-shadow:3px 3px #122034;white-space:nowrap}#stageBanner.show{opacity:1}#stageBanner strong{display:block;font-size:clamp(45px,6vw,92px);line-height:1;text-transform:uppercase;color:#fff}#stageBanner span{font:700 13px 'Space Mono',monospace;letter-spacing:.3em;color:var(--orange)}#toast{position:absolute;bottom:12%;left:50%;transform:translateX(-50%);background:#112235df;border-left:4px solid var(--cyan);padding:10px 20px;font:700 clamp(12px,1.1vw,16px) 'Space Mono',monospace;letter-spacing:.06em;opacity:0;transition:opacity .3s;white-space:nowrap}#toast.show{opacity:1}.attract-label{position:absolute;top:3%;left:50%;transform:translateX(-50%);font:700 12px 'Space Mono',monospace;letter-spacing:.2em;color:var(--cyan);display:none}.attract-label.on{display:block;animation:blink 1s infinite}@keyframes blink{50%{opacity:.4}}#error{position:absolute;inset:0;background:#101725;display:none;place-items:center;text-align:center;z-index:10;padding:20px}#error h2{font-size:clamp(40px,6vw,70px);margin:0}#error p{font-size:22px;max-width:680px}#touch{display:none;position:absolute;inset:0;z-index:20;background:#101725;place-items:center;text-align:center;padding:30px}#touch h2{font-size:45px;text-transform:uppercase}#touch button{padding:12px 30px;background:var(--orange);border:0;color:#101725;font-weight:900;font-size:22px;text-transform:uppercase}@media(max-width:700px){.title-content{width:90vw}.title:before{background:rgba(9,17,32,.8)}.columns{grid-template-columns:1fr}.foot{font-size:9px}.corner{display:none}h1{font-size:70px}}
+</style></head><body>
+<div id="app"><div class="corner">INDEPENDENT ARCADE SYSTEM<b>SS / 01</b>THE LAST SUN IS YOURS</div>
+<section class="screen title active" id="title"><div class="title-content"><div class="eyebrow">A hyper combat opera</div><h1>Soulflare<span>Soldier</span></h1><div class="tagline">One stolen soul. One impossible war.</div><div class="menu" id="titleMenu"><button data-action="start">Begin mission <small>01</small></button><button data-action="how">How to play <small>02</small></button><button data-action="online">Online score race <small>03</small></button><button data-action="settings">Settings <small>04</small></button><button data-action="about">About / credits <small>05</small></button></div></div><div class="foot">MOVE ↑↓ &nbsp; SELECT ✕ / ENTER &nbsp; • &nbsp; DEMO AFTER 10 SECONDS</div></section>
+<section class="screen panel" id="how"><div class="panel-box"><div class="micro">Field manual / 01</div><h2>Become the weapon.</h2><p>The empire has caged the sun inside a living machine. Break its guardians. Reach the heart. Make the sky remember your name.</p><div class="columns"><div class="row"><span>Move / aim</span><b>LEFT STICK / WASD</b></div><div class="row"><span>Fire</span><b>□ / J</b></div><div class="row"><span>Jump</span><b>✕ / K</b></div><div class="row"><span>Dash through danger</span><b>○ / L</b></div><div class="row"><span>Counter projectiles</span><b>△ / I</b></div><div class="row"><span>Hold position / aim</span><b>L1 / SHIFT</b></div><div class="row"><span>Cycle weapon</span><b>R1 / Q</b></div><div class="row"><span>Soulflare attack</span><b>R2 / E</b></div><div class="row"><span>Pause</span><b>OPTIONS / ESC</b></div></div><p class="hint">Hold L1 / Shift and aim with the left stick. Tap jump in midair to hover, then tap again to step-jump. Counter shots to heal and build soul energy. Dash grants brief invulnerability.</p><div class="menu"><button data-action="back">Back</button></div></div></section>
+<section class="screen panel" id="settings"><div class="panel-box"><div class="micro">System / 02</div><h2>Settings</h2><p>Make the controls feel right from the couch.</p><div class="menu" id="settingsMenu"><button data-action="invertX">Horizontal axis <small id="xValue">NORMAL</small></button><button data-action="invertY">Vertical axis <small id="yValue">NORMAL</small></button><button data-action="audio">Sound &amp; music <small id="audioValue">ON</small></button><button data-action="back">Back</button></div><p class="hint">Use up / down to choose. Press ✕ or enter to change.</p></div></section>
+<section class="screen panel" id="about"><div class="panel-box"><div class="micro">Archive / 03</div><h2>About &amp; credits</h2><div id="credits"></div><div class="menu"><button data-action="back">Back</button></div></div></section>
+<section class="screen panel" id="online"><div class="panel-box"><div class="micro">Transmission / 04</div><h2>Score race</h2><p>Race independently against up to three pilots. Highest score wins. Share the six-digit room code with your crew.</p><p id="onlineStatus">Create a room, or enter a code to join.</p><div class="menu" id="onlineMenu"><button data-action="host">Create room</button><button data-action="code">Room code <small id="roomCode">000000</small></button><button data-action="join">Join room</button><button data-action="begin">Launch race</button><button data-action="back">Back</button></div><p class="hint">Select the room code to edit; left / right changes a digit, up / down chooses a digit.</p></div></section>
+<section class="screen panel" id="pause"><div class="panel-box"><div class="micro">Mission suspended</div><h2>Take a breath.</h2><div class="menu"><button data-action="resume">Resume</button><button data-action="how">Field manual</button><button data-action="settings">Settings</button><button data-action="quit">Return to title</button></div></div></section>
+<section class="screen panel" id="result"><div class="panel-box"><div class="micro">Transmission complete</div><h2 id="resultTitle">The sun remembers.</h2><p id="resultText"></p><p id="raceScores"></p><div class="menu"><button data-action="start">Fight again</button><button data-action="quit">Return to title</button></div></div></section>
+<div id="hud"><div class="hudtop"><div class="hud-left"><div class="hud-label">SOUL / VITALITY</div><div class="bar"><i id="healthFill"></i></div><div class="hud-label">SOULFLARE CHARGE</div><div class="meter"><i id="chargeFill"></i></div><div class="weapon" id="weaponLabel">01 <em>VULCAN</em></div></div><div class="score"><small>SCORE / COMBAT RECORD</small><span id="score">000000</span></div></div><div id="bossHud"><div class="hud-label" id="bossName">GUARDIAN</div><div class="bar"><i id="bossFill"></i></div></div><div id="stageBanner"><span>WARNING / TARGET APPROACHING</span><strong></strong></div><div id="toast"></div></div><div class="attract-label" id="attractLabel">AUTO PLAY / PRESS ANY BUTTON</div></div>
+<div id="error"><div><div class="micro">SYSTEM NOTICE</div><h2>WebGPU required.</h2><p id="errorText">This mission needs a browser and device with WebGPU enabled.</p></div></div><div id="touch"><div><h2>Controller or keyboard required</h2><p>Connect a controller or use a keyboard to play.</p><button id="touchSettings">Settings</button></div></div>
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script><script type="module">// Procedural cel-shaded world and actors. All positions are in gameplay units.
+function createVisuals(THREE, renderer) {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x090f26);
+  const camera = new THREE.OrthographicCamera(-12, 12, 7, -7, 0.1, 150);
+  camera.position.set(12, 6.4, 42);
+  camera.lookAt(12, 6.4, 0);
+  const hemi = new THREE.HemisphereLight(0xaedaff, 0x202033, 2.0);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xffdfb7, 2.7);
+  sun.position.set(-5, 13, 12); scene.add(sun);
+  const rim = new THREE.DirectionalLight(0x61e4ed, 1.3);
+  rim.position.set(10, 3, -5); scene.add(rim);
+  const mat = (c, extra={}) => new THREE.MeshToonMaterial({color:c, ...extra});
+  const M = {
+    ink:mat(0x10142c), dark:mat(0x202b42), steel:mat(0x415b69), steel2:mat(0x63838b),
+    white:mat(0xc9ebd9), teal:mat(0x3ae5ca), gold:mat(0xffbf43), orange:mat(0xff6239),
+    red:mat(0xed3c56), violet:mat(0x9c53e5), glow:mat(0xfff0aa),
+    ground:mat(0x24384b), groundTop:mat(0x809897), distant:mat(0x202c47), far:mat(0x18223d),
+    neon: new THREE.MeshBasicMaterial({color:0x47e8ce}),
+    hot: new THREE.MeshBasicMaterial({color:0xffb35a}),
+    bullet: new THREE.MeshBasicMaterial({color:0xd9fff4}),
+    hostile: new THREE.MeshBasicMaterial({color:0xff587c}),
+  };
+  const boxGeo = new THREE.BoxGeometry(1,1,1);
+  const sphereGeo = new THREE.IcosahedronGeometry(1,1);
+  const orbGeo = new THREE.IcosahedronGeometry(1,2);
+  const coneGeo = new THREE.ConeGeometry(1,1,5);
+  const cylGeo = new THREE.CylinderGeometry(1,1,1,8);
+  function piece(parent, geometry, material, x,y,z, sx,sy,sz, rz=0) {
+    const o = new THREE.Mesh(geometry, material);
+    o.position.set(x,y,z); o.scale.set(sx,sy,sz); o.rotation.z=rz; parent.add(o); return o;
+  }
+  function box(parent, material, x,y,z, sx,sy,sz, rz=0) {return piece(parent,boxGeo,material,x,y,z,sx,sy,sz,rz);}
+  function orb(parent, material, x,y,z, sx,sy,sz) {return piece(parent,sphereGeo,material,x,y,z,sx,sy,sz);}
+  function cone(parent,material,x,y,z,sx,sy,sz,rz=0) {return piece(parent,coneGeo,material,x,y,z,sx,sy,sz,rz);}
+
+  // Distant poster-like sky and planet, built from flat forms instead of image assets.
+  const background = new THREE.Group(); scene.add(background);
+  const planet = piece(background, new THREE.CircleGeometry(5.4,40), new THREE.MeshBasicMaterial({color:0x8d334c}), 25,11,-28,1,1,1);
+  piece(background, new THREE.CircleGeometry(4.4,40), new THREE.MeshBasicMaterial({color:0xe47767}), 25,11,-27.9,1,1,1);
+  box(background, new THREE.MeshBasicMaterial({color:0x303654}),25,11,-27.7,11,.16,.1,-.25);
+  box(background, new THREE.MeshBasicMaterial({color:0x303654}),25,9.9,-27.7,10,.07,.1,-.25);
+  for(let i=0;i<55;i++) {
+    const x=((i*17)%53)-8, y=4+((i*43)%15);
+    box(background, i%3 ? M.steel : M.gold, x,y,-24,.04,.04,.04);
+  }
+  // Layered skyline: repeating monumental silhouettes frame the fights.
+  for(let i=0;i<24;i++) {
+    let x=i*2.6-12, h=2.4+((i*7)%6)*.7;
+    box(scene, i%2?M.far:M.distant,x,h/2,-15,2.2,h,.8);
+    box(scene, M.dark,x,h+.28,-15,.5,.6,.9);
+    if(i%3===0) {
+      box(scene,M.dark,x,h+1,-15,.12,1.5,.3);
+      box(scene,M.hot,x,h+1.75,-14.9,.25,.12,.1);
+    }
+    for(let j=0;j<3;j++) box(scene, i%3===0?M.neon:M.steel,x-.6+j*.6,h*.55,-14.55,.11,Math.max(.2,h*.38),.1);
+  }
+  // Industrial deck, with rear safety wall and readable stage markers.
+  box(scene,M.ground,16,-1.4,-1,54,2.8,7);
+  box(scene,M.groundTop,16,-.06,0,54,.12,7);
+  box(scene,M.dark,16,.22,-3.2,54,.45,.45);
+  box(scene,M.steel2,16,.48,-3.2,54,.06,.5);
+  for(let i=-3;i<43;i+=2) {
+    box(scene,M.dark,i,-.02,1,1.85,.035,4.4);
+    box(scene,M.steel,i,-.001,1,.05,.04,4.3);
+    box(scene,M.gold,i,.02,2.4,.7,.05,.2);
+    box(scene,M.ink,i,-.5,3.53,.08,.75,.1);
+    box(scene,i%4===0?M.neon:M.steel,i,-.6,3.55,.85,.12,.08);
+  }
+  for(let i=0;i<7;i++) {
+    let x=i*7-3;
+    box(scene,M.dark,x,2,-5.3,.35,4,.7);
+    box(scene,M.steel,x,4,-5.3,3.4,.3,.7);
+    box(scene,M.gold,x,4.3,-5.2,.8,.12,.3);
+    box(scene,M.ink,x,2.1,-5.2,2.6,2.1,.3);
+    box(scene,M.steel,x,2.1,-5,2.3,1.8,.1);
+    box(scene,M.dark,x,2.1,-4.92,2,1.5,.1);
+    box(scene,M.neon,x,2.7,-4.85,1.4,.06,.1);
+    box(scene,M.neon,x,1.7,-4.85,.7,.06,.1);
+  }
+  // Tall foreground framing posts make the world feel like a theatrical stage.
+  for(let x=-5;x<40;x+=10) {
+    box(scene,M.ink,x,1.8,4.6,.18,3.6,.18);
+    box(scene,M.steel,x,3.65,4.6,.42,.15,.2);
+  }
+
+  function makePlayer() {
+    const root = new THREE.Group();
+    const rig = new THREE.Group(); root.add(rig);
+    // Feet sit about 1.1 units below the body origin.
+    const legA = new THREE.Group(), legB = new THREE.Group();
+    legA.position.set(-.25,-.35,0); legB.position.set(.25,-.35,-.07); rig.add(legA,legB);
+    for(const leg of [legA,legB]) {
+      box(leg,M.ink,0,-.30,0,.27,.63,.35,-.13);
+      box(leg,M.teal,.02,-.31,.2,.18,.46,.07,-.13);
+      box(leg,M.white,.10,-.66,.02,.48,.18,.4);
+      box(leg,M.gold,.26,-.66,.06,.18,.13,.42);
+    }
+    orb(rig,M.ink,0,.1,0,.55,.65,.38);
+    orb(rig,M.teal,0,.16,.05,.48,.57,.37);
+    box(rig,M.white,.04,.13,.35,.55,.38,.12,-.18);
+    box(rig,M.gold,.07,.16,.42,.18,.23,.05,-.18);
+    // A bird-like helmet with a crest and amber visor.
+    orb(rig,M.ink,.04,.78,0,.43,.43,.38);
+    orb(rig,M.white,.04,.80,.04,.38,.39,.35);
+    cone(rig,M.teal,-.25,1.06,-.03,.29,.73,.25,-.55);
+    cone(rig,M.gold,.24,.72,.15,.25,.40,.2,-1.55);
+    box(rig,M.ink,.17,.84,.36,.4,.14,.07,-.1);
+    box(rig,M.hot,.20,.86,.41,.27,.07,.04,-.1);
+    // Wings / scarf communicate velocity and dash direction.
+    const scarf = new THREE.Group(); scarf.position.set(-.29,.45,-.15); rig.add(scarf);
+    box(scarf,M.orange,-.37,.02,0,.74,.15,.12,.17);
+    cone(scarf,M.orange,-.82,-.06,0,.18,.55,.08,-1.2);
+    const arm = new THREE.Group(); arm.position.set(.22,.32,.3); rig.add(arm);
+    orb(arm,M.white,0,0,0,.21,.22,.18);
+    box(arm,M.dark,.3,-.08,.03,.58,.2,.22,-.12);
+    box(arm,M.teal,.61,-.05,.04,.48,.19,.22);
+    box(arm,M.gold,.81,-.05,.04,.14,.28,.26);
+    box(arm,M.ink,.98,-.05,.04,.26,.12,.14);
+    const dash = new THREE.Group(); rig.add(dash);
+    for(let i=0;i<3;i++) cone(dash,i%2?M.gold:M.orange,-.65-i*.25,-.05+i*.22,-.1,.18,.8,.13,-1.45);
+    dash.visible=false;
+    return {root,rig,legA,legB,arm,scarf,dash};
+  }
+  const player=makePlayer(); scene.add(player.root);
+  function makeEnemy(type) {
+    const root=new THREE.Group(), rig=new THREE.Group(); root.add(rig);
+    if(type==='sentry') {
+      orb(rig,M.ink,0,0,0,.55,.55,.4); orb(rig,M.red,0,0,.06,.49,.48,.4);
+      box(rig,M.ink,.08,.05,.41,.68,.20,.08); box(rig,M.hot,.12,.06,.46,.45,.09,.06);
+      cone(rig,M.gold,0,.56,0,.20,.52,.18); box(rig,M.dark,-.65,-.04,0,.50,.15,.25,.28); box(rig,M.dark,.65,-.04,0,.50,.15,.25,-.28);
+    } else if(type==='skimmer') {
+      orb(rig,M.ink,0,0,0,.72,.35,.4); orb(rig,M.violet,0,.03,.08,.65,.28,.4);
+      box(rig,M.hot,.1,.03,.45,.45,.08,.06);
+      cone(rig,M.red,-.65,.15,0,.26,.68,.13,-1.1); cone(rig,M.red,.65,.15,0,.26,.68,.13,1.1);
+      cone(rig,M.gold,-.25,-.4,0,.16,.4,.1,Math.PI); cone(rig,M.gold,.25,-.4,0,.16,.4,.1,Math.PI);
+    } else {
+      const oracle=type==='oracle';
+      const scale=oracle?1.25:1.1;
+      rig.scale.setScalar(scale);
+      // Boss silhouettes are deliberately much larger and asymmetric.
+      orb(rig,M.ink,0,0,0,1.45,1.35,.65);
+      orb(rig,oracle?M.violet:M.red,0,.05,.05,1.30,1.23,.62);
+      orb(rig,M.dark,0,.1,.55,.94,.85,.18);
+      orb(rig,oracle?M.neon:M.hot,.1,.08,.73,.38,.38,.10);
+      for(let i=0;i<6;i++) {
+        const a=i*Math.PI/3;
+        cone(rig,i%2?M.gold:(oracle?M.violet:M.red),Math.cos(a)*1.37,Math.sin(a)*1.25,0,.23,.75,.2,a-Math.PI/2);
+      }
+      box(rig,M.ink,-1.35,-.5,0,.6,1.5,.5,.3);
+      box(rig,M.ink,1.35,-.5,0,.6,1.5,.5,-.3);
+      box(rig,oracle?M.teal:M.gold,-1.45,-.7,.25,.35,.8,.1,.3);
+      box(rig,oracle?M.teal:M.gold,1.45,-.7,.25,.35,.8,.1,-.3);
+    }
+    return {root,rig,type};
+  }
+  const enemies=new Map(), bullets=new Map(), sparks=[];
+  function projectile(type, owner) {
+    const g=new THREE.Group();
+    const m=owner==='player'?M.bullet:M.hostile;
+    if(type==='orb') {orb(g,M.hostile,0,0,0,.28,.28,.2); orb(g,M.hot,0,0,.2,.14,.14,.08);}
+    else {box(g,m,0,0,0,type==='lance'?1.0:.42,type==='lance'?.13:.11,.12); box(g,owner==='player'?M.neon:M.hot,-.2,0,-.02,.5,.05,.06);}
+    return g;
+  }
+  function burst(x,y,color=0xffc56a) {
+    const material=new THREE.MeshBasicMaterial({color});
+    for(let i=0;i<8;i++) {
+      const mesh=new THREE.Mesh(boxGeo,material);
+      mesh.position.set(x,y,.8); mesh.scale.set(.09,.09,.09); scene.add(mesh);
+      const a=i*Math.PI/4+Math.random()*.3, speed=1.5+Math.random()*3;
+      sparks.push({mesh,vx:Math.cos(a)*speed,vy:Math.sin(a)*speed,life:.3+Math.random()*.3});
+    }
+  }
+  let time=0;
+  function update(state,dt) {
+    if(!state || !state.player) return;
+    time+=dt;
+    const p=state.player;
+    player.root.position.set(p.x,p.y,0);
+    player.rig.scale.x=p.facing<0?-1:1;
+    const running=Math.abs(p.vx)>1 && p.grounded;
+    const stride=running?Math.sin(time*14)*.55:0;
+    player.legA.rotation.z=stride; player.legB.rotation.z=-stride;
+    player.rig.rotation.z=p.dashTime>0?-.18:Math.sin(time*3)*.025;
+    player.arm.rotation.z=Math.atan2(p.aimY||0,Math.abs(p.aimX||1));
+    player.scarf.rotation.z=Math.sin(time*9)*.12+(running?.15:0);
+    player.dash.visible=p.dashTime>0;
+    player.root.visible=!(p.invuln>0 && Math.floor(time*18)%2===0);
+    const seen=new Set();
+    for(const e of state.enemies||[]) {
+      seen.add(e.id);
+      let obj=enemies.get(e.id);
+      if(!obj){obj=makeEnemy(e.type); enemies.set(e.id,obj); scene.add(obj.root);}
+      obj.root.position.set(e.x,e.y,0);
+      obj.rig.rotation.z=Math.sin(time*2+Number(e.id||0))*.06;
+      obj.rig.scale.y=(e.type==='warden'||e.type==='oracle'?1.1:1)*(1+Math.sin(time*4)*.025);
+      obj.root.visible=!(e.flash>0 && Math.floor(time*25)%2===0);
+    }
+    for(const [id,obj] of enemies) if(!seen.has(id)){scene.remove(obj.root);enemies.delete(id);}
+    const shots=new Set();
+    for(const b of state.projectiles||[]) {
+      shots.add(b.id);
+      let mesh=bullets.get(b.id);
+      if(!mesh){mesh=projectile(b.type,b.owner);bullets.set(b.id,mesh);scene.add(mesh);}
+      mesh.position.set(b.x,b.y,.7); mesh.rotation.z=Math.atan2(b.vy||0,b.vx||1);
+    }
+    for(const [id,mesh] of bullets) if(!shots.has(id)){scene.remove(mesh);bullets.delete(id);}
+    for(let i=sparks.length-1;i>=0;i--){const s=sparks[i]; s.life-=dt;s.mesh.position.x+=s.vx*dt;s.mesh.position.y+=s.vy*dt;s.vy-=5*dt;s.mesh.rotation.z+=dt*5;if(s.life<=0){scene.remove(s.mesh);sparks.splice(i,1);}}
+    const target=Math.max(9,Math.min(23,p.x));
+    camera.position.x+=(target-camera.position.x)*Math.min(1,dt*3);
+    camera.position.y+=(5.5-camera.position.y)*Math.min(1,dt*3);
+    camera.lookAt(camera.position.x,camera.position.y,0);
+    background.position.x=(camera.position.x-12)*.18;
+  }
+  function resize() {
+    const aspect=Math.max(.5,window.innerWidth/window.innerHeight), height=13.4;
+    camera.left=-height*aspect/2; camera.right=height*aspect/2; camera.top=height/2; camera.bottom=-height/2;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth,window.innerHeight);
+  }
+  resize();
+  return {scene,camera,update,resize,burst};
+}
+
+/* Soulflare Soldier: combat simulation. Rendered separately from the deterministic state. */
+function createGame({ RAPIER, onEvent = () => {} }) {
+  const state = {
+    player: {}, enemies: [], projectiles: [], particles: [], stage: 0, stageName: '',
+    boss: null, score: 0, combo: 0, status: 'playing', time: 0, wave: 0,
+    message: '', messageTime: 0, attract: false
+  };
+  let world, body, id = 0, shootClock = 0, dashClock = 0, counterClock = 0;
+  let spawnClock = 0, stageClock = 0, comboClock = 0, wave = 0, stageStarted = false;
+  let heldWeapon = 0, heldJump = 0, heldDash = 0, heldCounter = 0, heldSpecial = 0;
+  const weaponNames = ['PULSE', 'FAN', 'LANCE'];
+  const stages = ['THE BREACH', 'IRON PSALM', 'THE HOLLOW', 'THE LAST VOICE'];
+  const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+  const event = (name, x, y, extra = {}) => onEvent(name, { x, y, ...extra });
+  const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  function announcement(text, time = 2.3) { state.message = text; state.messageTime = time; }
+  function makeWorld() {
+    if (world) world.free();
+    world = new RAPIER.World({x:0, y:-25, z:0});
+    const floor = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(16, -0.5, 0));
+    world.createCollider(RAPIER.ColliderDesc.cuboid(18, 0.5, 2), floor);
+    const desc = RAPIER.RigidBodyDesc.dynamic().setTranslation(6, 1.08, 0)
+      .enabledRotations(false, false, false).enabledTranslations(true, true, false);
+    body = world.createRigidBody(desc);
+    world.createCollider(RAPIER.ColliderDesc.capsule(0.55, 0.42).setFriction(0).setRestitution(0), body);
+  }
+  function reset() {
+    makeWorld();
+    Object.assign(state, {enemies: [], projectiles: [], particles: [], stage: 0, stageName: stages[0], boss: null,
+      score: 0, combo: 0, status: 'playing', time: 0, wave: 0, message: '', messageTime: 0});
+    Object.assign(state.player, {x:6, y:1.08, vx:0, vy:0, facing:1, health:100, maxHealth:100,
+      energy:100, maxEnergy:100, weapon:0, weaponName:weaponNames[0], invuln:0, dashTime:0,
+      grounded:true, aimX:1, aimY:0, lock:false, counterTime:0, hoverTime:0, airStage:0});
+    id=0; shootClock=0; dashClock=0; counterClock=0; spawnClock=0.5; stageClock=0;
+    comboClock=0; wave=0; stageStarted=false; heldWeapon=heldJump=heldDash=heldCounter=heldSpecial=0;
+    announcement('THE BREACH // BREAK THE SEAL');
+  }
+  function setAttract(value) { state.attract = !!value; }
+  function enemy(type,x,y) {
+    const hp = {sentry:28, skimmer:24, warden:410, oracle:570}[type];
+    const e = {id:++id, type, x, y, health:hp, maxHealth:hp, phase:0, flash:0,
+      age:0, cooldown:type === 'sentry' ? 1 : 1.6, baseX:x, baseY:y, contact:0};
+    state.enemies.push(e);
+    if (type === 'warden' || type === 'oracle') state.boss=e;
+    return e;
+  }
+  function spawnWave() {
+    const stage = state.stage;
+    wave++; state.wave = wave;
+    if (stage === 0) {
+      if (wave === 1) { enemy('sentry',21,1.2); enemy('skimmer',26,5); enemy('sentry',29,1.2); }
+      else { enemy('skimmer',19,5.8); enemy('sentry',25,1.2); enemy('skimmer',29,4); enemy('sentry',28,1.2); }
+    } else if (stage === 2) {
+      if (wave === 1) { enemy('skimmer',21,5); enemy('sentry',25,1.2); enemy('skimmer',29,6); enemy('sentry',28,1.2); }
+      else { enemy('skimmer',19,4.5); enemy('skimmer',24,6.3); enemy('sentry',27,1.2); enemy('sentry',30,1.2); }
+    } else if (stage === 1) {
+      enemy('warden',24,4.6); announcement('IRON PSALM // THE GATE HAS TEETH', 3);
+    } else {
+      enemy('oracle',24,5); announcement('THE LAST VOICE // ANSWER WITH FIRE', 3);
+    }
+    event('stage', 16, 4, {stage:state.stage, wave});
+  }
+  function nextStage() {
+    state.stage++;
+    if (state.stage >= stages.length) {
+      state.status='won'; state.stage=stages.length-1; state.boss=null;
+      state.projectiles=[]; announcement('THE SILENCE IS YOURS', 99); event('win', state.player.x,state.player.y);
+      return;
+    }
+    state.stageName=stages[state.stage]; state.boss=null; wave=0; state.wave=0;
+    stageStarted=false; spawnClock=2.5; stageClock=0;
+    state.player.health = Math.min(100, state.player.health + 20);
+    state.player.energy = Math.min(100, state.player.energy + 30);
+    state.projectiles = [];
+    announcement(stages[state.stage] + ' // SIGNAL APPROACHING', 2.5);
+    event('stage', 16, 4, {stage:state.stage,wave:0});
+  }
+  function shot(x,y,vx,vy,owner,type,damage=0) {
+    state.projectiles.push({id:++id,x,y,vx,vy,owner,type,damage,age:0});
+  }
+  function aimedShot(e, speed, angleOffset = 0, type='hostile') {
+    const p = state.player;
+    let a = Math.atan2(p.y-e.y,p.x-e.x) + angleOffset;
+    shot(e.x,e.y,Math.cos(a)*speed,Math.sin(a)*speed,'enemy',type);
+  }
+  function firePlayer() {
+    const p=state.player, a=Math.atan2(p.aimY,p.aimX), x=p.x+p.aimX*0.75, y=p.y+0.12+p.aimY*0.75;
+    if (p.weapon===0) {
+      shootClock=0.13; shot(x,y,Math.cos(a)*23,Math.sin(a)*23,'player','pulse',8);
+    } else if (p.weapon===1) {
+      shootClock=0.29;
+      for (const off of [-0.22,0,0.22]) shot(x,y,Math.cos(a+off)*20,Math.sin(a+off)*20,'player','spread',6);
+    } else {
+      shootClock=0.47; shot(x,y,Math.cos(a)*29,Math.sin(a)*29,'player','lance',24);
+    }
+    event('shoot',x,y,{weapon:p.weapon});
+  }
+  function damageEnemy(e, damage) {
+    if (e.health<=0) return;
+    e.health-=damage; e.flash=0.12;
+    state.score+=Math.round(damage*10*(1+Math.min(state.combo,30)*0.025));
+    state.combo++; comboClock=3;
+    event('hit',e.x,e.y,{type:e.type});
+    if (e.health <= 0) {
+      state.score += (e.type==='warden'||e.type==='oracle') ? 5000 : 500;
+      state.player.energy = Math.min(100,state.player.energy + 5);
+      event('explode',e.x,e.y,{type:e.type});
+    }
+  }
+  function damagePlayer(amount) {
+    const p=state.player;
+    if (p.invuln>0 || p.dashTime>0 || state.attract || state.status!=='playing') return;
+    p.health=Math.max(0,p.health-amount); p.invuln=0.9; state.combo=0;
+    event('hurt',p.x,p.y,{amount});
+    if (p.health<=0) { state.status='dead'; announcement('SIGNAL LOST',99); event('death',p.x,p.y); }
+  }
+  function dash() {
+    const p=state.player;
+    if (dashClock>0 || p.energy<15) return;
+    const full=p.energy>=99;
+    p.energy-=15; p.dashTime=0.22; p.invuln=0.28; dashClock=0.55;
+    p.dashDirection=p.aimX<0 ? -1 : 1; p.dashFull=full;
+    body.setLinvel({x:p.dashDirection*23,y:0,z:0},true);
+    event('dash',p.x,p.y,{full});
+  }
+  function counter() {
+    const p=state.player;
+    if (counterClock>0) return;
+    counterClock=0.55; p.counterTime=0.23;
+    let caught=0;
+    state.projectiles=state.projectiles.filter(b => {
+      if (b.owner==='enemy' && Math.hypot(b.x-p.x,b.y-p.y)<3.1) {caught++; event('hit',b.x,b.y,{type:'counter'}); return false;}
+      return true;
+    });
+    if (caught) { p.health=Math.min(100,p.health+caught*3); p.energy=Math.min(100,p.energy+caught*8); state.score+=caught*250; }
+    event('counter',p.x,p.y,{caught});
+  }
+  function special() {
+    const p=state.player;
+    if (p.energy<60) return;
+    p.energy-=60; p.invuln=0.8;
+    for (const e of state.enemies) if (distance(e,p)<8) damageEnemy(e,70);
+    state.projectiles=state.projectiles.filter(b=>b.owner!=='enemy'||distance(b,p)>9);
+    event('special',p.x,p.y); announcement('SOUL FLARE',0.8);
+  }
+  function aiInput() {
+    const p=state.player, nearest=state.enemies.reduce((a,e)=> !a||distance(e,p)<distance(a,p)?e:a,null);
+    if (!nearest) return {x: p.x<9?1:0, y:0,shoot:true};
+    const dx=nearest.x-p.x, dy=nearest.y-p.y;
+    const aimLength=Math.max(0.001,Math.hypot(dx,dy));
+    const approach=Math.abs(dx)>10;
+    return {x:approach?Math.sign(dx):dx/aimLength,
+      y:approach?0:dy/aimLength, shoot:true, lock:!approach,
+      jump:p.grounded && dy>2 && Math.random()<0.025, dash:Math.random()<0.006,
+      counter:state.projectiles.some(b=>b.owner==='enemy'&&distance(b,p)<3),
+      special:p.energy>=80&&Math.random()<0.015, weapon:Math.random()<0.001};
+  }
+  function update(dt, supplied={}) {
+    dt=Math.min(Math.max(dt,0),0.04);
+    if (state.status!=='playing') return;
+    const input=state.attract?aiInput():supplied, p=state.player;
+    state.time+=dt;
+    if(state.messageTime>0) state.messageTime-=dt;
+    shootClock-=dt; dashClock-=dt; counterClock-=dt; p.invuln=Math.max(0,p.invuln-dt);
+    p.dashTime=Math.max(0,p.dashTime-dt); p.counterTime=Math.max(0,p.counterTime-dt);
+    p.energy=Math.min(100,p.energy+dt*2.2);
+    comboClock-=dt; if(comboClock<=0)state.combo=0;
+    const ix=clamp(Number(input.x)||0,-1,1), iy=clamp(Number(input.y)||0,-1,1);
+    const jump=!!input.jump, dashPressed=!!input.dash, counterPressed=!!input.counter,
+      specialPressed=!!input.special, weaponPressed=!!input.weapon;
+    p.lock=!!input.lock;
+    if(p.lock) {
+      if(Math.hypot(ix,iy)>0.2) {let len=Math.hypot(ix,iy);p.aimX=ix/len;p.aimY=iy/len;if(Math.abs(ix)>0.2)p.facing=Math.sign(ix);}
+    } else {
+      if(Math.abs(ix)>0.2)p.facing=Math.sign(ix);
+      p.aimX=p.facing; p.aimY=0;
+    }
+    if(weaponPressed&&!heldWeapon){p.weapon=(p.weapon+1)%3;p.weaponName=weaponNames[p.weapon];event('weapon',p.x,p.y,{weapon:p.weapon});}
+    if(jump&&!heldJump){
+      if(p.grounded){body.setGravityScale(1,true);body.setLinvel({x:body.linvel().x,y:11.5,z:0},true);p.grounded=false;p.airStage=0;event('jump',p.x,p.y);}
+      else if(p.airStage===0){p.airStage=1;p.hoverTime=1.3;body.setGravityScale(0,true);body.setLinvel({x:body.linvel().x,y:0,z:0},true);event('jump',p.x,p.y,{hover:true});}
+      else if(p.airStage===1){p.airStage=2;p.hoverTime=0;body.setGravityScale(1,true);body.setLinvel({x:body.linvel().x,y:10,z:0},true);event('jump',p.x,p.y,{step:true});}
+    }
+    if(p.hoverTime>0){p.hoverTime=Math.max(0,p.hoverTime-dt);if(p.hoverTime===0){p.airStage=2;body.setGravityScale(1,true);}}
+    if(dashPressed&&!heldDash)dash();
+    if(counterPressed&&!heldCounter)counter();
+    if(specialPressed&&!heldSpecial)special();
+    heldWeapon=weaponPressed; heldJump=jump; heldDash=dashPressed; heldCounter=counterPressed; heldSpecial=specialPressed;
+    if(input.shoot&&shootClock<=0)firePlayer();
+    let v=body.linvel();
+    if(p.dashTime>0) body.setLinvel({x:p.dashDirection*23,y:0,z:0},true);
+    else body.setLinvel({x:p.lock?0:ix*8.2,y:v.y,z:0},true);
+    world.timestep=dt; world.step();
+    const pos=body.translation(); v=body.linvel();
+    p.x=clamp(pos.x,0.7,31.3);p.y=Math.max(0.96,pos.y);p.vx=v.x;p.vy=v.y;
+    if(pos.x!==p.x || pos.y<0.96) body.setTranslation({x:p.x,y:p.y,z:0},true);
+    p.grounded=p.y<1.04 && v.y<0.15;
+    if(p.grounded){p.airStage=0;p.hoverTime=0;body.setGravityScale(1,true);}
+    if(state.attract) { p.health=100; p.energy=100; }
+    if(!stageStarted) {
+      spawnClock-=dt;
+      if(spawnClock<=0){spawnWave();stageStarted=true;}
+    } else if(state.enemies.length===0) {
+      stageClock+=dt;
+      if(stageClock>1.5) {
+        stageClock=0;
+        if((state.stage===0||state.stage===2)&&wave<2){spawnWave();}
+        else nextStage();
+      }
+    }
+    for(const e of state.enemies) {
+      e.age+=dt; e.cooldown-=dt; e.flash=Math.max(0,e.flash-dt); e.contact-=dt;
+      e.phase=e.health<e.maxHealth*0.5?2:1;
+      if(e.type==='sentry') {
+        e.x=e.baseX+Math.sin(e.age*1.1)*1.5;
+        if(e.cooldown<=0){aimedShot(e,7); e.cooldown=1.8;}
+      } else if(e.type==='skimmer') {
+        e.x=e.baseX+Math.sin(e.age*1.4)*2.4; e.y=e.baseY+Math.sin(e.age*2)*0.8;
+        if(e.cooldown<=0){aimedShot(e,8,-0.14); aimedShot(e,8,0.14); e.cooldown=2.1;}
+      } else if(e.type==='warden') {
+        e.x=23+Math.sin(e.age*0.8)*3; e.y=4.6+Math.sin(e.age*1.3)*1.4;
+        if(e.cooldown<=0){
+          const n=e.phase===2?7:5;
+          for(let i=0;i<n;i++)aimedShot(e,7.5,(i-(n-1)/2)*0.18,'orb');
+          e.cooldown=e.phase===2?1.05:1.45;
+        }
+      } else {
+        e.x=23+Math.sin(e.age*0.9)*4; e.y=5+Math.sin(e.age*1.5)*2;
+        if(e.cooldown<=0){
+          const n=e.phase===2?12:9;
+          for(let i=0;i<n;i++){const a=(Math.PI*2*i/n)+e.age;shot(e.x,e.y,Math.cos(a)*6.2,Math.sin(a)*6.2,'enemy','orb');}
+          aimedShot(e,10); e.cooldown=e.phase===2?0.9:1.3;
+        }
+      }
+      if(distance(p,e)<(e.type==='warden'||e.type==='oracle'?2.1:1.05)) {
+        if(p.dashTime>0&&e.contact<=0) {damageEnemy(e,p.dashFull?80:30);e.contact=0.3;}
+        else if(p.dashTime<=0) damagePlayer(12);
+      }
+    }
+    for(const b of state.projectiles){
+      b.x+=b.vx*dt;b.y+=b.vy*dt;b.age+=dt;
+      if(b.owner==='player'){
+        for(const e of state.enemies){
+          const radius=e.type==='warden'||e.type==='oracle'?1.65:0.8;
+          if(e.health>0&&distance(b,e)<radius){damageEnemy(e,b.damage);b.age=99;break;}
+        }
+      }else if(distance(b,p)<0.7){
+        if(p.counterTime>0){p.health=Math.min(100,p.health+3);p.energy=Math.min(100,p.energy+8);state.score+=250;event('counter',p.x,p.y,{caught:1});}
+        else damagePlayer(b.type==='orb'?8:6);
+        b.age=99;
+      }
+    }
+    state.projectiles=state.projectiles.filter(b=>b.age<5&&b.x>-3&&b.x<35&&b.y>-2&&b.y<15);
+    state.enemies=state.enemies.filter(e=>e.health>0);
+    if(state.boss && state.boss.health<=0)state.boss=null;
+  }
+  reset();
+  return {state,update,reset,setAttract};
+}
+
+/* Standalone side-by-side score attack over WebRTC. PeerJS handles signaling. */
+function createMultiplayer({onStatus=()=>{},onStart=()=>{},onScores=()=>{}}={}) {
+  let peer=null, host=false, room='', conns=new Map(), scores={}, started=false, lastSend=0;
+  function status(message){ onStatus(message); }
+  function broadcast(message){ for(const c of conns.values()) if(c.open) c.send(message); }
+  function close(){ if(peer) peer.destroy(); peer=null; conns.clear(); scores={}; started=false; room=''; }
+  function watch(conn) {
+    if(host && (started || conns.size>=3)){conn.close();return;}
+    conn.on('open',()=>{conns.set(conn.peer,conn);status(host?'Pilot connected. Launch when ready.':'Connected. Waiting for host.');});
+    conn.on('close',()=>{conns.delete(conn.peer);delete scores[conn.peer];onScores(scores);status('A pilot disconnected.');});
+    conn.on('error',()=>status('Connection failed. Check the room code and retry.'));
+    conn.on('data',m=>{
+      if(!m || typeof m!=='object')return;
+      if(m.t==='start' && !host && !started){started=true;onStart(m.seed);}
+      if(m.t==='score' && host){ scores[conn.peer]=Math.max(0,Number(m.score)||0); onScores(scores); broadcast({t:'scores',scores}); }
+      if(m.t==='scores' && !host && m.scores && typeof m.scores==='object'){ scores=m.scores; onScores(scores); }
+    });
+  }
+  function makePeer(id, next){
+    if(typeof Peer==='undefined'){status('Online service unavailable. Check your connection.');return;}
+    peer=new Peer(id,{debug:0});
+    peer.on('open',next);
+    peer.on('error',e=>status(e.type==='unavailable-id'?'Room code is in use. Try again.':e.type==='peer-unavailable'?'Room not found. Check the code.':'Online connection failed. Try again.'));
+    peer.on('disconnected',()=>status('Signaling disconnected. Existing pilots may continue.'));
+    peer.on('connection',watch);
+  }
+  return {
+    host(){close();host=true;const n=new Uint32Array(1);crypto.getRandomValues(n);room=String(n[0]%1000000).padStart(6,'0');status('Opening room…');makePeer('soulflare-'+room,()=>status('Room '+room+' · Give this code to your wingmates.'));},
+    join(code){close();host=false;room=String(code).replace(/\D/g,'').slice(0,6);if(room.length!==6){status('Enter the six-digit room code.');return;}status('Connecting…');makePeer(undefined,()=>watch(peer.connect('soulflare-'+room,{reliable:true})));},
+    begin(){if(!host||!peer||started)return false;if(!conns.size){status('Waiting for at least one pilot.');return false;} const n=new Uint32Array(1);crypto.getRandomValues(n);started=true;broadcast({t:'start',seed:n[0]});onStart(n[0]);return true;},
+    progress(score){if(!peer||!started)return;const now=performance.now();if(now-lastSend<500)return;lastSend=now;score=Math.max(0,Number(score)||0);if(host){scores[peer.id]=score;onScores(scores);broadcast({t:'scores',scores});}else broadcast({t:'score',score});},
+    close,
+    get room(){return room;},
+    get connected(){return conns.size;},
+    get isHost(){return host;},
+    get active(){return !!peer;}
+  };
+}
+
+import * as THREE from '/lib/vendor/three/0.180.0/build/three.webgpu.js';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+
+const $=id=>document.getElementById(id), screens=[...document.querySelectorAll('.screen')];
+const settings=Object.assign({invertX:false,invertY:false,audio:true},JSON.parse(localStorage.getItem('soulflare-settings')||'{}'));
+let sceneName='title', previous='title', selected=0, menuIdle=0, attract=false, game, visuals, renderer, last=0, lastProgress=0, finished=false, hubEnded=false, roomDigits='000000', digit=0, editing=false, raceScores={}, inputSnapshot={};
+const keys=new Set(), keyEdges=new Set(); let previousButtons=[],previousAxes=[0,0], navDelay=0;
+const audio={ctx:null, master:null, next:0, beat:0,
+ start(){if(!settings.audio)return; try {if(!this.ctx){this.ctx=new AudioContext();this.master=this.ctx.createGain();this.master.gain.value=.18;this.master.connect(this.ctx.destination);} if(this.ctx.state==='suspended')this.ctx.resume();}catch(e){}},
+ tone(freq,duration,type='square',volume=.1,slide=0){if(!this.ctx||!settings.audio||this.ctx.state!=='running')return;const t=this.ctx.currentTime,o=this.ctx.createOscillator(),g=this.ctx.createGain();o.type=type;o.frequency.setValueAtTime(Math.max(40,freq),t);if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(40,freq+slide),t+duration);g.gain.setValueAtTime(volume,t);g.gain.exponentialRampToValueAtTime(.001,t+duration);o.connect(g).connect(this.master);o.start(t);o.stop(t+duration);},
+ event(name){if(!settings.audio)return;const tones={shoot:[510,.045,'square',.035,-160],jump:[350,.12,'triangle',.08,300],dash:[180,.16,'sawtooth',.08,480],counter:[680,.15,'triangle',.13,500],hurt:[150,.2,'sawtooth',.12,-80],hit:[600,.045,'square',.04,-200],explode:[100,.3,'sawtooth',.13,-60],special:[240,.4,'sawtooth',.12,650],weapon:[500,.1,'triangle',.07,200],stage:[210,.35,'sawtooth',.08,350],win:[440,.6,'triangle',.1,440],death:[240,.6,'sawtooth',.1,-180]};if(tones[name])this.tone(...tones[name]);},
+ update(){if(!this.ctx||!settings.audio||!['game','title'].includes(sceneName))return;const t=this.ctx.currentTime;if(t<this.next)return;this.next=t+.16;const scale=[0,3,7,10,12,10,7,3,0,3,8,10,12,15,10,7];const n=scale[this.beat%16];this.tone(110*Math.pow(2,n/12),.12,'triangle',.055);if(this.beat%4===0)this.tone(55,.12,'square',.065,-20);if(this.beat%8===4)this.tone(185,.07,'sawtooth',.03,-120);this.beat++;},
+ stop(){if(this.ctx&&this.ctx.state==='running')this.ctx.suspend();}
+};
+function saveSettings(){localStorage.setItem('soulflare-settings',JSON.stringify(settings));$('xValue').textContent=settings.invertX?'INVERTED':'NORMAL';$('yValue').textContent=settings.invertY?'INVERTED':'NORMAL';$('audioValue').textContent=settings.audio?'ON':'OFF';if(!settings.audio)audio.stop();else audio.start();}
+function show(name){sceneName=name;screens.forEach(s=>s.classList.toggle('active',s.id===name));$('hud').style.display=name==='game'?'block':'none';$('attractLabel').classList.toggle('on',attract&&name==='game');selected=0;editing=false;paintSelection();const box=document.querySelector('#'+name+' .panel-box');if(box)box.scrollTop=0;}
+function paintSelection(){const buttons=[...document.querySelectorAll('#'+sceneName+' .menu button')];if(!buttons.length)return;selected=(selected+buttons.length)%buttons.length;buttons.forEach((b,i)=>b.classList.toggle('selected',i===selected));if(buttons.length>1)buttons[selected].scrollIntoView({block:'nearest'});}
+function startGame(isAttract=false){if(!game)return;attract=isAttract;finished=false;game.setAttract(isAttract);game.reset();show('game');audio.start();}
+function stopAttract(){attract=false;game.setAttract(false);show('title');menuIdle=0;keyEdges.clear();}
+function finish(){if(finished)return;finished=true;const s=game.state;multiplayer.progress(s.score);if(AIHub.active)AIHub.result({score:s.score});$('resultTitle').textContent=s.status==='won'?'The sun remembers.':'Signal lost.';$('resultText').textContent=(s.status==='won'?'The last voice falls silent. A new dawn has teeth.':'The empire keeps its silence. Rise and answer again.')+'  SCORE '+String(Math.floor(s.score)).padStart(6,'0');$('raceScores').textContent=Object.keys(raceScores).length?'RACE RECORDS  '+Object.values(raceScores).map(n=>Math.floor(n)).join('  /  '):'';show('result');}
+const multiplayer=createMultiplayer({onStatus:text=>{$('onlineStatus').textContent=text;if(multiplayer.room) $('roomCode').textContent=multiplayer.room;},onStart:()=>startGame(false),onScores:s=>raceScores=s});
+function back(){if(sceneName==='settings'||sceneName==='how'){show(previous);}else if(sceneName==='online'){multiplayer.close();show('title');}else show('title');}
+function activate(action){audio.start();audio.tone(600,.07,'triangle',.07,100);menuIdle=0;switch(action){case 'start':multiplayer.close();startGame();break;case 'how':case 'settings':previous=sceneName;show(action);break;case 'about':case 'online':show(action);break;case 'back':back();break;case 'resume':show('game');break;case 'quit':multiplayer.close();attract=false;show('title');break;case 'invertX':settings.invertX=!settings.invertX;saveSettings();break;case 'invertY':settings.invertY=!settings.invertY;saveSettings();break;case 'audio':settings.audio=!settings.audio;saveSettings();break;case 'host':multiplayer.host();break;case 'code':editing=!editing;updateCode();break;case 'join':multiplayer.join(roomDigits);break;case 'begin':multiplayer.begin();break;}}
+function updateCode(){ $('roomCode').textContent=editing?roomDigits.slice(0,digit)+'['+roomDigits[digit]+']'+roomDigits.slice(digit+1):roomDigits; }
+function moveMenu(dx,dy){if(sceneName==='game')return;if((sceneName==='about'||sceneName==='how')&&dy){document.querySelector('#'+sceneName+' .panel-box').scrollBy({top:dy*110,behavior:'smooth'});return;}if(sceneName==='online'&&editing){if(dx)digit=(digit+dx+6)%6;if(dy){const a=roomDigits.split('');a[digit]=String((Number(a[digit])+dy+10)%10);roomDigits=a.join('');}updateCode();return;}if(dy){selected+=dy;paintSelection();audio.tone(350,.04,'triangle',.04,60);}}
+document.querySelectorAll('button[data-action]').forEach(b=>{b.addEventListener('click',()=>activate(b.dataset.action));b.addEventListener('pointerenter',()=>{const bs=[...document.querySelectorAll('#'+sceneName+' .menu button')];if(bs.includes(b)){selected=bs.indexOf(b);paintSelection();}});});
+$('touchSettings').onclick=()=>{$('touch').style.display='none';previous='title';show('settings');};
+window.addEventListener('keydown',e=>{if(!keys.has(e.code))keyEdges.add(e.code);keys.add(e.code);if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','Tab'].includes(e.code))e.preventDefault();if(attract){stopAttract();return;}menuIdle=0;audio.start();});
+window.addEventListener('keyup',e=>keys.delete(e.code));window.addEventListener('pointerdown',()=>{if(attract)stopAttract();menuIdle=0;audio.start();});
+function readInput(dt){const pad=[...navigator.getGamepads()].find(Boolean), btn=i=>!!pad?.buttons[i]?.pressed, edge=i=>btn(i)&&!previousButtons[i], k=(...codes)=>codes.some(c=>keys.has(c)), ke=(...codes)=>codes.some(c=>keyEdges.has(c));let x=(k('ArrowRight','KeyD')?1:0)-(k('ArrowLeft','KeyA')?1:0),y=(k('ArrowUp','KeyW')?1:0)-(k('ArrowDown','KeyS')?1:0);if(pad){let px=pad.axes[0]||0,py=pad.axes[1]||0;if(Math.abs(px)>.2)x=px;if(Math.abs(py)>.2)y=-py;if(btn(14))x=-1;if(btn(15))x=1;if(btn(12))y=1;if(btn(13))y=-1;}if(settings.invertX)x=-x;if(settings.invertY)y=-y;
+ const anyPad=pad&&(pad.buttons.some((b,i)=>b.pressed&&!previousButtons[i])||Math.abs(x-previousAxes[0])>.5||Math.abs(y-previousAxes[1])>.5);if(anyPad){menuIdle=0;audio.start();if(attract){stopAttract();previousButtons=pad.buttons.map(b=>b.pressed);keyEdges.clear();return {};}}
+ if(sceneName==='game'){if((ke('Escape')||edge(9))&&!btn(8)){if(AIHub.active){previous='game';show('settings');}else show('pause');} }
+ else {navDelay-=dt;const navY=y>.55?-1:y<-.55?1:0,navX=x>.55?1:x<-.55?-1:0;if((navY||navX)&&navDelay<=0){moveMenu(navX,navY);navDelay=.2;}if(ke('Enter','Space')||edge(0)){const b=document.querySelectorAll('#'+sceneName+' .menu button')[selected];if(b)activate(b.dataset.action);}if(ke('Escape','Backspace')||edge(1)){if(sceneName==='pause')show('game');else back();}}
+ const result={x,y,shoot:k('KeyJ')||btn(2),jump:k('KeyK','Space')||btn(0),dash:k('KeyL')||btn(1),counter:k('KeyI')||btn(3),lock:k('ShiftLeft','ShiftRight')||btn(4),weapon:k('KeyQ')||btn(5),special:k('KeyE')||btn(7)};previousButtons=pad?pad.buttons.map(b=>b.pressed):[];previousAxes=[x,y];keyEdges.clear();inputSnapshot=result;return result;}
+function onEvent(name,data){audio.event(name);if(visuals&&['hit','explode','dash','counter','special','hurt'].includes(name))visuals.burst(data.x,data.y,name==='hurt'?0xff405c:name==='special'?0x8affec:0xffa94e);}
+function hud(){let s=game.state,p=s.player;$('healthFill').style.width=(100*p.health/p.maxHealth)+'%';$('chargeFill').style.width=(100*p.energy/p.maxEnergy)+'%';$('weaponLabel').innerHTML=String(p.weapon+1).padStart(2,'0')+' <em>'+p.weaponName+'</em>';$('score').textContent=String(Math.floor(s.score)).padStart(6,'0');$('bossHud').style.display=s.boss?'block':'none';if(s.boss){$('bossName').textContent=s.boss.type==='warden'?'IRON PSALM / GATE WARDEN':'THE LAST VOICE / ORACLE';$('bossFill').style.width=(100*Math.max(0,s.boss.health)/s.boss.maxHealth)+'%';}const banner=$('stageBanner');banner.classList.toggle('show',s.messageTime>0);banner.querySelector('strong').textContent=s.message.split(' // ')[0];banner.querySelector('span').textContent=s.message.split(' // ')[1]||'SOULFLARE / COMBAT SYSTEM';}
+function loop(t){requestAnimationFrame(loop);const elapsed=(t-last)/1000||.016,dt=Math.min(.04,elapsed);last=t;const input=readInput(dt);audio.update();if(sceneName==='title'){menuIdle+=elapsed;if(menuIdle>=10)startGame(true);}if(sceneName==='game'&&!hubEnded&&(!AIHub.active||AIHub.time()>=0)){game.update(dt,input);if(attract&&game.state.status!=='playing'){game.reset();}else if(game.state.status!=='playing')finish();if(AIHub.active){AIHub.progress({score:game.state.score,label:game.state.stageName});if(AIHub.limitMs&&AIHub.time()>=AIHub.limitMs)finish();}if(multiplayer.active)multiplayer.progress(game.state.score);}if(game){visuals.update(game.state,dt);if(sceneName==='game')hud();}renderer.render(visuals.scene,visuals.camera);}
+async function init(){try{if(!navigator.gpu)throw Error('WebGPU is unavailable. Use a WebGPU-capable browser on a supported device.');const adapter=await navigator.gpu.requestAdapter();if(!adapter)throw Error('No WebGPU adapter was found.');await RAPIER.init();renderer=new THREE.WebGPURenderer({antialias:true});await renderer.init();if(!renderer.backend.isWebGPUBackend)throw Error('A WebGPU renderer could not be started.');renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));document.body.prepend(renderer.domElement);visuals=createVisuals(THREE,renderer);game=createGame({RAPIER,onEvent});window.addEventListener('resize',visuals.resize);saveSettings();paintSelection();AIHub.probe(()=>({scene:sceneName==='game'?'play':sceneName,menu:sceneName==='settings'||sceneName==='pause',world:game.state.time,input:{x:inputSnapshot.x||0,y:inputSnapshot.y||0,fire:!!inputSnapshot.shoot}}));AIHub.on('end',()=>{hubEnded=true;audio.stop();});const info=await AIHub.connect({mode:'parallel',seats:[1,4]});if(info&&AIHub.active){startGame();AIHub.ready();}requestAnimationFrame(loop);}catch(e){$('errorText').textContent=e.message||String(e);$('error').style.display='grid';if(window.AIHub)AIHub.fail(e.message||String(e));console.error(e);}}
+$('credits').innerHTML=`<p><b>SOURCE INFORMATION</b><br>Date: 2026-10-29 09:29 · Source: Alien Soldier<br>Tech: Three.js R180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio, PeerJS 1.5.5 / WebRTC, AI Hub Session 1.3.0.<br>Art: procedural cel-shaded geometry. Animation: procedural articulated motion. Audio: synthesized music and effects; no spoken voice. Online: AI Hub parallel score attack and standalone WebRTC score race.<br>Testing: lightweight headless checks. Environment: Codex CLI (headless); Linux; browser unknown. Model: OpenAI gpt-6.1-terra, reasoning effort ultra. Usage: unknown.</p><p><b>ENGINE FEEDBACK</b><br>Three.js makes procedural scenes approachable; WebGPU initialization and compatibility were the hardest parts. Combat, animation, and game flow were built from scratch. A clearer WebGPU-only initialization option would improve the engine. Wrong guess: Rapier descriptor method names. Removal or overhaul: WebGPU fallback behavior.</p><p><b>TESTING FEEDBACK</b><br>Testing caught three issues, one critical. Most helpful: real Rapier simulation. Least helpful: syntax checking alone.</p><p><b>PROMPT FEEDBACK</b><br>The strongest part was the clear creative and controller-first direction. The broad definition of a complete vertical slice was challenging; live multiplayer and physical controller testing would be the most valuable additional checks. Confusing: the exact boundary of the requested demo.</p>`;
+if(matchMedia('(pointer: coarse)').matches&&!matchMedia('(any-pointer: fine)').matches)$('touch').style.display='grid';
+init();
+</script></body></html>

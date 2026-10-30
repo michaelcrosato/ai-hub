@@ -1,0 +1,703 @@
+<!--
+GOOF TUFT — an original spiritual successor to Goof Troop
+
+SOURCE INFORMATION
+- Date: 2026-10-29 07:50
+- Source: Goof Troop
+- Tech: Three.js r180 (three/webgpu WebGPURenderer + TSL, WebGPU only, no fallback); Rapier 0.19.3 (@dimforge/rapier3d-compat) for physics; Gamepad API; Web Audio API; AI Hub session client 1.3.0; bundled with Bun 1.3; Three.js and Rapier load from the jsDelivr CDN through an import map
+- Art Direction: cel-shaded toon look: 4-step MeshToonMaterial ramp, inverted-hull ink outlines (TSL vertex extrusion), soft shadow map, pastel per-zone palettes, torch point lights in the fort and the deck
+- Animation: procedural rig animation (code-driven walk, carry, swing, dizzy and roll cycles on primitive-built rigs) with squash and stretch, hit-stop, camera shake and a particle pool
+- Audio: all code-written. Step-sequenced music (6 themes), synthesized sound effects (oscillators and noise), and Animalese-style gibberish voice acting (per-letter blips, 6 speaker voices). No audio files
+- Online: AI Hub Session Protocol v1, side-by-side (parallel) mode, 1-4 players: progress and result reporting, seeded loot deal, probe, time-up and end handling. No other networking. Local 2-player co-op: a second controller joins as Pip
+- Testing: lightweight and automated only: headless Chromium (Playwright) with WebGPU on SwiftShader, scripted mechanic checks, a fake DualSense for the gamepad path, and the AI Hub harness automatic check at 1 and 2 players
+- Environment: Claude Code CLI (headless); Linux (WSL2); browser unknown (tested in headless Chromium)
+- Model: Anthropic, claude-sonnet-5-5, reasoning effort medium
+- Usage: unknown (no token or cost counters were available in the session). Session time: about 45 minutes of wall clock, 07:15 to about 08:00
+
+TESTING FEEDBACK
+- Issues caught: 8 (gate glyphs colliding with crab and boss glyphs; attract AI dithering between targets; title menu covering the subtitle; empty HUD panels during intro; flipped test screenshots; no progress reports when the score was still 0; borderline pick-up reach; over-bright torch lights and wall tops matching the floor)
+- Critical / game-breaking: 2 (the glyph collision meant the boss and crabs never spawned; no progress reports failed the AI Hub check)
+- Most helpful test: the AI Hub harness automatic check, plus fast-forwarding the real simulation with the attract-mode AI through all four zones to the boss
+- Least helpful test: ordinary headless screenshots, because they show a blank WebGPU canvas
+
+ENGINE FEEDBACK
+- Liked most: Three.js WebGPU with TSL made cel shading cheap (MeshToonMaterial plus a TSL position node for outlines), and Rapier's kinematic character controller plus collision groups gave solid wall and block behavior for little code
+- Got stuck or guessed wrong: headless captures of a WebGPU canvas come out blank, so I rendered to a render target and read the pixels back. I also guessed wrong that gate letters and enemy letters could share one ASCII legend
+- Most important thing built by hand: the whole game layer: state machine, ASCII level loader, enemy AI and boss, carry and throw, hookshot, UI and menus, input mapping, and audio synthesis
+- Hardest part: getting Rapier interaction groups right so characters ignore thrown items but not kick blocks, and keeping dynamic boxes from snagging on floor seams (solved by merging colliders)
+- Overhaul or remove: Rapier compat's deprecated-init warning and its embedded-WASM packaging
+- One change: a built-in way to capture the WebGPU frame in headless runs
+
+PROMPT FEEDBACK
+- Liked most: a clear deliverable, the 10-foot controller-first framing, the inverted-axis toggle hint, and the attract-mode requirement
+- Confusing: the WebGPU-only, no-fallback rule next to the AI Hub guidance asking for a WebGL fallback (resolved with the hub:webgpu required meta); also the single-file rule next to CDN dependencies being allowed
+- Hardest thing: fitting a feature-complete vertical slice (4 zones, 5 enemy types, a boss, puzzles, co-op, attract mode, hub integration) into one pass
+- One test I wish I had run: a real-GPU headed run with a physical DualSense for a full 10-minute playthrough
+
+CONTROLS
+- Controller: left stick move, Cross grab/throw/read, Square kick, Triangle or R2 hookshot, Circle or R1 roll, Options pause. A second controller joins with Cross.
+- Keyboard: WASD move, Space grab/throw, F kick, E hookshot, Shift roll, Esc pause.
+
+Original characters, story, art and audio. Goof Troop is a trademark of its owners; this is an unaffiliated homage.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<title>Goof Tuft</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="8">
+<meta name="hub:session-goal" content="Most points: doubloons, pirates, zones cleared">
+<meta name="hub:session-howto" content="Move stick/WASD, grab+throw X/Space, kick Sq/F, hook Tri/E, roll O/Shift">
+<meta name="hub:webgpu" content="required">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "@dimforge/rapier3d-compat": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head>
+<body>
+<script type="module">
+import RAPIER2 from"@dimforge/rapier3d-compat";import*as THREE from"three/webgpu";import{positionLocal,normalLocal}from"three/tsl";var V3=THREE.Vector3,OUTLINE_COLOR=1708582,gradient=null;function ramp(){if(gradient)return gradient;let d=new Uint8Array([70,135,205,255]);return gradient=new THREE.DataTexture(d,4,1,THREE.RedFormat),gradient.minFilter=gradient.magFilter=THREE.NearestFilter,gradient.needsUpdate=!0,gradient}var matCache=new Map;function toon(color,opts={}){let key=color+"|"+(opts.emissive||0)+"|"+(opts.opacity||1);if(matCache.has(key))return matCache.get(key);let m=new THREE.MeshToonMaterial({color,gradientMap:ramp(),emissive:opts.emissive||0});if(opts.opacity)m.transparent=!0,m.opacity=opts.opacity;return matCache.set(key,m),m}var outlineMats=new Map;function outlineMat(w){if(outlineMats.has(w))return outlineMats.get(w);let m=new THREE.MeshBasicNodeMaterial({color:OUTLINE_COLOR,side:THREE.BackSide});return m.positionNode=positionLocal.add(normalLocal.mul(w)),outlineMats.set(w,m),m}var flashMat=new THREE.MeshBasicMaterial({color:16777215});function basic(color,opacity=1){return new THREE.MeshBasicMaterial({color,transparent:opacity<1,opacity,depthWrite:opacity>=1})}function mesh(geo,color,o={}){let m=new THREE.Mesh(geo,o.mat||toon(color,o));if(m.castShadow=o.shadow!==!1,m.receiveShadow=o.receive!==!1,o.outline!==!1){let ol=new THREE.Mesh(geo,outlineMat(o.ow||0.035));ol.userData.outline=!0,m.add(ol)}if(o.pos)m.position.set(...o.pos);if(o.rot)m.rotation.set(...o.rot);if(o.scale)m.scale.set(...o.scale);return m}var geoCache={},G={box:(w,h,d)=>geoCache["b"+w+h+d]||(geoCache["b"+w+h+d]=new THREE.BoxGeometry(w,h,d)),sph:(r,s=14)=>geoCache["s"+r+s]||(geoCache["s"+r+s]=new THREE.SphereGeometry(r,s,Math.max(6,s-4))),cyl:(rt,rb,h,s=14)=>geoCache["c"+rt+rb+h+s]||(geoCache["c"+rt+rb+h+s]=new THREE.CylinderGeometry(rt,rb,h,s)),cone:(r,h,s=10)=>geoCache["n"+r+h+s]||(geoCache["n"+r+h+s]=new THREE.ConeGeometry(r,h,s)),tor:(r,t)=>geoCache["t"+r+t]||(geoCache["t"+r+t]=new THREE.TorusGeometry(r,t,8,16))};async function initGfx(canvas){if(!navigator.gpu)throw Error("WebGPU is not available in this browser.");let renderer=new THREE.WebGPURenderer({canvas,antialias:!0});await renderer.init(),renderer.setPixelRatio(Math.min(devicePixelRatio||1,2)),renderer.shadowMap.enabled=!0,renderer.shadowMap.type=THREE.PCFSoftShadowMap;let scene=new THREE.Scene,camera=new THREE.PerspectiveCamera(38,1,0.5,200),hemi=new THREE.HemisphereLight(13625599,6969928,1.1);scene.add(hemi);let sun=new THREE.DirectionalLight(16773328,2.3);sun.castShadow=!0,sun.shadow.mapSize.set(2048,2048);let sc=sun.shadow.camera;sc.left=-26,sc.right=26,sc.top=20,sc.bottom=-20,sc.near=1,sc.far=90,sun.shadow.bias=-0.0004,sun.shadow.normalBias=0.03,scene.add(sun),scene.add(sun.target);let resize=()=>{let w=innerWidth,h=innerHeight;renderer.setSize(w,h,!1),camera.aspect=w/h,camera.fov=w/h<1.4?38+(1.4-w/h)*22:38,camera.updateProjectionMatrix()};return addEventListener("resize",resize),resize(),{renderer,scene,camera,sun,hemi}}class Rig{constructor(root){this.root=root,this.meshes=[],this.flashing=!1,this.t=Math.random()*10,this.stretch=1}reg(m){return m.userData.orig=m.material,this.meshes.push(m),m}flash(on){if(on===this.flashing)return;this.flashing=on;for(let m of this.meshes)m.material=on?flashMat:m.userData.orig}}function makeHumanoid(o){let root=new THREE.Group,rig=new Rig(root),L=o.lanky||1,S=o.scale||1,belly=o.belly||1,body=new THREE.Group;root.add(body),rig.body=body;let legLen=0.85*L,hips=new THREE.Group;hips.position.y=legLen,body.add(hips),rig.legs=[];for(let sx of[-1,1]){let pivot=new THREE.Group;pivot.position.set(sx*0.17,legLen,0),body.add(pivot),pivot.add(rig.reg(mesh(G.cyl(0.11,0.1,legLen,8),o.pants,{pos:[0,-legLen/2,0]}))),pivot.add(rig.reg(mesh(G.box(0.26,0.14,0.4),3877408,{pos:[0,-legLen+0.07,0.07]}))),rig.legs.push(pivot)}let torsoH=0.8*L,torso=rig.reg(mesh(G.cyl(0.3*belly,0.34*belly,torsoH,12),o.shirt,{pos:[0,legLen+torsoH/2,0]}));if(body.add(torso),rig.torso=torso,o.stripes)for(let i=0;i<3;i++)body.add(rig.reg(mesh(G.cyl(0.345*belly,0.345*belly,0.08,12),o.stripes,{pos:[0,legLen+0.2+i*0.22*L,0],outline:!1})));rig.arms=[];let shY=legLen+torsoH-0.12;for(let sx of[-1,1]){let pivot=new THREE.Group;if(pivot.position.set(sx*0.4*belly,shY,0),body.add(pivot),pivot.add(rig.reg(mesh(G.cyl(0.085,0.075,0.7*L,8),o.shirt,{pos:[0,-0.3*L,0]}))),pivot.add(rig.reg(mesh(G.sph(0.11,8),o.skin,{pos:[0,-0.68*L,0]}))),o.hook&&sx===1)pivot.add(rig.reg(mesh(G.cone(0.09,0.3,6),12567756,{pos:[0,-0.85*L,0.05],rot:[Math.PI,0,0]})));rig.arms.push(pivot)}let headY=legLen+torsoH+0.38,head=new THREE.Group;head.position.y=headY,body.add(head),rig.head=head,head.add(rig.reg(mesh(G.sph(0.34,16),o.skin))),head.add(rig.reg(mesh(G.sph(0.14,10),o.nose||15245434,{pos:[0,-0.04,0.34],scale:[1,0.9,1.3]})));for(let sx of[-1,1])if(head.add(mesh(G.sph(0.07,8),16777215,{pos:[sx*0.14,0.1,0.28],outline:!1})),head.add(mesh(G.sph(0.035,6),1118481,{pos:[sx*0.14,0.1,0.34],outline:!1})),o.ears)head.add(rig.reg(mesh(G.box(0.1,0.45,0.2),o.ears,{pos:[sx*0.34,-0.12,0],rot:[0,0,sx*0.2]})));switch(o.hat){case"tuft":for(let i=-1;i<=1;i++)head.add(rig.reg(mesh(G.cone(0.06,0.34,6),o.hair||15773744,{pos:[i*0.1,0.42,0],rot:[0,0,-i*0.35]})));break;case"cap":head.add(rig.reg(mesh(G.sph(0.35,12),o.hatColor||14170682,{pos:[0,0.1,-0.02],scale:[1,0.7,1]}))),head.add(rig.reg(mesh(G.box(0.4,0.05,0.3),o.hatColor||14170682,{pos:[0,0.12,0.38]})));break;case"bandana":head.add(rig.reg(mesh(G.cyl(0.355,0.355,0.14,12),o.hatColor||14170682,{pos:[0,0.2,0]}))),head.add(rig.reg(mesh(G.box(0.14,0.1,0.3),o.hatColor||14170682,{pos:[0.28,0.12,-0.3],rot:[0,0.5,0]})));break;case"pirate":head.add(rig.reg(mesh(G.cone(0.5,0.35,3),o.hatColor||2236979,{pos:[0,0.38,0],rot:[0,Math.PI/2,0],scale:[1.3,1,0.8]})));break;case"captain":head.add(rig.reg(mesh(G.cyl(0.5,0.62,0.14,14),2760522,{pos:[0,0.3,0]}))),head.add(rig.reg(mesh(G.cyl(0.36,0.42,0.45,14),2760522,{pos:[0,0.55,0]}))),head.add(rig.reg(mesh(G.cone(0.08,0.7,6),16735866,{pos:[0.3,0.8,0],rot:[0,0,-0.8]})));break;default:break}return root.scale.setScalar(S),rig.height=(headY+0.6)*S,rig.pose=(dt,st)=>{rig.t+=dt*(1+st.speed*9);let w=Math.sin(rig.t*1.4)*st.speed;if(rig.legs[0].rotation.x=w*0.9,rig.legs[1].rotation.x=-w*0.9,st.carry)rig.arms[0].rotation.set(-2.7,0,0.15),rig.arms[1].rotation.set(-2.7,0,-0.15);else if(st.swing>0)rig.arms[0].rotation.set(-2.2+(1-st.swing)*3.4,0,0),rig.arms[1].rotation.set(-2.2+(1-st.swing)*3.4,0,0);else if(st.windup>0)rig.arms[0].rotation.set(-2.6,0,0),rig.arms[1].rotation.set(-2.6,0,0);else rig.arms[0].rotation.set(-w*0.8,0,0.1),rig.arms[1].rotation.set(w*0.8,0,-0.1);let bob=Math.abs(Math.sin(rig.t*1.4))*0.07*st.speed,sq=st.squash||0;body.position.y=bob,body.scale.set(1+sq*0.25,1-sq*0.3,1+sq*0.25),body.rotation.z=st.dizzy?Math.sin(rig.t*2.5)*0.25:st.lean||0,body.rotation.x=st.roll?rig.t*2:st.tilt||0,rig.head.rotation.z=st.dizzy?Math.sin(rig.t*3)*0.4:0,root.visible=!(st.blink&&Math.floor(performance.now()/70)%2)},rig}function makeCrab(){let root=new THREE.Group,rig=new Rig(root);rig.body=root;let shell=rig.reg(mesh(G.sph(0.55,14),14831674,{pos:[0,0.4,0],scale:[1.3,0.7,1]}));root.add(shell);for(let sx of[-1,1]){root.add(mesh(G.sph(0.08,8),16777215,{pos:[sx*0.25,0.85,0.45],outline:!1})),root.add(mesh(G.sph(0.04,6),0,{pos:[sx*0.25,0.87,0.52],outline:!1}));let claw=rig.reg(mesh(G.sph(0.25,10),15886922,{pos:[sx*0.85,0.45,0.4],scale:[1,0.8,1.3]}));root.add(claw),claw.add(rig.reg(mesh(G.box(0.08,0.2,0.3),1708582,{pos:[0,0.1,0.25],outline:!1})));for(let i=0;i<3;i++)root.add(rig.reg(mesh(G.cyl(0.04,0.04,0.5,5),12729386,{pos:[sx*0.7,0.2,-0.3+i*0.3],rot:[0,0,sx*1.1]})))}return rig.height=1.2,rig.pose=(dt,st)=>{rig.t+=dt*(1+st.speed*14),root.position.y=Math.abs(Math.sin(rig.t*2))*0.08*st.speed,root.children[0].rotation.z=st.dizzy?Math.sin(rig.t*3)*0.3:0},rig}function makeParrot(){let root=new THREE.Group,rig=new Rig(root);rig.body=root,rig.body2=rig.reg(mesh(G.sph(0.4,12),3523690,{scale:[0.9,1,1.2]})),root.add(rig.body2);let head=rig.reg(mesh(G.sph(0.25,10),16765498,{pos:[0,0.3,0.4]}));root.add(head),root.add(rig.reg(mesh(G.cone(0.1,0.25,6),16742954,{pos:[0,0.27,0.65],rot:[Math.PI/2,0,0]}))),rig.wings=[];for(let sx of[-1,1]){let p=new THREE.Group;p.position.set(sx*0.3,0.1,0),root.add(p),p.add(rig.reg(mesh(G.box(0.9,0.08,0.5),sx>0?2789375:16730714,{pos:[sx*0.45,0,0]}))),rig.wings.push(p)}return root.add(rig.reg(mesh(G.box(0.15,0.06,0.6),16730714,{pos:[0,-0.05,-0.55]}))),rig.height=1,rig.pose=(dt,st)=>{rig.t+=dt*12;let f=st.grounded?0:Math.sin(rig.t*2)*0.9;rig.wings[0].rotation.z=f,rig.wings[1].rotation.z=-f,root.rotation.z=st.dizzy?Math.sin(rig.t)*0.4:0},rig}function makeCannon(){let root=new THREE.Group,rig=new Rig(root);rig.body=root,root.add(rig.reg(mesh(G.box(1.1,0.3,1.5),7031340,{pos:[0,0.4,0]})));for(let sx of[-1,1])root.add(rig.reg(mesh(G.cyl(0.4,0.4,0.2,12),4862752,{pos:[sx*0.6,0.4,0],rot:[0,0,Math.PI/2]})));return rig.barrel=rig.reg(mesh(G.cyl(0.3,0.4,1.5,12),3159100,{pos:[0,0.85,0.3],rot:[Math.PI/2,0,0]})),root.add(rig.barrel),rig.height=1.5,rig}var prop={pot(){let g=new THREE.Group;return g.add(mesh(G.sph(0.42,12),13792826,{pos:[0,0.45,0],scale:[1,1.05,1]})),g.add(mesh(G.cyl(0.24,0.3,0.2,12),11886635,{pos:[0,0.92,0]})),g.add(mesh(G.tor(0.3,0.04),15777888,{pos:[0,0.6,0],rot:[Math.PI/2,0,0],outline:!1})),g},barrel(){let g=new THREE.Group;g.add(mesh(G.cyl(0.42,0.42,1,14),10117940));for(let y of[-0.28,0.28])g.add(mesh(G.cyl(0.435,0.435,0.08,14),4869980,{pos:[0,y,0],outline:!1}));return g},bomb(){let g=new THREE.Group;g.add(mesh(G.sph(0.38,14),2830138,{pos:[0,0.38,0]})),g.add(mesh(G.cyl(0.07,0.09,0.14,8),5593702,{pos:[0,0.78,0]}));let sp=mesh(G.sph(0.09,6),16756784,{pos:[0,0.98,0],outline:!1,mat:new THREE.MeshBasicMaterial({color:16756784})});return g.add(sp),g.userData.spark=sp,g},block(){let g=new THREE.Group;g.add(mesh(G.box(1.7,1.7,1.7),12167564));for(let s of[-1,1])g.add(mesh(G.box(1.2,1.2,0.05),9338468,{pos:[0,0,s*0.86],outline:!1}));return g.add(mesh(G.box(0.05,1.2,1.2),9338468,{pos:[0.86,0,0],outline:!1})),g.add(mesh(G.box(0.05,1.2,1.2),9338468,{pos:[-0.86,0,0],outline:!1})),g},coin(){let g=new THREE.Group,c=mesh(G.cyl(0.32,0.32,0.08,16),16763176,{rot:[Math.PI/2,0,0],pos:[0,0.8,0]});return c.add(mesh(G.cyl(0.2,0.2,0.1,12),16769658,{outline:!1})),g.add(c),g.userData.spin=c,g},pudding(){let g=new THREE.Group;return g.add(mesh(G.cyl(0.4,0.28,0.5,14),15975514,{pos:[0,0.55,0]})),g.add(mesh(G.sph(0.4,12),16773312,{pos:[0,0.82,0],scale:[1,0.55,1]})),g.add(mesh(G.sph(0.12,8),15212602,{pos:[0,1.08,0]})),g},key(){let g=new THREE.Group,k=new THREE.Group;return k.position.y=0.9,k.add(mesh(G.tor(0.2,0.06),16765498,{pos:[0,0.25,0]})),k.add(mesh(G.cyl(0.05,0.05,0.6,8),16765498)),k.add(mesh(G.box(0.2,0.08,0.06),16765498,{pos:[0.1,-0.2,0]})),g.add(k),g.userData.spin=k,g},plate(color=5222655){let g=new THREE.Group;g.add(mesh(G.box(1.5,0.12,1.5),6709338,{pos:[0,0.06,0]}));let top=mesh(G.box(1.1,0.1,1.1),color,{pos:[0,0.14,0],outline:!1});return g.add(top),g.userData.top=top,g},gate(color=5222655){let g=new THREE.Group;for(let i=-2;i<=2;i++)g.add(mesh(G.cyl(0.08,0.08,2.6,8),5922668,{pos:[i*0.36,1.3,0]}));return g.add(mesh(G.box(2,0.16,0.2),color,{pos:[0,2.3,0]})),g.add(mesh(G.box(2,0.16,0.2),color,{pos:[0,0.5,0]})),g},door(){let g=new THREE.Group;return g.add(mesh(G.box(2,2.8,0.7),7227946,{pos:[0,1.4,0]})),g.add(mesh(G.box(0.5,0.5,0.2),16765498,{pos:[0,1.4,0.4]})),g.add(mesh(G.cyl(0.07,0.07,0.3,8),2236962,{pos:[0,1.4,0.52],rot:[Math.PI/2,0,0],outline:!1})),g},post(){let g=new THREE.Group;g.add(mesh(G.cyl(0.18,0.24,1.8,10),8016432,{pos:[0,0.9,0]}));let r=mesh(G.tor(0.3,0.07),16765498,{pos:[0,1.9,0]});return g.add(r),g.userData.ring=r,g},sign(){let g=new THREE.Group;return g.add(mesh(G.cyl(0.08,0.1,1.5,8),8016432,{pos:[0,0.75,0]})),g.add(mesh(G.box(1.2,0.8,0.12),15124874,{pos:[0,1.55,0]})),g.add(mesh(G.box(0.8,0.1,0.14),9067050,{pos:[0,1.7,0],outline:!1})),g.add(mesh(G.box(0.6,0.1,0.14),9067050,{pos:[0,1.45,0],outline:!1})),g},flag(){let g=new THREE.Group;g.add(mesh(G.cyl(0.06,0.06,2.2,6),3549,{pos:[0,1.1,0]}));let f=mesh(G.box(0.9,0.55,0.05),8947848,{pos:[0.45,1.9,0]});return g.add(f),g.userData.flag=f,g},exit(){let g=new THREE.Group,r=mesh(G.tor(0.9,0.12),7008416,{pos:[0,0.15,0],rot:[Math.PI/2,0,0],outline:!1,mat:basic(7008416,0.8)});g.add(r);let a=mesh(G.cone(0.4,0.8,4),7008416,{pos:[0,1.6,0],rot:[Math.PI,0,0],outline:!1,mat:basic(7008416,0.9)});return g.add(a),g.userData.arrow=a,g.userData.ring=r,g},crate(){let g=new THREE.Group;return g.add(mesh(G.box(1.6,1.4,1.6),9067050,{pos:[0,0.7,0]})),g.add(mesh(G.box(1.7,0.15,1.7),5913114,{pos:[0,1.4,0]})),g.add(mesh(G.box(0.3,0.3,1.65),14065994,{pos:[0,0.7,0],outline:!1})),g},torch(color=16752704){let g=new THREE.Group;return g.add(mesh(G.cyl(0.08,0.1,1,6),5913114,{pos:[0,0.5,0]})),g.add(mesh(G.sph(0.2,8),color,{pos:[0,1.1,0],outline:!1,mat:basic(color)})),g},palm(){let g=new THREE.Group;g.add(mesh(G.cyl(0.18,0.28,3.4,8),10119738,{pos:[0,1.7,0],rot:[0,0,0.12]}));for(let i=0;i<6;i++){let a=i/6*Math.PI*2;g.add(mesh(G.cone(0.35,2.2,4),3122778,{pos:[Math.cos(a)*0.9+0.2,3.5,Math.sin(a)*0.9],rot:[Math.sin(a)*1.2,0,-Math.cos(a)*1.2],scale:[1,1,0.25]}))}return g}};class Particles{constructor(scene,n=220){this.list=[];let g=G.sph(0.5,6);for(let i=0;i<n;i++){let m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:16777215,transparent:!0}));m.visible=!1,scene.add(m),this.list.push({m,life:0,vel:new V3,grav:0,size:1,max:1,shrink:!0})}this.cursor=0}emit(pos,o={}){let n=o.n||6;for(let i=0;i<n;i++){let p=this.list[this.cursor++%this.list.length],sp=o.speed||4,a=Math.random()*Math.PI*2,up=o.up===void 0?3:o.up;p.vel.set(Math.cos(a)*sp*Math.random(),up*(0.4+Math.random()),Math.sin(a)*sp*Math.random()),p.m.position.copy(pos),p.m.material.color.set(Array.isArray(o.color)?o.color[i%o.color.length]:o.color||16777215),p.m.material.opacity=1,p.size=(o.size||0.2)*(0.7+Math.random()*0.6),p.grav=o.grav===void 0?12:o.grav,p.max=p.life=(o.life||0.6)*(0.7+Math.random()*0.6),p.m.visible=!0,p.m.scale.setScalar(p.size)}}update(dt){for(let p of this.list){if(p.life<=0)continue;if(p.life-=dt,p.life<=0){p.m.visible=!1;continue}if(p.vel.y-=p.grav*dt,p.m.position.addScaledVector(p.vel,dt),p.m.position.y<0.05&&p.grav)p.m.position.y=0.05,p.vel.y*=-0.3,p.vel.x*=0.7,p.vel.z*=0.7;let k=p.life/p.max;p.m.scale.setScalar(p.size*(0.3+k*0.7)),p.m.material.opacity=Math.min(1,k*2)}}}import RAPIER from"@dimforge/rapier3d-compat";var TILE=2,ZONES=[{id:"beach",name:"Pudding Beach",music:"beach",sky:9427199,floor:[15784352,15124618],wall:13081194,cap:16181181,water:3844328,deco:"palm",cam:0.85,objective:"Beat the pirates on the beach.",goal:"clear",map:["######################","#@...T....#..c...c...#","#....p....#.....S....#","#.........#..........#","#.S.......#....r.....#","#.........a..........#","#...K.....#.........X#","#.........#..........#","#..1......#...p..u...#","#.........#..........#","#.........#.r........#","#....c....#.S....c...#","######################"],signs:[{who:"sign",lines:["Welcome to Pudding Beach! Press the grab button next to a pot to pick it up.","Press it again to THROW. Pirates hate flying pottery. Who doesn't?","Kick the stone block (square) onto the blue plate to open the gate."]}]},{id:"hollow",name:"Hookshot Hollow",music:"hollow",sky:8374432,floor:[8374138,7321706],wall:5204546,cap:10475146,water:2789288,pit:659480,deco:"palm",cam:0.85,objective:"Cross the chasm, find the rusty key, unlock the door.",goal:"door",map:["########################","#@...T...~~~.h....#.c.c#","#........~~~......#....#","#...S....~~~.....C#....#","#........~~~......#....#","#..p.....~~~..V...#....#","#......K..~.......L..X.#","#........~~~......#....#","#........~~~.....S#....#","#..p.....~~~..u...#....#","#........~~~.h....#....#","#...c....~~~...c.k#.C..#","########################"],signs:[{who:"sign",lines:["Big gap ahead! Press the hook button to fling your hookshot at a golden ring-post and zip across.","The hookshot also yanks pirates, parrots and loot toward you. Parrots can only be knocked down that way.","Or kick that block into the narrow gap. Pits swallow blocks and become bridges!"]}]},{id:"fort",name:"Fort Fiasco",music:"fort",sky:4932720,floor:[12038344,11051196],wall:6972552,cap:14078192,water:2105402,deco:"torch",cam:0.85,objective:"Open both gates. Mind the cannons!",goal:"gates",map:["##########################","#c.c.c.c.u#........#..c..#","#.c.c.c.c.#........#.....#","#####%#####.......N#..C..#","#...S.....#........#.....#","#.@..p..K.#...r....#..V..#","#.T.......a......2.b..X..#","#.....S...#........#.....#","#.......1.#........#..C..#","#.........#.......N#.....#","#.p.....o.#........#..c..#","#.........#...u....#.....#","##########################"],signs:[{who:"sign",lines:["Bomb pedestals grow fresh bombs. Grab one and throw it: BOOM. Cracked walls hide treasure.","Cannon pirates fire on sight. Kick a cannonball (square) and it flies right back at them!","A barrel on a plate holds it down just as well as you do."]}]},{id:"deck",name:"Clammy's Deck",music:"boss",sky:2762832,floor:[12814928,11828036],wall:5978658,cap:14725240,water:1052714,deco:"torch",cam:1.2,objective:"Defeat Captain Clammy and rescue the pudding!",goal:"boss",map:["####################","#..................#","#..Y............Y..#","#..................#","#....#........#....#","#..................#","#........B.........#","#..................#","#....#........#....#","#..................#","#..r...........r...#","#........@.........#","#..................#","####################"],signs:[]}],STORY={intro:[{who:"gran",text:"Barnaby! Pip! Captain Clammy and his crew stole my Great Big Wobbly Pudding!"},{who:"barnaby",text:"Gwarsh... I mean, ahoy! Fear not, Gran. Pip and I will fetch it back!"},{who:"pip",text:"Dad, you can't even fetch the mail without tripping over the mailbox."},{who:"barnaby",text:"That mailbox came out of nowhere, Pip. Now onward, to Pudding Beach!"}],zoneIntro:[[{who:"pip",text:"Look, Dad. Pirates! Throw something at them!"},{who:"barnaby",text:"Aha! A pot! Nobody suspects the pot."}],[{who:"barnaby",text:"A chasm! My old nemesis, the Floor Being Missing."},{who:"pip",text:"Use your hookshot, Dad. The shiny rings, remember?"}],[{who:"pip",text:"Cannons, Dad. Real ones."},{who:"barnaby",text:"Don't worry. I'll just... duck. Mostly."}],[{who:"clammy",text:"ARRR HARR HARR! Ye found me ship! Yer pudding be MINE, ye landlubbers!"},{who:"barnaby",text:"Not so fast, Captain Clammy. That pudding is for Sunday dinner!"}]],bossHalf:[{who:"clammy",text:"Grr! Bring out the cannons, me hearties!"}],bossLow:[{who:"clammy",text:"Ye'll not take me last scoop o' pudding! SCALLYWAGS! Assemble!"}],outro:[{who:"clammy",text:"Blimey... beaten by a pot-flinging bean pole. Take yer pudding."},{who:"gran",text:"Oh my wobbly dumplings! You did it, my darlings!"},{who:"pip",text:"Dad, you only tripped nine times. That's a record!"},{who:"barnaby",text:"Ten, if you count the walk home. But who is counting? Pudding time!"}],taunts:{scallywag:["Yarrr!","Arr arr!","Walk the plank!"],crab:["Snip snip!","Clack clack!"]},hints:["Tip: the block-kick (square) works on stunned pirates too!","Tip: barrels are heavy, but they hit like a sack of anvils.","Tip: the roll (circle) makes you hard to hit. Pirates hate that.","Tip: hookshot a parrot to knock it out of the sky."]};function validateZones(){let bad=[];for(let z of ZONES){let w=z.map[0].length;z.map.forEach((r,i)=>{if(r.length!==w)bad.push(`${z.id} row ${i} is ${r.length}, expected ${w}`)})}return bad}var NOTE_IDX={c:0,d:2,e:4,f:5,g:7,a:9,b:11};function midi(tok){let m=/^([a-g])([#b]?)(\d)$/.exec(tok);if(!m)return null;let n=NOTE_IDX[m[1]]+(m[2]==="#"?1:m[2]==="b"?-1:0);return 12*(parseInt(m[3],10)+1)+n}var hz=(m)=>440*Math.pow(2,(m-69)/12),seq=(s)=>s.trim().split(/\s+/).map((t)=>t==="."||t==="-"?t:midi(t)),THEMES={title:{bpm:124,lead:"c5 . e5 . g5 . e5 c5 d5 . f5 . a5 . f5 d5 e5 . g5 . c6 . g5 e5 d5 . g5 - b5 g5 d5 .",bass:"c3 . g3 . c3 . g3 . f3 . c4 . f3 . c4 . c3 . g3 . c3 . g3 . g3 . d4 . g3 . d4 .",drums:"k.h.s.h.k.h.s.hh",wave:"square",bw:"triangle"},beach:{bpm:140,lead:"g4 . b4 d5 . d5 b4 . a4 . c5 e5 . e5 c5 . g4 . b4 d5 . g5 d5 b4 . a4 c5 e5 d5 c5 b4 a4 g4 .",bass:"g2 . d3 . g2 . d3 . a2 . e3 . a2 . e3 . g2 . d3 . g2 . d3 . d3 . a3 . d3 . a3 .",drums:"k.hhs.hhk.hhs.hh",wave:"triangle",bw:"square"},hollow:{bpm:108,lead:"a4 . c5 . e5 . d5 c5 b4 . d5 . g5 . f5 e5 a4 . c5 . e5 . a5 e5 d5 . c5 . b4 . a4 .",bass:"a2 . . a2 . . e3 . f2 . . f2 . . c3 . a2 . . a2 . . e3 . g2 . . g2 . . d3 .",drums:"k...s..hk.h.s..h",wave:"sine",bw:"triangle"},fort:{bpm:118,lead:"d4 . f4 a4 . a4 g4 f4 e4 . g4 bb4 . a4 g4 . d4 . f4 a4 d5 . c5 bb4 a4 . g4 . f4 e4 d4 .",bass:"d2 d2 . d3 d2 . d3 . bb1 bb1 . bb2 bb1 . bb2 . g1 g1 . g2 g1 . g2 . a1 a1 . a2 a1 . e2 .",drums:"k.ks.hk.k.ksk.hs",wave:"sawtooth",bw:"square"},boss:{bpm:150,lead:"e4 e4 g4 e4 b4 . a4 g4 e4 e4 g4 e4 d5 . b4 a4 f4 f4 a4 f4 c5 . b4 a4 g4 g4 b4 g4 e5 d5 b4 g4",bass:"e2 e2 e3 e2 e2 e3 e2 e3 f2 f2 f3 f2 f2 f3 f2 f3 g2 g2 g3 g2 g2 g3 g2 g3 b2 b2 b3 b2 b2 b3 b2 b3",drums:"kkhskkhskkhskhsh",wave:"sawtooth",bw:"sawtooth"},victory:{bpm:132,lead:"c5 e5 g5 c6 . g5 c6 . d5 f5 a5 d6 . a5 d6 . e5 g5 c6 e6 . c6 g5 e5 c6 . . . c6 . . .",bass:"c3 . c3 . g3 . g3 . d3 . d3 . a3 . a3 . c3 . e3 . g3 . e3 . c3 . . . c3 . . .",drums:"k.hhs.hhk.hhskkk",wave:"square",bw:"triangle"}};for(let t of Object.values(THEMES))t.leadN=seq(t.lead),t.bassN=seq(t.bass);var VOICES={barnaby:{pitch:150,spread:1,formant:900,wave:"sawtooth",ms:52},pip:{pitch:330,spread:1.2,formant:1500,wave:"triangle",ms:42},clammy:{pitch:85,spread:0.7,formant:500,wave:"square",ms:70},gran:{pitch:230,spread:0.8,formant:1100,wave:"triangle",ms:60},sign:{pitch:190,spread:0.5,formant:700,wave:"square",ms:48},crab:{pitch:520,spread:1.5,formant:2200,wave:"square",ms:34}};class AudioEngine{constructor(){this.ctx=null,this.vol={master:0.8,music:0.6,sfx:0.8,voice:0.8},this.theme=null,this.step=0,this.nextT=0,this.timer=null,this.muted=!1}init(){if(this.ctx)return;let AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;this.ctx=new AC;let c=this.ctx;this.master=c.createGain(),this.master.connect(c.destination);let comp=c.createDynamicsCompressor();comp.connect(this.master),this.musicG=c.createGain(),this.sfxG=c.createGain(),this.voiceG=c.createGain(),this.musicG.connect(comp),this.sfxG.connect(comp),this.voiceG.connect(comp);let n=c.sampleRate*1;this.noiseBuf=c.createBuffer(1,n,c.sampleRate);let d=this.noiseBuf.getChannelData(0);for(let i=0;i<n;i++)d[i]=Math.random()*2-1;this.applyVolumes()}resume(){if(this.init(),this.ctx&&this.ctx.state!=="running")this.ctx.resume().catch(()=>{});if(this.ctx&&this.pending){let n=this.pending;this.pending=null,this.music(n)}}applyVolumes(){if(!this.ctx)return;let m=this.muted?0:this.vol.master;this.master.gain.value=m,this.musicG.gain.value=this.vol.music*0.5,this.sfxG.gain.value=this.vol.sfx*0.9,this.voiceG.gain.value=this.vol.voice*0.7}setVolume(k,v){this.vol[k]=v,this.applyVolumes()}silence(){this.muted=!0,this.stopMusic(),this.applyVolumes()}tone(f,dur,type="square",vol=0.3,slide=0,dest=null,delay=0,attack=0.005){let c=this.ctx;if(!c)return;let t=c.currentTime+delay,o=c.createOscillator(),g=c.createGain();if(o.type=type,o.frequency.setValueAtTime(f,t),slide)o.frequency.exponentialRampToValueAtTime(Math.max(20,f*slide),t+dur);g.gain.setValueAtTime(0.0001,t),g.gain.exponentialRampToValueAtTime(vol,t+attack),g.gain.exponentialRampToValueAtTime(0.0001,t+dur),o.connect(g),g.connect(dest||this.sfxG),o.start(t),o.stop(t+dur+0.02)}noise(dur,vol=0.3,freq=3000,q=0.8,type="bandpass",dest=null,delay=0,sweep=0){let c=this.ctx;if(!c)return;let t=c.currentTime+delay,s=c.createBufferSource();s.buffer=this.noiseBuf,s.playbackRate.value=0.8+Math.random()*0.4;let f=c.createBiquadFilter();if(f.type=type,f.frequency.setValueAtTime(freq,t),f.Q.value=q,sweep)f.frequency.exponentialRampToValueAtTime(Math.max(40,freq*sweep),t+dur);let g=c.createGain();g.gain.setValueAtTime(vol,t),g.gain.exponentialRampToValueAtTime(0.0001,t+dur),s.connect(f),f.connect(g),g.connect(dest||this.sfxG),s.start(t,Math.random()*0.5),s.stop(t+dur+0.02)}sfx(name,pitch=1){if(!this.ctx||this.muted)return;let T=(f,d,ty,v,sl,dl)=>this.tone(f*pitch,d,ty,v,sl,null,dl||0);switch(name){case"step":this.noise(0.05,0.08,500+Math.random()*300,1,"lowpass");break;case"grab":T(300,0.09,"square",0.2,2),T(520,0.08,"square",0.18,1,0.07);break;case"throw":this.noise(0.18,0.25,1200,0.7,"bandpass",null,0,4),T(220,0.15,"triangle",0.2,2.4);break;case"hit":this.noise(0.12,0.4,900,0.6),T(160,0.14,"square",0.3,0.4);break;case"bonk":T(220,0.12,"triangle",0.35,0.5),T(660,0.07,"square",0.2,0.6,0.02);break;case"break":this.noise(0.3,0.5,1800,0.5,"highpass"),T(120,0.2,"sawtooth",0.2,0.3);break;case"coin":T(988,0.07,"square",0.2),T(1319,0.18,"square",0.2,1,0.07);break;case"heal":[523,659,784,1046].forEach((f,i)=>T(f,0.12,"triangle",0.25,1,i*0.07));break;case"hurt":T(400,0.3,"sawtooth",0.3,0.3),this.noise(0.2,0.3,700,1);break;case"kick":this.noise(0.1,0.35,400,1,"lowpass"),T(130,0.12,"square",0.3,0.5);break;case"hook":T(800,0.12,"sawtooth",0.12,2.5),this.noise(0.1,0.1,5000,2,"highpass");break;case"hookhit":T(1200,0.05,"square",0.2),T(300,0.15,"triangle",0.3,0.6,0.04);break;case"door":this.noise(0.5,0.35,220,1.5,"lowpass"),T(70,0.5,"sawtooth",0.2,0.7);break;case"plate":T(180,0.08,"square",0.3),T(360,0.14,"square",0.25,1,0.07);break;case"key":[880,1175,1760].forEach((f,i)=>T(f,0.1,"triangle",0.25,1,i*0.08));break;case"explode":this.noise(0.8,0.7,700,0.5,"lowpass",null,0,0.2),T(70,0.5,"sawtooth",0.4,0.3);break;case"fuse":this.noise(0.3,0.1,6000,3,"highpass");break;case"cannon":this.noise(0.4,0.6,500,0.5,"lowpass"),T(90,0.3,"square",0.4,0.4);break;case"dizzy":[600,500,600,500].forEach((f,i)=>T(f,0.09,"triangle",0.2,1,i*0.1));break;case"splash":this.noise(0.4,0.3,1500,0.5,"bandpass",null,0,0.3);break;case"boing":T(200,0.3,"sine",0.35,3);break;case"dash":this.noise(0.15,0.18,2500,1,"bandpass",null,0,0.3);break;case"menuMove":T(660,0.04,"square",0.1);break;case"menuSelect":T(660,0.05,"square",0.15),T(990,0.1,"square",0.15,1,0.05);break;case"menuBack":T(500,0.05,"square",0.15),T(330,0.1,"square",0.15,1,0.05);break;case"zone":[392,523,659,784].forEach((f,i)=>T(f,0.15,"square",0.18,1,i*0.09));break;case"lose":[440,392,349,262].forEach((f,i)=>T(f,0.25,"sawtooth",0.22,0.9,i*0.2));break;case"win":[523,659,784,1046,784,1046,1318].forEach((f,i)=>T(f,0.18,"square",0.2,1,i*0.12));break;case"alert":T(880,0.08,"square",0.18),T(1100,0.12,"square",0.18,1,0.08);break;case"stomp":T(60,0.3,"sine",0.5,0.5),this.noise(0.2,0.4,300,1,"lowpass");break;default:break}}voice(ch,speaker="barnaby"){if(!this.ctx||this.muted)return;let v=VOICES[speaker]||VOICES.barnaby,l=ch.toLowerCase();if(l<"a"||l>"z")return;let idx=l.charCodeAt(0)-97,semis=[0,2,4,7,9,12][idx%6]+(idx>12?3:0)+Math.random()*1.5,f=v.pitch*Math.pow(2,semis*v.spread/12),c=this.ctx,t=c.currentTime,o=c.createOscillator();o.type=v.wave,o.frequency.setValueAtTime(f,t),o.frequency.linearRampToValueAtTime(f*(1+(idx%3-1)*0.08),t+v.ms/1000);let bp=c.createBiquadFilter();bp.type="bandpass",bp.frequency.value=v.formant*(0.8+idx%5*0.1),bp.Q.value=2.5;let g=c.createGain();g.gain.setValueAtTime(0.0001,t),g.gain.exponentialRampToValueAtTime(0.5,t+0.008),g.gain.exponentialRampToValueAtTime(0.0001,t+v.ms/1000),o.connect(bp),bp.connect(g),g.connect(this.voiceG),o.start(t),o.stop(t+v.ms/1000+0.02)}bark(speaker,n=4){for(let i=0;i<n;i++)setTimeout(()=>this.voice(String.fromCharCode(97+Math.floor(Math.random()*26)),speaker),i*70)}music(name,opts={}){if(!this.ctx){this.pending=name;return}if(this.theme===name&&this.timer)return;this.stopMusic(),this.theme=name,this.loop=opts.loop!==!1,this.step=0,this.nextT=this.ctx.currentTime+0.08,this.timer=setInterval(()=>this.schedule(),40)}stopMusic(){if(this.timer)clearInterval(this.timer);this.timer=null,this.theme=null}schedule(){let th=THEMES[this.theme];if(!th||!this.ctx)return;let dur=60/th.bpm/2;while(this.nextT<this.ctx.currentTime+0.25){let s=this.step,t=this.nextT,delay=Math.max(0,t-this.ctx.currentTime),ln=th.leadN[s%th.leadN.length],bn=th.bassN[s%th.bassN.length];if(typeof ln==="number")this.tone(hz(ln),dur*1.6,th.wave,0.16,0,this.musicG,delay,0.01);if(typeof bn==="number")this.tone(hz(bn),dur*1.8,th.bw,0.22,0,this.musicG,delay,0.01);let d=th.drums[s%th.drums.length];if(d==="k")this.tone(120,0.12,"sine",0.5,0.3,this.musicG,delay);else if(d==="s")this.noise(0.12,0.28,1800,0.8,"bandpass",this.musicG,delay);else if(d==="h")this.noise(0.04,0.12,8000,1,"highpass",this.musicG,delay);if(this.step++,this.nextT+=dur,!this.loop&&this.step>=th.leadN.length){this.stopMusic();return}}}}var audio=new AudioEngine;var settings={invertX:!1,invertY:!1,rumble:!0,shake:!0,shadows:!0,textScale:1,aimAssist:!0};var keys=new Set,keyEdge=new Set,mouseL=!1,mouseR=!1,mouseLEdge=!1,mouseREdge=!1,anyFlag=!1,KB={up:["KeyW","ArrowUp"],down:["KeyS","ArrowDown"],left:["KeyA","ArrowLeft"],right:["KeyD","ArrowRight"],grab:["Space","KeyJ"],kick:["KeyF","KeyK"],hook:["KeyE","KeyL"],dash:["ShiftLeft","ShiftRight","KeyO"],pause:["Escape","KeyP"],ok:["Enter","Space","KeyJ"],back:["Escape","Backspace"]};function blank(){return{mx:0,my:0,grab:!1,kick:!1,hook:!1,dash:!1,grabHeld:!1,connected:!1,active:!1}}class Input{constructor(){this.p=[blank(),blank()],this.menu={up:!1,down:!1,left:!1,right:!1,ok:!1,back:!1,pause:!1},this.device="kb",this.padCount=0,this.prevBtn=[[],[]],this.rep={dir:null,t:0},this.coarseOnly=!1,this.mouse={x:0,y:0}}bind(){addEventListener("keydown",(e)=>{if(["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Tab"].includes(e.code))e.preventDefault();if(!keys.has(e.code))keyEdge.add(e.code);keys.add(e.code),anyFlag=!0,this.device="kb"}),addEventListener("keyup",(e)=>keys.delete(e.code)),addEventListener("blur",()=>{keys.clear(),mouseL=mouseR=!1}),addEventListener("mousedown",(e)=>{if(anyFlag=!0,this.device="kb",e.button===0)mouseL=!0,mouseLEdge=!0;else if(e.button===2)mouseR=!0,mouseREdge=!0}),addEventListener("mouseup",(e)=>{if(e.button===0)mouseL=!1;else if(e.button===2)mouseR=!1}),addEventListener("contextmenu",(e)=>e.preventDefault()),addEventListener("mousemove",(e)=>{if(Math.abs(e.movementX)+Math.abs(e.movementY)>2)anyFlag=!0,this.mouse.x=e.clientX,this.mouse.y=e.clientY}),addEventListener("touchstart",()=>{this.touched=!0},{passive:!0}),addEventListener("gamepadconnected",()=>{anyFlag=!0}),this.coarseOnly=!matchMedia("(any-pointer: fine)").matches&&matchMedia("(any-pointer: coarse)").matches}consumeAny(){let a=anyFlag;return anyFlag=!1,a}kd(list){return list.some((k)=>keys.has(k))}ke(list){return list.some((k)=>keyEdge.has(k))}pads(){let out=[],gps=navigator.getGamepads?navigator.getGamepads():[];for(let g of gps)if(g&&g.connected)out.push(g);return out}axis(v){return Math.abs(v)<0.22?0:v}update(dt){let pads=this.pads();this.padCount=pads.length,this.menu={up:!1,down:!1,left:!1,right:!1,ok:!1,back:!1,pause:!1};for(let i=0;i<2;i++){let p=this.p[i],g=pads[i];p.connected=!!g;let prev=this.prevBtn[i],btn=g?g.buttons.map((b)=>b.pressed):[],edge=(n)=>!!btn[n]&&!prev[n],mx=0,my=0,grab=!1,kick=!1,hook=!1,dash=!1,pause=!1,ok=!1,back=!1,grabHeld=!1;if(g){let ax=g.axes[0]||0,ay=g.axes[1]||0,l=Math.hypot(ax,ay);if(l<0.22)ax=0,ay=0;else{let s=(Math.min(1,l)-0.22)/0.78/l;ax*=s,ay*=s}if(btn[14])ax=-1;if(btn[15])ax=1;if(btn[12])ay=-1;if(btn[13])ay=1;if(settings.invertX)ax=-ax;if(settings.invertY)ay=-ay;if(mx=ax,my=ay,grab=edge(0),kick=edge(2),hook=edge(3)||edge(7),dash=edge(1)||edge(5),grabHeld=!!btn[0],pause=edge(9)&&!btn[8],ok=edge(0),back=edge(1),btn.some((b,n)=>b&&!prev[n])||Math.hypot(g.axes[0]||0,g.axes[1]||0)>0.5){if(anyFlag=!0,i===0)this.device="pad";p.active=!0}let mnx=Math.abs(ax)>0.6?Math.sign(ax):0,mny=Math.abs(ay)>0.6?Math.sign(ay):0;if(this.navDir(i,mnx,mny,edge(14)||edge(15)||edge(12)||edge(13)),ok)this.menu.ok=!0;if(back)this.menu.back=!0;if(pause)this.menu.pause=!0}if(this.prevBtn[i]=btn,i===0){let kx=0,ky=0;if(this.kd(KB.left))kx-=1;if(this.kd(KB.right))kx+=1;if(this.kd(KB.up))ky-=1;if(this.kd(KB.down))ky+=1;if(kx||ky){let l=Math.hypot(kx,ky);mx=kx/l,my=ky/l}if(grab=grab||this.ke(KB.grab)||mouseLEdge,grabHeld=grabHeld||this.kd(KB.grab)||mouseL,kick=kick||this.ke(KB.kick)||mouseREdge,hook=hook||this.ke(KB.hook),dash=dash||this.ke(KB.dash),pause=pause||this.ke(KB.pause),this.ke(KB.ok))this.menu.ok=!0;if(this.ke(KB.back))this.menu.back=!0;if(pause)this.menu.pause=!0;let nkx=this.ke(KB.left)?-1:this.ke(KB.right)?1:0,nky=this.ke(KB.up)?-1:this.ke(KB.down)?1:0;if(nkx<0)this.menu.left=!0;if(nkx>0)this.menu.right=!0;if(nky<0)this.menu.up=!0;if(nky>0)this.menu.down=!0;p.active=!0}p.mx=mx,p.my=my,p.grab=grab,p.kick=kick,p.hook=hook,p.dash=dash,p.grabHeld=grabHeld,p.pause=pause}keyEdge.clear(),mouseLEdge=mouseREdge=!1}navDir(i,mnx,mny,dpadEdge){let key=mnx+","+mny;if(!mnx&&!mny){if(this.rep.pad===i)this.rep.dir=null;return}let fire=()=>{if(mnx<0)this.menu.left=!0;if(mnx>0)this.menu.right=!0;if(mny<0)this.menu.up=!0;if(mny>0)this.menu.down=!0};if(this.rep.dir!==key)this.rep.dir=key,this.rep.t=performance.now()+380,this.rep.pad=i,fire();else if(performance.now()>this.rep.t)this.rep.t=performance.now()+120,fire()}rumble(i,strong,ms){if(!settings.rumble)return;let g=this.pads()[i],a=g&&g.vibrationActuator;if(a&&a.playEffect)a.playEffect("dual-rumble",{duration:ms,strongMagnitude:strong,weakMagnitude:strong*0.7}).catch(()=>{})}glyph(action){let ps={grab:"✕",kick:"□",hook:"△",dash:"○",pause:"OPTIONS",ok:"✕",back:"○",move:"L-STICK"},kb={grab:"SPACE",kick:"F",hook:"E",dash:"SHIFT",pause:"ESC",ok:"ENTER",back:"ESC",move:"WASD"};return(this.device==="pad"?ps:kb)[action]}}var input=new Input;var WALL=1,ITEM=2,CHAR=4,BLOCK=8,FLOOR=16,grp=(m,f)=>(m<<16|f)>>>0,G_WALL=grp(WALL,WALL|ITEM|CHAR|BLOCK),G_FLOOR=grp(FLOOR,ITEM|BLOCK),G_ITEM=grp(ITEM,WALL|ITEM|BLOCK|FLOOR),G_BLOCK=grp(BLOCK,WALL|ITEM|BLOCK|CHAR|FLOOR),G_CHAR=grp(CHAR,WALL|BLOCK),Q_CHAR=grp(CHAR,WALL|BLOCK),rnd=(a=0,b=1)=>a+Math.random()*(b-a),angDiff=(a,b)=>{let d=b-a;while(d>Math.PI)d-=2*Math.PI;while(d<-Math.PI)d+=2*Math.PI;return d},dist2=(a,b)=>Math.hypot(a.x-b.x,a.z-b.z),ENEMY={scallywag:{hp:2,r:0.5,speed:3.4,score:50},crab:{hp:1,r:0.55,speed:5.2,score:40},cannon:{hp:3,r:0.7,speed:0,score:80},parrot:{hp:1,r:0.5,speed:7,score:60},boss:{hp:8,r:1,speed:0,score:1000}},PCOL=["#2fd0b5","#ff6a5a"];class Sim{constructor(scene,particles,cb){this.scene=scene,this.fx=particles,this.cb=cb||{},this.players=[],this.zoneIdx=-1,this.cheat={invuln:!1,noclip:!1},this.stats={defeated:0,coins:0,thrown:0,hooks:0,kicks:0,falls:0,deaths:0,bombs:0,time:0,reflects:0},this.score=0,this.coins=0,this.keys=0,this.lives=3,this.shake=0,this.hitstop=0,this.time=0,this.slowmo=0,this.lights=[]}dispose(){if(this.group)this.scene.remove(this.group);for(let l of this.lights)this.scene.remove(l);if(this.lights=[],this.world)this.world.free(),this.world=null}loadZone(idx,opts={}){this.dispose();let Z=ZONES[idx];this.zone=Z,this.zoneIdx=idx,this.W=Z.map[0].length,this.H=Z.map.length,this.world=new RAPIER.World({x:0,y:-26,z:0}),this.cc=this.world.createCharacterController(0.02),this.cc.setUp({x:0,y:1,z:0}),this.cc.setSlideEnabled(!0),this.group=new THREE.Group,this.scene.add(this.group),this.tiles=Z.map.map((r)=>r.split("")),this.solid=Z.map.map((r)=>r.split("").map((c)=>"#abdL%".includes(c))),this.items=[],this.enemies=[],this.pickups=[],this.plates=[],this.gates=[],this.doors=[],this.posts=[],this.signs=[],this.cracked=[],this.crates=[],this.projectiles=[],this.bridges=[],this.spawn=null,this.exit=null,this.exitActive=!1,this.boss=null,this.ropes=[],this.zoneTime=0,this.cleared=!1,this.wipe=!1,this.leaving=!1,this.bossActive=!1,this.pedestals=[],this.hookDone=!1,this.bossPhase=0,this.supplyT=4,this.bounds={w:this.W*TILE,h:this.H*TILE},this.signRead=new Set;let[c1,c2]=Z.floor,wallTint=Z.wall,water=new THREE.Mesh(new THREE.PlaneGeometry(260,260),new THREE.MeshBasicMaterial({color:Z.water}));water.rotation.x=-Math.PI/2,water.position.set(this.bounds.w/2,-2.4,this.bounds.h/2),this.group.add(water),this.water=water;let addCollider=(desc,body)=>this.world.createCollider(desc,body),torchTiles=[];for(let r=0;r<this.H;r++)for(let c=0;c<this.W;c++){let ch=Z.map[r][c],x=c*TILE+1,zc=r*TILE+1,wallish=ch==="#"||ch==="%";if(ch==="~"){this.tiles[r][c]="~";let pm=new THREE.Mesh(new THREE.PlaneGeometry(2,2),new THREE.MeshBasicMaterial({color:Z.pit||Z.water}));pm.rotation.x=-Math.PI/2,pm.position.set(x,-1.3,zc),this.group.add(pm),this.pitMarks=this.pitMarks||[];continue}if(!wallish){let fl=mesh(G.box(2,1.4,2),(r+c)%2?c1:c2,{pos:[x,-0.7,zc],outline:!1,shadow:!1});this.group.add(fl)}if(ch==="#"){let edge=r===0||c===0||r===this.H-1||c===this.W-1,h=edge?3.2:2.6+(r*7+c*3)%4*0.2,w=mesh(G.box(2,h,2),wallTint,{pos:[x,h/2,zc]});if(w.add(mesh(G.box(2.05,0.25,2.05),Z.cap||16777215,{pos:[0,h/2,0],outline:!1,ow:0.03})),this.group.add(w),Z.deco==="palm"&&edge&&(r+c)%4===0&&r!==0&&c!==0){let p=prop.palm();p.position.set(x,h-0.2,zc),p.rotation.y=r+c,this.group.add(p)}if(Z.deco==="torch"&&(r===0&&c%5===2||c===0&&r%5===3||c===this.W-1&&r%5===3))torchTiles.push([x,zc,r,c])}let p0={x,z:zc};switch(ch){case"@":this.spawn=p0;break;case"p":this.addItem("pot",x,zc);break;case"r":this.addItem("barrel",x,zc);break;case"K":this.addItem("block",x,zc);break;case"o":this.addPedestal(x,zc);break;case"1":case"2":case"3":{let m=prop.plate();m.position.set(x,0,zc),this.group.add(m),this.plates.push({x,z:zc,g:+ch,mesh:m,pressed:!1,latched:!1});break}case"a":case"b":case"d":this.addGate(ch,x,zc,r,c);break;case"L":{let m=prop.door();m.position.set(x,0,zc),m.rotation.y=this.tiles[r-1][c]==="#"?Math.PI/2:0,this.group.add(m);let col=addCollider(RAPIER.ColliderDesc.cuboid(1,1.6,1).setTranslation(x,1.6,zc).setCollisionGroups(G_WALL));this.doors.push({x,z:zc,r,c,mesh:m,col,opened:!1});break}case"k":this.addPickup("key",x,zc);break;case"c":this.addPickup("coin",x,zc);break;case"u":this.addPickup("pudding",x,zc);break;case"h":{let m=prop.post();m.position.set(x,0,zc),this.group.add(m),addCollider(RAPIER.ColliderDesc.cylinder(0.9,0.3).setTranslation(x,0.9,zc).setCollisionGroups(G_WALL)),this.posts.push({x,z:zc,mesh:m}),this.solid[r][c]=!0;break}case"T":{let m=prop.sign();m.position.set(x,0,zc),this.group.add(m),addCollider(RAPIER.ColliderDesc.cuboid(0.5,1,0.3).setTranslation(x,1,zc).setCollisionGroups(G_WALL)),this.signs.push({x,z:zc,mesh:m,idx:this.signs.length});break}case"X":{let m=prop.exit();m.position.set(x,0,zc),this.group.add(m),this.exit={x,z:zc,mesh:m};break}case"%":{let m=mesh(G.box(2,2.6,2),10127994,{pos:[x,1.3,zc]});for(let i=0;i<4;i++)m.add(mesh(G.box(0.9,0.06,0.06),2760728,{pos:[rnd(-0.4,0.4),rnd(-1,1),1.04],rot:[0,0,rnd(-1,1)],outline:!1}));this.group.add(m);let col=addCollider(RAPIER.ColliderDesc.cuboid(1,1.6,1).setTranslation(x,1.6,zc).setCollisionGroups(G_WALL));this.cracked.push({x,z:zc,r,c,mesh:m,col});break}case"Y":{let m=prop.crate();m.position.set(x,0,zc),this.group.add(m),addCollider(RAPIER.ColliderDesc.cuboid(0.8,0.7,0.8).setTranslation(x,0.7,zc).setCollisionGroups(G_WALL)),this.crates.push({x,z:zc}),this.solid[r][c]=!0;break}case"S":this.addEnemy("scallywag",x,zc);break;case"C":this.addEnemy("crab",x,zc);break;case"N":this.addEnemy("cannon",x,zc);break;case"V":this.addEnemy("parrot",x,zc);break;case"B":this.addEnemy("boss",x,zc);break;default:break}}for(let q of this.mergeRects((r,c)=>!"#~%".includes(Z.map[r][c])))addCollider(RAPIER.ColliderDesc.cuboid(q.w,0.7,q.h).setTranslation(q.x,-0.7,q.z).setCollisionGroups(G_FLOOR).setFriction(0.8));for(let q of this.mergeRects((r,c)=>Z.map[r][c]==="#"))addCollider(RAPIER.ColliderDesc.cuboid(q.w,1.6,q.h).setTranslation(q.x,1.6,q.z).setCollisionGroups(G_WALL));if(!this.exit&&Z.goal==="boss"){let m=prop.exit();m.position.set(this.bounds.w/2,0,this.bounds.h/2+4),m.visible=!1,this.group.add(m),this.exit={x:m.position.x,z:m.position.z,mesh:m,late:!0}}this.decorate(),torchTiles.forEach(([x,zc,r,c],i)=>{let t=prop.torch(),inward=r===0?[0,1]:c===0?[1,0]:[-1,0];if(t.position.set(x+inward[0]*0.9,1,zc+inward[1]*0.9),this.group.add(t),i%2===0&&this.lights.length<6){let l=new THREE.PointLight(16753226,22,14,2);l.position.set(x+inward[0]*1.4,2.2,zc+inward[1]*1.4),this.scene.add(l),this.lights.push(l)}});let keep=this.players.map((p)=>({hp:p.hp,max:p.max,slot:p.slot}));this.players.forEach((p)=>p.rig&&this.group.remove(p.rig.root)),this.players=[];let slots=keep.length?keep:[{slot:0,hp:5,max:5}];for(let k of slots)this.spawnPlayer(k.slot,k.hp>0?k.hp:3,k.max);this.respawn={x:this.spawn.x,z:this.spawn.z},this.cb.zoneLoaded&&this.cb.zoneLoaded(this)}mergeRects(isTile){let used=this.tiles.map((r)=>r.map(()=>!1)),out=[];for(let r=0;r<this.H;r++)for(let c=0;c<this.W;c++){if(used[r][c]||!isTile(r,c))continue;let w=1;while(c+w<this.W&&isTile(r,c+w)&&!used[r][c+w])w++;let h=1;grow:while(r+h<this.H){for(let k=0;k<w;k++)if(!isTile(r+h,c+k)||used[r+h][c+k])break grow;h++}for(let i=0;i<h;i++)for(let k=0;k<w;k++)used[r+i][c+k]=!0;out.push({x:(c+w/2)*TILE,z:(r+h/2)*TILE,w,h})}return out}decorate(){let[c1]=this.zone.floor;for(let i=0;i<38;i++){let c=1+Math.floor(Math.random()*(this.W-2)),r=1+Math.floor(Math.random()*(this.H-2));if(this.tiles[r][c]!==".")continue;let x=c*TILE+rnd(0.2,1.8),z=r*TILE+rnd(0.2,1.8),m=Math.random()<0.5?mesh(G.cone(0.1,0.35,5),3840586,{pos:[x,0.15,z],outline:!1}):mesh(G.sph(0.12,6),[16747168,16777215,16767050][i%3],{pos:[x,0.1,z],outline:!1});m.castShadow=!1,this.group.add(m)}}addItem(kind,x,z,y=0.9){let m=prop[kind]();this.group.add(m);let rb,col;if(kind==="block")rb=this.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,0.85,z).lockRotations().setLinearDamping(5).setCcdEnabled(!0)),col=this.world.createCollider(RAPIER.ColliderDesc.cuboid(0.85,0.85,0.85).setFriction(0).setRestitution(0).setDensity(3).setCollisionGroups(G_BLOCK),rb);else{let r=kind==="barrel"?0.45:kind==="bomb"?0.38:0.42;rb=this.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,y,z).setLinearDamping(kind==="bomb"?1.5:1.2).setAngularDamping(2).setCcdEnabled(!0)),col=this.world.createCollider((kind==="barrel"?RAPIER.ColliderDesc.cylinder(0.5,0.45):RAPIER.ColliderDesc.ball(r)).setRestitution(kind==="bomb"?0.4:0.25).setFriction(0.8).setDensity(kind==="barrel"?2:1).setCollisionGroups(G_ITEM),rb)}let it={kind,mesh:m,rb,col,carrier:null,thrown:!1,hits:0,fuse:0,dead:!1,age:0,power:0};return this.items.push(it),it}removeItem(it){if(it.dead=!0,this.group.remove(it.mesh),it.rb)this.world.removeRigidBody(it.rb),it.rb=null}addPedestal(x,z){let m=mesh(G.cyl(0.7,0.85,0.5,12),5922668,{pos:[x,0.25,z]});this.group.add(m),this.pedestal={x,z,t:0,item:null},this.pedestals=this.pedestals||[],this.pedestals.push(this.pedestal),this.pedestal.item=this.addItem("bomb",x,z,1.2)}addGate(ch,x,z,r,c){let g={a:1,b:2,d:3}[ch],vertical=this.tiles[r-1][c]==="#",m=prop.gate([5222655,16751162,9109354][g-1]);m.position.set(x,0,z),m.rotation.y=vertical?Math.PI/2:0,this.group.add(m);let col=this.world.createCollider(RAPIER.ColliderDesc.cuboid(1,1.6,1).setTranslation(x,1.6,z).setCollisionGroups(G_WALL));this.gates.push({g,x,z,r,c,mesh:m,col,open:!1,t:0})}addPickup(kind,x,z,extra){let m=prop[kind]();m.position.set(x,0,z),this.group.add(m);let p={kind,x,z,y:0,mesh:m,t:Math.random()*6,fly:null,v:extra&&extra.v};return this.pickups.push(p),p}spawnCoin(x,z,n=1){for(let i=0;i<n;i++){let p=this.addPickup("coin",x+rnd(-0.6,0.6),z+rnd(-0.6,0.6));p.pop=0.5}}makeCC(pos,r=0.4){let rb=this.world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(pos.x,0.75,pos.z)),col=this.world.createCollider(RAPIER.ColliderDesc.capsule(0.35,r).setCollisionGroups(G_CHAR),rb);return{rb,col}}spawnPlayer(slot,hp,max){let base=this.spawn||{x:4,z:4},pos=new V3(base.x+slot*1.6,0,base.z+(slot?0.4:0)),rig=makeHumanoid(slot===0?{shirt:3121104,pants:14714938,skin:15911322,hat:"tuft",lanky:1.15,scale:1,ears:15911322,hair:15773744,nose:15245434}:{shirt:15777840,pants:3824328,skin:15911322,hat:"cap",hatColor:15221818,lanky:0.85,scale:0.82,ears:15911322,nose:15245434});this.group.add(rig.root);let{rb,col}=this.makeCC(pos),p={slot,name:slot?"Pip":"Barnaby",pos,face:0,vel:new V3,hp,max:max||5,invuln:0,state:"move",t:0,carry:null,rig,rb,col,kickT:0,kickCd:0,hookCd:0,throwT:0,dashCd:0,speedAnim:0,safe:pos.clone(),dead:!1,hook:null,stepT:0,fall:0,squash:0,stomp:0,kb:new V3};return this.players.push(p),p}addEnemy(type,x,z){let S=ENEMY[type],rig;if(type==="scallywag")rig=makeHumanoid({shirt:15986658,stripes:2767498,pants:3816014,skin:14721136,hat:"bandana",hatColor:13642298,lanky:0.8,belly:1.25,scale:1.05});else if(type==="crab")rig=makeCrab();else if(type==="parrot")rig=makeParrot();else if(type==="cannon")rig=makeCannon();else rig=makeHumanoid({shirt:8006282,pants:2760522,skin:13668448,hat:"captain",hook:!0,lanky:0.85,belly:1.6,scale:1.7,ears:13668448});this.group.add(rig.root);let mk=(g)=>{let k=new THREE.Group;return k.visible=!1,rig.root.add(k),k},stars=mk();for(let i=0;i<3;i++)stars.add(mesh(G.sph(0.1,6),16769354,{pos:[Math.cos(i*2.1)*0.5,0,Math.sin(i*2.1)*0.5],outline:!1,mat:basic(16769354)}));let alert=mk();alert.add(mesh(G.box(0.14,0.4,0.14),16726586,{pos:[0,0.1,0],outline:!1,mat:basic(16726586)})),alert.add(mesh(G.sph(0.1,6),16726586,{pos:[0,-0.2,0],outline:!1,mat:basic(16726586)}));let e={type,S,pos:new V3(x,type==="parrot"?3:0,z),home:new V3(x,0,z),face:Math.PI,hp:S.hp,state:"idle",t:rnd(0,2),stun:0,rig,stars,alert,kb:new V3,dead:!1,cd:rnd(0.5,2),flash:0,dir:new V3,ph:Math.random()*6,grounded:!1,charge:0,dmgCd:0};if(type!=="parrot")if(type==="cannon"){let rb=this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x,0.75,z));this.world.createCollider(RAPIER.ColliderDesc.cuboid(0.7,0.75,0.8).setCollisionGroups(G_WALL),rb),e.rb=rb}else{let{rb,col}=this.makeCC(e.pos,type==="boss"?0.9:type==="crab"?0.5:0.42);if(e.rb=rb,e.col=col,type==="boss")rb.setTranslation({x,y:1.2,z},!0)}if(type==="boss")this.boss=e,e.state="intro",e.t=1,e.phase=1,e.cd=2,e.say={};if(stars.position.y=rig.height+0.2,alert.position.y=rig.height+0.7,type==="boss")stars.scale.setScalar(1.8),alert.scale.setScalar(1.8);return this.enemies.push(e),e}tileAt(x,z){let c=Math.floor(x/TILE),r=Math.floor(z/TILE);return this.tiles[r]&&this.tiles[r][c]||"#"}isSolid(x,z){let c=Math.floor(x/TILE),r=Math.floor(z/TILE);return!this.solid[r]||this.solid[r][c]!==!1}isPit(x,z){return this.tileAt(x,z)==="~"}alive(){return this.players.filter((p)=>!p.dead)}nearestPlayer(pos,maxD=1e9){let b=null,bd=maxD;for(let p of this.alive()){let d=dist2(p.pos,pos);if(d<bd)bd=d,b=p}return b}addShake(v){if(settings.shake)this.shake=Math.max(this.shake,v)}burst(pos,color,n=8,o={}){this.fx.emit(pos,{n,color,...o})}moveChar(o,dx,dz,noclip){if(noclip)o.pos.x+=dx,o.pos.z+=dz;else{this.cc.computeColliderMovement(o.col,{x:dx,y:0,z:dz},void 0,Q_CHAR);let m=this.cc.computedMovement();o.pos.x+=m.x,o.pos.z+=m.z,o.moved=Math.hypot(m.x,m.z)}o.rb.setNextKinematicTranslation({x:o.pos.x,y:o.type==="boss"?1.2:0.75,z:o.pos.z})}aimDir(p,mx,my){let dir=new V3(Math.sin(p.face),0,Math.cos(p.face));if(settings.aimAssist){let best=null,bd=0.42;for(let e of this.enemies){if(e.dead||e.type==="parrot"&&!e.grounded)continue;let v=new V3(e.pos.x-p.pos.x,0,e.pos.z-p.pos.z),d=v.length();if(d>14||d<0.5)continue;let a=Math.abs(angDiff(p.face,Math.atan2(v.x,v.z)));if(a<bd)bd=a,best=v.normalize()}if(best)return best}return dir}nearInteract(p){let fx=Math.sin(p.face),fz=Math.cos(p.face),best=null,bd=2.3,consider=(type,obj,x,z,reach=2.1)=>{let dx=x-p.pos.x,dz=z-p.pos.z,d=Math.hypot(dx,dz);if(d>reach)return;let front=(dx*fx+dz*fz)/(d||1),score=d-front*0.7;if(front>-0.2&&score<bd)bd=score,best={type,obj}};for(let s of this.signs)consider("sign",s,s.x,s.z);for(let it of this.items)if(!it.dead&&!it.carrier&&it.kind!=="block"&&it.rb){let t=it.rb.translation();consider("item",it,t.x,t.z,2.3)}return best}update(rawDt,ins,mode={}){if(this.hitstop>0){this.hitstop-=rawDt,this.syncMeshes(rawDt);return}let dt=Math.min(rawDt,0.03333333333333333);if(this.slowmo>0)this.slowmo-=rawDt,dt*=0.3;if(this.time+=dt,this.zoneTime+=dt,this.stats.time+=dt,this.cheat=mode.cheat||{invuln:!1,noclip:!1},this.shake>0)this.shake=Math.max(0,this.shake-dt*2.2);for(let p of this.players)this.updatePlayer(p,ins[p.slot]||{},dt);if(this.updateItems(dt),this.updateEnemies(dt),this.updateProjectiles(dt),this.updatePuzzles(dt),this.updatePickups(dt),this.world.timestep=dt,this.world.step(),this.fallCheck(dt),this.syncMeshes(dt),this.checkExit(),this.players.length&&this.players.every((p)=>p.dead)&&!this.wipe)this.wipe=!0,this.cb.wipe&&this.cb.wipe(this)}updatePlayer(p,inp,dt){if(p.invuln=Math.max(0,p.invuln-dt),p.kickCd-=dt,p.hookCd-=dt,p.dashCd-=dt,p.kickT=Math.max(0,p.kickT-dt),p.throwT=Math.max(0,p.throwT-dt),p.squash=Math.max(0,p.squash-dt*4),p.dead){p.t+=dt,p.rig.root.visible=!1,p.rb.setNextKinematicTranslation({x:p.pos.x,y:-30,z:p.pos.z});let buddy=this.players.find((q)=>!q.dead);if(buddy&&p.t>4.5)p.dead=!1,p.hp=2,p.pos.set(buddy.pos.x+1,0,buddy.pos.z+1),p.invuln=2,p.state="move",p.rig.root.visible=!0,this.cb.toast&&this.cb.toast(`${p.name} is back in the game!`),audio.sfx("heal");return}let noclip=this.cheat.noclip&&p.slot===0,speedBase=p.carry?p.carry.kind==="barrel"?4.1:4.8:6.4;if(p.state==="falling"){if(p.fall+=dt,p.pos.y=-p.fall*6,p.rig.root.scale.setScalar(Math.max(0.1,1-p.fall*1.2)),p.fall>0.9)this.recover(p);return}if(p.state==="hook"){let h=p.hook;p.t+=dt;let{x:tx,z:tz}=h,d=Math.hypot(tx-p.pos.x,tz-p.pos.z),step=Math.min(d,26*dt);if(d>0.05)p.pos.x+=(tx-p.pos.x)/d*step,p.pos.z+=(tz-p.pos.z)/d*step;if(p.pos.y=Math.sin(Math.min(1,p.t/h.dur)*Math.PI)*0.6,p.rb.setNextKinematicTranslation({x:p.pos.x,y:0.75,z:p.pos.z}),d<0.2||p.t>1.2)p.state="move",p.pos.y=0,p.invuln=Math.max(p.invuln,0.4),this.hideRope(p),audio.sfx("hookhit");else this.drawRope(p,h.px,h.pz);return}let mx=inp.mx||0,my=inp.my||0,mag=Math.min(1,Math.hypot(mx,my));if(p.state==="dash"){p.t+=dt;let sp=13;if(this.moveChar(p,Math.sin(p.face)*sp*dt,Math.cos(p.face)*sp*dt,noclip),p.t>0.26)p.state="move",p.dashCd=0.35}else if(!this.talking){let want=new V3(mx,0,my).multiplyScalar(speedBase);if(p.vel.lerp(want,Math.min(1,dt*(mag>0.05?14:18))),p.kb.lengthSq()>0.01)p.vel.add(p.kb),p.kb.multiplyScalar(Math.max(0,1-dt*8));if(mag>0.1){let target=Math.atan2(mx,my);p.face+=angDiff(p.face,target)*Math.min(1,dt*16)}if(this.moveChar(p,p.vel.x*dt,p.vel.z*dt,noclip),p.speedAnim=Math.hypot(p.vel.x,p.vel.z)/6.4,p.stepT-=dt*Math.hypot(p.vel.x,p.vel.z),p.stepT<=0&&p.speedAnim>0.3){if(p.stepT=2.4,audio.sfx("step"),Math.random()<0.4)this.burst(p.pos.clone().setY(0.1),15259824,1,{size:0.12,speed:0.6,up:1,life:0.4})}}if(p.pos.x=Math.max(0.5,Math.min(this.bounds.w-0.5,p.pos.x)),p.pos.z=Math.max(0.5,Math.min(this.bounds.h-0.5,p.pos.z)),!this.talking&&p.state==="move"){if(inp.grab)this.actGrab(p);if(inp.kick&&p.kickCd<=0)this.actKick(p);if(inp.hook&&p.hookCd<=0&&!p.carry)this.actHook(p);if(inp.dash&&p.dashCd<=0&&!p.carry)p.state="dash",p.t=0,p.invuln=Math.max(p.invuln,0.35),audio.sfx("dash"),this.burst(p.pos.clone().setY(0.2),16777215,5,{size:0.15,speed:2,up:1})}if(p.kickT>0)this.kickHit(p);if(!noclip&&p.state!=="dash"&&this.isPit(p.pos.x,p.pos.z)&&p.state==="move")p.state="falling",p.fall=0,audio.sfx("splash"),this.stats.falls++,this.burst(p.pos.clone().setY(0),this.zone.water===1450543?6987984:10148095,12,{size:0.2,speed:3,up:5});else if(p.state==="move"&&!this.cheat.noclip&&!this.isPit(p.pos.x,p.pos.z)){if(p.safeT=(p.safeT||0)-dt,p.safeT<=0){if([[1.1,0],[-1.1,0],[0,1.1],[0,-1.1]].every(([a,b])=>!this.isPit(p.pos.x+a,p.pos.z+b)&&!this.isSolid(p.pos.x+a,p.pos.z+b)))p.safe.copy(p.pos),p.safeT=0.25}}if(p.carry){let it=p.carry,h=p.rig.height*0.98,tp=new V3(p.pos.x+Math.sin(p.face)*0.15,p.pos.y+h+(it.kind==="barrel"?0.45:0.25),p.pos.z+Math.cos(p.face)*0.15);it.rb.setNextKinematicTranslation(tp)}if(p.rig.pose(dt,{speed:p.state==="dash"?0.3:Math.min(1,p.speedAnim),carry:!!p.carry,swing:p.throwT>0?p.throwT/0.25:0,squash:p.squash,roll:p.state==="dash",blink:p.invuln>0&&p.state!=="dash"&&!this.cheat.invuln,lean:p.kickT>0?-0.35:0,tilt:p.kickT>0?-0.2:0}),p.kickT>0)p.rig.legs[1].rotation.x=-1.8}recover(p){if(p.state="move",p.pos.copy(p.safe),p.pos.y=0,p.rig.root.scale.setScalar(p.slot?0.82:1),p.rb.setNextKinematicTranslation({x:p.pos.x,y:0.75,z:p.pos.z}),p.rb.setTranslation({x:p.pos.x,y:0.75,z:p.pos.z},!0),p.vel.set(0,0,0),p.invuln=0,this.damage(p,1,null,!0),p.carry)this.dropCarry(p)}hurtFx(p){audio.sfx("hurt"),input.rumble(p.slot,0.8,250),this.addShake(0.5),this.hitstop=0.07}damage(p,n,from,silent){if(p.dead||p.invuln>0||this.cheat.invuln&&p.slot===0)return!1;if(p.state==="hook")return!1;if(p.hp-=n,p.invuln=1.5,p.rig.flash(!0),p.flashT=0.12,p.squash=1,!silent)this.hurtFx(p),this.burst(p.pos.clone().setY(1.2),16769354,8,{size:0.18,speed:4});if(from){let k=new V3(p.pos.x-from.x,0,p.pos.z-from.z).normalize().multiplyScalar(12);p.kb=k}if(p.carry)this.dropCarry(p);if(p.hp<=0)this.killPlayer(p);return!0}killPlayer(p){p.dead=!0,p.t=0,this.stats.deaths++,audio.sfx("lose"),input.rumble(p.slot,1,500),this.burst(p.pos.clone().setY(1),[16769354,16735866],16,{size:0.25,speed:6,up:6}),this.cb.toast&&this.cb.toast(`${p.name} took a pratfall!`)}dropCarry(p){let it=p.carry;if(!it)return;p.carry=null,it.carrier=null,it.rb.setBodyType(RAPIER.RigidBodyType.Dynamic,!0),it.col.setEnabled(!0),it.rb.setLinvel({x:0,y:1,z:0},!0)}actGrab(p){if(p.carry){let it2=p.carry,dir=this.aimDir(p),sp=it2.kind==="barrel"?11:it2.kind==="bomb"?11:13;p.carry=null,it2.carrier=null,it2.thrown=!0,it2.hits=0,it2.age=0,it2.rb.setBodyType(RAPIER.RigidBodyType.Dynamic,!0),it2.col.setEnabled(!0);let t2=it2.rb.translation();it2.rb.setTranslation({x:t2.x+dir.x*0.6,y:t2.y-0.2,z:t2.z+dir.z*0.6},!0),it2.rb.setLinvel({x:dir.x*sp,y:3.6,z:dir.z*sp},!0),p.throwT=0.25,p.face=Math.atan2(dir.x,dir.z),this.stats.thrown++,audio.sfx("throw"),input.rumble(p.slot,0.3,90);return}let t=this.nearInteract(p);if(!t)return;if(t.type==="sign"){this.cb.sign&&this.cb.sign(t.obj);return}let it=t.obj;if(p.carry=it,it.carrier=p,it.thrown=!1,it.rb.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased,!0),it.col.setEnabled(!1),it.kind==="bomb")it.fuse=it.fuse||3.2,audio.sfx("fuse");audio.sfx("grab"),p.squash=0.6}actKick(p){p.kickT=0.22,p.kickCd=0.42,p.kickHitDone=!1,this.stats.kicks++,audio.sfx("kick"),input.rumble(p.slot,0.25,70)}kickHit(p){if(p.kickT>0.12||p.kickHitDone)return;p.kickHitDone=!0;let fx=Math.sin(p.face),fz=Math.cos(p.face),reach=(o)=>{let dx=o.x-p.pos.x,dz=o.z-p.pos.z,d=Math.hypot(dx,dz);return d<2.1&&(dx*fx+dz*fz)/(d||1)>0.25},hit=!1;for(let it of this.items){if(it.dead||it.carrier||!it.rb)continue;let t=it.rb.translation();if(!reach(t))continue;hit=!0;let sp=it.kind==="block"?11:12;it.rb.setLinvel({x:fx*sp,y:it.kind==="block"?0:3,z:fz*sp},!0),it.thrown=it.kind!=="block",it.kicked=!0,it.age=0,it.hits=0,this.burst(new V3(t.x,0.5,t.z),16777215,5,{size:0.15,speed:3})}for(let e of this.enemies){if(e.dead||!reach(e.pos)||e.type==="parrot"&&!e.grounded)continue;if(hit=!0,e.type==="boss"){if(e.state==="dizzy")this.hurtEnemy(e,1,p,"kick");continue}if(e.type==="cannon"){this.hurtEnemy(e,1,p,"kick");continue}if(e.stun>0)this.hurtEnemy(e,9,p,"kick");else this.hurtEnemy(e,e.type==="crab"?9:1,p,"kick")}for(let pr of this.projectiles){if(pr.owner!=="enemy"||!reach(pr.pos))continue;hit=!0;let dir=this.aimDir(p);pr.owner="player",pr.vel.set(dir.x*17,0,dir.z*17),pr.life=4,this.stats.reflects++,audio.sfx("hookhit"),this.burst(pr.pos.clone(),16769354,8,{size:0.2,speed:5}),this.hitstop=0.06,this.cb.pop&&this.cb.pop(pr.pos,"REFLECT!","#ffe14a")}for(let q of this.players)if(q!==p&&!q.dead&&reach(q.pos))q.kb=new V3(fx*9,0,fz*9),hit=!0;if(hit)audio.sfx("bonk"),this.addShake(0.2)}actHook(p){p.hookCd=0.55,this.stats.hooks++,audio.sfx("hook");let dir=this.aimDir(p);p.face=Math.atan2(dir.x,dir.z);let range=11,o=p.pos,wallD=range,ray=new RAPIER.Ray({x:o.x,y:1,z:o.z},{x:dir.x,y:0,z:dir.z}),wh=this.world.castRay(ray,range,!0,void 0,grp(65535,WALL));if(wh)wallD=wh.timeOfImpact;let best=null,bd=1e9,test=(kind,obj,x,z,y=0,lat=0.9)=>{let dx=x-o.x,dz=z-o.z,along=dx*dir.x+dz*dir.z,perp=Math.abs(dx*dir.z-dz*dir.x);if(along<0.8||along>wallD+1.3||perp>lat)return;if(along<bd)bd=along,best={kind,obj,x,z,y,along}};for(let po of this.posts)test("post",po,po.x,po.z,1.9,1);for(let e of this.enemies)if(!e.dead)test("enemy",e,e.pos.x,e.pos.z,0,e.type==="boss"?1.4:1);for(let it of this.items)if(!it.dead&&!it.carrier&&it.rb&&it.kind!=="block"){let t=it.rb.translation();test("item",it,t.x,t.z,0,0.8)}for(let pk of this.pickups)test("pickup",pk,pk.x,pk.z,0,0.8);let end=best?best.along:Math.min(wallD,range);if(this.makeRope(p,o.x+dir.x*end,o.z+dir.z*end),!best)return;let tp=best;if(tp.kind==="post"){let stop=Math.max(0,tp.along-1.35);p.state="hook",p.t=0,p.hook={x:o.x+dir.x*stop,z:o.z+dir.z*stop,px:tp.x,pz:tp.z,dur:stop/26+0.05},p.vel.set(0,0,0),this.burst(new V3(tp.x,1.9,tp.z),16765498,8,{size:0.15,speed:3})}else if(tp.kind==="enemy"){let e=tp.obj;if(audio.sfx("hookhit"),e.type==="boss")if(e.state==="idle"||e.state==="telegraph")this.stunEnemy(e,2.8),this.cb.pop&&this.cb.pop(e.pos,"HAT YANKED!","#ffe14a");else audio.sfx("bonk");else{if(e.type!=="cannon")e.pull={x:o.x+dir.x*1.5,z:o.z+dir.z*1.5,t:0.35};if(this.stunEnemy(e,3.2),e.type==="parrot")e.grounded=!0,e.pos.y=0.2}}else if(tp.kind==="item")tp.obj.rb.setLinvel({x:-dir.x*14,y:3,z:-dir.z*14},!0),audio.sfx("hookhit");else if(tp.kind==="pickup")tp.obj.fly=p,audio.sfx("hookhit")}makeRope(p,x,z){let r=p.ropeMesh||(p.ropeMesh=(()=>{let m=new THREE.Mesh(new THREE.BoxGeometry(0.1,0.1,1),new THREE.MeshBasicMaterial({color:16765498}));return this.group.add(m),m})());r.visible=!0,p.ropeT=0.22,p.ropeTo={x,z},this.drawRope(p,x,z)}drawRope(p,x,z){let r=p.ropeMesh;if(!r)return;let a=new V3(p.pos.x,1.2,p.pos.z),b=new V3(x,1.2,z),len=a.distanceTo(b);r.position.copy(a).lerp(b,0.5),r.scale.set(1,1,Math.max(0.1,len)),r.lookAt(b),r.visible=!0}hideRope(p){if(p.ropeMesh)p.ropeMesh.visible=!1;p.ropeT=0}updateItems(dt){for(let it of this.items){if(it.dead)continue;if(it.age+=dt,it.kind==="bomb"&&(it.carrier||it.fuse>0||it.thrown)){if(it.fuse<=0)it.fuse=2.2;if(it.fuse-=dt,it.mesh.userData.spark)it.mesh.userData.spark.scale.setScalar(0.8+Math.abs(Math.sin(it.fuse*18))*0.8);if(Math.random()<0.3){let t2=it.rb.translation();this.burst(new V3(t2.x,t2.y+0.6,t2.z),16756784,1,{size:0.1,speed:0.5,up:1,life:0.3})}if(it.fuse<=0){this.explode(it);continue}}let t=it.rb.translation();if(t.y<-1){let c=Math.floor(t.x/TILE),r=Math.floor(t.z/TILE);if(it.kind==="block"&&this.tiles[r]&&this.tiles[r][c]==="~")this.fillPit(r,c);else audio.sfx("splash");if(it.carrier)it.carrier.carry=null;this.removeItem(it);continue}let v=it.rb.linvel(),sp=Math.hypot(v.x,v.z);if((it.thrown||it.kind==="block"&&sp>3.5)&&!it.carrier){let consumed=!1;for(let e of this.enemies){if(e.dead)continue;if(e.type==="parrot"&&!e.grounded)continue;if(Math.hypot(e.pos.x-t.x,e.pos.z-t.z)<e.S.r+0.55&&t.y<e.rig.height+0.5&&sp>2.5){let dmg=it.kind==="barrel"?2:it.kind==="block"?2:1;if(this.hurtEnemy(e,dmg,null,it.kind,it)||e.type!=="boss")if(it.hits++,it.kind==="block")it.rb.setLinvel({x:v.x*0.3,y:0,z:v.z*0.3},!0);else if(it.kind==="barrel"){if(it.rb.setLinvel({x:-v.x*0.4,y:4,z:-v.z*0.4},!0),it.hits>=2)this.breakItem(it),consumed=!0}else if(it.kind==="bomb")this.explode(it),consumed=!0;else this.breakItem(it),consumed=!0;else it.rb.setLinvel({x:-v.x*0.5,y:5,z:-v.z*0.5},!0),audio.sfx("bonk"),it.thrown=!1;break}}if(consumed||it.dead)continue;if(it.kind==="pot"&&it.thrown&&it.age>0.15&&t.y<0.55&&sp>3){this.breakItem(it);continue}if(it.thrown&&sp<1.5&&it.age>0.4)it.thrown=!1}if(it.kind==="pot"&&it.thrown&&it.age>0.1&&sp<1.2){this.breakItem(it);continue}}this.items=this.items.filter((i)=>!i.dead);for(let pd of this.pedestals||[])if(!pd.item||pd.item.dead){if(pd.t+=dt,pd.t>3)pd.t=0,pd.item=this.addItem("bomb",pd.x,pd.z,1.2)}}breakItem(it){let t=it.rb?it.rb.translation():{x:0,y:0,z:0};if(this.burst(new V3(t.x,t.y,t.z),it.kind==="pot"?[13792826,11886635,15777888]:[10117940,4869980],14,{size:0.22,speed:5,up:5}),audio.sfx("break"),it.kind==="pot"){let r=this.rngDeal();if(r<0.55)this.spawnCoin(t.x,t.z,1+(r<0.15?1:0));else if(r>0.96)this.addPickup("pudding",t.x,t.z)}this.removeItem(it)}rngDeal(){return window.AIHub&&window.AIHub.active&&window.AIHub.rng?(this._deal||(this._deal=window.AIHub.rng("deal")))():Math.random()}explode(it){let t=it.rb.translation(),pos=new V3(t.x,0.5,t.z);this.stats.bombs++,audio.sfx("explode"),this.addShake(1),this.hitstop=0.08,this.burst(pos,[16756784,16734762,4473924,16769354],34,{size:0.5,speed:7,up:6,life:0.8,grav:4});for(let e of this.enemies)if(!e.dead&&Math.hypot(e.pos.x-t.x,e.pos.z-t.z)<3.6)if(e.type==="boss"){if(e.state==="dizzy")this.hurtEnemy(e,2,null,"bomb")}else this.hurtEnemy(e,3,null,"bomb");for(let p of this.players)if(!p.dead&&Math.hypot(p.pos.x-t.x,p.pos.z-t.z)<2.6)this.damage(p,1,pos);for(let cr of this.cracked.slice())if(Math.hypot(cr.x-t.x,cr.z-t.z)<3.6)this.breakWall(cr);for(let o of this.items)if(!o.dead&&o!==it&&o.rb){let q=o.rb.translation(),d=Math.hypot(q.x-t.x,q.z-t.z);if(d<3.6&&!o.carrier)o.rb.setLinvel({x:(q.x-t.x)/(d||1)*9,y:5,z:(q.z-t.z)/(d||1)*9},!0)}if(it.carrier)it.carrier.carry=null;this.removeItem(it)}breakWall(cr){this.world.removeCollider(cr.col,!0),this.group.remove(cr.mesh),this.solid[cr.r][cr.c]=!1,this.tiles[cr.r][cr.c]=".";let fl=mesh(G.box(2,1.4,2),this.zone.floor[0],{pos:[cr.x,-0.7,cr.z],outline:!1,shadow:!1});this.group.add(fl),this.world.createCollider(RAPIER.ColliderDesc.cuboid(1,0.7,1).setTranslation(cr.x,-0.7,cr.z).setCollisionGroups(G_FLOOR)),this.cracked=this.cracked.filter((c)=>c!==cr),this.burst(new V3(cr.x,1,cr.z),[10127994,6969930],22,{size:0.35,speed:5,up:5}),this.cb.toast&&this.cb.toast("A secret room! Treasure ahoy!"),audio.sfx("door")}fillPit(r,c){let x=c*TILE+1,z=r*TILE+1;this.tiles[r][c]=".";let fl=mesh(G.box(2,1.4,2),11569754,{pos:[x,-0.7,z],outline:!1,shadow:!1});this.group.add(fl),this.world.createCollider(RAPIER.ColliderDesc.cuboid(1,0.7,1).setTranslation(x,-0.7,z).setCollisionGroups(G_FLOOR)),this.burst(new V3(x,0.2,z),[10148095,11569754],14,{size:0.25,speed:4}),audio.sfx("plate"),audio.sfx("splash"),this.cb.toast&&this.cb.toast("The block plugged the gap!")}stunEnemy(e,t){if(e.stun=t,e.stars.visible=!0,audio.sfx("dizzy"),e.type==="boss")e.state="dizzy",e.t=t}hurtEnemy(e,dmg,by,kind,item){if(e.dead)return!1;if(e.type==="boss"){if(!(e.state==="dizzy"||kind==="reflect"))return!1;if(e.hitCd>0)return!1;e.hitCd=0.6}if(e.type==="parrot"&&!e.grounded)return!1;if(e.dmgCd>0&&e.type!=="boss")return!1;e.hp-=dmg,e.flash=0.12,e.rig.flash(!0),e.dmgCd=0.15,audio.sfx("hit"),this.hitstop=0.07,this.addShake(0.35),input.rumble(0,0.5,120);let pos=e.pos.clone().setY(1);if(this.burst(pos,[16769354,16777215],10,{size:0.2,speed:5}),this.cb.pop&&this.cb.pop(pos,dmg>1?"POW!":"BONK!","#ffe14a"),kind==="kick"&&by&&e.hp<=0&&e.type!=="cannon")e.launch=new V3(Math.sin(by.face)*16,8,Math.cos(by.face)*16);if(e.hp<=0)return this.defeat(e),!0;if(e.type==="boss")return this.bossHit(e),!0;if(e.type!=="cannon")this.stunEnemy(e,e.type==="scallywag"?2.8:2);if(item&&item.rb){let v=item.rb.linvel();e.kb.set(v.x*0.3,0,v.z*0.3)}return!0}defeat(e){e.dead=!0,e.deadT=0,this.stats.defeated++,this.score+=e.S.score,audio.sfx(e.type==="boss"?"explode":"break");let pos=e.pos.clone().setY(0.8);if(this.burst(pos,[16777215,16769354,16735866],e.type==="boss"?40:14,{size:0.3,speed:6,up:6}),this.cb.pop&&this.cb.pop(pos,"+"+e.S.score,"#ffd23a"),this.spawnCoin(e.pos.x,e.pos.z,e.type==="boss"?6:e.type==="scallywag"?2:1),e.rb)this.world.removeRigidBody(e.rb),e.rb=null;if(e.type==="boss")this.cb.bossDown&&this.cb.bossDown(e);else if(this.cb.score)this.cb.score()}bossHit(e){if(audio.bark("clammy",5),e.hp<=5&&e.phase<2)e.phase=2,this.cb.say&&this.cb.say("bossHalf");if(e.hp<=2&&e.phase<3){e.phase=3,this.cb.say&&this.cb.say("bossLow");for(let[x,z]of[[6,6],[this.bounds.w-6,6]]){let s=this.addEnemy("scallywag",x,z);s.spawned=!0,s.state="chase"}}e.state="recover",e.t=0.9+(e.stun>0?0:0),e.stars.visible=!0,e.stun=e.t}updateEnemies(dt){for(let e of this.enemies){if(e.dead){if(e.deadT+=dt,e.launch)e.pos.addScaledVector(e.launch,dt),e.launch.y-=30*dt,e.pos.y=Math.max(0,e.pos.y+e.launch.y*dt),e.rig.root.rotation.z+=dt*12;e.rig.root.scale.setScalar(Math.max(0,1-e.deadT*2.5)*(e.type==="boss"?1.7:1)),e.rig.root.position.copy(e.pos);continue}if(e.flash-=dt,e.flash<=0)e.rig.flash(!1);e.dmgCd-=dt,e.hitCd=(e.hitCd||0)-dt,e.cd-=dt;let tgt=this.nearestPlayer(e.pos);if(e.pull){e.pull.t-=dt;let dx=e.pull.x-e.pos.x,dz=e.pull.z-e.pos.z,mv=new V3(dx,0,dz).multiplyScalar(Math.min(1,dt*18));if(e.type==="parrot")e.pos.add(mv);else this.moveChar(e,mv.x,mv.z,!1);if(e.pull.t<=0)e.pull=null}if(e.stun>0){if(e.stun-=dt,e.stars.visible=!0,e.stars.rotation.y+=dt*6,e.alert.visible=!1,e.type!=="boss"){if(e.kb.lengthSq()>0.01){if(e.type==="parrot")e.pos.addScaledVector(e.kb,dt);else this.moveChar(e,e.kb.x*dt,e.kb.z*dt,!1);e.kb.multiplyScalar(Math.max(0,1-dt*6))}}if(e.stun<=0){if(e.stars.visible=!1,e.type==="parrot")e.grounded=!1,e.state="rise";if(e.type==="boss")e.state="idle",e.t=1.4}else if(e.type!=="boss"){this.poseEnemy(e,dt,0);continue}}if(!tgt){this.poseEnemy(e,dt,0);continue}switch(e.type){case"scallywag":this.aiScallywag(e,tgt,dt);break;case"crab":this.aiCrab(e,tgt,dt);break;case"cannon":this.aiCannon(e,tgt,dt);break;case"parrot":this.aiParrot(e,tgt,dt);break;case"boss":this.aiBoss(e,tgt,dt);break;default:break}}this.enemies=this.enemies.filter((e)=>!(e.dead&&e.deadT>0.8&&(this.group.remove(e.rig.root),!0)))}poseEnemy(e,dt,speed,extra={}){if(e.rig.pose)e.rig.pose(dt,{speed,dizzy:e.stun>0,grounded:e.grounded,...extra});if(e.rig.root.position.copy(e.pos),e.type!=="cannon")e.rig.root.rotation.y=e.face}touchHurt(e,r,dmg=1){for(let p of this.players)if(!p.dead&&Math.hypot(p.pos.x-e.pos.x,p.pos.z-e.pos.z)<r)this.damage(p,dmg,e.pos)}aiScallywag(e,tgt,dt){let dx=tgt.pos.x-e.pos.x,dz=tgt.pos.z-e.pos.z,d=Math.hypot(dx,dz);e.t-=dt;let turn=(a)=>{e.face+=angDiff(e.face,a)*Math.min(1,dt*8)};if(e.state==="idle"){if(e.t<=0)e.dir.set(rnd(-1,1),0,rnd(-1,1)).normalize(),e.t=rnd(1,2.5),e.walk=Math.random()<0.6;if(e.walk)this.moveChar(e,e.dir.x*1.6*dt,e.dir.z*1.6*dt),turn(Math.atan2(e.dir.x,e.dir.z));if(d<9){if(e.state="chase",audio.sfx("alert"),Math.random()<0.5)audio.bark("clammy",3);let tl=STORY.taunts.scallywag;this.cb.pop&&this.cb.pop(e.pos.clone().setY(2.6),tl[Math.floor(Math.random()*tl.length)],"#ff8a8a")}this.poseEnemy(e,dt,e.walk?0.3:0)}else if(e.state==="chase"){turn(Math.atan2(dx,dz));let sp=e.S.speed*(e.spawned?1.1:1);if(this.moveChar(e,dx/d*sp*dt,dz/d*sp*dt),d<1.9&&e.cd<=0)e.state="windup",e.t=0.55,e.alert.visible=!0,audio.sfx("alert");if(d>16)e.state="idle";this.poseEnemy(e,dt,0.8)}else if(e.state==="windup"){if(turn(Math.atan2(dx,dz)),e.t-=0,e.t<=0)e.state="swing",e.t=0.28,e.alert.visible=!1,audio.sfx("throw"),e.struck=!1;this.poseEnemy(e,dt,0,{windup:1})}else if(e.state==="swing"){if(!e.struck&&e.t<0.2){e.struck=!0,this.burst(e.pos.clone().setY(1).add(new V3(Math.sin(e.face),0,Math.cos(e.face)).multiplyScalar(1.3)),16777215,4,{size:0.2,speed:2});for(let p of this.players){let px=p.pos.x-e.pos.x,pz=p.pos.z-e.pos.z,pd=Math.hypot(px,pz);if(!p.dead&&pd<2.3&&Math.abs(angDiff(e.face,Math.atan2(px,pz)))<1.1)this.damage(p,1,e.pos)}}if(e.t<=0)e.state="chase",e.cd=1.1;this.poseEnemy(e,dt,0,{swing:e.t/0.28})}else e.state="chase"}aiCrab(e,tgt,dt){let dx=tgt.pos.x-e.pos.x,dz=tgt.pos.z-e.pos.z,d=Math.hypot(dx,dz);if(e.t-=dt,e.state==="idle"){if(e.t<=0)e.dir.set(rnd(-1,1),0,rnd(-1,1)).normalize(),e.t=rnd(0.6,1.4);if(this.moveChar(e,e.dir.x*2.2*dt,e.dir.z*2.2*dt),e.face=Math.atan2(dx,dz),d<8){if(e.state="scuttle",e.t=0.9,Math.random()<0.5){audio.bark("crab",2);let tl=STORY.taunts.crab;this.cb.pop&&this.cb.pop(e.pos.clone().setY(1.6),tl[Math.floor(Math.random()*tl.length)],"#ffb08a")}}}else if(e.state==="scuttle"){let side=new V3(-dz,0,dx).normalize().multiplyScalar(Math.sin(e.ph+this.time*1.5)>0?1:-1);if(this.moveChar(e,(side.x*4.5+dx/d*1.5)*dt,(side.z*4.5+dz/d*1.5)*dt),e.face=Math.atan2(dx,dz),e.t<=0)e.state="windup",e.t=0.4,e.alert.visible=!0,e.dir.set(dx/d,0,dz/d)}else if(e.state==="windup"){if(e.face=Math.atan2(dx,dz),e.dir.set(dx/d,0,dz/d),e.t<=0)e.state="charge",e.t=0.55,e.alert.visible=!1,audio.sfx("dash")}else if(e.state==="charge"){if(this.moveChar(e,e.dir.x*10*dt,e.dir.z*10*dt),this.touchHurt(e,1.1),e.t<=0||e.moved<0.02)e.state="rest",e.t=1}else if(e.t<=0)e.state="idle";this.poseEnemy(e,dt,e.state==="idle"||e.state==="scuttle"||e.state==="charge"?0.8:0)}aiCannon(e,tgt,dt){let dx=tgt.pos.x-e.pos.x,dz=tgt.pos.z-e.pos.z,d=Math.hypot(dx,dz),a=Math.atan2(dx,dz);if(d<17)e.aim=e.aim===void 0?a:e.aim+angDiff(e.aim,a)*Math.min(1,dt*3);if(e.rig.root.position.copy(e.pos),e.rig.root.rotation.y=e.aim||0,e.alert.visible=!1,d<17&&e.cd<=0)if(!e.charging)e.charging=!0,e.cd=0.7,audio.sfx("fuse");else{e.charging=!1,e.cd=2.8+Math.random();let dir=new V3(Math.sin(e.aim),0,Math.cos(e.aim));this.fireBall(e.pos.clone().add(dir.clone().multiplyScalar(1.6)).setY(1),dir.multiplyScalar(8.5),"enemy"),audio.sfx("cannon"),this.addShake(0.25),e.rig.root.position.addScaledVector(dir,-0.25)}if(e.charging)e.rig.barrel.material=new THREE.MeshBasicMaterial({color:16742970});else if(e.rig.barrel.material.isMeshBasicMaterial)e.rig.barrel.material=e.rig.barrel.userData.orig}fireBall(pos,vel,owner){let m=mesh(G.sph(0.34,10),2237740,{pos:[pos.x,pos.y,pos.z]});this.group.add(m),this.projectiles.push({pos,vel,owner,mesh:m,life:5}),this.burst(pos,[16756784,7829367],8,{size:0.3,speed:2,up:1})}aiParrot(e,tgt,dt){let dx=tgt.pos.x-e.pos.x,dz=tgt.pos.z-e.pos.z,d=Math.hypot(dx,dz);if(e.t-=dt,e.grounded){e.pos.y=0.2,this.poseEnemy(e,dt,0);return}if(e.state==="idle"||e.state==="rise"){e.pos.y+=(3.2-e.pos.y)*Math.min(1,dt*3);let ang=this.time*1.2+e.ph,tx=e.home.x+Math.cos(ang)*3.2,tz=e.home.z+Math.sin(ang)*3.2;if(e.pos.x+=(tx-e.pos.x)*Math.min(1,dt*2),e.pos.z+=(tz-e.pos.z)*Math.min(1,dt*2),e.face=Math.atan2(dx,dz),e.state==="rise"&&e.pos.y>2.8)e.state="idle";if(d<11&&e.cd<=0&&e.state==="idle")e.state="windup",e.t=0.7,e.alert.visible=!0,audio.sfx("alert")}else if(e.state==="windup"){if(e.pos.y+=dt*0.8,e.face=Math.atan2(dx,dz),e.dir.set(dx/(d||1),0,dz/(d||1)),e.t<=0)e.state="dive",e.t=1,e.alert.visible=!1,e.tp=tgt.pos.clone()}else if(e.state==="dive"){let vx=e.tp.x-e.pos.x,vz=e.tp.z-e.pos.z,vd=Math.hypot(vx,vz)||1;if(e.pos.x+=vx/vd*10*dt,e.pos.z+=vz/vd*10*dt,e.pos.y=Math.max(0.9,e.pos.y-5*dt),this.touchHurt(e,1),e.t<=0||vd<0.6)e.state="idle",e.cd=3+Math.random()*2}e.pos.x=Math.max(1,Math.min(this.bounds.w-1,e.pos.x)),e.pos.z=Math.max(1,Math.min(this.bounds.h-1,e.pos.z)),this.poseEnemy(e,dt,1)}aiBoss(e,tgt,dt){let dx=tgt.pos.x-e.pos.x,dz=tgt.pos.z-e.pos.z,d=Math.hypot(dx,dz)||1;if(e.t-=dt,!this.bossActive){this.poseEnemy(e,dt,0);return}let faceTo=(a,k=6)=>{e.face+=angDiff(e.face,a)*Math.min(1,dt*k)};if(this.supplyT-=dt,this.supplyT<=0&&this.crates.length){if(this.supplyT=5.5,this.items.filter((i)=>i.kind==="barrel"&&!i.dead).length<3){let cr=this.crates[Math.floor(Math.random()*this.crates.length)];this.addItem("barrel",cr.x+(cr.x<this.bounds.w/2?1.6:-1.6),cr.z+1.2,2).rb.setLinvel({x:0,y:4,z:3},!0),audio.sfx("boing")}}switch(e.state){case"intro":if(faceTo(Math.atan2(dx,dz)),e.t<=0)e.state="idle",e.t=1.4;break;case"idle":if(faceTo(Math.atan2(dx,dz)),e.dir.set(dx/d,0,dz/d),e.alert.visible=!1,e.t<=0){if(e.phase>=2&&Math.random()<0.5&&e.volleyCd!==!0)e.state="volley",e.t=0.8,e.shots=e.phase===3?4:3,this.warnLanes(tgt);else e.state="telegraph",e.t=e.phase===3?0.65:0.95,audio.bark("clammy",3);e.volleyCd=!1}break;case"telegraph":if(faceTo(Math.atan2(e.dir.x,e.dir.z),10),e.alert.visible=!0,e.rig.root.position.x=e.pos.x+Math.sin(this.time*60)*0.06,e.t<=0)e.state="charge",e.t=2.6,e.alert.visible=!1,e.chargeV=e.phase===3?15:12.5,audio.sfx("stomp");break;case"charge":{if(e.moved=1,this.moveChar(e,e.dir.x*e.chargeV*dt,e.dir.z*e.chargeV*dt),Math.random()<0.5)this.burst(e.pos.clone().setY(0.2),15259824,1,{size:0.3,speed:1,up:1});if(this.touchHurt(e,1.9,1),e.moved<e.chargeV*dt*0.35||e.t<=0)if(e.t>0)audio.sfx("stomp"),this.addShake(1.2),this.hitstop=0.1,input.rumble(0,1,300),this.burst(e.pos.clone().setY(1.5),[16769354,16777215,11171635],24,{size:0.35,speed:7,up:7}),this.cb.pop&&this.cb.pop(e.pos.clone().setY(2),"BONK!","#ffe14a"),this.stunEnemy(e,4.6),this.cb.toast&&this.cb.toast("Clammy is dizzy! Throw a barrel!");else e.state="idle",e.t=1;break}case"volley":if(faceTo(Math.atan2(dx,dz)),e.t<=0)if(e.shots>0){e.shots--,e.t=0.8;let side=Math.random()<0.5?1:-1;this.fireBall(new V3(side>0?2:this.bounds.w-2,1,tgt.pos.z),new V3(side>0?8:-8,0,0),"enemy"),audio.sfx("cannon"),this.warnLanes(tgt)}else e.state="idle",e.t=1.2,e.volleyCd=!0;break;case"dizzy":e.stars.visible=!0;break;case"recover":if(e.t<=0&&e.stun<=0)e.state="idle",e.t=1.2;break;default:break}e.pos.y=0;let sp=e.state==="charge"?1:e.state==="idle"?0:0.2;e.rig.pose(dt,{speed:sp,dizzy:e.state==="dizzy",windup:e.state==="telegraph"?1:0,swing:0,squash:e.state==="telegraph"?0.5:0}),e.rig.root.position.set(e.pos.x,0,e.pos.z),e.rig.root.rotation.y=e.face}warnLanes(tgt){this.burst(new V3(tgt.pos.x,0.2,tgt.pos.z),16726586,5,{size:0.2,speed:1,up:0.5,grav:0})}updateProjectiles(dt){for(let pr of this.projectiles){if(pr.life-=dt,pr.pos.addScaledVector(pr.vel,dt),pr.mesh.position.copy(pr.pos),pr.mesh.rotation.x+=dt*8,this.isSolid(pr.pos.x,pr.pos.z))pr.life=0;if(Math.random()<0.4)this.burst(pr.pos.clone(),8947848,1,{size:0.15,speed:0.3,up:0.3,grav:0,life:0.3});if(pr.owner==="enemy"){for(let p of this.players)if(!p.dead&&Math.hypot(p.pos.x-pr.pos.x,p.pos.z-pr.pos.z)<0.85&&pr.pos.y<2.2){if(this.damage(p,1,pr.pos))pr.life=0,this.burst(pr.pos.clone(),[16756784,6710886],12,{size:0.3,speed:5}),audio.sfx("explode")}}else for(let e of this.enemies){if(e.dead||e.type==="parrot"&&!e.grounded)continue;if(Math.hypot(e.pos.x-pr.pos.x,e.pos.z-pr.pos.z)<e.S.r+0.5){this.hurtEnemy(e,2,null,"reflect"),pr.life=0,this.burst(pr.pos.clone(),[16756784,6710886],12,{size:0.3,speed:5}),audio.sfx("explode");break}}if(pr.life<=0)this.group.remove(pr.mesh),pr.done=!0}this.projectiles=this.projectiles.filter((p)=>!p.done)}openGateGroup(g,silent){for(let gt of this.gates)if(gt.g===g&&!gt.open)gt.open=!0,this.world.removeCollider(gt.col,!0),this.solid[gt.r][gt.c]=!1,this.tiles[gt.r][gt.c]=".";if(!silent)audio.sfx("door"),this.addShake(0.4),this.cb.toast&&this.cb.toast("A gate rumbles open!")}updatePuzzles(dt){for(let pl of this.plates){let on=!1;for(let p of this.players)if(!p.dead&&p.state!=="falling"&&Math.hypot(p.pos.x-pl.x,p.pos.z-pl.z)<0.9)on=!0;for(let it of this.items)if(!it.dead&&!it.carrier&&it.rb){let t=it.rb.translation();if(t.y<1.5&&Math.hypot(t.x-pl.x,t.z-pl.z)<0.95)on=!0}if(on&&!pl.pressed)audio.sfx("plate");if(pl.pressed=on,on&&!pl.latched)pl.latched=!0,this.openGateGroup(pl.g);pl.mesh.userData.top.position.y+=((pl.latched?0.03:on?0.05:0.14)-pl.mesh.userData.top.position.y)*Math.min(1,dt*12)}for(let gt of this.gates){let ty=gt.open?-3:0;gt.mesh.position.y+=(ty-gt.mesh.position.y)*Math.min(1,dt*4)}for(let dr of this.doors){if(dr.opened){dr.mesh.position.y+=(-3.2-dr.mesh.position.y)*Math.min(1,dt*3);continue}if(this.keys>0){for(let p of this.players)if(!p.dead&&Math.hypot(p.pos.x-dr.x,p.pos.z-dr.z)<2.6){this.keys--,dr.opened=!0,this.world.removeCollider(dr.col,!0),this.solid[dr.r][dr.c]=!1,this.tiles[dr.r][dr.c]=".",audio.sfx("door"),audio.sfx("key"),this.addShake(0.5),this.cb.toast&&this.cb.toast("Unlocked! Clink-clank!");break}}}for(let po of this.posts)po.mesh.userData.ring.rotation.z+=dt*2;for(let s of this.signs)s.mesh.rotation.z=Math.sin(this.time*2+s.idx)*0.03;for(let p of this.players)if(p.ropeT>0){if(p.ropeT-=dt,p.ropeT<=0&&p.state!=="hook")this.hideRope(p)}if(!this.cleared){let g=this.zone.goal;if(g==="clear"?this.enemies.every((e)=>e.dead):g==="door"?this.doors.every((d)=>d.opened):g==="gates"?this.gates.every((x)=>x.open):this.boss&&this.boss.dead){if(this.cleared=!0,this.exitActive=!0,this.exit)this.exit.mesh.visible=!0;this.cb.cleared&&this.cb.cleared(this)}}if(this.exit){let m=this.exit.mesh;m.userData.ring.rotation.z+=dt*2,m.userData.arrow.position.y=1.6+Math.sin(this.time*4)*0.2,m.userData.ring.material.opacity=this.exitActive?0.9:0.25,m.userData.arrow.visible=this.exitActive}if(this.supplyHint===void 0)this.supplyHint=0}updatePickups(dt){for(let pk of this.pickups){if(pk.t+=dt,pk.pop>0)pk.pop-=dt,pk.y=Math.sin((0.5-pk.pop)/0.5*Math.PI)*1.2;if(pk.mesh.userData.spin)pk.mesh.userData.spin.rotation.y+=dt*3;else pk.mesh.rotation.y+=dt*2;if(pk.mesh.position.set(pk.x,pk.y+Math.sin(pk.t*3)*0.08,pk.z),pk.fly){let d=Math.hypot(pk.fly.pos.x-pk.x,pk.fly.pos.z-pk.z)||1;pk.x+=(pk.fly.pos.x-pk.x)/d*16*dt,pk.z+=(pk.fly.pos.z-pk.z)/d*16*dt}for(let p of this.players){if(p.dead||pk.dead)continue;let d=Math.hypot(p.pos.x-pk.x,p.pos.z-pk.z);if(pk.kind==="coin"&&d<2.6&&!pk.pop)pk.x+=(p.pos.x-pk.x)*Math.min(1,dt*8),pk.z+=(p.pos.z-pk.z)*Math.min(1,dt*8);if(d<1&&!(pk.pop>0.3)){if(pk.kind==="pudding"&&p.hp>=p.max&&this.players.every((q)=>q.dead||q.hp>=q.max))continue;if(pk.dead=!0,pk.kind==="coin")this.coins++,this.stats.coins++,this.score+=10,audio.sfx("coin",1+this.coins%5*0.06),this.burst(new V3(pk.x,1,pk.z),16765498,4,{size:0.12,speed:2}),this.cb.score&&this.cb.score();else if(pk.kind==="pudding")p.hp=Math.min(p.max,p.hp+2),audio.sfx("heal"),this.burst(p.pos.clone().setY(1.5),[16735866,16777215],10,{size:0.2,speed:3}),this.cb.pop&&this.cb.pop(p.pos.clone().setY(2.2),"+HP","#ff8aa0");else if(pk.kind==="key")this.keys++,audio.sfx("key"),this.cb.toast&&this.cb.toast("Got the Rusty Key!"),this.burst(p.pos.clone().setY(1.8),16765498,12,{size:0.18,speed:4})}}}for(let pk of this.pickups)if(pk.dead)this.group.remove(pk.mesh);this.pickups=this.pickups.filter((p)=>!p.dead)}fallCheck(){for(let e of this.enemies)if(!e.dead&&e.type!=="parrot"&&e.rb&&this.isPit(e.pos.x,e.pos.z))this.hurtEnemy(e,99,null,"pit")}checkExit(){if(!this.exit||!this.exitActive||this.leaving)return;for(let p of this.players)if(!p.dead&&Math.hypot(p.pos.x-this.exit.x,p.pos.z-this.exit.z)<1.4){this.leaving=!0,this.cb.exit&&this.cb.exit(this);return}}cheatSolve(){for(let e of this.enemies)if(!e.dead)this.defeat(e);for(let g of[1,2,3])this.openGateGroup(g,!0);for(let d of this.doors)if(!d.opened)d.opened=!0,this.world.removeCollider(d.col,!0),this.solid[d.r][d.c]=!1}syncMeshes(dt){for(let it of this.items){if(it.dead||!it.rb)continue;let t=it.rb.translation(),q=it.rb.rotation();it.mesh.position.set(t.x,t.y-(it.kind==="block"?0.85:it.kind==="barrel"?0.5:it.kind==="bomb"?0.38:0.45),t.z),it.mesh.quaternion.set(q.x,q.y,q.z,q.w)}for(let p of this.players)if(p.rig.root.position.set(p.pos.x,p.pos.y,p.pos.z),p.rig.root.rotation.y=p.face,p.flashT>0){if(p.flashT-=dt,p.flashT<=0)p.rig.flash(!1)}if(this.fx.update(dt),this.water)this.water.position.y=-2.4+Math.sin(this.time*1.5)*0.04;this.lights.forEach((l,i)=>{l.intensity=22+Math.sin(this.time*9+i*2)*4})}}var CSS=`
+:root{--ink:#1a1226;--paper:#fff6dc;--hot:#ffd23a;--pink:#ff5e7a;--teal:#2fd0b5}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#10142a;color:var(--paper);font-family:"Trebuchet MS","Comic Sans MS",system-ui,sans-serif;font-size:calc(20px * var(--ts,1))}
+canvas#gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+#ui{position:fixed;inset:0;pointer-events:none;user-select:none}
+.hidden{display:none!important}
+.panel{background:rgba(26,18,38,.9);border:4px solid var(--hot);border-radius:22px;box-shadow:0 10px 0 rgba(0,0,0,.35);padding:1.2em 1.8em}
+#hud{position:absolute;inset:0}
+.pcard{position:absolute;bottom:2.5vh;padding:.45em .8em;display:flex;gap:.6em;align-items:center;font-size:1.15rem;font-weight:800}
+.pcard .hearts{letter-spacing:.1em;font-size:1.6rem;text-shadow:0 2px 0 #000}
+#top-right{position:absolute;top:2.5vh;right:2vw;text-align:right;font-weight:800;font-size:1.5rem;display:flex;flex-direction:column;gap:.3em}
+#top-right .panel{padding:.35em .9em;border-width:3px;border-radius:16px}
+#objective{position:absolute;top:2.5vh;left:50%;transform:translateX(-50%);padding:.4em 1.2em;font-size:1.25rem;font-weight:700;white-space:nowrap;border-width:3px}
+#prompt{position:absolute;bottom:13vh;left:50%;transform:translateX(-50%);padding:.4em 1.1em;font-size:1.6rem;font-weight:800;border-width:3px;white-space:nowrap}
+#toast{position:absolute;top:14vh;left:50%;transform:translateX(-50%);font-size:1.8rem;font-weight:900;color:var(--hot);text-shadow:0 3px 0 #000,0 0 14px #000;text-align:center;transition:opacity .3s}
+#banner{position:absolute;top:30vh;left:0;right:0;text-align:center;transition:opacity .5s,transform .5s}
+#banner h1{font-size:4rem;margin:0;color:var(--hot);text-shadow:0 5px 0 #000,0 0 20px #000;letter-spacing:.05em}
+#banner p{font-size:1.6rem;margin:.2em 0;text-shadow:0 3px 0 #000}
+.key{display:inline-block;min-width:1.7em;padding:.05em .4em;border-radius:.5em;background:var(--hot);color:var(--ink);text-align:center;font-weight:900}
+.pop{position:absolute;font-weight:900;font-size:1.6rem;text-shadow:0 3px 0 #000;transform:translate(-50%,-50%);transition:transform .8s ease-out,opacity .8s}
+#dialog{position:absolute;left:10vw;right:10vw;bottom:5vh;min-height:20vh;pointer-events:none;font-size:1.7rem;line-height:1.35}
+#dialog .who{position:absolute;top:-1.1em;left:1em;background:var(--pink);color:#fff;border-radius:.6em;padding:.1em .8em;font-weight:900;font-size:1.3rem;border:3px solid var(--ink)}
+#dialog .go{position:absolute;right:1.2em;bottom:.5em;font-size:1.2rem;opacity:.9;animation:bob 1s infinite}
+@keyframes bob{50%{transform:translateY(-4px)}}
+#menu{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,8,24,.55);pointer-events:auto}
+#menu .panel{min-width:min(620px,86vw);max-width:92vw;max-height:88vh;overflow:auto}
+#menu.lowered{align-items:flex-end;background:linear-gradient(transparent 40%,rgba(10,8,24,.6));padding-bottom:5vh}
+#menu.lowered .panel{min-width:min(520px,86vw);padding:.6em 1.4em}
+#menu.lowered h2,#menu.lowered .sub{display:none}
+#menu.lowered .item{padding:.25em 1em;font-size:1.4rem}
+#menu h2{margin:.1em 0 .1em;font-size:2.6rem;color:var(--hot);text-align:center;text-shadow:0 4px 0 #000}
+#menu .sub{text-align:center;opacity:.85;margin-bottom:.6em;font-size:1.2rem}
+.item{display:flex;justify-content:space-between;align-items:center;gap:1.5em;padding:.45em 1em;margin:.3em 0;border-radius:14px;font-size:1.55rem;font-weight:800;border:3px solid transparent;cursor:pointer}
+.item.focus{background:var(--hot);color:var(--ink);border-color:#fff;transform:scale(1.03)}
+.item .val{font-weight:900;min-width:6em;text-align:right}
+.item.dis{opacity:.45}
+.foot{margin-top:.8em;text-align:center;font-size:1.1rem;opacity:.85}
+.about{font-size:1.05rem;line-height:1.45;text-align:left;white-space:pre-wrap;max-height:56vh;overflow:auto;padding:.4em .8em;background:rgba(0,0,0,.3);border-radius:12px;pointer-events:auto}
+#title{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding-top:7vh;pointer-events:none}
+#title h1{font-size:min(9.5vw,8rem);margin:0;color:var(--hot);letter-spacing:.04em;text-shadow:0 8px 0 #7a3b00,0 0 40px rgba(255,94,122,.7);transform:rotate(-3deg);-webkit-text-stroke:3px var(--ink);animation:wob 3s ease-in-out infinite}
+@keyframes wob{50%{transform:rotate(-1deg) scale(1.03)}}
+#title p{font-size:1.8rem;font-weight:800;text-shadow:0 3px 0 #000;margin:.3em 0}
+#attract{position:absolute;bottom:6vh;left:0;right:0;text-align:center;font-size:2.4rem;font-weight:900;color:var(--hot);text-shadow:0 4px 0 #000;animation:blink 1.1s infinite}
+@keyframes blink{50%{opacity:.25}}
+#fade{position:absolute;inset:0;background:#000;opacity:0;transition:opacity .35s;pointer-events:none}
+#notice{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1em;background:#10142a;font-size:2.2rem;font-weight:900;text-align:center;pointer-events:auto;padding:2em}
+#loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#10142a;font-size:2rem;font-weight:900}
+.hearts .e{opacity:.3}
+`,esc=(s)=>String(s).replace(/[&<>]/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;"})[c]);class UI{constructor(){this.menuStack=[],this.dialog=null,this.focus=0,this.cache={}}mount(){let st=document.createElement("style");st.textContent=CSS,document.head.appendChild(st);let root=document.createElement("div");root.id="ui",root.innerHTML=`
+      <div id="hud" class="hidden">
+        <div id="p0" class="pcard panel" style="left:2vw"></div>
+        <div id="p1" class="pcard panel hidden" style="left:22vw"></div>
+        <div id="top-right"><div class="panel" id="coins"></div><div class="panel hidden" id="keys"></div></div>
+        <div id="objective" class="panel"></div>
+        <div id="prompt" class="panel hidden"></div>
+        <div id="toast"></div>
+        <div id="banner" style="opacity:0"><h1></h1><p></p></div>
+      </div>
+      <div id="title" class="hidden"><h1>GOOF TUFT</h1><p>A pudding-powered pirate pratfall</p></div>
+      <div id="dialog" class="panel hidden"><div class="who"></div><div class="txt"></div><div class="go"></div></div>
+      <div id="notice" class="hidden"></div>
+      <div id="menu" class="hidden"><div class="panel"></div></div>
+      <div id="attract" class="hidden"></div>
+      <div id="fade"></div>
+      <div id="loading">Hoisting the sails...</div>`,document.body.appendChild(root),this.q=(s)=>root.querySelector(s),this.root=root}setScale(s){document.documentElement.style.setProperty("--ts",s)}show(sel,on){this.q(sel).classList.toggle("hidden",!on)}fade(on){this.q("#fade").style.opacity=on?1:0}loaded(){this.q("#loading").classList.add("hidden")}fatal(msg){let l=this.q("#loading");l.classList.remove("hidden"),l.innerHTML=`<div style="max-width:30em;text-align:center">${esc(msg)}</div>`}setHud(s){let set=(sel,html)=>{if(this.cache[sel]!==html)this.cache[sel]=html,this.q(sel).innerHTML=html};for(let i=0;i<2;i++){let p=s.players[i];if(this.q("#p"+i).classList.toggle("hidden",!p),!p)continue;let hearts=Array.from({length:p.max},(_,k)=>`<span class="${k<p.hp?"":"e"}" style="color:${k<p.hp?"#ff5e7a":"#fff"}">${k<p.hp?"♥":"♡"}</span>`).join("");set("#p"+i,`<span style="color:${p.color}">${esc(p.name)}</span><span class="hearts">${hearts}</span>${p.carry?"<span>\uD83E\uDD32</span>":""}`)}set("#coins",`\uD83E\uDE99 ${s.coins} &nbsp; ★ ${s.score} &nbsp; ${s.lives!==null?"\uD83C\uDF6E×"+s.lives:""}`),this.q("#keys").classList.toggle("hidden",!s.keys),set("#keys",s.keys?"\uD83D\uDDDD "+s.keys:""),set("#objective",esc(s.objective||""))}prompt(html){let el=this.q("#prompt");if(html===null){el.classList.add("hidden"),this.cache.prompt=null;return}if(this.cache.prompt!==html)this.cache.prompt=html,el.innerHTML=html;el.classList.remove("hidden")}toast(text,ms=2200){let t=this.q("#toast");t.innerHTML=text,t.style.opacity=1,clearTimeout(this._tt),this._tt=setTimeout(()=>t.style.opacity=0,ms)}banner(title,sub,ms=2600){let b=this.q("#banner");b.querySelector("h1").textContent=title,b.querySelector("p").textContent=sub||"",b.style.opacity=1,b.style.transform="scale(1)",clearTimeout(this._bt),this._bt=setTimeout(()=>{b.style.opacity=0,b.style.transform="scale(1.15)"},ms)}pop(x,y,text,color="#fff"){let d=document.createElement("div");d.className="pop",d.textContent=text,d.style.color=color,d.style.left=x+"px",d.style.top=y+"px",this.q("#hud").appendChild(d),requestAnimationFrame(()=>{d.style.transform="translate(-50%,-150%)",d.style.opacity=0}),setTimeout(()=>d.remove(),900)}say(lines){return new Promise((resolve)=>{this.dialog={lines,i:0,n:0,t:0,resolve,done:!1},this.show("#dialog",!0),this.startLine()})}startLine(){let d=this.dialog,ln=d.lines[d.i],names={barnaby:"Barnaby Tuft",pip:"Pip",gran:"Gran Tuft",clammy:"Capt. Clammy",sign:"Sign"};this.q("#dialog .who").textContent=names[ln.who]||ln.who,this.q("#dialog .who").style.background={barnaby:"#2fa0d0",pip:"#e8443a",gran:"#a060d0",clammy:"#7a2a8a",sign:"#8a5a2a"}[ln.who]||"#ff5e7a",d.n=0,d.t=0,d.done=!1,this.q("#dialog .go").textContent="",this.q("#dialog .txt").textContent=""}updateDialog(dt,advance){let d=this.dialog;if(!d)return!1;let ln=d.lines[d.i];if(!d.done){d.t+=dt*42;while(d.n<Math.floor(d.t)&&d.n<ln.text.length){let ch=ln.text[d.n++];if(d.n%2===0)audio.voice(ch,VOICES[ln.who]?ln.who:"sign")}if(this.q("#dialog .txt").textContent=ln.text.slice(0,d.n),d.n>=ln.text.length)d.done=!0,this.q("#dialog .go").innerHTML=`<span class="key">${advance.label}</span> ${d.i<d.lines.length-1?"Next":"Done"}`;if(advance.pressed&&!d.done)d.n=ln.text.length,d.t=d.n}else if(advance.pressed)if(audio.sfx("menuMove"),++d.i>=d.lines.length){this.show("#dialog",!1);let r=d.resolve;this.dialog=null,r()}else this.startLine();return!0}get menuActive(){return this.menuStack.length>0}pushMenu(def){this.menuStack.push(def),def.focus=def.focus||0,this.renderMenu(),audio.sfx("menuSelect")}popMenu(silent){let m=this.menuStack.pop();if(!silent)audio.sfx("menuBack");if(m&&m.onClose)m.onClose();if(this.menuStack.length)this.renderMenu();else this.show("#menu",!1)}clearMenus(){while(this.menuStack.length){let m=this.menuStack.pop();if(m.onClose)m.onClose()}this.show("#menu",!1)}top(){return this.menuStack[this.menuStack.length-1]}enabledItems(m){return m.items.map((it,i)=>({it,i})).filter((x)=>x.it.kind!=="label"&&!x.it.disabled)}renderMenu(){let m=this.top();if(!m)return;this.show("#menu",!0),this.q("#menu").classList.toggle("lowered",!!m.lowered);let panel=this.q("#menu .panel"),val=(it)=>{if(it.kind==="toggle")return it.get()?"ON":"OFF";if(it.kind==="slider")return"◀ "+Math.round(it.get()*100)+"% ▶";if(it.kind==="cycle")return"◀ "+it.options[it.get()]+" ▶";return""};panel.innerHTML=`<h2>${esc(m.title)}</h2>${m.sub?`<div class="sub">${esc(m.sub)}</div>`:""}`+(m.text?`<div class="about" id="abouttext">${esc(m.text)}</div>`:"")+m.items.map((it,i)=>`<div class="item ${i===m.focus?"focus":""} ${it.disabled?"dis":""}" data-i="${i}"><span>${esc(it.label)}</span><span class="val">${val(it)}</span></div>`).join("")+`<div class="foot">${m.footer||""}</div>`,panel.querySelectorAll(".item").forEach((el)=>{let i=+el.dataset.i;el.addEventListener("mouseenter",()=>{if(m.items[i].kind!=="label"&&!m.items[i].disabled&&m.focus!==i)m.focus=i,this.markFocus(),audio.sfx("menuMove")}),el.addEventListener("click",()=>{m.focus=i,this.activate(0)})}),this.markFocus()}markFocus(){let m=this.top();if(!m)return;this.root.querySelectorAll("#menu .item").forEach((el)=>el.classList.toggle("focus",+el.dataset.i===m.focus))}activate(dir){let m=this.top();if(!m)return;let it=m.items[m.focus];if(!it||it.disabled)return;if(it.kind==="toggle")it.set(!it.get()),audio.sfx("menuSelect"),this.refreshVals();else if(it.kind==="slider")it.set(Math.max(0,Math.min(1,+(it.get()+(dir||0.1)*0.1).toFixed(2)))),audio.sfx("menuMove"),this.refreshVals();else if(it.kind==="cycle"){let n=it.options.length;it.set((it.get()+(dir||1)+n)%n),audio.sfx("menuMove"),this.refreshVals()}else if(it.action)audio.sfx("menuSelect"),it.action()}refreshVals(){let f=this.cache.focusKeep;if(this.top()){let sc=this.q("#menu .panel").scrollTop;this.renderMenu(),this.q("#menu .panel").scrollTop=sc}}menuInput(mi){let m=this.top();if(!m)return;let en=this.enabledItems(m),idx=en.findIndex((x)=>x.i===m.focus),move=(d)=>{if(!en.length)return;let n=en[(idx+d+en.length)%en.length].i;m.focus=n,this.markFocus(),audio.sfx("menuMove");let el=this.root.querySelector("#menu .item.focus");if(el)el.scrollIntoView({block:"nearest"})};if(mi.up)if(m.text&&m.items.length<=1)this.q("#abouttext").scrollTop-=90;else move(-1);if(mi.down)if(m.text&&m.items.length<=1)this.q("#abouttext").scrollTop+=90;else move(1);if(mi.left)this.activate(-1);if(mi.right)this.activate(1);if(mi.ok){let it=m.items[m.focus];if(it&&(it.kind==="button"||it.kind===void 0))this.activate(0);else if(it)this.activate(1)}if(mi.back||mi.pause)if(m.onBack)m.onBack();else this.popMenu()}attract(on){let a=this.q("#attract");if(a.classList.toggle("hidden",!on),on)a.textContent="DEMO — PRESS ANY BUTTON"}notice(html){let n=this.q("#notice");if(n.classList.toggle("hidden",!html),html)n.innerHTML=html}}var ui=new UI;var about_default={text:`GOOF TUFT — an original spiritual successor to Goof Troop
+
+SOURCE INFORMATION
+- Date: 2026-10-29 07:50
+- Source: Goof Troop
+- Tech: Three.js r180 (three/webgpu WebGPURenderer + TSL, WebGPU only, no fallback); Rapier 0.19.3 (@dimforge/rapier3d-compat) for physics; Gamepad API; Web Audio API; AI Hub session client 1.3.0; bundled with Bun 1.3; Three.js and Rapier load from the jsDelivr CDN through an import map
+- Art Direction: cel-shaded toon look: 4-step MeshToonMaterial ramp, inverted-hull ink outlines (TSL vertex extrusion), soft shadow map, pastel per-zone palettes, torch point lights in the fort and the deck
+- Animation: procedural rig animation (code-driven walk, carry, swing, dizzy and roll cycles on primitive-built rigs) with squash and stretch, hit-stop, camera shake and a particle pool
+- Audio: all code-written. Step-sequenced music (6 themes), synthesized sound effects (oscillators and noise), and Animalese-style gibberish voice acting (per-letter blips, 6 speaker voices). No audio files
+- Online: AI Hub Session Protocol v1, side-by-side (parallel) mode, 1-4 players: progress and result reporting, seeded loot deal, probe, time-up and end handling. No other networking. Local 2-player co-op: a second controller joins as Pip
+- Testing: lightweight and automated only: headless Chromium (Playwright) with WebGPU on SwiftShader, scripted mechanic checks, a fake DualSense for the gamepad path, and the AI Hub harness automatic check at 1 and 2 players
+- Environment: Claude Code CLI (headless); Linux (WSL2); browser unknown (tested in headless Chromium)
+- Model: Anthropic, claude-sonnet-5-5, reasoning effort medium
+- Usage: unknown (no token or cost counters were available in the session). Session time: about 45 minutes of wall clock, 07:15 to about 08:00
+
+TESTING FEEDBACK
+- Issues caught: 8 (gate glyphs colliding with crab and boss glyphs; attract AI dithering between targets; title menu covering the subtitle; empty HUD panels during intro; flipped test screenshots; no progress reports when the score was still 0; borderline pick-up reach; over-bright torch lights and wall tops matching the floor)
+- Critical / game-breaking: 2 (the glyph collision meant the boss and crabs never spawned; no progress reports failed the AI Hub check)
+- Most helpful test: the AI Hub harness automatic check, plus fast-forwarding the real simulation with the attract-mode AI through all four zones to the boss
+- Least helpful test: ordinary headless screenshots, because they show a blank WebGPU canvas
+
+ENGINE FEEDBACK
+- Liked most: Three.js WebGPU with TSL made cel shading cheap (MeshToonMaterial plus a TSL position node for outlines), and Rapier's kinematic character controller plus collision groups gave solid wall and block behavior for little code
+- Got stuck or guessed wrong: headless captures of a WebGPU canvas come out blank, so I rendered to a render target and read the pixels back. I also guessed wrong that gate letters and enemy letters could share one ASCII legend
+- Most important thing built by hand: the whole game layer: state machine, ASCII level loader, enemy AI and boss, carry and throw, hookshot, UI and menus, input mapping, and audio synthesis
+- Hardest part: getting Rapier interaction groups right so characters ignore thrown items but not kick blocks, and keeping dynamic boxes from snagging on floor seams (solved by merging colliders)
+- Overhaul or remove: Rapier compat's deprecated-init warning and its embedded-WASM packaging
+- One change: a built-in way to capture the WebGPU frame in headless runs
+
+PROMPT FEEDBACK
+- Liked most: a clear deliverable, the 10-foot controller-first framing, the inverted-axis toggle hint, and the attract-mode requirement
+- Confusing: the WebGPU-only, no-fallback rule next to the AI Hub guidance asking for a WebGL fallback (resolved with the hub:webgpu required meta); also the single-file rule next to CDN dependencies being allowed
+- Hardest thing: fitting a feature-complete vertical slice (4 zones, 5 enemy types, a boss, puzzles, co-op, attract mode, hub integration) into one pass
+- One test I wish I had run: a real-GPU headed run with a physical DualSense for a full 10-minute playthrough
+
+CONTROLS
+- Controller: left stick move, Cross grab/throw/read, Square kick, Triangle or R2 hookshot, Circle or R1 roll, Options pause. A second controller joins with Cross.
+- Keyboard: WASD move, Space grab/throw, F kick, E hookshot, Shift roll, Esc pause.
+
+Original characters, story, art and audio. Goof Troop is a trademark of its owners; this is an unaffiliated homage.`};var AIHub=window.AIHub,SESSION=!!(AIHub&&AIHub.active),IDLE_ATTRACT=10,G2={state:"boot",sim:null,gfx:null,zoneIdx:0,attract:!1,idle:0,session:!1,over:!1,camT:new V3,camShake:0,brain:null,started:!1,paused:!1,hubStarted:!1,resultSent:!1,runOver:!1,time:0};window.__game=G2;window.__THREE=THREE;window.__ui=ui;window.__input=input;window.__settings=settings;G2.advance=(frames,ins=[{},{}],mode={})=>{for(let i=0;i<frames;i++)if(ui.dialog)ui.updateDialog(0.016666666666666666,{pressed:!1,label:""});else G2.sim.update(0.016666666666666666,ins,mode);hud()};var STORE="gooftuft.settings.v1";function loadSettings(){try{let s=JSON.parse(localStorage.getItem(STORE)||"{}");Object.assign(settings,s.settings||{}),Object.assign(audio.vol,s.vol||{})}catch(e){}ui.setScale(settings.textScale),audio.applyVolumes()}function saveSettings(){try{localStorage.setItem(STORE,JSON.stringify({settings,vol:audio.vol}))}catch(e){}}function settingsMenu(){let sl=(label,k)=>({label,kind:"slider",get:()=>audio.vol[k],set:(v)=>{audio.setVolume(k,v),saveSettings()}}),tg=(label,k,after)=>({label,kind:"toggle",get:()=>settings[k],set:(v)=>{if(settings[k]=v,after)after();saveSettings()}});ui.pushMenu({title:"Settings",sub:"Changes apply right away",footer:`<span class="key">${input.glyph("back")}</span> Back`,items:[sl("Master volume","master"),sl("Music volume","music"),sl("Effects volume","sfx"),sl("Voice volume","voice"),tg("Invert horizontal stick","invertX"),tg("Invert vertical stick","invertY"),tg("Controller rumble","rumble"),tg("Screen shake","shake"),tg("Aim assist","aimAssist"),tg("Shadows","shadows",()=>{if(G2.gfx)G2.gfx.renderer.shadowMap.enabled=settings.shadows;if(G2.gfx)G2.gfx.sun.castShadow=settings.shadows}),{label:"Text size",kind:"cycle",options:["Normal","Large","Huge"],get:()=>({1:0,1.25:1,1.5:2})[settings.textScale]||0,set:(i)=>{settings.textScale=[1,1.25,1.5][i],ui.setScale(settings.textScale),saveSettings()}},{label:"Back",kind:"button",action:()=>ui.popMenu()}]})}function controlsMenu(){ui.pushMenu({title:"Controls",footer:`<span class="key">${input.glyph("back")}</span> Back`,text:`CONTROLLER (DualSense)
+  Left stick / D-pad ..... Move
+  ✕ Cross ................. Grab / Throw / Read signs
+  □ Square ................ Kick (blocks, pirates, cannonballs)
+  △ Triangle / R2 ........ Hookshot
+  ○ Circle / R1 .......... Dodge roll
+  Options ................. Pause & Settings
+  2nd controller: press ✕ to join as Pip!
+
+KEYBOARD + MOUSE
+  WASD / Arrows .......... Move
+  Space / J / Left click .. Grab / Throw / Read
+  F / K / Right click .... Kick
+  E / L ................... Hookshot
+  Shift / O ............... Dodge roll
+  Esc / P ................. Pause & Settings
+
+TIPS
+  Pots hide doubloons. Barrels hit hard. Bombs go BOOM after a short fuse.
+  Pits swallow kick blocks and turn into bridges.`,items:[{label:"Back",kind:"button",action:()=>ui.popMenu()}]})}function aboutMenu(){ui.pushMenu({title:"About & Credits",sub:"Goof Tuft — an original spiritual successor to Goof Troop",text:about_default.text,footer:`<span class="key">${input.glyph("back")}</span> Back &nbsp; Up/Down scroll`,items:[{label:"Back",kind:"button",action:()=>ui.popMenu()}]})}async function boot(){ui.mount(),input.bind(),loadSettings();let bad=validateZones();if(bad.length)console.error("Level errors",bad);if(input.coarseOnly&&!SESSION)showTouchNotice();if(!navigator.gpu){if(ui.fatal("This game needs WebGPU (Chrome, Edge or another WebGPU browser). There is no fallback."),SESSION)AIHub.fail("No WebGPU");return}try{await RAPIER2.init();let canvas=document.createElement("canvas");canvas.id="gl",document.body.prepend(canvas),G2.gfx=await initGfx(canvas)}catch(e){if(console.error(e),ui.fatal("Could not start the graphics: "+e.message),SESSION)AIHub.fail("Graphics failed");return}if(G2.gfx.renderer.shadowMap.enabled=settings.shadows,G2.gfx.sun.castShadow=settings.shadows,G2.particles=new Particles(G2.gfx.scene),G2.sim=new Sim(G2.gfx.scene,G2.particles,callbacks()),G2.sim.loadZone(0),applyZoneLook(),ui.loaded(),AIHub)AIHub.probe(probe);if(G2.gfx.renderer.setAnimationLoop(frame),SESSION){if(await AIHub.connect({mode:"parallel",seats:[1,4]})){G2.session=!0,AIHub.on("time-up",()=>finishRun("time-up")),AIHub.on("end",()=>{G2.runOver=!0,G2.session="ended",audio.silence(),ui.clearMenus(),ui.show("#hud",!1)}),AIHub.on("start",()=>{audio.resume()}),startGame({skipStory:!0}),AIHub.ready();return}}goTitle()}function showTouchNotice(){ui.notice('<div>Controller or keyboard required</div><div style="font-size:1.3rem;font-weight:700;opacity:.8">Connect a controller or use a keyboard to play.</div><div class="item focus" id="tn-set" style="pointer-events:auto">Settings</div>'),document.getElementById("tn-set").onclick=()=>{if(!ui.menuActive)settingsMenu()};let hide=()=>{ui.notice(null),removeEventListener("keydown",hide),removeEventListener("gamepadconnected",hide)};addEventListener("keydown",hide),addEventListener("gamepadconnected",hide)}function probe(){return{scene:G2.state==="title"?"title":G2.state==="play"?G2.runOver?"over":"play":G2.state==="over"?"over":"menu",menu:ui.menuActive,world:G2.sim?G2.sim.time:0,input:{x:input.p[0].mx,y:input.p[0].my,fire:input.p[0].grabHeld}}}function applyZoneLook(){let Z=ZONES[G2.sim.zoneIdx],{scene,hemi,sun}=G2.gfx;scene.background=new THREE.Color(Z.sky),scene.fog=new THREE.Fog(Z.sky,45,110);let dark=Z.id==="fort"||Z.id==="deck";hemi.intensity=dark?0.75:1.15,sun.intensity=dark?1.5:2.3,sun.color.set(dark?12103935:16773328),audio.music(Z.music),G2.camSnap=!0}function callbacks(){return{toast:(t)=>ui.toast(t),pop:(pos,text,color)=>{let v=pos.clone().project(G2.gfx.camera);ui.pop((v.x*0.5+0.5)*innerWidth,(-v.y*0.5+0.5)*innerHeight,text,color)},sign:(s)=>{let lines=ZONES[G2.sim.zoneIdx].signs[s.idx];if(lines)say(lines.lines.map((t)=>({who:lines.who,text:t})))},score:()=>reportProgress(),say:(key)=>say(STORY[key]),cleared:(sim)=>{sim.score+=200,ui.banner("Zone Clear!","+200",2200),audio.sfx("win"),ui.toast(sim.exit?"Head for the glowing exit!":""),reportProgress()},exit:()=>nextZone(),wipe:()=>onWipe(),bossDown:()=>onBossDown(),zoneLoaded:()=>{}}}async function say(lines){G2.attract,G2.sim.talking=!0,await ui.say(lines),G2.sim.talking=!1}function reportProgress(){if(G2.session!==!0)return;AIHub.progress({score:G2.sim.score,label:`Zone ${G2.sim.zoneIdx+1} of ${ZONES.length}`.slice(0,24)})}function goTitle(){G2.state="title",G2.attract=!1,G2.idle=0,ui.attract(!1),ui.show("#hud",!1),ui.show("#dialog",!1),ui.clearMenus(),G2.sim.cheat={invuln:!1,noclip:!1},G2.sim.players.length=0,G2.sim.loadZone(0),applyZoneLook(),audio.music("title"),ui.show("#title",!0),input.consumeAny(),titleMenu()}function titleMenu(){ui.pushMenu({title:"Main Menu",lowered:!0,sub:"Press a button to begin",footer:`<span class="key">${input.glyph("ok")}</span> Select`,onBack:()=>{},items:[{label:"Start Adventure",kind:"button",action:()=>startGame({})},{label:"Settings",kind:"button",action:settingsMenu},{label:"Controls",kind:"button",action:controlsMenu},{label:"About & Credits",kind:"button",action:aboutMenu}]})}function resetRun(){let s=G2.sim;s.score=0,s.coins=0,s.keys=0,s.lives=3,s.players.length=0,Object.keys(s.stats).forEach((k)=>s.stats[k]=0),G2.runOver=!1,G2.resultSent=!1,G2.over=!1,G2.zoneStart=performance.now()}async function startGame({skipStory=!1,attract=!1}={}){if(audio.resume(),ui.clearMenus(),ui.show("#title",!1),G2.attract=attract,G2.state="play",resetRun(),G2.sim.loadZone(0),applyZoneLook(),attract)G2.sim.cheat={invuln:!0,noclip:!0};if(ui.show("#hud",!0),ui.attract(attract),hud(),ui.banner(ZONES[0].name,"Zone 1 of "+ZONES.length),!skipStory&&!SESSION)await say(STORY.intro),await say(STORY.zoneIntro[0])}async function nextZone(){let s=G2.sim,idx=s.zoneIdx+1;if(idx>=ZONES.length)return;if(audio.sfx("zone"),ui.fade(!0),await wait(450),s.loadZone(idx),s.keys=0,applyZoneLook(),ui.fade(!1),ui.banner(ZONES[idx].name,`Zone ${idx+1} of ${ZONES.length}`),reportProgress(),G2.attract)G2.brain=new Brain;if(G2.session===!0||SESSION){if(ZONES[idx].goal==="boss")s.bossActive=!0;return}if(await say(STORY.zoneIntro[idx]),ZONES[idx].goal==="boss")s.bossActive=!0,audio.sfx("stomp")}function wait(ms){return new Promise((r)=>setTimeout(r,ms))}async function onWipe(){let s=G2.sim;if(s.lives--,await wait(1100),s.lives<=0){if(SESSION)return finishRun("out of lives");G2.state="over",ui.show("#hud",!1),ui.pushMenu({title:"Game Over",sub:`Score ${s.score} — Gran says: "Try again, dumplings!"`,onBack:()=>{},items:[{label:"Try this zone again",kind:"button",action:()=>{ui.clearMenus(),s.lives=3,s.loadZone(s.zoneIdx),applyZoneLook(),ui.show("#hud",!0),G2.state="play"}},{label:"Back to title",kind:"button",action:goTitle}]}),audio.stopMusic();return}ui.fade(!0),await wait(500);let idx=s.zoneIdx;if(s.players.forEach((p)=>{p.hp=p.max,p.dead=!1}),s.loadZone(idx),applyZoneLook(),ui.fade(!1),ui.toast("Oops! A pudding cup is lost — "+s.lives+" left<br><small>"+STORY.hints[(s.stats.deaths+s.zoneIdx)%STORY.hints.length]+"</small>",4200),ZONES[idx].goal==="boss")s.bossActive=!0}async function onBossDown(){let s=G2.sim;if(s.slowmo=1.6,s.addShake(1.4),audio.sfx("win"),audio.music("victory",{loop:!1}),await wait(2200),G2.attract){ui.fade(!0),await wait(600),startGame({attract:!0,skipStory:!0}),ui.fade(!1),G2.brain=new Brain;return}if(!SESSION)await say(STORY.outro);s.score+=1000,s.cleared=!0,finishRun("victory")}function finishRun(reason){if(G2.resultSent||G2.attract)return;G2.resultSent=!0,G2.runOver=!0;let s=G2.sim,st=s.stats;if(SESSION&&G2.session===!0){let awards=[];if(reason==="victory")awards.push({title:"Pudding Rescued!",detail:"Beat Captain Clammy"});if(st.reflects>=2)awards.push({title:"Cannonball Returns",detail:st.reflects+" reflected"});if(st.bombs>=3)awards.push({title:"Boom Goes the Dynamite",detail:st.bombs+" bombs"});AIHub.result({score:s.score,stats:{doubloons:s.coins,pirates:st.defeated,zone:s.zoneIdx+1,kicks:st.kicks,hooks:st.hooks,falls:st.falls},awards}),ui.show("#hud",!0),ui.banner(reason==="victory"?"Pudding Saved!":"Round Over","Score "+s.score,60000);return}G2.state="over",ui.show("#hud",!1);let secs=Math.round(st.time),mm=Math.floor(secs/60),ss=String(secs%60).padStart(2,"0");ui.pushMenu({title:reason==="victory"?"Pudding Rescued!":"The End?",sub:`Score ${s.score}`,onBack:()=>{},text:`Doubloons ${s.coins}
+Pirates bonked ${st.defeated}
+Things thrown ${st.thrown}
+Kicks ${st.kicks}    Hookshots ${st.hooks}
+Bombs ${st.bombs}    Cannonballs returned ${st.reflects}
+Pratfalls ${st.deaths+st.falls}
+Time ${mm}:${ss}
+
+Gran Tuft serves the Great Big Wobbly Pudding. Everybody gets a spoon.`,items:[{label:"Play again",kind:"button",action:()=>{ui.clearMenus(),startGame({})}},{label:"Back to title",kind:"button",action:goTitle}]})}function openPause(){if(ui.menuActive||G2.state!=="play")return;G2.paused=!0;let items=[{label:"Resume",kind:"button",action:closePause},{label:"Settings",kind:"button",action:settingsMenu},{label:"Controls",kind:"button",action:controlsMenu}];if(!SESSION)items.push({label:"Restart zone",kind:"button",action:()=>{closePause(),G2.sim.lives=3,G2.sim.loadZone(G2.sim.zoneIdx),applyZoneLook()}}),items.push({label:"Quit to title",kind:"button",action:()=>{closePause(),goTitle()}});ui.pushMenu({title:"Paused",sub:ZONES[G2.sim.zoneIdx].name,onBack:closePause,onClose:()=>{},items,footer:`<span class="key">${input.glyph("pause")}</span> Resume`})}function closePause(){ui.clearMenus(),G2.paused=!1,audio.sfx("menuBack")}var angD=(a,b)=>{let d=b-a;while(d>Math.PI)d-=2*Math.PI;while(d<-Math.PI)d+=2*Math.PI;return d};class Brain{constructor(){this.t=0,this.cool=0,this.signDone=new Set,this.solved=!1,this.tgt=null,this.step=0,this.hookT=0}go(p,x,z,out,stop=0.4){let dx=x-p.pos.x,dz=z-p.pos.z,d=Math.hypot(dx,dz);if(d>stop)out.mx=dx/d,out.my=dz/d;return d}think(dt){let s=G2.sim,p=s.players[0],out={mx:0,my:0,grab:!1,kick:!1,hook:!1,dash:!1};if(!p||p.dead||s.talking)return out;this.t+=dt,this.cool-=dt;let boss=s.boss&&!s.boss.dead?s.boss:null;if(!s.cleared&&!this.solved&&s.zoneTime>(boss?70:32))if(this.solved=!0,boss)boss.hp=1,s.hurtEnemy(boss,5,null,"reflect");else s.cheatSolve();if(s.cleared&&s.exit)return this.go(p,s.exit.x,s.exit.z,out,0.3),out;for(let sg of s.signs)if(!this.signDone.has(sg.idx)){if(this.go(p,sg.x,sg.z+1.6,out,0.5)<2.4&&this.cool<=0){let want=Math.atan2(sg.x-p.pos.x,sg.z-p.pos.z);if(Math.abs(angD(p.face,want))>0.4)out.mx=Math.sin(want)*0.2,out.my=Math.cos(want)*0.2;else out.grab=!0,this.signDone.add(sg.idx),this.cool=1}return out}if(s.posts.length&&!s.hookDone){let po=s.posts.reduce((a,b)=>Math.abs(a.z-p.pos.z)<Math.abs(b.z-p.pos.z)?a:b);if(this.go(p,po.x-6.5,po.z,out,0.3)<0.6){let want=Math.atan2(po.x-p.pos.x,po.z-p.pos.z);if(Math.abs(angD(p.face,want))>0.25)out.mx=Math.sin(want)*0.2,out.my=Math.cos(want)*0.2;else if(p.hookCd<=0)out.hook=!0,s.hookDone=!0}return out}let foes=s.enemies.filter((e)=>!e.dead&&e.type!=="cannon"),cannons=s.enemies.filter((e)=>!e.dead&&e.type==="cannon"),targets=foes.length?foes:cannons;if(targets.length){let dd=(e2)=>Math.hypot(e2.pos.x-p.pos.x,e2.pos.z-p.pos.z);if(!this.tgt||this.tgt.dead||!targets.includes(this.tgt))this.tgt=targets.reduce((a,b)=>dd(a)<dd(b)?a:b);let e=this.tgt,d=dd(e),want=Math.atan2(e.pos.x-p.pos.x,e.pos.z-p.pos.z),aimed=Math.abs(angD(p.face,want))<0.22,turnTo=()=>{out.mx=Math.sin(want)*0.25,out.my=Math.cos(want)*0.25},bossWait=e.type==="boss"&&e.state!=="dizzy";if(e.type==="parrot"&&!e.grounded&&d<10&&p.hookCd<=0&&!p.carry){if(!aimed)turnTo();else out.hook=!0;return out}if(p.carry){if(bossWait)return turnTo(),out;if(d>6.5)this.go(p,e.pos.x,e.pos.z,out,0);else if(!aimed)turnTo();else if(this.cool<=0)out.grab=!0,this.cool=0.7;return out}let wantItem=(i)=>!i.dead&&i.rb&&!i.carrier&&i.kind!=="block"&&(e.type!=="boss"||i.kind==="barrel"),best=null,bd=1e9;for(let i of s.items)if(wantItem(i)){let t=i.rb.translation(),q=Math.hypot(t.x-p.pos.x,t.z-p.pos.z);if(q<bd)bd=q,best=t}if(best&&e.stun<=0&&(e.type==="boss"||bd<9||d>10)){if(this.go(p,best.x,best.z,out,1.2),bd<1.8&&this.cool<=0){let w2=Math.atan2(best.x-p.pos.x,best.z-p.pos.z);if(Math.abs(angD(p.face,w2))>0.5)out.mx=Math.sin(w2)*0.25,out.my=Math.cos(w2)*0.25;else out.grab=!0,this.cool=0.6}return out}if(bossWait)return out;if(this.go(p,e.pos.x,e.pos.z,out,1.3),d<2&&p.kickCd<=0)if(!aimed)turnTo();else out.kick=!0;return out}let plate=s.plates.find((pl)=>!pl.latched);if(plate)return this.go(p,plate.x,plate.z,out,0.2),out;let key=s.pickups.find((k)=>k.kind==="key");if(key)return this.go(p,key.x,key.z,out,0.2),out;let door=s.doors.find((d)=>!d.opened);if(door)return this.go(p,door.x-1.4,door.z,out,0.3),out;if(s.exit)this.go(p,s.exit.x,s.exit.z,out,0.3);return out}}var last=performance.now();function frame(now){let raw=(now-last)/1000,dt=Math.min(0.05,raw);last=now,G2.time+=dt,input.update(dt);let any=input.consumeAny(),s=G2.sim;if(!s)return;if(any)audio.resume();if(G2.state==="title"){if(any)G2.idle=0;else G2.idle+=raw;if(!G2.attract&&G2.idle>IDLE_ATTRACT&&!input.coarseOnly)startAttract();titleCamera(dt),s.syncMeshes(dt),s.players.forEach((p)=>p.rig.pose(dt,{speed:0}))}else if(G2.attract)if(any)stopAttract();else attractTick(dt);else if(G2.state==="play")playTick(dt);if(ui.menuActive)ui.menuInput(input.menu);else if(G2.state==="play"&&!G2.attract&&!ui.dialog&&input.menu.pause&&!(SESSION&&G2.session!==!0))openPause();if(G2.state==="over"&&ui.menuActive===!1&&!SESSION);updateCamera(dt),G2.gfx.renderer.render(G2.gfx.scene,G2.gfx.camera)}function playTick(dt){let s=G2.sim;if(G2.session===!0&&!G2.runOver&&AIHub.time()>=0){if(G2.progT=(G2.progT||0)-dt,G2.progT<=0)G2.progT=1,reportProgress()}let hubGate=SESSION?G2.session===!0&&AIHub.time()>=0:!0;if(ui.dialog){hud();let g=input.p[0];ui.updateDialog(dt,{pressed:g.grab||input.menu.ok||input.p[1].grab&&input.p[1].connected,label:input.glyph("grab")}),s.syncMeshes(dt);return}if(G2.paused||ui.menuActive||!hubGate||G2.runOver){s.syncMeshes(dt);return}if(s.players.length===1&&input.p[1].connected&&input.p[1].grab&&!SESSION)s.spawnPlayer(1,5,5).pos.set(s.players[0].pos.x+1.5,0,s.players[0].pos.z+1),ui.toast("Pip joins the fun!"),audio.sfx("heal");s.update(dt,[input.p[0],input.p[1]],{}),hud()}function attractTick(dt){let s=G2.sim;if(!G2.brain)G2.brain=new Brain;if(ui.dialog){if(ui.updateDialog(dt,{pressed:(G2.autoAdv=(G2.autoAdv||0)+dt)>1.2&&ui.dialog.done,label:"…"}),ui.dialog&&ui.dialog.done===!1)G2.autoAdv=0;s.syncMeshes(dt);return}let inp=G2.brain.think(dt);s.update(dt,[inp,{}],{cheat:{invuln:!0,noclip:!0}}),hud()}function hud(){let s=G2.sim,objective=ZONES[s.zoneIdx].objective;if(s.boss&&!s.boss.dead&&s.bossActive)objective="Captain Clammy "+"♥".repeat(Math.max(0,s.boss.hp));if(s.cleared)objective=s.exit?"Zone clear! Head for the exit.":objective;ui.setHud({players:s.players.map((p)=>({hp:Math.max(0,p.hp),max:p.max,name:p.name,color:PCOL[p.slot],carry:!!p.carry})),coins:s.coins,score:s.score,lives:s.lives,keys:s.keys,objective});let p0=s.players.find((p)=>!p.dead);if(!p0||G2.attract){ui.prompt(null);return}let k=(a)=>`<span class="key">${input.glyph(a)}</span>`,html=null;if(p0.carry)html=`${k("grab")} Throw ${p0.carry.kind}`;else{let t=s.nearInteract(p0);if(t)html=t.type==="sign"?`${k("grab")} Read sign`:`${k("grab")} Pick up ${t.obj.kind}`;else if(s.exit&&!s.exitActive&&Math.hypot(p0.pos.x-s.exit.x,p0.pos.z-s.exit.z)<3)html="Exit locked: "+ZONES[s.zoneIdx].objective;else if(s.doors.some((d)=>!d.opened&&Math.hypot(p0.pos.x-d.x,p0.pos.z-d.z)<3.2)&&s.keys===0)html="Locked. Find the Rusty Key!";else if(s.posts.length&&s.posts.some((po)=>Math.hypot(po.x-p0.pos.x,po.z-p0.pos.z)<11)&&!s.hookDone)html=`${k("hook")} Hookshot to the golden ring`}if(!html&&s.players.length===1&&input.p[1].connected&&!SESSION)html=`Controller 2: press ${"✕"} to join!`;ui.prompt(html)}function startAttract(){ui.clearMenus(),ui.show("#title",!1),G2.attract=!0,G2.state="title",G2.autoAdv=0,startGame({attract:!0,skipStory:!0}),G2.brain=new Brain,G2.state="play",input.consumeAny()}function stopAttract(){ui.attract(!1),ui.show("#dialog",!1),ui.dialog=null,G2.sim.talking=!1,G2.attract=!1,G2.brain=null,audio.sfx("menuBack"),ui.fade(!0),setTimeout(()=>{goTitle(),ui.fade(!1)},300)}function titleCamera(dt){let s=G2.sim,a=G2.time*0.12;G2.camT.set(s.bounds.w/2+Math.sin(a)*6,0,s.bounds.h/2),G2.camOrbit=a}function updateCamera(dt){let{camera,sun}=G2.gfx,s=G2.sim;if(G2.state!=="title"){let alive=s.players.filter((p)=>!p.dead),list=alive.length?alive:s.players;if(list.length){let c=new V3;list.forEach((p)=>c.add(p.pos)),c.multiplyScalar(1/list.length);let cs=ZONES[s.zoneIdx].cam||1,mx=Math.max(0,s.bounds.w/2-9*cs),mz=Math.max(0,s.bounds.h/2-5.5*cs);if(c.x=Math.max(s.bounds.w/2-mx,Math.min(s.bounds.w/2+mx,c.x)),c.z=Math.max(s.bounds.h/2-mz,Math.min(s.bounds.h/2+mz,c.z)),c.y=0,G2.camT.lerp(c,Math.min(1,dt*4)),G2.camSnap)G2.camT.copy(c),G2.camSnap=!1}}let t=G2.camT,sh=s.shake*s.shake,off=G2.state==="title"?new V3(Math.sin(G2.camOrbit||0)*6,24,21):new V3(0,17,12.5).multiplyScalar(ZONES[s.zoneIdx].cam||1);camera.position.set(t.x+off.x+(Math.random()-0.5)*sh*0.8,t.y+off.y+(Math.random()-0.5)*sh*0.8,t.z+off.z),camera.lookAt(t.x,0.5,t.z),sun.position.set(t.x-12,28,t.z+10),sun.target.position.set(t.x,0,t.z),sun.target.updateMatrixWorld()}G2.startGame=startGame;G2.advanceBrain=(frames)=>{if(!G2.brain)G2.brain=new Brain;for(let i=0;i<frames;i++){if(ui.dialog){ui.updateDialog(0.5,{pressed:ui.dialog.done,label:""});continue}let inp=G2.brain.think(0.016666666666666666);G2.sim.update(0.016666666666666666,[inp,{}],{cheat:{invuln:!0,noclip:!0}})}hud()};boot();
+
+</script>
+</body>
+</html>

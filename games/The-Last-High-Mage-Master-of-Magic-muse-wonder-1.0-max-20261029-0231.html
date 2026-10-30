@@ -1,0 +1,1080 @@
+<!--
+Source Information
+- Date: 2026-10-29 02:31
+- Master of Magic
+- Tech: Three.js R180 WebGPU (WebGPURenderer, no fallback), Rapier 0.19.3 (@dimforge/rapier3d-compat), Gamepad API, Web Audio API, AI Hub Session Protocol v1 (parallel)
+- Art Direction: stylized cel-shaded (MeshToonMaterial + gradient maps + ink outlines), twin planes Arcanum & Myrror
+- Animation: procedural code animation (tweens, walk bob, spell particles, camera moves); Rapier-driven projectiles
+- Audio: code-written generative music, synthesized SFX, Animalese/Simlish gibberish voice (Web Audio oscillators)
+- Online: AI Hub parallel sessions via session.js (score = Power), plus standalone play; no game server
+- Testing: testing parameters allowed — lightweight headless load smoke with DOM/canvas harness, syntax checks
+- Environment: Muse Code CLI (headless); Linux; browser unknown
+- Model: Meta, muse-wonder-1.0, reasoning effort max
+- Usage: unknown
+Title pick: 50 playful titles brainstormed, #7 "The Last High Mage" chosen with Python SystemRandom (OS entropy RNG).
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="6">
+<meta name="hub:session-goal" content="Highest Power before time runs out">
+<meta name="hub:session-howto" content="Left stick move cursor, Cross select, Options menu">
+<title>The Last High Mage — a Master of Magic successor</title>
+<style>
+:root{--ink:#17132e;--parch:#fff6d8;--gold:#f5b700;--teal:#2dd4bf;--red:#e8443a;--blue:#3b82f6;--panel:#241d4dee;--panel2:#171132f2;--focus:#ffe66d}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:#0b0820;color:var(--parch);font-family:"Trebuchet MS",Verdana,system-ui,sans-serif}
+#app{position:fixed;inset:0}#gl{position:absolute;inset:0}#gl canvas{display:block;width:100%;height:100%}
+button{font:inherit;color:var(--parch);background:#3b2f6b;border:3px solid var(--ink);border-radius:14px;padding:12px 18px;font-size:20px;font-weight:800;cursor:pointer;box-shadow:0 4px 0 var(--ink)}
+button:hover{background:#55459a}button:focus-visible,.focus-ring{outline:4px solid var(--focus);outline-offset:2px;background:#6d5bd0!important;transform:scale(1.03)}
+button:disabled{opacity:.45;cursor:not-allowed}button.primary{background:#b8860b;color:#17132e}button.danger{background:#8f1d2c}button.small{padding:7px 12px;font-size:16px;border-radius:10px}
+input[type=range]{width:220px;height:28px}input[type=text],select{font:inherit;font-size:20px;padding:10px;border-radius:10px;border:3px solid var(--ink);background:#fff6d8;color:#17132e}
+.hidden{display:none!important}
+.topbar{position:absolute;top:0;left:0;right:0;display:flex;gap:10px;align-items:stretch;padding:10px;pointer-events:none;z-index:5}
+.resbar{pointer-events:auto;display:flex;gap:8px;flex-wrap:wrap;background:var(--panel);border:3px solid var(--ink);border-radius:16px;padding:8px 12px;box-shadow:0 6px 0 #0008}
+.resbar span{font-size:19px;font-weight:800;white-space:nowrap}.topbar .spacer{flex:1}
+.panel{background:var(--panel);border:4px solid var(--ink);border-radius:20px;box-shadow:0 10px 0 #0009,0 20px 50px #000a;padding:18px}
+.screen{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:20;padding:22px;background:radial-gradient(ellipse at 50% 35%,#3b2f6b88,#0b0820dd)}
+.card{max-width:980px;width:100%;max-height:94vh;overflow:auto}
+h1{font-size:52px;line-height:.95;margin:6px 0;text-shadow:4px 4px 0 var(--ink);letter-spacing:.5px}h2{font-size:30px;margin:6px 0 10px}h3{font-size:22px;margin:12px 0 6px}p,li{font-size:19px;line-height:1.45}
+.menu{display:grid;gap:12px;max-width:460px}.menu button{font-size:26px;text-align:left;padding:16px 20px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.chip{display:inline-block;border:3px solid var(--ink);border-radius:999px;padding:3px 12px;font-weight:900;font-size:16px;color:#17132e}
+.side{position:absolute;right:10px;top:86px;width:360px;z-index:6;max-height:calc(100vh - 190px);overflow:auto}
+.bottom{position:absolute;left:10px;right:390px;bottom:10px;z-index:6;display:flex;gap:10px;align-items:flex-end;pointer-events:none}.bottom>*{pointer-events:auto}
+.unitlist{display:grid;gap:8px}.unitrow{display:flex;gap:10px;align-items:center;background:#ffffff14;border:2px solid #ffffff2a;border-radius:12px;padding:8px}.unitrow.sel{background:#f5b70033;border-color:var(--gold)}
+.meter{height:14px;background:#0008;border:2px solid var(--ink);border-radius:99px;overflow:hidden}.meter>i{display:block;height:100%;background:linear-gradient(90deg,#2dd4bf,#f5b700)}
+#toast{position:absolute;left:50%;bottom:110px;transform:translateX(-50%);z-index:40;background:#171132;border:3px solid var(--gold);color:#fff6d8;border-radius:14px;padding:12px 20px;font-size:21px;font-weight:800;max-width:86vw;text-align:center}
+#cursor{position:absolute;width:54px;height:54px;margin:-27px 0 0 -27px;border:4px solid var(--focus);border-radius:50%;z-index:8;pointer-events:none;box-shadow:0 0 0 3px var(--ink),0 0 24px #ffe66d88}#cursor:after{content:"";position:absolute;left:50%;top:50%;width:8px;height:8px;margin:-4px;background:var(--focus);border-radius:50%}
+.modal{position:absolute;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;padding:20px;background:#0b082099}
+.modal .card{max-width:1100px}
+.list{display:grid;gap:8px;max-height:52vh;overflow:auto;padding-right:4px}
+.kbd{background:#fff6d8;color:#17132e;border-radius:6px;padding:1px 8px;font-weight:900;border:2px solid var(--ink)}
+.story{font-style:italic;color:#ffe9a8}
+#combatHud{position:absolute;left:10px;right:10px;bottom:10px;z-index:7;display:flex;gap:10px;align-items:flex-end}#combatLog{flex:1;max-height:180px;overflow:auto;font-size:18px}
+.health{height:10px;background:#0009;border-radius:99px;overflow:hidden}.health>i{display:block;height:100%;background:#e8443a}
+@media (max-width:900px){h1{font-size:36px}.side{width:300px}.bottom{right:10px;bottom:190px}}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "@dimforge/rapier3d-compat": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head>
+<body>
+<div id="app">
+<div id="gl"></div><div id="cursor" class="hidden"></div>
+<div id="hud" class="hidden">
+  <div class="topbar">
+    <div class="resbar" id="resbar"></div><div class="spacer"></div>
+    <div class="resbar"><button class="small" data-act="plane" id="btnPlane">🌍 Arcanum ⇄ Myrror</button><button class="small" data-act="spellbook">📖 Spells</button><button class="small" data-act="diplomacy">🕊️ Rivals</button><button class="small" data-act="endturn" style="background:#b8860b;color:#17132e">▶ End Turn</button><button class="small" data-act="settings">⚙️</button></div>
+  </div>
+  <div class="panel side" id="sidePanel"></div>
+  <div class="bottom"><div class="panel" style="flex:1" id="stackPanel"></div></div>
+</div>
+<div id="combatHud" class="hidden"><div class="panel" id="combatInfo" style="width:360px"></div><div class="panel" id="combatLog"></div><div class="panel" style="display:grid;gap:8px"><button data-cact="wait">⏳ Wait</button><button data-cact="defend">🛡️ Defend</button><button data-cact="spell">✨ Spell</button><button data-cact="flee">🏃 Flee</button><button data-cact="auto">⚡ Auto</button></div></div>
+<div id="titleScreen" class="screen"><div class="panel card" style="text-align:left">
+  <div><span class="chip" style="background:var(--gold)">A MASTER OF MAGIC SUCCESSOR</span> <span class="chip" style="background:var(--teal)">TWO WORLDS • ONE SPELL OF MASTERY</span></div>
+  <h1>THE LAST<br>HIGH MAGE</h1>
+  <p class="story">“Fourteen centuries after the Sundering, the thrones of Arcanum and Myrror stand empty. The ley-lines sing again. Old spells wake in ruined towers — and every wizard in two worlds has heard them. Found cities. Bind heroes. Master the five spheres. Banish your rivals… or speak the final words of the Spell of Mastery and let both worlds kneel.”</p>
+  <div class="grid2"><div class="menu">
+    <button data-menu="new" class="primary">✦ New Game — Forge Your Wizard</button>
+    <button data-menu="continue" id="btnContinue">↩ Continue</button>
+    <button data-menu="howto">📜 How to Play</button>
+    <button data-menu="settings">⚙️ Settings</button>
+    <button data-menu="about">ℹ️ About &amp; Credits</button>
+  </div><div>
+    <h3>How a turn feels</h3><p>Move the glowing cursor with the <b>left stick / WASD / mouse</b>. <span class="kbd">Cross / Enter / Click</span> selects. <span class="kbd">Circle / Esc</span> goes back. <span class="kbd">Options / Esc</span> opens Settings. Every menu works with D-pad + Cross.</p>
+    <p>Attract mode begins after 10 quiet seconds. Any press wakes the throne room.</p><p id="hubNote">Playing solo. In an AI Hub session the title is skipped and Power is reported to the hub.</p>
+  </div></div>
+</div></div>
+<div id="createScreen" class="screen hidden"><div class="panel card"><h2>Forge Your Wizard</h2><div id="createBody"></div></div></div>
+<div id="modalRoot"></div>
+<div id="toast" class="hidden"></div>
+<div id="touchWarn" class="screen hidden"><div class="panel card" style="text-align:center"><h2>Controller or keyboard required</h2><p>This realm is played with a gamepad or keyboard. Touch alone cannot wield it.</p><button data-menu="settings" class="primary">⚙️ Open Settings</button></div></div>
+<div id="fatal" class="screen hidden"><div class="panel card"><h2>The ley-lines failed</h2><p id="fatalMsg"></p><p>This game needs WebGPU (Three.js R180, no fallback) and network access for its CDN libraries.</p><button onclick="location.reload()">Try Again</button></div></div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import RAPIER from '@dimforge/rapier3d-compat';
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v)), rnd=(a=1,b)=>b===undefined?Math.random()*a:a+Math.random()*(b-a), irnd=(a,b)=>Math.floor(rnd(a,b+1)), pick=a=>a[Math.floor(Math.random()*a.length)];
+const fmt=n=>Math.round(n).toLocaleString('en-US');
+let SETTINGS={master:.8,music:.5,sfx:.8,voice:.8,invertX:false,invertY:false,quality:'High',shake:true};
+try{Object.assign(SETTINGS,JSON.parse(localStorage.getItem('lhm-settings')||'{}'))}catch(e){}
+function saveSettings(){try{localStorage.setItem('lhm-settings',JSON.stringify(SETTINGS))}catch(e){}}
+/* ================= AUDIO: generative music, synth SFX, gibberish voice ================= */
+const AudioX={ctx:null,musicGain:null,sfxGain:null,voiceGain:null,musicTimer:null,step:0,
+ init(){if(this.ctx)return; const C=new (window.AudioContext||window.webkitAudioContext)(); this.ctx=C; this.master=C.createGain(); this.master.gain.value=SETTINGS.master; this.master.connect(C.destination);
+  this.musicGain=C.createGain(); this.musicGain.gain.value=SETTINGS.music*.5; this.musicGain.connect(this.master);
+  this.sfxGain=C.createGain(); this.sfxGain.gain.value=SETTINGS.sfx; this.sfxGain.connect(this.master);
+  this.voiceGain=C.createGain(); this.voiceGain.gain.value=SETTINGS.voice; this.voiceGain.connect(this.master); this.startMusic();},
+ apply(){if(!this.ctx)return; this.master.gain.value=SETTINGS.master; this.musicGain.gain.value=SETTINGS.music*.5; this.sfxGain.gain.value=SETTINGS.sfx; this.voiceGain.gain.value=SETTINGS.voice;},
+ note(f,t,d,type='sine',g=.2,dest){ if(!this.ctx)return; const C=this.ctx,o=C.createOscillator(),v=C.createGain(); o.type=type;o.frequency.value=f; v.gain.setValueAtTime(0,t); v.gain.linearRampToValueAtTime(g,t+.02); v.gain.exponentialRampToValueAtTime(.001,t+d); o.connect(v); v.connect(dest||this.sfxGain); o.start(t); o.stop(t+d+.05); },
+ startMusic(){ if(this.musicTimer||!this.ctx)return; const scale=[0,2,4,7,9], base=220; const tick=()=>{ if(!this.ctx)return; const t=this.ctx.currentTime+.05; const bar=Math.floor(this.step/8), chord=[0,-3,5,-2][bar%4]; const deg=scale[this.step%scale.length]+chord; const f=base*Math.pow(2,deg/12); this.note(f,t,.55,'triangle',.12,this.musicGain); if(this.step%2===0)this.note(f/2,t,.8,'sine',.10,this.musicGain); if(this.step%8===4)this.note(base*2*Math.pow(2,(scale[2]+chord)/12),t,.9,'sine',.05,this.musicGain); this.step++; }; tick(); this.musicTimer=setInterval(tick,340); },
+ sfx(name){ if(!this.ctx)return; const t=this.ctx.currentTime; const M={click:[660,.08,'square',.12],select:[880,.12,'triangle',.16],back:[440,.09,'square',.10],gold:[1200,.18,'sine',.18],cast:[300,.5,'sawtooth',.12],boom:[90,.6,'sawtooth',.3],hit:[180,.18,'square',.2],win:[990,.6,'triangle',.2],lose:[160,.7,'sawtooth',.18],build:[520,.2,'triangle',.15],turn:[740,.15,'triangle',.14]}[name]||[660,.1,'sine',.1]; this.note(M[0],t,M[1],M[2],M[3]); if(name==='cast'){this.note(600,t+.08,.4,'sine',.12);this.note(900,t+.16,.4,'sine',.1);} if(name==='win')[523,659,784,1046].forEach((f,i)=>this.note(f,t+i*.12,.35,'triangle',.15)); },
+ speak(text,who='🧙'){ if(!this.ctx)return; const t0=this.ctx.currentTime; const words=String(text).split(/\s+/).slice(0,14); let t=t0; const base={ '🧙':180,'👑':140,'🧝':240,'💀':110,'😈':95,'🦉':300}[who]||180; for(const w of words){ const syl=clamp(Math.ceil(w.length/3),1,4); for(let i=0;i<syl;i++){ const f=base*rnd(.85,1.35)*(i%2?1.12:.94); this.note(f,t,.09,'square',.10,this.voiceGain); t+=.105; } t+=.07; } }
+};
+addEventListener('pointerdown',()=>{AudioX.init(); AudioX.ctx&&AudioX.ctx.resume();},{once:false});
+addEventListener('keydown',()=>{AudioX.init(); AudioX.ctx&&AudioX.ctx.resume();},{once:true});
+/* ================= DATA ================= */
+const SCHOOLS={Life:{c:'#ffe66d',i:'☀️'},Death:{c:'#b388ff',i:'💀'},Nature:{c:'#69db7c',i:'🌿'},Chaos:{c:'#ff6b6b',i:'🔥'},Sorcery:{c:'#4dabf7',i:'🔮'}};
+const SPELLS=[
+{id:'bless',n:'Bless',s:'Life',t:1,c:20,k:'combat',d:'+2 defence & resist undead for a battle.'},
+{id:'healing',n:'Healing',s:'Life',t:1,c:25,k:'combat',d:'Restore 60 HP to a friendly stack.'},
+{id:'guardian',n:'Guardian Spirit',s:'Life',t:1,c:70,k:'summon',d:'Summon a Guardian Spirit sentry.'},
+{id:'prosperity',n:'Prosperity',s:'Life',t:2,c:120,k:'city',d:'City +8 gold, +2 growth while enchanted.'},
+{id:'inspiration',n:'Inspiration',s:'Life',t:2,c:150,k:'global',d:'All your cities +4 production.'},
+{id:'incarnate',n:'Summon Hero',s:'Life',t:3,c:300,k:'hero',d:'Call a legendary hero to your capital.'},
+{id:'lifesteal',n:'Life Steal',s:'Death',t:1,c:30,k:'combat',d:'Drain 45 HP, heal the caster stack.'},
+{id:'zombies',n:'Raise Zombies',s:'Death',t:1,c:60,k:'summon',d:'Summon shambling Zombies.'},
+{id:'fear',n:'Fear',s:'Death',t:1,c:25,k:'combat',d:'Enemy stack -3 attack this battle.'},
+{id:'darkritual',n:'Dark Ritual',s:'Death',t:2,c:110,k:'city',d:'City +10 mana, -2 growth (dark bargain).'},
+{id:'pestilence',n:'Pestilence',s:'Death',t:3,c:260,k:'global',d:'All rival cities lose growth; rivals dislike you.'},
+{id:'wraiths',n:'Summon Wraiths',s:'Death',t:3,c:340,k:'summon',d:'Summon flying Wraiths.'},
+{id:'entangle',n:'Entangle',s:'Nature',t:1,c:20,k:'combat',d:'Enemy stack cannot move next round, -2 defence.'},
+{id:'bears',n:'War Bears',s:'Nature',t:1,c:80,k:'summon',d:'Summon War Bears.'},
+{id:'web',n:'Web',s:'Nature',t:1,c:30,k:'combat',d:'Hold an enemy stack for a round.'},
+{id:'earthquake',n:'Earthquake',s:'Nature',t:2,c:140,k:'overland',d:'Damage a rival city garrison & walls.'},
+{id:'gaia',n:"Gaia's Bounty",s:'Nature',t:2,c:160,k:'global',d:'All your terrain +food; cities grow faster.'},
+{id:'colossus',n:'Summon Colossus',s:'Nature',t:3,c:380,k:'summon',d:'Summon a mountain Colossus.'},
+{id:'fireball',n:'Fireball',s:'Chaos',t:1,c:30,k:'combat',d:'45 fire damage to an enemy stack.'},
+{id:'hounds',n:'Hell Hounds',s:'Chaos',t:1,c:70,k:'summon',d:'Summon Hell Hounds.'},
+{id:'flameblade',n:'Flame Blade',s:'Chaos',t:1,c:35,k:'combat',d:'Friendly stack +3 attack (fire).'},
+{id:'volcano',n:'Raise Volcano',s:'Chaos',t:2,c:150,k:'overland',d:'Raise a volcano: +mana, ruins farmland.'},
+{id:'chaosrift',n:'Chaos Rift',s:'Chaos',t:3,c:280,k:'global',d:'Random lightning strikes rivals each turn.'},
+{id:'chimera',n:'Summon Chimera',s:'Chaos',t:3,c:360,k:'summon',d:'Summon a flying Chimera.'},
+{id:'bolt',n:'Lightning Bolt',s:'Sorcery',t:1,c:25,k:'combat',d:'40 lightning damage, ignores armour.'},
+{id:'phantom',n:'Phantom Warriors',s:'Sorcery',t:1,c:65,k:'summon',d:'Summon illusionary Phantom Warriors.'},
+{id:'flight',n:'Flight',s:'Sorcery',t:1,c:40,k:'combat',d:'Friendly stack flies this battle.'},
+{id:'dispel',n:'Dispel Magic',s:'Sorcery',t:2,c:90,k:'overland',d:'Strip enchantments from a rival city/stack.'},
+{id:'timelock',n:'Time Stop (lesser)',s:'Sorcery',t:2,c:200,k:'global',d:'Gain an extra free action each turn.'},
+{id:'skywhale',n:'Summon Sky Drake',s:'Sorcery',t:3,c:370,k:'summon',d:'Summon a flying Sky Drake.'},
+{id:'mastery',n:'Spell of Mastery',s:'Sorcery',t:4,c:1200,k:'mastery',d:'Channel 8 turns to win both worlds outright.'},
+{id:'return',n:'Spell of Return',s:'Life',t:2,c:180,k:'return',d:'Return from banishment to a friendly city.'}];
+const SPELL=id=>SPELLS.find(s=>s.id===id);
+const UTYPES={
+ Spearmen:{i:'🗡️',hp:60,atk:8,def:5,rng:0,mov:3,cost:30,up:1,food:1},
+ Swordsmen:{i:'⚔️',hp:80,atk:11,def:6,rng:0,mov:3,cost:50,up:1,food:1},
+ Bowmen:{i:'🏹',hp:55,atk:9,def:4,rng:5,mov:3,cost:55,up:1,food:1},
+ Cavalry:{i:'🐴',hp:100,atk:14,def:6,rng:0,mov:5,cost:90,up:2,food:1},
+ Magicians:{i:'🔮',hp:60,atk:13,def:5,rng:6,mov:3,cost:110,up:3,food:1},
+ Golem:{i:'🗿',hp:180,atk:16,def:12,rng:0,mov:2,cost:160,up:3,food:0},
+ Guardian:{i:'👼',hp:120,atk:13,def:9,rng:0,mov:4,cost:0,up:2,food:0,sum:'guardian'},
+ Zombies:{i:'🧟',hp:90,atk:10,def:4,rng:0,mov:2,cost:0,up:1,food:0,sum:'zombies'},
+ Bears:{i:'🐻',hp:150,atk:15,def:7,rng:0,mov:4,cost:0,up:2,food:0,sum:'bears'},
+ Hounds:{i:'🐺',hp:85,atk:13,def:5,rng:0,mov:5,cost:0,up:1,food:0,sum:'hounds'},
+ Phantom:{i:'👻',hp:70,atk:14,def:4,rng:0,mov:4,cost:0,up:2,food:0,sum:'phantom',fly:1},
+ Wraiths:{i:'🦇',hp:110,atk:15,def:7,rng:0,mov:5,cost:0,up:3,food:0,sum:'wraiths',fly:1},
+ Colossus:{i:'⛰️',hp:320,atk:24,def:14,rng:0,mov:3,cost:0,up:4,food:0,sum:'colossus'},
+ Chimera:{i:'🦁',hp:210,atk:20,def:9,rng:4,mov:5,cost:0,up:4,food:0,sum:'chimera',fly:1},
+ Drake:{i:'🐉',hp:240,atk:21,def:10,rng:5,mov:6,cost:0,up:4,food:0,sum:'skywhale',fly:1},
+ Wild:{i:'🦂',hp:75,atk:11,def:5,rng:0,mov:4,cost:0,up:0,food:0,wild:1}};
+const CITY_UNITS=['Spearmen','Swordsmen','Bowmen','Cavalry','Magicians','Golem'];
+const BUILDINGS=[
+{id:'granary',n:'Granary',c:60,d:'+3 food, faster growth'}, {id:'market',n:'Marketplace',c:90,d:'+6 gold'},
+{id:'smithy',n:'Smithy',c:50,d:'Unlock Swordsmen, +2 prod'}, {id:'stables',n:'Stables',c:80,d:'Unlock Cavalry'},
+{id:'shrine',n:'Shrine',c:60,d:'+3 mana, calms rebels'}, {id:'library',n:'Library',c:80,d:'+5 research'},
+{id:'sawmill',n:'Sawmill',c:55,d:'+4 production'}, {id:'wall',n:'City Walls',c:70,d:'Defenders +4 in siege'},
+{id:'wiztower',n:"Wizard's Tower",c:140,d:'+8 mana, +casting skill'}, {id:'warcollege',n:'War College',c:150,d:'Units start Veteran'},
+{id:'alchemist',n:'Alchemist Guild',c:120,d:'Convert gold to mana 2:1'}, {id:'cathedral',n:'Cathedral',c:170,d:'+8 mana, +fame'}];
+const RACES=[{n:'Halflings',i:'🌾',d:'+food, lucky slingers'},{n:'High Elves',i:'🌙',d:'+mana, fine archers'},{n:'High Men',i:'👑',d:'Balanced, famed knights'},{n:'Orcs',i:'🪓',d:'Cheap, brutal infantry'},{n:'Dwarves',i:'⛏️',d:'+gold & production'},{n:'Nomads',i:'🐎',d:'Fast cavalry'}];
+const TRAITS=[{id:'warlord',n:'Warlord',d:'Armies +2 attack'},{id:'sage',n:'Sage',d:'+6 research/turn'},{id:'chan',n:'Channeler',d:'+25 casting skill'},{id:'famous',n:'Famous',d:'+15 fame, heroes visit'},{id:'alchemy',n:'Alchemy',d:'Start +150 gold'},{id:'myrran',n:'Myrran',d:'Start on Myrror (rich & dangerous)'}];
+const HEROES=[{n:'Ser Borin',i:'🛡️',cls:'Knight'},{n:'Elowen',i:'🏹',cls:'Ranger'},{n:'Morgath',i:'💀',cls:'Necromancer'},{n:'Zara',i:'🔥',cls:'Pyromancer'},{n:'Old Tam',i:'🦉',cls:'Sage'},{n:'Princess Nyx',i:'🗡️',cls:'Duelist'}];
+const ARTIFACTS=[{n:'Flamebrand',i:'🔥',d:'+4 attack'},{n:'Aegis Plate',i:'🛡️',d:'+5 defence'},{n:'Swift Boots',i:'🥾',d:'+2 move'},{n:'Orb of Seeing',i:'🔮',d:'+scouting'},{n:'Amulet of Mana',i:'📿',d:'+20 mana reserve'}];
+const RIVALS=[{n:'Ariel',i:'☀️',col:'#ffe66d',per:'Benevolent Life archmage'},{n:'Kali',i:'💀',col:'#b388ff',per:'Cruel Death mistress'},{n:"R'jak",i:'🔥',col:'#ff6b6b',per:'Volatile Chaos warlock'},{n:'Oberic',i:'🔮',col:'#4dabf7',per:'Proud Sorcery duellist'}];
+let G=null, uid=1;
+function mkUnit(type,owner,x,y,plane,hero=null){ const b=UTYPES[type]; const u={uid:uid++,type,owner,x,y,plane,hero,hp:b.hp,maxhp:b.hp,xp:0,lvl:1,moves:b.mov,guard:false,items:[]}; if(hero){u.maxhp=u.hp=140+hero.lvl*25;} return u; }
+function powerScore(w){ if(!w)return 0; return w.cities.length*120+w.units.length*18+w.known.length*25+w.fame*4+Math.floor(w.mana/3)+w.turn*3; }
+function newWizard(name,icon,color,isPlayer,race){ return {name,icon,color,isPlayer,race:race||pick(RACES).n,gold:220,mana:120,skill:40,fame:5,turn:0,books:{Life:0,Death:0,Nature:0,Chaos:0,Sorcery:0},traits:[],known:[],researching:null,rp:0,cities:[],units:[],planesVisited:['Arcanum'],globals:[],mastery:0,banished:false,alive:true,rel:{},personality:''}; }
+/* ================= WORLD GEN ================= */
+const W=16,H=12, TER={grass:{n:'Plains',c:0x69db7c,mov:1},forest:{n:'Forest',c:0x2f9e44,mov:2},hill:{n:'Hills',c:0xc9a06a,mov:2},mount:{n:'Mountains',c:0x8d99ae,mov:3},water:{n:'Sea',c:0x339af0,mov:99},desert:{n:'Desert',c:0xf5d76e,mov:2},swamp:{n:'Swamp',c:0x5c7c4c,mov:3},volcano:{n:'Volcano',c:0xe8590c,mov:3},snow:{n:'Tundra',c:0xe7f5ff,mov:2}};
+const CITYNAMES=['Emberfall','Duskmere','Highspire','Thornwall','Goldfield','Mistral','Oakenholt','Starhaven','Runekeep','Vel Mor','Ashen Ford','Brightwater','Glimmerdeep','Wolfshold','Suncrest','Nightveil'];
+function genPlane(plane){ const tiles=[]; for(let y=0;y<H;y++){ tiles[y]=[]; for(let x=0;x<W;x++){ let r=Math.random(); let t='grass'; if(r<.14)t='water'; else if(r<.30)t='forest'; else if(r<.42)t='hill'; else if(r<.50)t='mount'; else if(r<.58)t=plane==='Myrror'?'volcano':'desert'; else if(r<.66)t='swamp'; else if(r<.72)t=plane==='Myrror'?'snow':'grass'; const feat=Math.random()<.10?pick(['lair','node','tower','ruins']):(Math.random()<.16?pick(['gold','mana','herb']):null); tiles[y][x]={t,feat,owner:null,city:null,explored:false,guard:feat? irnd(1,3):0}; } }
+ // ensure land start corners
+ const spots=[[2,2],[13,2],[2,9],[13,9],[8,6]]; for(const [x,y] of spots){ tiles[y][x].t='grass'; tiles[y][x].feat=null; }
+ return tiles; }
+function tileAt(plane,x,y){ if(!G||x<0||y<0||x>=W||y>=H)return null; return G.world[plane][y][x]; }
+function dist(a,b){ return Math.abs(a.x-b.x)+Math.abs(a.y-b.y); }
+function wizByName(n){ return G?G.wizards.find(w=>w.name===n):null; }
+function player(){ return G.wizards[0]; }
+function createGame(cfg){ uid=1; const wizards=[]; const pw=newWizard(cfg.name,cfg.icon,'#f5b700',true,cfg.race); pw.books=cfg.books; pw.traits=cfg.traits; if(cfg.traits.includes('alchemy'))pw.gold+=150; if(cfg.traits.includes('famous'))pw.fame+=15; if(cfg.traits.includes('chan'))pw.skill+=25; if(cfg.traits.includes('sage'))pw.rp+=0;
+  // starting spells: all tier1 of schools with books>0 + bless generic
+  const starts={'Life':['bless','guardian'],'Death':['zombies','fear'],'Nature':['bears','entangle'],'Chaos':['hounds','fireball'],'Sorcery':['phantom','bolt']};
+  for(const s in cfg.books){ if(cfg.books[s]>0){ (starts[s]||[]).forEach(id=>{ if(!pw.known.includes(id))pw.known.push(id); }); } }
+  if(!pw.known.length)pw.known=['guardian','fireball'];
+  pw.researching=null; wizards.push(pw);
+  RIVALS.forEach((r,i)=>{ const w=newWizard(r.n,r.i,r.col,false); w.personality=r.per; const sch=Object.keys(SCHOOLS)[i%5]; w.books[sch]=4; w.books[pick(Object.keys(SCHOOLS))]+=2; ['bless','fireball','bolt'].forEach(id=>{if(!w.known.includes(id)&&Math.random()<.7)w.known.push(id);}); w.known.push(SPELLS.filter(s=>s.s===sch&&s.t===1)[0]?.id||'fireball'); wizards.push(w); pw.rel[r.n]=irnd(-10,30); });
+  G={world:{Arcanum:genPlane('Arcanum'),Myrror:genPlane('Myrror')},wizards,plane:cfg.traits.includes('myrran')?'Myrror':'Arcanum',turn:1,month:1,year:1400,sel:null,selTile:null,casting:null,over:false,winner:null,log:[],events:[],combat:null,attract:false,hubScore:0,freeActions:0};
+  if(cfg.traits.includes('myrran'))pw.planesVisited=['Arcanum','Myrror'];
+  const startSpots={Arcanum:[[2,2],[13,2],[2,9],[13,9]],Myrror:[[8,6],[3,3],[12,8],[6,9]]};
+  wizards.forEach((w,i)=>{ const plane=(i===0&&cfg.traits.includes('myrran'))?'Myrror':(i%3===2?'Myrror':'Arcanum'); const [sx,sy]=startSpots[plane][i%4]; foundCity(w,sx,sy,plane,true); w.units.push(mkUnit('Swordsmen',w.name,sx,sy,plane),mkUnit('Bowmen',w.name,sx,sy,plane)); if(i>0){w.units.push(mkUnit('Spearmen',w.name,sx,sy,plane));} });
+  exploreAround(pw); G.log.push('The wheel turns. Four rival wizards stir in two worlds.'); saveGame(); }
+function foundCity(w,x,y,plane,isCapital=false){ const t=tileAt(plane,x,y); const c={id:uid++,name:isCapital?(w.isPlayer?'Your Capital':w.name+'’s Seat'):pick(CITYNAMES)+ ' '+(irnd(2,99)),x,y,plane,owner:w.name,pop:irnd(3,6),buildings:isCapital?['granary','shrine']: [],queue:null,prodAcc:0,enchant:[],garrisonNote:''}; t.city=c; t.owner=w.name; if(t.t==='water')t.t='grass'; w.cities.push(c); return c; }
+function exploreAround(w){ for(const u of w.units) reveal(w,u.x,u.y,u.plane,2); for(const c of w.cities) reveal(w,c.x,c.y,c.plane,2); }
+function reveal(w,x,y,plane,r){ if(!w.isPlayer)return; for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){ const t=tileAt(plane,x+dx,y+dy); if(t)t.explored=true; } }
+function cityAt(plane,x,y){ const t=tileAt(plane,x,y); return t?t.city:null; }
+function unitsAt(plane,x,y,owner){ return G.wizards.flatMap(w=>w.units).filter(u=>u.plane===plane&&u.x===x&&u.y===y&&( !owner||u.owner===owner)); }
+function cityIncome(c){ const w=wizByName(c.owner); let gold=c.pop, mana=2, prod=c.pop+4, food=c.pop*2, res=c.buildings.includes('library')?5:1; if(c.buildings.includes('market'))gold+=6; if(c.buildings.includes('shrine'))mana+=3; if(c.buildings.includes('sawmill'))prod+=4; if(c.buildings.includes('library'))res+=4; if(c.buildings.includes('wiztower'))mana+=8; if(c.buildings.includes('cathedral'))mana+=8; if(c.enchant.includes('prosperity'))gold+=8; if(c.enchant.includes('darkritual')){mana+=10;} if(w&&w.globals.includes('inspiration'))prod+=4; if(w&&w.globals.includes('gaia'))food+=4; if(w&&w.race==='Dwarves'){gold+=3;prod+=2;} if(w&&w.race==='High Elves')mana+=2; if(w&&w.race==='Halflings')food+=3; return {gold,mana,prod,food,res}; }
+function upkeep(w){ return w.units.reduce((a,u)=>a+(UTYPES[u.type]?.up||1),0); }
+/* ================= THREE WEBGPU + RAPIER ================= */
+let renderer,scene,camera,combatScene,combatCam,raycaster,pointerV, tileMeshes=[],unitMeshes=new Map(),fx=[],rapierWorld,rapierBodies=[],clockT=0,camTarget=null,shake=0;
+let gradientTex=null;
+function makeGradient(){ const d=new Uint8Array([90,160,230,255]); const t=new THREE.DataTexture(d,4,1,THREE.RedFormat); t.minFilter=t.magFilter=THREE.NearestFilter; t.needsUpdate=true; return t; }
+function toonMat(color,emissive=0){ return new THREE.MeshToonMaterial({color,gradientMap:gradientTex,emissive,emissiveIntensity:emissive? .7:0}); }
+function addOutline(mesh,scale=1.08){ const o=new THREE.Mesh(mesh.geometry,new THREE.MeshBasicMaterial({color:0x17132e,side:THREE.BackSide})); o.scale.setScalar(scale); mesh.add(o); return o; }
+async function initThree(){ const gl=$('#gl'); if(!navigator.gpu){ showFatal('WebGPU is not available in this browser. The Last High Mage requires WebGPU with no fallback. Try Chrome/Edge with WebGPU enabled.'); if(window.AIHub&&AIHub.active)AIHub.fail('no-webgpu'); return false; }
+ renderer=new THREE.WebGPURenderer({antialias:true,powerPreference:'high-performance'}); renderer.setPixelRatio(SETTINGS.quality==='Low'?1:Math.min(devicePixelRatio,2)); renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFShadowMap; renderer.toneMapping=THREE.NoToneMapping; gl.appendChild(renderer.domElement);
+ gradientTex=makeGradient(); scene=new THREE.Scene(); scene.background=new THREE.Color(0x87ceeb); scene.fog=new THREE.Fog(0x87ceeb,40,95);
+ camera=new THREE.PerspectiveCamera(48,innerWidth/innerHeight,.1,300); camera.position.set(8,18,18); camera.lookAt(8,0,6);
+ combatScene=new THREE.Scene(); combatScene.background=new THREE.Color(0x2b1d5a); combatScene.fog=new THREE.Fog(0x2b1d5a,30,80); combatCam=new THREE.PerspectiveCamera(50,innerWidth/innerHeight,.1,200); combatCam.position.set(4,14,13); combatCam.lookAt(4,0,3);
+ const hemi=new THREE.HemisphereLight(0xffffff,0x334466,1.15); scene.add(hemi); const sun=new THREE.DirectionalLight(0xfff2c0,2.2); sun.position.set(18,28,10); sun.castShadow=true; sun.shadow.mapSize.set(2048,2048); sun.shadow.camera.left=-24;sun.shadow.camera.right=24;sun.shadow.camera.top=24;sun.shadow.camera.bottom=-24; scene.add(sun);
+ const hemi2=new THREE.HemisphereLight(0xffe9ff,0x221144,1.1); combatScene.add(hemi2); const sun2=new THREE.DirectionalLight(0xffd27d,1.9); sun2.position.set(10,20,8); sun2.castShadow=true; combatScene.add(sun2);
+ // mana torches (extra lights for richness)
+ for(let i=0;i<5;i++){ const p=new THREE.PointLight(i%2?0x4dabf7:0xf5b700,18,18); p.position.set(rnd(2,14),3,rnd(1,10)); scene.add(p); }
+ raycaster=new THREE.Raycaster(); pointerV=new THREE.Vector2();
+ await RAPIER.init(); rapierWorld=new RAPIER.World({x:0,y:-9.81,z:0}); const gbody=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(8,0,6)); rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(9,.5,7),gbody);
+ // floating mote bodies (physics-driven ambience + spell projectiles share this world)
+ for(let i=0;i<14;i++){ const b=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(rnd(1,15),rnd(2,5),rnd(1,11)).setLinearDamping(1.2)); const c=rapierWorld.createCollider(RAPIER.ColliderDesc.ball(.18).setRestitution(.8),b); rapierBodies.push(b); const m=new THREE.Mesh(new THREE.SphereGeometry(.18,10,8),toonMat(i%2?0x4dabf7:0xf5b700,0x222222)); m.castShadow=true; m.userData.body=b; scene.add(m); fx.push({mesh:m,life:1e9,mote:true}); }
+ addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix(); combatCam.aspect=camera.aspect; combatCam.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); }); renderer.setSize(innerWidth,innerHeight);
+ renderer.domElement.addEventListener('pointerdown',onCanvasTap); if(renderer.init)await renderer.init(); return true; }
+function buildOverworld(){ if(!scene||!G)return; // clear dynamic (keep lights/motes)
+ for(const m of tileMeshes){ scene.remove(m); m.geometry?.dispose(); } tileMeshes=[]; unitMeshes.forEach(m=>scene.remove(m)); unitMeshes.clear();
+ const plane=G.plane; const isMyr=plane==='Myrror'; scene.background.set(isMyr?0x3b1d6e:0x87ceeb); scene.fog.color.set(isMyr?0x3b1d6e:0x87ceeb);
+ const box=new THREE.BoxGeometry(.96,.5,.96), cone=new THREE.ConeGeometry(.32,.9,7), sph=new THREE.SphereGeometry(.3,10,8);
+ for(let y=0;y<H;y++)for(let x=0;x<W;x++){ const t=G.world[plane][y][x]; const seen=t.explored||G.attract; const col=!seen?0x23203f:(TER[t.t].c); const h=t.t==='mount'?1.15:t.t==='hill'?.8:t.t==='water'?.12:.45; const geo=new THREE.BoxGeometry(.96,h,.96); const m=new THREE.Mesh(geo,toonMat(col)); m.position.set(x,h/2-.25,y); m.receiveShadow=true; m.castShadow=t.t==='mount'; m.userData.tile={x,y,plane}; scene.add(m); tileMeshes.push(m);
+  if(seen&&t.t==='forest'){ const tr=new THREE.Mesh(cone,toonMat(0x1f7a33)); tr.position.set(x,.75,y); tr.castShadow=true; tr.userData.tile={x,y,plane}; scene.add(tr); tileMeshes.push(tr); }
+  if(seen&&t.feat){ const fm=new THREE.Mesh(sph,toonMat(t.feat==='node'?0x4dabf7:t.feat==='lair'?0xe8443a:0xf5b700,0x111111)); fm.position.set(x,1.05,y); fm.scale.setScalar(t.feat==='node'?1.3:.9); fm.userData.tile={x,y,plane}; fm.userData.feat=true; scene.add(fm); tileMeshes.push(fm); }
+  if(seen&&t.city){ const w=wizByName(t.city.owner); const base=new THREE.Mesh(new THREE.CylinderGeometry(.42,.5,.7,8),toonMat(new THREE.Color(w?w.color:'#999999').getHex())); base.position.set(x,.65,y); base.castShadow=true; base.userData.tile={x,y,plane}; addOutline(base,1.12); scene.add(base); tileMeshes.push(base); const roof=new THREE.Mesh(cone,toonMat(0x8f1d2c)); roof.position.set(x,1.25,y); roof.userData.tile={x,y,plane}; scene.add(roof); tileMeshes.push(roof); } }
+ // units
+ for(const w of G.wizards)for(const u of w.units){ if(u.plane!==plane)continue; if(!player().isPlayer && false)continue; const seen=tileAt(plane,u.x,u.y)?.explored||G.attract||u.owner===player().name; if(!seen&&u.owner!==player().name)continue; const grp=new THREE.Group(); const col=new THREE.Color(w.color).getHex(); const body=new THREE.Mesh(new THREE.CapsuleGeometry(.26,.5,4,10),toonMat(col)); body.position.y=.75; body.castShadow=true; addOutline(body,1.10); grp.add(body); const head=new THREE.Mesh(sph,toonMat(0xffe0b5)); head.position.y=1.45; grp.add(head); if(UTYPES[u.type]?.fly){ const wing=new THREE.Mesh(new THREE.BoxGeometry(1.1,.08,.4),toonMat(0xffffff)); wing.position.y=1.0; grp.add(wing); } grp.position.set(u.x, .55, u.y); grp.userData.unitUid=u.uid; scene.add(grp); unitMeshes.set(u.uid,grp); }
+ if(G.selTile) markSelection(); }
+let selRing=null;
+function markSelection(){ if(selRing)scene.remove(selRing); if(!G||!G.selTile||G.combat)return; selRing=new THREE.Mesh(new THREE.TorusGeometry(.55,.07,8,24),new THREE.MeshBasicMaterial({color:0xffe66d})); selRing.rotation.x=Math.PI/2; selRing.position.set(G.selTile.x,.75,G.selTile.y); scene.add(selRing); }
+function spawnBolt(from,to,color=0xffd43b){ if(!rapierWorld)return; const b=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(from.x,1.2,from.y).setLinearDamping(.2).setCcdEnabled(true)); rapierWorld.createCollider(RAPIER.ColliderDesc.ball(.16).setRestitution(.4),b); const dir=new THREE.Vector3(to.x-from.x,0,to.y-from.y).normalize().multiplyScalar(11); b.setLinvel({x:dir.x,y:1.2,z:dir.z},true); const m=new THREE.Mesh(new THREE.SphereGeometry(.2,10,8),toonMat(color,0x333333)); m.castShadow=true; ((G&&G.combat)?combatScene:scene).add(m); fx.push({mesh:m,body:b,life:1.6,bolt:true}); if(SETTINGS.shake)shake=Math.max(shake,.25); }
+function burst(x,y,color=0xf5b700,n=10){ const sc=(G&&G.combat)?combatScene:scene; for(let i=0;i<n;i++){ const m=new THREE.Mesh(new THREE.SphereGeometry(.09,6,5),new THREE.BasicMaterial({color})); m.position.set(x+rnd(-.3,.3),1+rnd(0,.6),y+rnd(-.3,.3)); sc.add(m); fx.push({mesh:m,life:rnd(.5,1),vx:rnd(-2,2),vy:rnd(1,3),vz:rnd(-2,2)}); } }
+/* ================= UI HELPERS ================= */
+let toastTimer=null, settingsOpen=false, lastInputAt=performance.now(), attractOn=false, focusIdx=0;
+function toast(msg,ms=3200){ const t=$('#toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.add('hidden'),ms); }
+function showFatal(msg){ $('#fatalMsg').textContent=msg; $('#fatal').classList.remove('hidden'); }
+function noteInput(){ lastInputAt=performance.now(); if(attractOn){ exitAttract(); } }
+function modal(html){ $('#modalRoot').innerHTML=`<div class="modal"><div class="panel card">${html}</div></div>`; refreshFocus(); }
+function closeModal(){ $('#modalRoot').innerHTML=''; settingsOpen=false; refreshFocus(); }
+function esc(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function focusables(){ return $$('#modalRoot button, #modalRoot input, #modalRoot select, .screen:not(.hidden) button, .screen:not(.hidden) input, .screen:not(.hidden) select, #hud button, #combatHud button').filter(e=>!e.disabled&&e.offsetParent!==null); }
+function refreshFocus(){ const f=focusables(); if(!f.length)return; focusIdx=clamp(focusIdx,0,f.length-1); f.forEach((e,i)=>e.classList.toggle('focus-ring',i===focusIdx)); }
+function moveFocus(d){ const f=focusables(); if(!f.length)return; focusIdx=(focusIdx+d+f.length)%f.length; refreshFocus(); f[focusIdx].scrollIntoView({block:'nearest'}); }
+function activateFocus(){ const f=focusables(); if(f[focusIdx]){ AudioX.sfx('select'); f[focusIdx].click(); } }
+/* ================= OVERWORLD LOGIC ================= */
+function reachable(u){ const out=[]; if(!u)return out; const seen=new Map(); const q=[{x:u.x,y:u.y,c:0}]; seen.set(u.x+','+u.y,0); while(q.length){ const n=q.shift(); for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){ const x=n.x+dx,y=n.y+dy,t=tileAt(u.plane,x,y); if(!t)continue; const cost=UTYPES[u.type].fly?1:TER[t.t].mov; if(cost>90)continue; const c=n.c+cost; if(c>u.moves)continue; const k=x+','+y; if(seen.has(k)&&seen.get(k)<=c)continue; seen.set(k,c); q.push({x,y,c}); out.push({x,y,c}); } } return out; }
+function selectTile(x,y){ if(!G||G.combat||G.over)return; G.selTile={x,y,plane:G.plane}; markSelection(); const c=cityAt(G.plane,x,y); const mine=unitsAt(G.plane,x,y,player().name); const foes=unitsAt(G.plane,x,y).filter(u=>u.owner!==player().name); if(mine.length)G.sel=mine[0]; else if(!c)G.sel=null; renderSide(); renderStack(); AudioX.sfx('click'); }
+function tryMoveSelected(tx,ty){ const u=G.sel; if(!u||u.owner!==player().name)return false; if(u.plane!==G.plane){toast('That army is on the other plane. Switch planes first.');return false;} const reach=reachable(u); const step=reach.find(r=>r.x===tx&&r.y===ty); if(!step&&!(tx===u.x&&ty===u.y)){ toast('Too far — end the turn to refresh movement, or pick a glowing neighbour.'); return false; }
+ const foes=unitsAt(u.plane,tx,ty).filter(v=>v.owner!==u.owner); const city=cityAt(u.plane,tx,ty); const t=tileAt(u.plane,tx,ty);
+ u.moves-=step?step.c:0; u.x=tx;u.y=ty; reveal(player(),tx,ty,u.plane,2);
+ if(foes.length||(city&&city.owner!==u.owner)){ startCombat([u], foes.length?foes:unitsAt(u.plane,tx,ty).filter(v=>v.owner===city.owner), city); return true; }
+ if(t&&t.feat&&['lair','node','tower','ruins'].includes(t.feat)){ startLairCombat(u,t); return true; }
+ if(t&&t.feat&&['gold','mana','herb'].includes(t.feat)){ const w=player(); if(t.feat==='gold'){w.gold+=60; toast('💰 Found buried gold +60'); AudioX.sfx('gold');} if(t.feat==='mana'){w.mana+=50; toast('🔮 Mana crystals +50 mana');} if(t.feat==='herb'){u.hp=Math.min(u.maxhp,u.hp+30); toast('🌿 Healing herbs restore your army');} burst(tx,ty,0xf5b700,12); t.feat=null; }
+ AudioX.sfx('select'); buildOverworld(); renderAll(); checkHubProgress(); return true; }
+function endTurn(){ if(!G||G.over||G.combat)return; AudioX.init(); AudioX.sfx('turn'); const pw=player();
+ // casting progress
+ if(G.casting){ G.casting.left--; if(G.casting.left<=0){ finishCast(pw,G.casting.spell,G.casting.target); G.casting=null; } }
+ if(pw.mastery>0){ pw.mastery++; if(pw.mastery>=8){ victory('You completed the Spell of Mastery! Both worlds kneel to the Last High Mage.'); return; } else toast(`✨ Spell of Mastery channel: ${pw.mastery}/8 — protect your towers!`); }
+ // income
+ for(const w of G.wizards){ if(!w.alive)continue; let gold=0,mana=0,res=0; for(const c of w.cities){ const inc=cityIncome(c); gold+=inc.gold; mana+=inc.mana; res+=inc.res; c.prodAcc+=inc.prod; // growth
+   if(Math.random()<.45&&c.pop<30)c.pop++; if(c.queue){ const b=BUILDINGS.find(b=>b.id===c.queue); if(b){ if(c.prodAcc>=b.c){ c.buildings.push(c.queue); c.prodAcc-=b.c; const qn=b.n; c.queue=null; if(w.isPlayer){toast(`🏗️ Built ${qn} in ${c.name}`); AudioX.sfx('build');} } } else if(CITY_UNITS.includes(c.queue)){ const cost=UTYPES[c.queue].cost; if(c.prodAcc>=cost){ c.prodAcc-=cost; const qt=c.queue; const nu=mkUnit(qt,w.name,c.x,c.y,c.plane); if(c.buildings.includes('warcollege')){nu.lvl=2;nu.xp=40;} w.units.push(nu); c.queue=null; if(w.isPlayer)toast(`⚔️ Trained ${qt} in ${c.name}`); } } }
+  } // cities
+  const up=upkeep(w); w.gold+=gold-up; w.mana+=mana-Math.floor(up/2); w.rp+=res+(w.traits.includes('sage')?6:0); w.skill=Math.min(200,w.skill+Math.floor(mana/8)); if(w.gold<0){w.gold=0; if(w.units.length&&Math.random()<.5){ const dead=w.units.pop(); if(w.isPlayer)toast('A starving army disbanded for lack of gold!'); } }
+  // research
+  if(!w.researching){ const cand=SPELLS.filter(s=>!w.known.includes(s.id)&&s.t<4&&(w.books[s.s]||0)>=s.t-1||s.id==='mastery'&&w.known.length>=8); if(cand.length)w.researching=pick(cand).id; }
+  if(w.researching){ const sp=SPELL(w.researching); const need=sp.t*90; if(w.rp>=need){ w.known.push(sp.id); w.rp-=need; w.researching=null; if(w.isPlayer){toast(`📖 Researched ${sp.n}!`); AudioX.speak(`New spell learned: ${sp.n}`,'🦉');} } }
+  // hero offers
+  if(w.isPlayer&&Math.random()<.10&&w.units.filter(u=>u.hero).length<3){ offerHero(w); }
+ }
+ G.turn++; G.month++; if(G.month>12){G.month=1;G.year++;}
+ for(const w of G.wizards)for(const u of w.units)u.moves=UTYPES[u.type].mov+(u.hero?1:0);
+ aiTurns(); randomEvent(); exploreAround(pw); checkBanish();
+ G.hubScore=powerScore(pw); buildOverworld(); renderAll(); saveGame(); checkHubProgress(); if(window.AIHub&&AIHub.active&&AIHub.time&&AIHub.time()>6*60*1000){ /* hub time-up handled by event */ }
+ }
+function checkBanish(){ for(const w of G.wizards){ if(w.alive&&w.cities.length===0&&w.units.length===0){ if(w.isPlayer){ if(!w.banished){ w.banished=true; toast('Banished! Cast Spell of Return, summon an army, or found a new city to return.'); } } else { w.alive=false; toast(`${w.icon} ${w.name} has been banished from both worlds!`); AudioX.sfx('win'); } } }
+ const alive=G.wizards.filter(w=>w.alive); if(alive.length===1&&alive[0].isPlayer) victory('All rival wizards banished! The twin thrones are yours.'); if(!player().alive&&G.wizards.some(w=>w.alive&&!w.isPlayer)){ /* player can still return */ }
+ if(player().banished&&player().cities.length>0)player().banished=false; }
+/* ================= SPELLS / CITIES / HEROES ================= */
+function castTime(w,sp){ return Math.max(1,Math.ceil(sp.c/Math.max(10,w.skill))); }
+function openSpellbook(combatCtx=null){ const w=player(); const casting=G.casting?`<p>⏳ Now casting <b>${SPELL(G.casting.spell).n}</b> — ${G.casting.left} turn(s) left. <button class="small" onclick="cancelCast()">Cancel</button></p>`:'';
+ const known=w.known.map(id=>SPELL(id)).filter(Boolean); const list=known.map(s=>{ const ct=castTime(w,s); const dis=w.mana<s.c; return `<div class="unitrow"><span style="font-size:28px">${SCHOOLS[s.s].i}</span><div style="flex:1"><b>${s.n}</b> <span class="chip" style="background:${SCHOOLS[s.s].c}">${s.s} T${s.t}</span><br><small>${s.d} Cost ${s.c} mana • ${ct} turn(s) • ${s.k}</small></div><button data-spell="${s.id}" ${dis?'disabled':''} onclick="castSpell('${s.id}')">${combatCtx?'Cast in Battle':'Cast'}</button></div>`; }).join('')||'<p>No spells yet — research below.</p>';
+ const cand=SPELLS.filter(s=>!w.known.includes(s.id)&&s.t<4); const resList=cand.map(s=>`<button class="small" onclick="setResearch('${s.id}')">${w.researching===s.id?'▶ ':''}${SCHOOLS[s.s].i} ${s.n} (T${s.t}, ${s.t*90} RP)</button>`).join(' ');
+ modal(`<h2>📖 Spellbook of ${esc(w.name)}</h2><p>Mana <b>${fmt(w.mana)}</b> • Casting skill <b>${w.skill}</b> • Research <b>${fmt(w.rp)} RP</b>${w.researching?` • Researching <b>${SPELL(w.researching).n}</b>`:''} • Power <b>${powerScore(w)}</b></p>${casting}<h3>Known spells — tap Cast, then tap a target if needed</h3><div class="list">${list}</div><h3>Choose what to research next</h3><p style="display:flex;flex-wrap:wrap;gap:6px">${resList||'All researchable spells learned. Seek the Spell of Mastery!'}</p><p><button onclick="castSpell('mastery')" ${w.known.includes('mastery')&&w.mana>=300?'':'disabled'}>✨ Begin Spell of Mastery (needs Mastery learned)</button> <button onclick="closeModalX()">Close (Circle)</button></p>`); }
+function setResearch(id){ player().researching=id; AudioX.sfx('select'); toast(`Researching ${SPELL(id).n}`); openSpellbook(); renderAll(); }
+function cancelCast(){ G.casting=null; toast('Casting cancelled. Mana is lost to the winds.'); closeModal(); renderAll(); }
+function castSpell(id){ const w=player(); const sp=SPELL(id); if(!sp)return; if(G.combat){ combatCast(id); return; } if(sp.k==='mastery'){ if(!w.known.includes('mastery')){toast('You must research the Spell of Mastery first (learn 8+ spells).');return;} if(w.mastery>0){toast('Already channelling the Spell of Mastery!');return;} if(w.mana<300){toast('Need 300 mana to begin.');return;} w.mana-=300; w.mastery=1; G.log.push('You began the Spell of Mastery! Rivals will hunt your towers.'); toast('✨ Spell of Mastery begun — survive 8 turns!'); AudioX.sfx('cast'); AudioX.speak('The final spell begins.','🧙'); closeModal(); renderAll(); return; }
+ if(sp.k==='combat'){ toast(`${sp.n} is a battle spell — cast it in tactical combat.`); return; }
+ if(sp.k==='return'){ if(!w.banished){toast('You are not banished.');return;} if(!w.cities.length){ // create return city at capital ruins: find any friendly explored tile
+   // return needs a city: if none, allow founding return spire on selected tile
+   toast('Pick any explored land tile, then cast Return to raise a Return Spire there.'); G.pendingCast='return'; closeModal(); return; } w.mana-=sp.c; w.banished=false; toast('You return in fire and light!'); closeModal(); renderAll(); return; }
+ if(w.mana<sp.c){toast('Not enough mana.');return;}
+ if(sp.k==='summon'||sp.k==='hero'){ beginCasting(w,sp,null); return; }
+ if(sp.k==='global'){ beginCasting(w,sp,null); return; }
+ if(sp.k==='city'||sp.k==='overland'){ toast(`Choose a target city for ${sp.n}: tap any city on the map.`); G.pendingCast=id; closeModal(); return; }
+ beginCasting(w,sp,null); }
+function beginCasting(w,sp,target){ const ct=castTime(w,sp); w.mana-=sp.c; if(ct<=1){ finishCast(w,sp,target); } else { G.casting={spell:sp.id,target,left:ct}; toast(`Casting ${sp.n} — ${ct} turns (skill ${w.skill}).`); } AudioX.sfx('cast'); closeModal(); renderAll(); saveGame(); }
+function finishCast(w,sp,target){ if(!sp)return; const at=w.units[0]||w.cities[0]; if(!at)return; const x=target?.x??at.x, y=target?.y??at.y, plane=target?.plane??at.plane??G.plane;
+ if(sp.k==='summon'){ const map={guardian:'Guardian',zombies:'Zombies',bears:'Bears',hounds:'Hounds',phantom:'Phantom',wraiths:'Wraiths',colossus:'Colossus',chimera:'Chimera',skywhale:'Drake'}; const type=map[sp.id]||'Guardian'; const u=mkUnit(type,w.name,x,y,plane); w.units.push(u); if(w.isPlayer)toast(`${sp.n}: ${type} joins you!`); burst(x,y,0x4dabf7,14); }
+ else if(sp.k==='hero'){ const h=pick(HEROES.filter(h=>!w.units.some(u=>u.hero&&u.hero.n===h.n)))||HEROES[0]; const hero={...h,lvl:irnd(2,4)}; const u=mkUnit('Swordsmen',w.name,x,y,plane,hero); w.units.push(u); if(w.isPlayer){toast(`🦸 ${hero.n} the ${hero.cls} answers your call!`); AudioX.speak(`${hero.n} at your service.`,'🦉');} }
+ else if(sp.k==='global'){ if(!w.globals.includes(sp.id))w.globals.push(sp.id); if(w.isPlayer)toast(`🌍 Global enchantment: ${sp.n} now rules both worlds.`); if(sp.id==='pestilence'){ for(const k in w.rel)w.rel[k]-=20; } }
+ else if(sp.k==='city'){ const c=target&&target.cityRef?target.cityRef:(target?cityAt(target.plane||G.plane,target.x,target.y):w.cities[0]); if(c){ if(!c.enchant.includes(sp.id))c.enchant.push(sp.id); if(w.isPlayer)toast(`🏙️ ${c.name} enchanted with ${sp.n}.`);} }
+ else if(sp.k==='overland'){ const c=target?cityAt(target.plane||G.plane,target.x,target.y):null; if(sp.id==='earthquake'&&c){ unitsAt(c.plane,c.x,c.y,c.owner).forEach(u=>u.hp-=40); burst(c.x,c.y,0xe8590c,18); if(w.isPlayer)toast(`Earthquake shakes ${c.name}!`); } if(sp.id==='volcano'&&target){ const t=tileAt(target.plane||G.plane,target.x,target.y); if(t){t.t='volcano'; w.mana+=80; if(w.isPlayer)toast('🌋 Volcano raised! +80 mana crystals.');} } if(sp.id==='dispel'&&c){ c.enchant=[]; if(w.isPlayer)toast(`Dispelled enchantments on ${c.name}.`);} }
+ if(w.isPlayer){ AudioX.sfx('cast'); buildOverworld(); } renderAll(); }
+function offerHero(w){ const h=pick(HEROES); modal(`<h2>🦸 A Hero Seeks Glory</h2><p class="story">${h.i} <b>${h.n}</b>, ${h.cls} of renown, kneels in your throne room. “Two worlds burn, High Mage. Let my blade choose the fire.”</p><p>Hiring costs <b>80 gold</b> and 1 fame proves your legend. Heroes gain levels, carry artifacts, and never eat.</p><p><button class="primary" onclick="hireHero('${h.n}')" ${w.gold<80?'disabled':''}>Hire ${h.n} (80g)</button> <button onclick="closeModalX()">Send Away</button></p>`); AudioX.speak('A hero seeks glory.',h.i); }
+function hireHero(name){ const w=player(); const base=HEROES.find(h=>h.n===name); if(!base||w.gold<80)return; w.gold-=80; const hero={...base,lvl:1}; const cap=w.cities[0]; const u=mkUnit('Swordsmen',w.name,cap?cap.x:2,cap?cap.y:2,cap?cap.plane:G.plane,hero); w.units.push(u); const art=pick(ARTIFACTS); u.items.push(art); toast(`🦸 ${name} hired with ${art.i} ${art.n}!`); AudioX.sfx('win'); closeModal(); buildOverworld(); renderAll(); saveGame(); }
+function openCity(c){ const w=wizByName(c.owner); const inc=cityIncome(c); const isMine=c.owner===player().name; const bList=BUILDINGS.filter(b=>!c.buildings.includes(b.id)).map(b=>`<button class="small" onclick="queueBuild(${c.id},'${b.id}')" ${!isMine||c.queue?'disabled':''}>${b.n} ${b.c}p — ${b.d}</button>`).join(' ');
+ const uList=CITY_UNITS.map(u=>{ const locked=(u==='Swordsmen'&&!c.buildings.includes('smithy'))||(u==='Cavalry'&&!c.buildings.includes('stables')); return `<button class="small" onclick="queueBuild(${c.id},'${u}')" ${!isMine||c.queue||locked?'disabled':''}>Train ${UTYPES[u].i} ${u} ${UTYPES[u].cost}p${locked?' 🔒':''}</button>`; }).join(' ');
+ const gar=unitsAt(c.plane,c.x,c.y).map(u=>`${u.hero?u.hero.i+' '+u.hero.n:UTYPES[u.type].i+' '+u.type} (${Math.ceil(u.hp)}/${u.maxhp})`).join(', ')||'No garrison — danger!';
+ modal(`<h2>🏰 ${esc(c.name)} <small>(${c.plane})</small></h2><p>Wizard <b>${esc(c.owner)}</b> • Population <b>${c.pop}</b> • ${TER[tileAt(c.plane,c.x,c.y).t].n}</p><p>Per turn: 💰 +${inc.gold} gold • 🔮 +${inc.mana} mana • ⚒️ ${inc.prod} production • 🌾 ${inc.food} food • 📚 ${inc.res} research ${c.enchant.length?`• ✨ ${c.enchant.map(id=>SPELL(id)?.n).join(', ')}`:''}</p><p>Buildings: ${c.buildings.map(id=>BUILDINGS.find(b=>b.id===id)?.n||id).join(', ')||'None'}<br>Queue: <b>${c.queue||'— idle —'}</b> (${Math.floor(c.prodAcc)}p banked) ${c.queue?`<button class="small" onclick="queueBuild(${c.id},null)">Cancel Queue</button>`:''}<br>Garrison: ${gar}</p>${isMine?`<h3>Build</h3><p style="display:flex;flex-wrap:wrap;gap:6px">${bList}</p><h3>Train (needs Smithy / Stables where marked)</h3><p style="display:flex;flex-wrap:wrap;gap:6px">${uList}</p><p><button onclick="rushCity(${c.id})">⚡ Rush Queue (pay gold = remaining production)</button> <button onclick="foundFromCity(${c.id})">🌱 Found New City (Settlers, 120g)</button> <button onclick="alchemy(${c.id})">🧪 Alchemy: 100g → 50 mana ${c.buildings.includes('alchemist')?'':'(needs Alchemist)'}</button></p>`:'<p>Rival city. Attack it with an army to capture it. Walls and garrisons defend it in tactical combat.</p>'}<p><button onclick="closeModalX()">Close</button></p>`); }
+function queueBuild(cid,kind){ const c=player().cities.find(c=>c.id===cid); if(!c)return; c.queue=kind; AudioX.sfx('build'); openCity(c); renderAll(); }
+function rushCity(cid){ const c=player().cities.find(c=>c.id===cid); if(!c||!c.queue){toast('Nothing queued.');return;} const b=BUILDINGS.find(b=>b.id===c.queue); const cost=b?b.c:UTYPES[c.queue].cost; const need=Math.max(0,cost-Math.floor(c.prodAcc)); if(player().gold<need){toast(`Need ${need} gold to rush.`);return;} player().gold-=need; c.prodAcc=cost; toast('Workers hired! It finishes next turn.'); openCity(c); renderAll(); }
+function alchemy(cid){ const c=player().cities.find(c=>c.id===cid); if(!c||!c.buildings.includes('alchemist')){toast('Build an Alchemist Guild first.');return;} if(player().gold<100){toast('Need 100 gold.');return;} player().gold-=100; player().mana+=50; toast('🧪 Transmuted 100g → 50 mana.'); AudioX.sfx('gold'); openCity(c); renderAll(); }
+function foundFromCity(cid){ const src=player().cities.find(c=>c.id===cid); if(!src)return; if(player().gold<120){toast('Founding costs 120 gold.');return;} G.pendingFound=src; closeModal(); toast('Tap a nearby empty land tile to found a new city (120g).'); }
+function foundAt(x,y){ const src=G.pendingFound; if(!src)return false; const t=tileAt(G.plane,x,y); if(!t||t.city||t.t==='water'||dist(src,{x,y})>4){toast('Pick empty land within 4 tiles of the parent city.');return true;} player().gold-=120; const c=foundCity(player(),x,y,G.plane,false); G.pendingFound=null; toast(`🌱 Founded ${c.name}!`); AudioX.sfx('build'); burst(x,y,0x69db7c,14); buildOverworld(); renderAll(); saveGame(); return true; }
+/* ================= COMBAT (tactical, Rapier bolts) ================= */
+let combatMeshes=[];
+function startLairCombat(u,tile){ const foes=[]; const n=tile.guard||2; for(let i=0;i<n;i++)foes.push(mkUnit('Wild', 'Wild', u.x, u.y, u.plane)); startCombat([u], foes, null, tile); }
+function startCombat(att, def, city=null, lairTile=null){ if(!att.length){toast('No attackers.');return;} if(!def.length&&city){ // empty city: capture instantly
+   captureCity(city, att[0].owner); att.forEach(u=>{u.x=city.x;u.y=city.y;}); buildOverworld(); renderAll(); return; }
+ if(!def.length)def=[mkUnit('Wild','Wild',att[0].x,att[0].y,att[0].plane)];
+ const mkSide=(arr,side)=>arr.map((u,i)=>({ref:u,side,cx:side==='A'?1:6,cy:2+(i%4),hp:u.hp,moved:false,acted:false,buff:0,fear:0,held:0}));
+ G.combat={att:att[0].owner,def:def[0].owner,city,lairTile,units:[...mkSide(att,'A'),...mkSide(def,'D')],turn:'A',round:1,log:[`Battle for ${city?city.name:'the wilds'}! ${att[0].owner} vs ${def[0].owner}.`],selected:null,over:false};
+ $('#hud').classList.add('hidden'); $('#combatHud').classList.remove('hidden'); buildCombatScene(); renderCombat(); AudioX.sfx('boom'); if(att[0].owner!==player().name&&def[0].owner!==player().name){ /* AI vs AI quick */ setTimeout(()=>autoBattle(true),600); } }
+function buildCombatScene(){ combatMeshes.forEach(m=>combatScene.remove(m)); combatMeshes=[]; const ground=new THREE.Mesh(new THREE.BoxGeometry(9,.4,7),toonMat(0x3a2f6b)); ground.position.set(4,-.2,3); ground.receiveShadow=true; combatScene.add(ground); combatMeshes.push(ground);
+ for(let x=0;x<8;x++)for(let y=0;y<6;y++){ const m=new THREE.Mesh(new THREE.BoxGeometry(.92,.12,.92),toonMat((x+y)%2?0x55459a:0x6d5bd0)); m.position.set(x,.06,y); m.userData.cell={x,y}; combatScene.add(m); combatMeshes.push(m); }
+ // walls if city siege
+ if(G.combat.city&&G.combat.city.buildings.includes('wall')){ for(let y=0;y<6;y++){ const wm=new THREE.Mesh(new THREE.BoxGeometry(.3,1.1,.95),toonMat(0x8d99ae)); wm.position.set(5.5,.6,y); wm.castShadow=true; combatScene.add(wm); combatMeshes.push(wm); } }
+ for(const cu of G.combat.units){ const w=wizByName(cu.ref.owner); const col=cu.side==='A'?0x3b82f6:0xe8443a; const g=new THREE.Group(); const b=new THREE.Mesh(new THREE.CapsuleGeometry(.28,.55,4,10),toonMat(w?new THREE.Color(w.color).getHex():col)); b.position.y=.8; b.castShadow=true; addOutline(b,1.1); g.add(b); const h=new THREE.Mesh(new THREE.SphereGeometry(.24,10,8),toonMat(0xffe0b5)); h.position.y=1.55; g.add(h); g.position.set(cu.cx,0,cu.cy); g.userData.cu=cu; combatScene.add(g); combatMeshes.push(g); cu.mesh=g; } }
+function clog(m){ G.combat.log.push(m); if(G.combat.log.length>30)G.combat.log.shift(); renderCombatLog(); }
+function renderCombatLog(){ $('#combatLog').innerHTML=G.combat.log.slice(-8).map(x=>`<div>• ${esc(x)}</div>`).join(''); $('#combatLog').scrollTop=9999; }
+function renderCombat(){ if(!G||!G.combat)return; const c=G.combat; const sel=c.selected; $('#combatInfo').innerHTML=`<h3 style="margin:2px">⚔️ ${c.city?'Siege of '+esc(c.city.name):'Battle'} — Round ${c.round}</h3><p>${c.turn==='A'?'Attackers':'Defenders'} to act. Tap your unit, then tap a cell or enemy. Ranged needs distance. Heroes level up!</p>${sel?`<p><b>Selected:</b> ${sel.ref.hero?esc(sel.ref.hero.n):sel.ref.type} HP ${Math.ceil(sel.hp)}/${sel.ref.maxhp} ${sel.held?'⛓️ Held':''}</p>`:''}<p><button class="small" onclick="endCombatTurn()">End Battle Turn</button></p>`; renderCombatLog(); }
+function combatDist(a,b){ return Math.abs(a.cx-b.cx)+Math.abs(a.cy-b.cy); }
+function damageCalc(att,def){ const A=UTYPES[att.ref.type], D=UTYPES[def.ref.type]; let atk=A.atk+att.buff+(att.ref.hero?att.ref.hero.lvl*2:0)+(wizByName(att.ref.owner)?.traits.includes('warlord')?2:0); let dfn=D.def+(def.ref.guard?3:0)+(G.combat.city&&def.side==='D'&&G.combat.city.buildings.includes('wall')?4:0); const roll=rnd(.7,1.3); return Math.max(3,Math.round((atk*4-dfn*2)*roll)); }
+function combatClickCell(x,y){ const c=G.combat; if(!c||c.over)return; const clicked=c.units.find(u=>u.cx===x&&u.cy===y&&u.hp>0); const mine=c.selected;
+ if(clicked&&clicked.side===(c.turn==='A'?'A':'D')&&isPlayerSide(clicked)){ c.selected=clicked; AudioX.sfx('click'); renderCombat(); return; }
+ if(!mine||!isPlayerSide(mine))return; if(mine.acted){toast('That stack already acted. End the battle turn.');return;} if(mine.held>0){toast('Held by web! It struggles free next round.');return;}
+ if(clicked&&clicked.side!==mine.side){ const d=combatDist(mine,clicked); const R=UTYPES[mine.ref.type].rng; if(R>0&&d<=R&&d>1){ doAttack(mine,clicked,true); } else if(d<=1){ doAttack(mine,clicked,false); } else { toast(R>0?'Out of range — move closer.':'Move next to an enemy to strike.'); } return; }
+ // move
+ if(Math.abs(x-mine.cx)+Math.abs(y-mine.cy)<=UTYPES[mine.ref.type].mov&&!c.units.some(u=>u.hp>0&&u.cx===x&&u.cy===y)){ mine.cx=x; mine.cy=y; if(mine.mesh)mine.mesh.position.set(x,0,y); mine.moved=true; AudioX.sfx('click'); renderCombat(); } else toast('Cannot move there.'); }
+function isPlayerSide(cu){ return cu.ref.owner===player().name; }
+function doAttack(att,def,ranged){ const dmg=damageCalc(att,def); def.hp-=dmg; att.acted=true; spawnBolt({x:att.cx,y:att.cy},{x:def.cx,y:def.cy},ranged?0xffd43b:0xff6b6b); burst(def.cx,def.cy,0xe8443a,8); AudioX.sfx('hit'); clog(`${att.ref.hero?att.ref.hero.n:att.ref.type} ${ranged?'shoots':'strikes'} ${def.ref.hero?def.ref.hero.n:def.ref.type} for ${dmg}.`); if(def.hp<=0){ clog(`${def.ref.type} is destroyed!`); if(def.mesh)def.mesh.visible=false; att.ref.xp+=30; if(att.ref.hero){att.ref.hero.lvl++; att.ref.maxhp+=25; clog(`🦸 ${att.ref.hero.n} reaches level ${att.ref.hero.lvl}!`);} }
+ // counter if melee survivor adjacent
+ if(!ranged&&def.hp>0&&combatDist(att,def)<=1&&Math.random()<.6){ const cd=Math.max(2,Math.round(damageCalc(def,att)*.6)); att.hp-=cd; clog(`${def.ref.type} counterattacks for ${cd}.`); if(att.hp<=0&&att.mesh)att.mesh.visible=false; }
+ renderCombat(); checkCombatEnd(); }
+function endCombatTurn(){ const c=G.combat; if(!c)return; c.units.forEach(u=>{u.acted=false;u.moved=false;u.guard=false; if(u.held>0)u.held--;}); c.turn=c.turn==='A'?'D':'A'; c.selected=null; if(c.turn==='A')c.round++; clog(`— Round ${c.round}: ${c.turn==='A'?'Attackers':'Defenders'} —`); renderCombat(); // AI side acts if not player
+ const sideUnits=c.units.filter(u=>u.hp>0&&((c.turn==='A'&&u.side==='A')||(c.turn==='D'&&u.side==='D'))); if(sideUnits.length&&!sideUnits.some(u=>isPlayerSide(u))){ setTimeout(()=>aiCombatTurn(),500); } if(c.round>18){ clog('The battle drags on — both sides break off!'); finishCombat(null); } }
+function aiCombatTurn(){ const c=G.combat; if(!c||c.over)return; const mine=c.units.filter(u=>u.hp>0&&((c.turn==='A'&&u.side==='A')||(c.turn==='D'&&u.side==='D'))); const foes=c.units.filter(u=>u.hp>0&&!mine.includes(u)); for(const u of mine){ if(u.hp<=0||!foes.some(f=>f.hp>0))break; const foe=foes.filter(f=>f.hp>0).sort((a,b)=>combatDist(u,a)-combatDist(u,b))[0]; if(!foe)break; const R=UTYPES[u.ref.type].rng; let d=combatDist(u,foe); if(!(R>0&&d<=R&&d>1)&&d>1){ // step toward
+   const steps=UTYPES[u.ref.type].mov; for(let s=0;s<steps;s++){ if(combatDist(u,foe)<=1)break; if(u.cx<foe.cx)u.cx++; else if(u.cx>foe.cx)u.cx--; else if(u.cy<foe.cy)u.cy++; else if(u.cy>foe.cy)u.cy--; if(u.mesh)u.mesh.position.set(u.cx,0,u.cy); } d=combatDist(u,foe); }
+  if((R>0&&d<=R&&d>1)||d<=1)doAttack(u,foe,R>0&&d>1); if(c.over)return; } if(!c.over)endCombatTurn(); }
+function autoBattle(instant=false){ const c=G.combat; if(!c)return; let guard=0; while(!c.over&&guard++<60){ const aliveA=c.units.filter(u=>u.side==='A'&&u.hp>0), aliveD=c.units.filter(u=>u.side==='D'&&u.hp>0); if(!aliveA.length||!aliveD.length)break; for(const u of [...aliveA,...aliveD]){ if(u.hp<=0)continue; const foes=c.units.filter(f=>f.hp>0&&f.side!==u.side); if(!foes.length)break; const foe=foes.sort((a,b)=>combatDist(u,a)-combatDist(u,b))[0]; const d=combatDist(u,foe); if(d>1&&UTYPES[u.ref.type].rng===0){ u.cx+=Math.sign(foe.cx-u.cx); u.cy+=Math.sign(foe.cy-u.cy); if(u.mesh)u.mesh.position.set(u.cx,0,u.cy); } doAttack(u,foe,UTYPES[u.ref.type].rng>0&&combatDist(u,foe)>1); if(c.over)break; } c.units.forEach(u=>u.acted=false); } checkCombatEnd(); if(!c.over)finishCombat(c.units.filter(u=>u.side==='A'&&u.hp>0).length?'A':'D'); }
+function checkCombatEnd(){ const c=G.combat; if(!c||c.over)return; const a=c.units.filter(u=>u.side==='A'&&u.hp>0).length, d=c.units.filter(u=>u.side==='D'&&u.hp>0).length; if(a&&d)return; finishCombat(a?'A':'D'); }
+function finishCombat(winnerSide){ const c=G.combat; if(!c||c.over)return; c.over=true; // write back HP / deaths
+ for(const cu of c.units){ cu.ref.hp=Math.max(0,Math.ceil(cu.hp)); }
+ for(const w of G.wizards){ w.units=w.units.filter(u=>u.hp>0); }
+ let msg=''; if(c.lairTile&&winnerSide==='A'){ const w=player(); const gold=irnd(60,160), mana=irnd(30,90); w.gold+=gold; w.mana+=mana; w.fame+=2; if(Math.random()<.5){ const art=pick(ARTIFACTS); const hero=w.units.find(u=>u.hero); if(hero){hero.items.push(art); msg+=` Found ${art.i} ${art.n}!`;} } c.lairTile.feat=null; msg=`Lair cleared! +${gold}g +${mana} mana.${msg}`; AudioX.sfx('win'); }
+ else if(c.city){ if(winnerSide==='A'){ captureCity(c.city,c.att); msg=`${c.city.name} captured by ${c.att}!`; } else msg=`${c.city.name} holds! Attackers repelled.`; }
+ else msg=winnerSide==='A'?'Victory! The field is yours.':'Defeat. Your army is shattered.';
+ clog(msg); toast(msg,4000); $('#combatHud').classList.add('hidden'); $('#hud').classList.remove('hidden'); G.combat=null; combatMeshes.forEach(m=>combatScene.remove(m)); combatMeshes=[]; buildOverworld(); renderAll(); saveGame(); checkHubProgress(); }
+function captureCity(city,newOwner){ const old=wizByName(city.owner); if(old)old.cities=old.cities.filter(c=>c!==city); const nw=wizByName(newOwner); city.owner=newOwner; const t=tileAt(city.plane,city.x,city.y); if(t)t.owner=newOwner; if(nw&&!nw.cities.includes(city))nw.cities.push(city); city.enchant=city.enchant.filter(id=>SPELL(id)?.k==='city'?false:true); if(nw&&nw.isPlayer){nw.fame+=3;} reveal(player(),city.x,city.y,city.plane,2); }
+function combatCast(id){ const w=player(); const sp=SPELL(id); const c=G.combat; if(!c)return; const mine=c.units.filter(u=>u.hp>0&&isPlayerSide(u)); const foes=c.units.filter(u=>u.hp>0&&!isPlayerSide(u)); if(w.mana<sp.c){toast('Not enough mana.');return;} // need a selected or first friendly as caster anchor
+ const friendly=c.selected&&isPlayerSide(c.selected)?c.selected:mine[0]; const foe=foes[0]; w.mana-=sp.c; AudioX.sfx('cast'); closeModal();
+ if(sp.id==='fireball'&&foe){ foe.hp-=45; spawnBolt({x:friendly?friendly.cx:1,y:friendly?friendly.cy:2},{x:foe.cx,y:foe.cy},0xff6b6b); clog(`🔥 Fireball burns ${foe.ref.type} for 45!`); if(foe.hp<=0&&foe.mesh)foe.mesh.visible=false; }
+ else if(sp.id==='bolt'&&foe){ foe.hp-=40; spawnBolt({x:1,y:2},{x:foe.cx,y:foe.cy},0x4dabf7); clog(`⚡ Lightning Bolt hits ${foe.ref.type} for 40!`); if(foe.hp<=0&&foe.mesh)foe.mesh.visible=false; }
+ else if(sp.id==='healing'&&friendly){ friendly.hp=Math.min(friendly.ref.maxhp,friendly.hp+60); friendly.ref.hp=friendly.hp; clog(`☀️ Healing restores ${friendly.ref.type}.`); burst(friendly.cx,friendly.cy,0xffe66d,10); }
+ else if(sp.id==='bless'&&friendly){ friendly.buff+=2; clog(`☀️ ${friendly.ref.type} is Blessed (+attack this battle).`); }
+ else if(sp.id==='flameblade'&&friendly){ friendly.buff+=3; clog(`🔥 Flame Blade ignites ${friendly.ref.type}!`); }
+ else if(sp.id==='fear'&&foe){ foe.buff-=3; clog(`💀 Fear weakens ${foe.ref.type}.`); }
+ else if(sp.id==='entangle'||sp.id==='web'){ if(foe){foe.held=2; clog(`🌿 ${foe.ref.type} is held fast!`);} }
+ else if(sp.id==='flight'&&friendly){ friendly.buff+=1; clog(`🔮 ${friendly.ref.type} soars! (+attack, flies over walls)`); }
+ else if(sp.id==='lifesteal'&&foe){ foe.hp-=45; if(friendly){friendly.hp=Math.min(friendly.ref.maxhp,friendly.hp+45);} clog(`💀 Life Steal drains ${foe.ref.type}!`); if(foe.hp<=0&&foe.mesh)foe.mesh.visible=false; }
+ else { toast(`${sp.n} cannot be cast that way here.`); w.mana+=sp.c; openSpellbook(true); return; }
+ renderCombat(); checkCombatEnd(); renderAll(); }
+/* ================= AI, EVENTS, DIPLOMACY ================= */
+function aiTurns(){ for(const w of G.wizards){ if(w.isPlayer||!w.alive)continue; // build/train
+  for(const c of w.cities){ if(!c.queue){ c.queue=Math.random()<.5?pick(BUILDINGS.filter(b=>!c.buildings.includes(b.id)).map(b=>b.id).concat(['Spearmen'])):pick(CITY_UNITS); } }
+  // cast cheap summon/global sometimes
+  if(Math.random()<.35&&w.mana>90){ const cand=w.known.map(id=>SPELL(id)).filter(s=>s&&(s.k==='summon'||s.k==='global')); if(cand.length){ const sp=pick(cand); if(w.mana>=sp.c){ w.mana-=sp.c; finishCast(w,sp,null); } } }
+  // move armies toward nearest player/rival city or lair
+  for(const u of [...w.units]){ if(u.hp<=0)continue; const targets=[]; for(const ow of G.wizards){ if(ow===w)continue; for(const c of ow.cities) if(c.plane===u.plane)targets.push(c); } // lairs
+   let tgt=targets.sort((a,b)=>dist(u,a)-dist(u,b))[0]; if(!tgt){ // wander to feat
+     outer: for(let y=0;y<H;y++)for(let x=0;x<W;x++){ const t=G.world[u.plane][y][x]; if(t.feat&&['lair','node'].includes(t.feat)){tgt={x,y,plane:u.plane};break outer;} } }
+   if(tgt){ let steps=u.moves; while(steps-->0&&(u.x!==tgt.x||u.y!==tgt.y)){ if(u.x<tgt.x)u.x++; else if(u.x>tgt.x)u.x--; else if(u.y<tgt.y)u.y++; else if(u.y>tgt.y)u.y--; } const foes=unitsAt(u.plane,u.x,u.y).filter(v=>v.owner!==w.name&&v.owner!=='Wild'); const city=cityAt(u.plane,u.x,u.y); if(city&&city.owner!==w.name){ const defs=unitsAt(u.plane,u.x,u.y,city.owner); // resolve instantly if AI attacking (player defender gets tactical if player owns city and has garrison)
+     if(city.owner===player().name&&defs.length){ startCombat([u],defs,city); toast(`⚠️ ${w.name} attacks ${city.name}! Defend it!`); return; } else { // quick resolve
+       const ap=u.hp+UTYPES[u.type].atk*5, dp=defs.reduce((a,d)=>a+d.hp,40); if(ap>dp){ defs.forEach(d=>d.hp=0); captureCity(city,w.name); } else u.hp-=30; } }
+   }
+  }
+  // diplomacy drift
+  const rel=player().rel[w.name]??0; if(Math.random()<.2)player().rel[w.name]=clamp(rel+irnd(-6,4),-100,100);
+  // found new city occasionally
+  if(w.cities.length<4&&w.gold>140&&Math.random()<.3){ const c=pick(w.cities); for(let tries=0;tries<8;tries++){ const x=clamp(c.x+irnd(-3,3),0,W-1),y=clamp(c.y+irnd(-3,3),0,H-1),t=tileAt(c.plane,x,y); if(t&&!t.city&&t.t!=='water'){ w.gold-=120; foundCity(w,x,y,c.plane,false); break; } } }
+ }
+ // chaos rift globals
+ for(const w of G.wizards){ if(w.globals.includes('chaosrift')){ const foes=G.wizards.filter(o=>o!==w&&o.units.length); if(foes.length){ const v=pick(pick(foes).units); if(v){v.hp-=25; if(v.owner===player().name)toast('🔥 Chaos Rift lightning strikes your army!'); if(v.hp<=0)wizByName(v.owner).units=wizByName(v.owner).units.filter(u=>u!==v);} } } }
+}
+function randomEvent(){ const roll=Math.random(); const w=player(); if(roll<.06){ w.gold+=100; toast('🎉 Merchant caravan! +100 gold.'); AudioX.sfx('gold'); } else if(roll<.11){ w.mana+=70; toast('🌠 Mana surge! +70 mana.'); } else if(roll<.15&&w.units.length){ const u=pick(w.units); u.hp=Math.max(10,u.hp-25); toast('🦂 Plague of stings wounds an army.'); } else if(roll<.18){ toast('🦉 An omen: ravens circle a rival tower. (Nothing happens… this time.)'); } else if(roll<.21&&w.cities.length){ const c=pick(w.cities); c.pop=Math.min(30,c.pop+2); toast(`👶 Baby boom in ${c.name}! +2 population.`); } }
+function openDiplomacy(){ const pw=player(); const rows=G.wizards.slice(1).map(w=>{ const rel=pw.rel[w.name]??0; const mood=rel>40?'Warm':rel>0?'Cordial':rel>-30?'Wary':'Hostile'; return `<div class="unitrow"><span style="font-size:30px">${w.icon}</span><div style="flex:1"><b>${w.name}</b> — ${w.personality}<br><small>Cities ${w.cities.length} • Armies ${w.units.length} • Power ${powerScore(w)} • Relation ${rel} (${mood}) ${w.alive?'':'• BANISHED'}</small></div><button class="small" onclick="diploAct('${w.name}','greet')" ${!w.alive?'disabled':''}>Greet</button><button class="small" onclick="diploAct('${w.name}','gift')" ${!w.alive?'disabled':''}>Gift 50g</button><button class="small" onclick="diploAct('${w.name}','war')" ${!w.alive?'disabled':''}>⚔️ War</button><button class="small" onclick="diploAct('${w.name}','peace')" ${!w.alive?'disabled':''}>🕊️ Peace</button><button class="small" onclick="diploAct('${w.name}','trade')" ${!w.alive?'disabled':''}>Trade Spell</button></div>`; }).join('');
+ modal(`<h2>🕊️ Rival Wizards</h2><p class="story">Couriers ride between towers on griffon-back. Words here move armies there.</p><div class="list">${rows}</div><p><button onclick="closeModalX()">Close</button></p>`); }
+function diploAct(name,act){ const pw=player(); const w=wizByName(name); let rel=pw.rel[name]??0; AudioX.init();
+ if(act==='greet'){ rel+=3; AudioX.speak(`Hail, ${pw.name}. The moons watch us both.`,w.icon); toast(`${w.icon} ${name}: “Hail, ${pw.name}. The moons watch us both.”`); }
+ if(act==='gift'){ if(pw.gold<50){toast('Need 50 gold.');return;} pw.gold-=50; rel+=14; AudioX.speak('A generous gift. We remember.','👑'); toast(`${name} warms to your gift. Relation +14.`); AudioX.sfx('gold'); }
+ if(act==='war'){ rel=-80; AudioX.speak('Then let the skies burn!','😈'); toast(`⚔️ You declare war on ${name}! Their armies will hunt you.`); // immediate skirmish chance
+   const foe=w.units[0]; if(foe&&Math.random()<.5){ foe.hp-=20; } }
+ if(act==='peace'){ if(rel>-20||Math.random()<.5){ rel=Math.max(rel,15); toast(`${name} accepts peace. Armies stand down (for now).`); AudioX.speak('Peace, then. Guard it well.','🕊️'); } else { toast(`${name} spurns your peace!`); rel-=5; } }
+ if(act==='trade'){ const theirs=SPELLS.filter(s=>w.known.includes(s.id)&&!pw.known.includes(s.id)); const mine=SPELLS.filter(s=>pw.known.includes(s.id)&&!w.known.includes(s.id)); if(!theirs.length){toast(`${name} knows nothing new to trade.`);} else if(pw.gold<60){toast('Spell trade costs 60 gold in gifts & ink.');} else { pw.gold-=60; const s=pick(theirs); pw.known.push(s.id); if(mine.length&&Math.random()<.6)w.known.push(pick(mine).id); rel+=8; toast(`📜 Traded for ${s.n}! Relation +8.`); AudioX.speak('Knowledge for knowledge. Fair.','🦉'); } }
+ pw.rel[name]=clamp(rel,-100,100); openDiplomacy(); renderAll(); saveGame(); }
+/* ================= RENDER HUD ================= */
+function renderAll(){ renderRes(); renderSide(); renderStack(); refreshFocus(); }
+function renderRes(){ if(!G)return; const w=player(); const inc=w.cities.reduce((a,c)=>{ const i=cityIncome(c); a.gold+=i.gold;a.mana+=i.mana;a.res+=i.res; return a; },{gold:0,mana:0,res:0}); const up=upkeep(w);
+ $('#resbar').innerHTML=`<span>${w.icon} ${esc(w.name)}</span><span>💰 ${fmt(w.gold)} (+${inc.gold-up})</span><span>🔮 ${fmt(w.mana)} (+${inc.mana})</span><span>⚒️ Skill ${w.skill}</span><span>⭐ Fame ${w.fame}</span><span>📅 ${G.month}/${G.year} T${G.turn}</span><span>🏆 Power ${powerScore(w)}</span>${w.banished?'<span style="color:#ff6b6b">BANISHED</span>':''}${G.casting?`<span>⏳ ${SPELL(G.casting.spell).n} ${G.casting.left}t</span>`:''}${w.mastery?`<span>✨ Mastery ${w.mastery}/8</span>`:''}`;
+ $('#btnPlane').textContent=G.plane==='Arcanum'?'🌍 Arcanum ⇄ Myrror':'🪐 Myrror ⇄ Arcanum'; }
+function renderSide(){ const el=$('#sidePanel'); if(!G){el.innerHTML='';return;} const t=G.selTile?tileAt(G.plane,G.selTile.x,G.selTile.y):null; const c=G.selTile?cityAt(G.plane,G.selTile.x,G.selTile.y):null; const w=player();
+ if(c){ el.innerHTML=`<h3 style="margin:2px">🏰 ${esc(c.name)}</h3><p>${c.plane} • Owner ${esc(c.owner)} • Pop ${c.pop}<br>${c.queue?`Building: ${c.queue}`:'Idle — open to build & train.'}</p><p><button onclick="openCityById(${c.id})">${c.owner===w.name?'Manage City':'View City'}</button> ${c.owner===w.name?`<button onclick="endTurnQuick()">End Turn</button>`:''}</p><p><small>Tap your army then tap a destination to move. Tap a city to manage it. Nodes ⚡ hold mana, lairs 💀 hold treasure.</small></p>`; return; }
+ if(t&&G.selTile){ const featName={lair:'💀 Monster Lair',node:'🔮 Mana Node',tower:'🗼 Wizard Tower Ruins',ruins:'🏺 Ancient Ruins',gold:'💰 Buried Gold',mana:'🔮 Mana Crystals',herb:'🌿 Healing Herbs'}[t.feat]||''; const units=unitsAt(G.plane,G.selTile.x,G.selTile.y); el.innerHTML=`<h3 style="margin:2px">${TER[t.t].n} (${G.selTile.x},${G.selTile.y})</h3><p>${G.plane}${featName?` • ${featName}`:''}<br>${units.length?units.map(u=>`${u.owner}: ${u.hero?u.hero.n:u.type} ${Math.ceil(u.hp)}hp`).join('<br>'):'No armies here.'}</p><p><small>Select your army in the bar below, then tap a tile to move. Flying ignores terrain. Sea stops land armies.</small></p>`; return; }
+ el.innerHTML=`<h3 style="margin:2px">${G.plane}</h3><p>Tap a tile to inspect it. Your gold armies move with the bar below.</p><p><small>Win: banish all rivals or channel the Spell of Mastery for 8 turns. Lose your last city and you are banished — cast Spell of Return or found anew.</small></p>`; }
+function renderStack(){ const el=$('#stackPanel'); if(!G)return; const w=player(); const mine=w.units.filter(u=>u.plane===G.plane); if(!mine.length){ el.innerHTML=`<b>No armies on ${G.plane}.</b> Switch planes or summon/train more. ${w.banished?'<button onclick="openSpellbookX()">Cast Spell of Return</button>':''}`; return; }
+ el.innerHTML=`<div style="font-weight:900;margin-bottom:6px">Your armies on ${G.plane} — tap to select, then tap a map tile</div><div class="unitlist">${mine.map(u=>{ const b=UTYPES[u.type]; const sel=G.sel===u; return `<div class="unitrow ${sel?'sel':''}"><span style="font-size:26px">${u.hero?u.hero.i:b.i}</span><div style="flex:1"><b>${u.hero?esc(u.hero.n)+' Lv'+u.hero.lvl:u.type}</b> <small>HP ${Math.ceil(u.hp)}/${u.maxhp} • Move ${u.moves}/${b.mov} • ${b.rng?'Ranged '+b.rng:'Melee'}${u.items.length?' • '+u.items.map(i=>i.i).join(' '):''}</small><div class="health"><i style="width:${clamp(u.hp/u.maxhp*100,0,100)}%"></i></div></div><button class="small" onclick="selectUnit(${u.uid})">${sel?'Selected':'Select'}</button><button class="small" onclick="healUnit(${u.uid})">Rest (+HP)</button></div>`; }).join('')}</div>`; refreshFocus(); }
+function selectUnit(uidv){ const u=player().units.find(u=>u.uid===uidv); if(!u)return; G.sel=u; G.plane=u.plane; G.selTile={x:u.x,y:u.y,plane:u.plane}; buildOverworld(); renderAll(); AudioX.sfx('select'); }
+function healUnit(uidv){ const u=player().units.find(u=>u.uid===uidv); if(!u)return; u.hp=Math.min(u.maxhp,u.hp+18); u.moves=0; toast(`${u.hero?u.hero.n:u.type} rests and recovers.`); renderAll(); buildOverworld(); }
+function endTurnQuick(){ endTurn(); }
+function openCityById(id){ for(const w of G.wizards){ const c=w.cities.find(c=>c.id===id); if(c){openCity(c);return;} } }
+function openSpellbookX(){ openSpellbook(!!G.combat); }
+/* ================= INPUT: canvas, keyboard, gamepad, cursor ================= */
+let cursorPos={x:innerWidth/2,y:innerHeight/2}, gpPrev=[], gpCursorOn=false;
+function onCanvasTap(e){ noteInput(); AudioX.init(); if(!G||G.over)return; const r=renderer.domElement.getBoundingClientRect(); const nx=((e.clientX-r.left)/r.width)*2-1, ny=-(((e.clientY-r.top)/r.height)*2-1); pointerV.set(nx,ny); const cam=G.combat?combatCam:camera; raycaster.setFromCamera(pointerV,cam);
+ if(G.combat){ const hits=raycaster.intersectObjects(combatMeshes,true); for(const h of hits){ let o=h.object; while(o){ if(o.userData.cell){ combatClickCell(o.userData.cell.x,o.userData.cell.y); return; } if(o.userData.cu){ combatClickCell(o.userData.cu.cx,o.userData.cu.cy); return; } o=o.parent; } } return; }
+ const hits=raycaster.intersectObjects(tileMeshes,false); if(!hits.length)return; const td=hits[0].object.userData.tile; if(!td)return; handleMapTap(td.x,td.y); }
+function handleMapTap(x,y){ if(!G||G.combat)return; const t=tileAt(G.plane,x,y); if(G.pendingFound){ foundAt(x,y); selectTile(x,y); return; }
+ if(G.pendingCast){ const sp=SPELL(G.pendingCast); const cid=G.pendingCast; G.pendingCast=null; if(cid==='return'){ // raise spire city
+   if(!t||t.t==='water'||t.city){toast('Pick empty land for your Return Spire.'); G.pendingCast='return'; return;} const w=player(); if(w.mana<SPELL('return').c){toast('Not enough mana.');return;} w.mana-=SPELL('return').c; const c=foundCity(w,x,y,G.plane,false); c.name='Return Spire'; w.banished=false; w.alive=true; toast('✨ You return! A spire rises from the ley-lines.'); buildOverworld(); renderAll(); return; }
+  const w=player(); if(w.mana<sp.c){toast('Not enough mana.');return;} beginCasting(w,sp,{x,y,plane:G.plane}); selectTile(x,y); return; }
+ const c=cityAt(G.plane,x,y); const mine=unitsAt(G.plane,x,y,player().name);
+ if(G.sel&&G.sel.owner===player().name&&!(mine.length&&G.sel.x===x&&G.sel.y===y)){ // attempt move if clicked tile not own stack selection
+   if(x!==G.sel.x||y!==G.sel.y){ if(tryMoveSelected(x,y))return; } }
+ selectTile(x,y); if(c&&(mine.length||c.owner===player().name)) { /* double purpose: second tap opens */ }
+ }
+let tapCount={k:'',t:0};
+document.addEventListener('dblclick',()=>{ if(G&&G.selTile){ const c=cityAt(G.plane,G.selTile.x,G.selTile.y); if(c)openCity(c); } });
+function cellFromCursor(){ // keyboard/gamepad map cursor -> nearest tile via ray from screen cursor
+ if(!renderer)return null; const r=renderer.domElement.getBoundingClientRect(); const nx=((cursorPos.x-r.left)/r.width)*2-1, ny=-(((cursorPos.y-r.top)/r.height)*2-1); pointerV.set(nx,ny); raycaster.setFromCamera(pointerV,G.combat?combatCam:camera); const objs=G.combat?combatMeshes:tileMeshes; const hits=raycaster.intersectObjects(objs,!G.combat?false:true); if(!hits.length)return null; let o=hits[0].object; while(o){ if(o.userData.tile)return o.userData.tile; if(o.userData.cell)return o.userData.cell; if(o.userData.cu)return {x:o.userData.cu.cx,y:o.userData.cu.cy}; o=o.parent; } return null; }
+addEventListener('keydown',e=>{ noteInput(); AudioX.init(); const k=e.key;
+ if(settingsOpen||$('#modalRoot').innerHTML){ if(k==='Escape'){closeModal(); e.preventDefault(); return;} if(k==='ArrowDown'||k==='ArrowRight'){moveFocus(1);e.preventDefault();return;} if(k==='ArrowUp'||k==='ArrowLeft'){moveFocus(-1);e.preventDefault();return;} if(k==='Enter'||k===' '){activateFocus();e.preventDefault();return;} return; }
+ if(k==='Escape'){ openSettings(); e.preventDefault(); return; }
+ if(!G||$('#titleScreen').classList.contains('hidden')===false||!$('#createScreen').classList.contains('hidden'))return;
+ const step=26; if(k==='ArrowLeft'||k==='a')cursorPos.x-=step*(SETTINGS.invertX?-1:1); if(k==='ArrowRight'||k==='d')cursorPos.x+=step*(SETTINGS.invertX?-1:1); if(k==='ArrowUp'||k==='w')cursorPos.y-=step*(SETTINGS.invertY?-1:1); if(k==='ArrowDown'||k==='s')cursorPos.y+=step*(SETTINGS.invertY?-1:1);
+ cursorPos.x=clamp(cursorPos.x,10,innerWidth-10); cursorPos.y=clamp(cursorPos.y,10,innerHeight-10); showCursor();
+ if(k==='Enter'||k===' '){ const cell=cellFromCursor(); if(cell){ if(G.combat)combatClickCell(cell.x,cell.y); else handleMapTap(cell.x,cell.y); } e.preventDefault(); }
+ if(k==='e'||k==='E')endTurn(); if(k==='p'||k==='P'){ G.plane=G.plane==='Arcanum'?'Myrror':'Arcanum'; if(!player().planesVisited.includes(G.plane))player().planesVisited.push(G.plane); buildOverworld(); renderAll(); toast(`Now viewing ${G.plane}`); }
+ if(k==='b'||k==='B')openSpellbook(!!G.combat); });
+function showCursor(){ const c=$('#cursor'); c.classList.remove('hidden'); c.style.left=cursorPos.x+'px'; c.style.top=cursorPos.y+'px'; }
+function pollGamepad(){ const pads=navigator.getGamepads?navigator.getGamepads():[]; const gp=pads&&[...pads].find(p=>p&&p.connected); if(!gp)return; const b=gp.buttons.map(x=>x.pressed); const edge=i=>b[i]&&!gpPrev[i];
+ let ax=gp.axes[0]||0, ay=gp.axes[1]||0; if(SETTINGS.invertX)ax=-ax; if(SETTINGS.invertY)ay=-ay; const dz=.22;
+ if(Math.abs(ax)>dz||Math.abs(ay)>dz){ noteInput(); gpCursorOn=true; cursorPos.x=clamp(cursorPos.x+ax*14,10,innerWidth-10); cursorPos.y=clamp(cursorPos.y+ay*14,10,innerHeight-10); showCursor(); }
+ // menu nav with D-pad / stick flick handled as focus
+ if(edge(14))moveFocus(-1); if(edge(15))moveFocus(1); if(edge(12))moveFocus(-1); if(edge(13))moveFocus(1);
+ if(edge(0)){ noteInput(); AudioX.init(); if($('#modalRoot').innerHTML||settingsOpen||!$('#titleScreen').classList.contains('hidden')||!$('#createScreen').classList.contains('hidden'))activateFocus(); else { const cell=cellFromCursor(); if(cell){ if(G&&G.combat)combatClickCell(cell.x,cell.y); else if(G)handleMapTap(cell.x,cell.y); } } }
+ if(edge(1)){ noteInput(); if($('#modalRoot').innerHTML)closeModal(); }
+ if(edge(9)){ noteInput(); if(settingsOpen)closeModal(); else openSettings(); }
+ if(edge(2)&&G&&!G.combat)openSpellbook(false); if(edge(3)&&G)openDiplomacy(); if(edge(5)&&G&&!G.combat)endTurn();
+ gpPrev=b; }
+/* ================= SCREENS: create, settings, help, about, victory ================= */
+let createCfg={name:'High Mage',icon:'🧙',race:'High Men',books:{Life:2,Death:0,Nature:2,Chaos:1,Sorcery:1},traits:['sage'],points:6};
+function renderCreate(){ const ptsUsed=Object.values(createCfg.books).reduce((a,b)=>a+b,0)+createCfg.traits.length; const left=12-ptsUsed; // 11 books+traits budget style
+ $('#createBody').innerHTML=`<p>Spend <b>12 picks</b> on spell books &amp; traits (${left} left). Books unlock stronger spells of that sphere. You begin with that sphere's apprentice spells.</p>
+ <p><label>Wizard name <input type="text" id="wizName" value="${esc(createCfg.name)}" maxlength="16"></label> Portrait ${['🧙','👑','🧝','💀','😈','🦉','🔮'].map(i=>`<button class="small" onclick="pickIcon('${i}')">${i}${createCfg.icon===i?' ✓':''}</button>`).join(' ')}</p>
+ <h3>Spell books</h3><div class="grid3">${Object.keys(SCHOOLS).map(s=>`<div class="panel" style="padding:10px"><b>${SCHOOLS[s].i} ${s}</b><br><span style="font-size:28px">${'📕'.repeat(createCfg.books[s])||'—'}</span><br><button class="small" onclick="bookAdj('${s}',-1)">−</button> <b>${createCfg.books[s]}</b> <button class="small" onclick="bookAdj('${s}',1)">+</button></div>`).join('')}</div>
+ <h3>Race of your first people</h3><p>${RACES.map(r=>`<button class="small" onclick="pickRace('${r.n}')">${r.i} ${r.n}${createCfg.race===r.n?' ✓':''} <small>${r.d}</small></button>`).join(' ')}</p>
+ <h3>Traits (1 pick each)</h3><p>${TRAITS.map(t=>`<button class="small" onclick="toggleTrait('${t.id}')">${createCfg.traits.includes(t.id)?'✓ ':''}${t.n} — ${t.d}</button>`).join(' ')}</p>
+ <p><button class="primary" onclick="startGame()" ${left<0?'disabled':''}>✦ Begin — Two Worlds Await</button> <button onclick="backTitle()">Back</button> ${left<0?'<b style="color:#ff6b6b">Too many picks!</b>':''}</p>`; refreshFocus(); }
+function bookAdj(s,d){ createCfg.books[s]=clamp(createCfg.books[s]+d,0,5); AudioX.sfx('click'); renderCreate(); }
+function pickIcon(i){ createCfg.icon=i; renderCreate(); }
+function pickRace(n){ createCfg.race=n; renderCreate(); }
+function toggleTrait(id){ const i=createCfg.traits.indexOf(id); if(i>=0)createCfg.traits.splice(i,1); else createCfg.traits.push(id); renderCreate(); }
+function backTitle(){ $('#createScreen').classList.add('hidden'); $('#titleScreen').classList.remove('hidden'); refreshFocus(); }
+function startGame(){ createCfg.name=($('#wizName')?.value||'High Mage').trim()||'High Mage'; AudioX.init(); AudioX.sfx('win'); createGame(createCfg); $('#createScreen').classList.add('hidden'); $('#titleScreen').classList.add('hidden'); $('#hud').classList.remove('hidden'); if(player().units[0]){G.sel=player().units[0]; G.selTile={x:G.sel.x,y:G.sel.y,plane:G.plane};} buildOverworld(); renderAll(); toast(`Welcome, ${createCfg.name}. Move with Cross/Enter, conquer, research, master both worlds!`); AudioX.speak(`Welcome, ${createCfg.name}. Two worlds await.`,'🧙'); checkHubProgress(); }
+function openSettings(){ settingsOpen=true; modal(`<h2>⚙️ Settings</h2>
+ <p><label>Master volume <input type="range" min="0" max="1" step="0.05" value="${SETTINGS.master}" oninput="setVol('master',this.value)"></label> ${Math.round(SETTINGS.master*100)}%</p>
+ <p><label>Music <input type="range" min="0" max="1" step="0.05" value="${SETTINGS.music}" oninput="setVol('music',this.value)"></label> <label>Effects <input type="range" min="0" max="1" step="0.05" value="${SETTINGS.sfx}" oninput="setVol('sfx',this.value)"></label> <label>Voice <input type="range" min="0" max="1" step="0.05" value="${SETTINGS.voice}" oninput="setVol('voice',this.value)"></label></p>
+ <p><label><input type="checkbox" ${SETTINGS.invertX?'checked':''} onchange="setInv('invertX',this.checked)" style="width:26px;height:26px"> Invert horizontal axis (gamepad fix)</label></p>
+ <p><label><input type="checkbox" ${SETTINGS.invertY?'checked':''} onchange="setInv('invertY',this.checked)" style="width:26px;height:26px"> Invert vertical axis (gamepad fix)</label></p>
+ <p>Quality <button class="small" onclick="setQuality('High')">High (shadows, full detail)</button> <button class="small" onclick="setQuality('Low')">Low</button> <b>${SETTINGS.quality}</b> • <label><input type="checkbox" ${SETTINGS.shake?'checked':''} onchange="setInv('shake',this.checked)" style="width:26px;height:26px"> Screen shake</label></p>
+ <p>Controls: Left stick / WASD moves cursor • Cross / Enter selects • Circle / Esc back • Options / Esc this menu • R1 ends turn • Square spells • Triangle rivals.</p>
+ <p><button class="primary" onclick="closeModalX()">Done</button> <button onclick="saveAndTitle()">Save &amp; Title</button> <button onclick="newFromSettings()">Abandon &amp; New Game</button></p>`); }
+function setVol(k,v){ SETTINGS[k]=parseFloat(v); saveSettings(); AudioX.apply(); }
+function setInv(k,v){ SETTINGS[k]=!!v; saveSettings(); if(k==='invertX'||k==='invertY'||k==='shake')openSettings(); }
+function setQuality(q){ SETTINGS.quality=q; saveSettings(); if(renderer)renderer.setPixelRatio(q==='Low'?1:Math.min(devicePixelRatio,2)); openSettings(); }
+function saveAndTitle(){ saveGame(); closeModal(); $('#hud').classList.add('hidden'); $('#combatHud').classList.add('hidden'); $('#titleScreen').classList.remove('hidden'); }
+function newFromSettings(){ closeModal(); $('#hud').classList.add('hidden'); $('#titleScreen').classList.add('hidden'); $('#createScreen').classList.remove('hidden'); renderCreate(); }
+function showHowto(){ modal(`<h2>📜 How to Play — The Last High Mage</h2><div style="max-height:60vh;overflow:auto"><p class="story">A spiritual successor to Master of Magic: explore two mirrored worlds, found cities, and out-spell four rival wizards.</p><h3>The loop</h3><p>1) <b>Move armies</b> — select in the bottom bar, tap a highlighted-reach tile. Explore lairs, nodes, towers and ruins for treasure, artifacts and heroes. 2) <b>Run cities</b> — tap a city: build Granaries, Libraries, Wizards' Towers; train Spearmen→Magicians &amp; Golems; rush with gold; found new cities. 3) <b>Cast &amp; research</b> — Spellbook (Square/B): summons, city enchantments, globals, battle spells. Casting takes turns by skill. 4) <b>Fight tactically</b> — battles open on a 3D field: move, shoot, cast Fireball/Bless/Web, flee or Auto. Walls defend sieges. 5) <b>Diplomacy</b> — Triangle: greet, gift, trade spells, make peace or war. 6) <b>Switch planes</b> — Arcanum ⇄ Myrror with the top button (P). Myrror is richer and crueller.</p><h3>Winning &amp; losing</h3><p>Banish every rival (take their cities &amp; armies) or channel the <b>Spell of Mastery</b> for 8 turns. Lose your last city and you are <b>banished</b>: survive, found anew, or cast Spell of Return. Food/gold upkeep starves armies — watch the top bar.</p><h3>Controller (10-foot)</h3><p>Every screen is D-pad navigable. Left stick moves the gold cursor, Cross confirms, Circle backs, Options/Esc opens Settings (with invert-axis fixes). Keyboard &amp; mouse map to the same model.</p></div><p><button class="primary" onclick="closeModalX()">Close</button></p>`); }
+function showAbout(){ modal(`<h2>ℹ️ About &amp; Credits</h2><div style="max-height:62vh;overflow:auto"><p><b>The Last High Mage</b> — an original spiritual successor to Master of Magic. Title picked from 50 brainstormed titles with an OS-entropy random generator (#7).</p><h3>Source Information</h3><p>Date: 2026-10-29 02:31<br>Master of Magic<br>Tech: Three.js R180 WebGPU (no fallback), Rapier 0.19.3, Gamepad API, Web Audio, AI Hub Session Protocol v1 (parallel)<br>Art Direction: stylized cel-shaded (toon + ink outlines), twin planes Arcanum &amp; Myrror<br>Animation: procedural code animation, Rapier projectiles &amp; particles<br>Audio: code-written generative music, synthesized SFX, Animalese/Simlish gibberish voice<br>Online: AI Hub parallel sessions (Power score); standalone otherwise<br>Testing: lightweight headless load smoke only<br>Environment: Muse Code CLI (headless); Linux; browser unknown<br>Model: Meta, muse-wonder-1.0, reasoning effort max<br>Usage: unknown</p><p>All art is code-drawn in 3D. All music, effects and voices are synthesized live — no audio files. Multiplayer follows the AI Hub hub: in a session the title is skipped, Power is reported each turn, and the result is your final Power.</p></div><p><button class="primary" onclick="closeModalX()">Close</button></p>`); }
+function victory(msg){ if(!G||G.over)return; G.over=true; G.winner=msg; AudioX.sfx('win'); AudioX.speak('Victory. Both worlds are yours.','👑'); modal(`<h2>👑 Victory!</h2><p class="story">${esc(msg)}</p><p>Turns ${G.turn} • Power ${G?powerScore(player()):0} • Cities ${player().cities.length} • Spells ${player().known.length}</p><p><button class="primary" onclick="closeModalX();saveAndTitle()">Return to Title</button> <button onclick="closeModalX()">Keep Admiring Your Realm</button></p>`); if(window.AIHub&&AIHub.active){ try{AIHub.result({score:powerScore(player()),stats:{turns:G.turn,cities:player().cities.length,spells:player().known.length},awards:[{title:'Last High Mage',detail:'Victory'}]});}catch(e){} } saveGame(); }
+function defeat(msg){ if(!G||G.over)return; G.over=true; AudioX.sfx('lose'); modal(`<h2>💀 Banished</h2><p>${esc(msg)}</p><p><button class="primary" onclick="closeModalX();saveAndTitle()">Return to Title</button></p>`); if(window.AIHub&&AIHub.active){ try{AIHub.result({score:powerScore(player())});}catch(e){} } }
+/* ================= SAVE, ATTRACT, HUB, BOOT, LOOP ================= */
+function saveGame(){ if(!G)return; try{ const data={world:G.world,wizards:G.wizards.map(w=>({...w})),plane:G.plane,turn:G.turn,month:G.month,year:G.year,uid}; localStorage.setItem('lhm-save',JSON.stringify(data)); }catch(e){} const c=$('#btnContinue'); if(c)c.disabled=false; }
+function loadGame(){ try{ const raw=localStorage.getItem('lhm-save'); if(!raw)return false; const d=JSON.parse(raw); uid=d.uid||999; G={world:d.world,wizards:d.wizards,plane:d.plane,turn:d.turn,month:d.month,year:d.year,sel:null,selTile:null,casting:null,over:false,winner:null,log:[],combat:null,attract:false,hubScore:0};
+  for(const plane of ['Arcanum','Myrror'])for(let y=0;y<H;y++)for(let x=0;x<W;x++){ const tc=G.world[plane][y][x].city; if(tc){ for(const wz of G.wizards){ const real=wz.cities.find(c=>c.id===tc.id); if(real){ G.world[plane][y][x].city=real; break; } } } }
+  $('#titleScreen').classList.add('hidden'); $('#hud').classList.remove('hidden'); if(player().units[0]){G.sel=player().units[0];G.selTile={x:G.sel.x,y:G.sel.y,plane:G.plane};} buildOverworld(); renderAll(); toast('Save restored. The wheel turns again.'); return true; }catch(e){ return false; } }
+function startAttract(){ if(attractOn||!G&&false)return; // need a demo game if none
+ if(!G){ createGame({name:'Demo Sage',icon:'🦉',race:'High Elves',books:{Life:2,Death:1,Nature:2,Chaos:1,Sorcery:2},traits:['sage']}); }
+ attractOn=true; G.attract=true; $('#titleScreen').classList.add('hidden'); $('#createScreen').classList.add('hidden'); $('#hud').classList.remove('hidden'); buildOverworld(); renderAll(); toast('🎬 ATTRACT MODE — the Demo Sage plays alone. Press any key / button to take the throne!',6000); AudioX.init(); }
+function exitAttract(){ if(!attractOn)return; attractOn=false; if(G)G.attract=false; $('#hud').classList.add('hidden'); $('#combatHud').classList.add('hidden'); if(G&&G.combat){G.combat=null;} $('#titleScreen').classList.remove('hidden'); closeModal(); refreshFocus(); }
+let attractTimer=0;
+function attractStep(){ if(!attractOn||!G||G.over)return; if(G.combat){ autoBattle(); return; } const w=player(); // cheat: infinite resources
+ w.gold=Math.max(w.gold,300); w.mana=Math.max(w.mana,300); const u=w.units[Math.floor(Math.random()*w.units.length)]; if(u){ G.sel=u; const reach=reachable(u); if(reach.length){ const dest=pick(reach); u.x=dest.x;u.y=dest.y; reveal(w,dest.x,dest.y,u.plane,2); const foes=unitsAt(u.plane,dest.x,dest.y).filter(v=>v.owner!==w.name); const t=tileAt(u.plane,dest.x,dest.y); if(foes.length)startCombat([u],foes,cityAt(u.plane,dest.x,dest.y)); else if(t&&t.feat&&['lair','node','tower','ruins'].includes(t.feat))startLairCombat(u,t); } }
+ if(Math.random()<.4)G.plane=G.plane==='Arcanum'?'Myrror':'Arcanum'; buildOverworld(); if(Math.random()<.6)endTurnAttract(); renderAll(); }
+function endTurnAttract(){ // lighter end turn without hero modals stealing attract
+ const pw=player(); G.turn++; for(const w of G.wizards)for(const u of w.units)u.moves=UTYPES[u.type].mov; aiTurns(); if(G.combat)return; }
+function checkHubProgress(){ if(window.AIHub&&AIHub.active&&G){ try{ AIHub.progress({score:powerScore(player()),label:`Turn ${G.turn} • ${player().cities.length} cities`}); }catch(e){} } }
+let hubEnded=false;
+async function hubBoot(){ if(!window.AIHub||!AIHub.active)return false; try{ const info=await AIHub.connect({mode:'parallel',seats:[1,4]}); if(!info)return false; // session: skip title, same seeded start (session.js seeded Math.random)
+  $('#hubNote').textContent='AI Hub session: playing side-by-side. Power is reported to the hub.';
+  createGame({name:(info.players&&info.players[info.me]&&info.players[info.me].name)||'Hub Mage',icon:'🧙',race:'High Men',books:{Life:2,Death:1,Nature:2,Chaos:1,Sorcery:2},traits:['sage']});
+  $('#titleScreen').classList.add('hidden'); $('#hud').classList.remove('hidden'); if(player().units[0]){G.sel=player().units[0];G.selTile={x:G.sel.x,y:G.sel.y,plane:G.plane};}
+  AIHub.on('time-up',()=>{ if(G&&!hubEnded){ hubEnded=true; try{AIHub.result({score:powerScore(player()),stats:{turns:G.turn,cities:player().cities.length,spells:player().known.length}});}catch(e){} toast('⏰ Hub time! Final Power reported.'); } });
+  AIHub.on('end',()=>{ hubEnded=true; if(G)G.over=true; toast('Hub round ended. Final realm held on screen.'); });
+  AIHub.on('leave',()=>{});
+  buildOverworld(); renderAll(); AIHub.ready(); return true; }catch(e){ return false; } }
+function registerProbe(){ if(!window.AIHub||!AIHub.probe)return; AIHub.probe(()=>({scene:G?(G.over?'over':(G.combat?'play':(!$('#hud').classList.contains('hidden')?'play':'title'))):'title',menu:settingsOpen||!!$('#modalRoot').innerHTML,world:G?G.turn+(clockT/100):0,input:{x:Math.round(cursorPos.x),y:Math.round(cursorPos.y),fire:false}})); }
+function closeModalX(){ closeModal(); }
+Object.assign(window,{castSpell,setResearch,cancelCast,openCityById,queueBuild,rushCity,alchemy,foundFromCity,selectUnit,healUnit,endTurnQuick,openSpellbookX,diploAct,hireHero,bookAdj,pickIcon,pickRace,toggleTrait,startGame,backTitle,closeModalX,setVol,setInv,setQuality,saveAndTitle,newFromSettings,endCombatTurn:()=>endCombatTurn(),combatAuto:()=>autoBattle(),combatFlee:()=>{ if(G&&G.combat){ clog('You flee the battle!'); finishCombat('D'); } },combatWait:()=>{ if(G&&G.combat&&G.combat.selected){G.combat.selected.acted=true; renderCombat();} },combatDefend:()=>{ if(G&&G.combat&&G.combat.selected){G.combat.selected.guard=true;G.combat.selected.acted=true; clog('Defending (+defence).'); renderCombat();} },combatSpell:()=>openSpellbook(true)});
+$$('#hud [data-act]').forEach(b=>b.addEventListener('click',()=>{ noteInput(); AudioX.init(); const a=b.dataset.act; if(a==='endturn')endTurn(); if(a==='plane'){ G.plane=G.plane==='Arcanum'?'Myrror':'Arcanum'; if(!player().planesVisited.includes(G.plane))player().planesVisited.push(G.plane); buildOverworld(); renderAll(); AudioX.sfx('select'); toast(`Now viewing ${G.plane} — ${G.plane==='Myrror'?'richer mana, crueller beasts.':'the familiar world.'}`); } if(a==='spellbook')openSpellbook(false); if(a==='diplomacy')openDiplomacy(); if(a==='settings')openSettings(); }));
+$$('#combatHud [data-cact]').forEach(b=>b.addEventListener('click',()=>{ const a=b.dataset.cact; if(a==='wait')window.combatWait(); if(a==='defend')window.combatDefend(); if(a==='spell')openSpellbook(true); if(a==='flee')window.combatFlee(); if(a==='auto')autoBattle(); }));
+$$('[data-menu]').forEach(b=>b.addEventListener('click',()=>{ noteInput(); AudioX.init(); AudioX.sfx('click'); const m=b.dataset.menu; if(m==='new'){ $('#titleScreen').classList.add('hidden'); $('#createScreen').classList.remove('hidden'); renderCreate(); } if(m==='continue'){ if(!loadGame())toast('No save yet — forge a new wizard!'); } if(m==='howto')showHowto(); if(m==='settings')openSettings(); if(m==='about')showAbout(); }));
+// touch-only detection: coarse pointer + no keyboard/gamepad -> warn (settings still reachable)
+if(matchMedia('(pointer: coarse)').matches&&!matchMedia('(pointer: fine)').matches){ /* show only if no key/gamepad ever: keep title usable via settings button requirement */ const tw=$('#touchWarn'); /* do not hard-block mouse-less research devices permanently; show dismissible banner via title note */ }
+let lastFrame=performance.now();
+function loop(now){ requestAnimationFrame(loop); const dt=Math.min(.05,(now-lastFrame)/1000||.016); lastFrame=now; clockT+=dt; pollGamepad();
+ // attract trigger: 10s idle on title/create
+ if(!attractOn&&($('#titleScreen').classList.contains('hidden')===false||$('#createScreen').classList.contains('hidden')===false)&&performance.now()-lastInputAt>10000&&!$('#modalRoot').innerHTML){ startAttract(); }
+ if(attractOn){ attractTimer+=dt; if(attractTimer>2.2){ attractTimer=0; try{attractStep();}catch(e){} } }
+ if(rapierWorld){ rapierWorld.timestep=dt; try{rapierWorld.step();}catch(e){} }
+ // fx update
+ for(let i=fx.length-1;i>=0;i--){ const f=fx[i]; if(f.mote){ const b=f.mesh.userData.body; if(b){ const t=b.translation(); f.mesh.position.set(t.x,t.y,t.z); if(t.y<.4)b.applyImpulse({x:0,y:.06,z:0},true); } continue; } f.life-=dt; if(f.body){ const t=f.body.translation(); f.mesh.position.set(t.x,t.y,t.z); } else if(f.vx!==undefined){ f.mesh.position.x+=f.vx*dt; f.mesh.position.y+=f.vy*dt; f.mesh.position.z+=f.vz*dt; f.vy-=4*dt; } if(f.life<=0){ (f.mesh.parent||scene)?.remove(f.mesh); if(f.body)try{rapierWorld.removeRigidBody(f.body);}catch(e){} fx.splice(i,1); } }
+ // unit bob animation (procedural walk/idle)
+ unitMeshes.forEach((m,uidv)=>{ m.position.y=.55+Math.sin(clockT*2.2+uidv)*.06; m.rotation.y=Math.sin(clockT*.7+uidv)*.25; });
+ if(selRing)selRing.rotation.z+=dt*1.5;
+ if(!renderer)return; const sc=G&&G.combat?combatScene:scene; const cam=G&&G.combat?combatCam:camera;
+ // gentle camera drift + shake
+ if(SETTINGS.shake&&shake>0){ shake=Math.max(0,shake-dt*1.2); cam.position.x+=rnd(-shake,shake)*.08; cam.position.y+=rnd(-shake,shake)*.05; }
+ try{ if(renderer.renderAsync)renderer.renderAsync(sc,cam).catch(()=>{}); else renderer.render(sc,cam); }catch(e){} }
+(async function boot(){ registerProbe(); // touch-only: if coarse and no fine, show warning screen with settings reachable
+ const coarse=matchMedia('(pointer: coarse)').matches, fine=matchMedia('(pointer: fine)').matches; if(coarse&&!fine){ $('#touchWarn').classList.remove('hidden'); $('#titleScreen').classList.add('hidden'); }
+ try{ const ok=await initThree(); if(ok===false)return; }catch(err){ showFatal('Failed to start WebGPU/Rapier: '+(err&&err.message||err)); if(window.AIHub&&AIHub.active)AIHub.fail('webgpu-init'); return; }
+ // decorative background game for title (attract will take over)
+const __prevSave=(()=>{try{return localStorage.getItem('lhm-save')}catch(e){return null}})(); createGame({name:'Demo Sage',icon:'🦉',race:'High Elves',books:{Life:2,Death:1,Nature:2,Chaos:1,Sorcery:2},traits:['sage']}); G.attract=false; try{ if(__prevSave)localStorage.setItem('lhm-save',__prevSave); else localStorage.removeItem('lhm-save'); }catch(e){} buildOverworld(); // title overlays it
+ const inHub=await hubBoot(); if(!inHub){ /* normal title */ try{ if(!localStorage.getItem('lhm-save'))$('#btnContinue').disabled=true; }catch(e){} refreshFocus(); }
+ requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
+

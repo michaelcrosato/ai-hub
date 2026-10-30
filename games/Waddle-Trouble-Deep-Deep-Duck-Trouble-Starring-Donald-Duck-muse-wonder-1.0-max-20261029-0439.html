@@ -1,0 +1,1890 @@
+<!--
+Source Information
+- Date: 2026-10-29 04:40
+- Deep Duck Trouble Starring Donald Duck
+- Tech: Three.js 0.180.0 WebGPURenderer (WebGPU, no fallback), Rapier 0.19.3 (@dimforge/rapier3d-compat), Gamepad API, Web Audio API, AI Hub Session Protocol v1 client 1.3.0 (parallel)
+- Art Direction: Stylized cel-shaded (MeshToonMaterial + 4-step gradient, inverted-hull outlines, flat saturated island palette)
+- Animation: Procedural code animation (waddle cycle, wing-flap glide, tail wag, enemy slither/hover, boss stomp) - no skeletal assets
+- Audio: Code-written music and sound effects (Web Audio oscillators/noise) and Animalese/Simlish gibberish voice (per-character formant blips)
+- Online: AI Hub parallel sessions (1-4, score race) via session.js + local 1-2 player co-op on one device; standalone solo play
+- Testing: Lightweight - Node syntax check, HTTP serve check, headless Chrome load smoke
+- Environment: Muse Code CLI (headless); Linux; browser unknown
+- Model: Meta, muse-wonder-1.0, reasoning effort max
+- Usage: unknown
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);</script>
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="4">
+<meta name="hub:session-goal" content="Most gems and shards before time runs out">
+<meta name="hub:session-howto" content="Stick move, Cross jump, Square peck, Triangle pound">
+<meta name="hub:webgpu" content="required">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waddle Trouble Deep</title>
+<style>:root{
+  --ink:#FFF7E6; --ink-dim:#D8E8D9; --panel:#14342B; --panel2:#1D4A3A; --line:#FFC93C;
+  --accent:#FFC93C; --accent2:#FF8A2A; --teal:#1FB6A6; --danger:#FF6B5E; --good:#7BE495;
+  --focus:#FFE66D; --shadow:0 10px 0 rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#0B2E2A;font-family:"Trebuchet MS","Segoe UI",Verdana,sans-serif;color:var(--ink)}
+#app{position:fixed;inset:0}
+canvas{display:block}
+button{font-family:inherit}
+#hud{position:absolute;inset:0;pointer-events:none;display:none}
+#hud.on{display:block}
+.hud-top{position:absolute;top:18px;left:22px;right:22px;display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.hud-card{background:rgba(10,38,32,.88);border:3px solid rgba(255,201,60,.9);border-radius:14px;padding:10px 16px;box-shadow:var(--shadow)}
+.hearts{font-size:30px;letter-spacing:2px;line-height:1}
+.hearts .off{opacity:.28;filter:grayscale(1)}
+.hud-stats{display:flex;gap:18px;font-size:24px;font-weight:900;text-shadow:0 2px 0 #000}
+.hud-stats small{display:block;font-size:12px;letter-spacing:.12em;color:var(--ink-dim);font-weight:800}
+.shards{display:flex;gap:8px;margin-top:6px}
+.shard{width:28px;height:28px;transform:rotate(45deg);border:3px solid #fff3;border-radius:6px;background:#2A2A2A}
+.shard.got{border-color:#fff;box-shadow:0 0 14px currentColor}
+#bossWrap{position:absolute;left:50%;transform:translateX(-50%);bottom:108px;width:min(680px,72vw);display:none}
+#bossWrap.on{display:block}
+#bossWrap .hud-card{padding:10px 14px}
+#bossName{font-size:18px;font-weight:900;letter-spacing:.06em;text-align:center}
+#bossBar{height:18px;background:#2B1714;border:2px solid #FFD9A0;border-radius:99px;overflow:hidden;margin-top:6px}
+#bossFill{height:100%;width:100%;background:#FF6B5E;transition:width .25s}
+#prompt{position:absolute;left:50%;bottom:96px;transform:translateX(-50%);background:#FFF7E6;color:#17352B;font-weight:900;font-size:22px;padding:10px 18px;border-radius:99px;border:3px solid #14342B;box-shadow:var(--shadow);display:none;white-space:nowrap}
+#prompt.on{display:block}
+#dialogue{position:absolute;left:50%;transform:translateX(-50%);bottom:22px;width:min(900px,92vw);background:#FFF7E6;color:#17352B;border:4px solid #14342B;border-radius:18px;box-shadow:var(--shadow);padding:16px 20px 14px;display:none}
+#dialogue.on{display:block}
+#dlgName{font-size:16px;font-weight:900;letter-spacing:.12em;color:#B45A12}
+#dlgText{font-size:26px;line-height:1.35;font-weight:700;min-height:70px;margin-top:4px}
+#dlgHint{font-size:16px;font-weight:900;text-align:right;color:#1D6B5A}
+#toast{position:absolute;left:50%;top:86px;transform:translateX(-50%);background:#FFC93C;color:#17352B;font-size:24px;font-weight:900;padding:10px 20px;border-radius:12px;border:3px solid #14342B;box-shadow:var(--shadow);opacity:0;transition:opacity .2s;white-space:nowrap;pointer-events:none}
+#toast.on{opacity:1}
+#vignette{position:absolute;inset:0;box-shadow:inset 0 0 120px rgba(255,40,20,.0);transition:box-shadow .15s;pointer-events:none}
+#vignette.hit{box-shadow:inset 0 0 140px rgba(255,40,20,.65)}
+.screen{position:absolute;inset:0;display:none;align-items:center;justify-content:center;padding:24px;background:linear-gradient(180deg,rgba(6,32,28,.18),rgba(6,32,28,.72))}
+.screen.on{display:flex}
+.panel{width:min(860px,94vw);max-height:92vh;overflow:auto;background:var(--panel);border:4px solid var(--line);border-radius:22px;box-shadow:0 18px 0 rgba(0,0,0,.4);padding:28px 34px}
+.panel.wide{width:min(980px,96vw)}
+h1.title{font-size:64px;line-height:.95;margin:0;color:#fff;text-shadow:0 5px 0 #0A2A22,0 10px 0 rgba(0,0,0,.25);letter-spacing:.01em}
+h1.title .y{color:var(--accent)}
+.subtitle{font-size:24px;line-height:1.35;color:var(--ink-dim);font-weight:700;margin:12px 0 4px}
+.menu{display:flex;flex-direction:column;gap:12px;margin-top:22px}
+.btn{pointer-events:auto;text-align:left;background:var(--panel2);color:var(--ink);border:3px solid rgba(255,255,255,.22);border-radius:16px;padding:16px 20px;font-size:28px;font-weight:900;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:14px}
+.btn small{font-size:16px;color:var(--ink-dim);font-weight:800}
+.btn.focus{border-color:var(--focus);background:#2A6B52;outline:4px solid rgba(255,230,109,.35);transform:scale(1.02)}
+.btn:disabled{opacity:.45;cursor:default}
+.btn.primary{background:#B45A12;border-color:#FFD9A0}
+.row{display:flex;justify-content:space-between;align-items:center;gap:16px;background:rgba(255,255,255,.06);border:2px solid rgba(255,255,255,.14);border-radius:14px;padding:14px 16px;margin-top:10px}
+.row.focus{border-color:var(--focus);outline:3px solid rgba(255,230,109,.3)}
+.row .lab{font-size:22px;font-weight:900}
+.row .lab small{display:block;font-size:14px;color:var(--ink-dim);font-weight:700;margin-top:2px}
+.pill{min-width:118px;text-align:center;background:#0B2E2A;border:2px solid var(--line);color:var(--accent);border-radius:99px;padding:8px 14px;font-size:20px;font-weight:900}
+.meter{width:210px;height:16px;background:#0B2E2A;border:2px solid rgba(255,255,255,.35);border-radius:99px;overflow:hidden}
+.meter i{display:block;height:100%;background:var(--teal)}
+.kv{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px;margin-top:14px;font-size:20px;line-height:1.4}
+.kv b{color:var(--accent)}
+.credits{font-size:19px;line-height:1.55;color:var(--ink-dim)}
+.credits b{color:#fff}
+.foot{margin-top:16px;font-size:16px;color:var(--ink-dim);font-weight:700;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#attractBadge{position:absolute;top:18px;left:50%;transform:translateX(-50%);background:#FF6B5E;color:#fff;font-size:22px;font-weight:900;letter-spacing:.08em;padding:10px 18px;border-radius:99px;border:3px solid #fff;display:none;box-shadow:var(--shadow)}
+#attractBadge.on{display:block}
+#touchWarn{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(6,32,28,.92);z-index:50;padding:24px}
+#touchWarn.on{display:flex}
+#errorBox{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:#2B1714;z-index:60;padding:24px}
+#errorBox.on{display:flex}
+#loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#0B2E2A;z-index:40}
+#loading .panel{text-align:center}
+.spin{width:54px;height:54px;border:6px solid rgba(255,255,255,.2);border-top-color:var(--accent);border-radius:50%;margin:18px auto;animation:sp 0.9s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+@media (max-width:700px){h1.title{font-size:44px}.btn{font-size:22px}.kv{grid-template-columns:1fr}#dlgText{font-size:21px}}
+@media (prefers-reduced-motion:reduce){.spin{animation:none}}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "@dimforge/rapier3d-compat": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="hud">
+  <div class="hud-top">
+    <div class="hud-card"><div class="hearts" id="hearts"></div><div class="hud-stats"><span><small>GEMS</small><span id="statGems">0</span></span><span><small>SCORE</small><span id="statScore">0</span></span><span><small>TIME</small><span id="statTime">0:00</span></span></div><div class="shards" id="shards"></div><div id="p2Hud" style="font-size:16px;font-weight:900;margin-top:6px;display:none"></div></div>
+    <div class="hud-card" style="text-align:right"><div style="font-size:18px;font-weight:900" id="zoneLabel">Jungle Trail</div><div style="font-size:15px;color:var(--ink-dim);font-weight:700" id="objLabel">Find the Remedy Shards!</div><div style="font-size:14px;color:var(--ink-dim);font-weight:700" id="hubLabel"></div></div>
+  </div>
+  <div id="bossWrap"><div class="hud-card"><div id="bossName">IDOL GUARDIAN</div><div id="bossBar"><div id="bossFill"></div></div></div></div>
+  <div id="prompt"></div>
+  <div id="toast"></div>
+  <div id="dialogue"><div id="dlgName">TIKI</div><div id="dlgText"></div><div id="dlgHint">✕ / Enter — Next &nbsp; • &nbsp; Hold for voice</div></div>
+  <div id="vignette"></div>
+</div>
+<div id="attractBadge">★ ATTRACT MODE — PRESS ANY BUTTON ★</div>
+
+<section class="screen" id="scrTitle"><div class="panel">
+  <div style="font-size:18px;font-weight:900;letter-spacing:.14em;color:var(--accent)">UNCLE GOLDBEAK NEEDS YOU!</div>
+  <h1 class="title">Waddle<br><span class="y">Trouble</span> Deep</h1>
+  <p class="subtitle">Uncle Goldbeak touched the Giggling Idol and puffed up like a parade balloon! Cross the island, gather <b style="color:#fff">4 Remedy Shards</b>, and pop him back to normal — with style.</p>
+  <div class="menu" id="menuTitle"></div>
+  <div class="foot"><span id="bestLabel">Best: —</span><span>🎮 Controller-first • Keyboard works too • P2: press Join anytime</span></div>
+</div></section>
+
+<section class="screen" id="scrHow"><div class="panel wide">
+  <h2 style="margin:0;font-size:38px">How to Play</h2>
+  <p class="subtitle" style="margin-top:6px">Every move below works in the demo. Try them all on the Jungle Trail!</p>
+  <div class="kv" id="howList"></div>
+  <div class="menu"><button class="btn" data-act="back">← Back <small>Circle / Esc</small></button></div>
+</div></section>
+
+<section class="screen" id="scrSettings"><div class="panel wide">
+  <h2 style="margin:0;font-size:38px">Settings</h2>
+  <p class="subtitle" style="margin-top:6px">Only this device. In a Hub session, Quit &amp; Restart are paused — the Hub clock rules!</p>
+  <div id="setList"></div>
+  <div class="menu"><button class="btn" data-act="back">← Done <small>Options / Esc</small></button></div>
+</div></section>
+
+<section class="screen" id="scrAbout"><div class="panel wide">
+  <h2 style="margin:0;font-size:38px">About &amp; Credits</h2>
+  <div class="credits" id="aboutBody"></div>
+  <div class="menu"><button class="btn" data-act="back">← Back <small>Circle / Esc</small></button></div>
+</div></section>
+
+<section class="screen" id="scrPause"><div class="panel">
+  <h2 style="margin:0;font-size:42px">Paused</h2>
+  <p class="subtitle">Uncle is still floating. He believes in you. Probably.</p>
+  <div class="menu" id="menuPause"></div>
+</div></section>
+
+<section class="screen" id="scrOver"><div class="panel" style="text-align:center">
+  <h2 style="margin:0;font-size:52px">Oh, feathers!</h2>
+  <p class="subtitle" id="overText">The island got the best of you this time.</p>
+  <div class="hud-stats" style="justify-content:center" id="overStats"></div>
+  <div class="menu" id="menuOver" style="text-align:left"></div>
+</div></section>
+
+<section class="screen" id="scrWin"><div class="panel" style="text-align:center">
+  <h2 style="margin:0;font-size:52px">You did it, hero! 🎉</h2>
+  <p class="subtitle">The Remedy fizzes, Uncle Goldbeak shrinks with a happy <i>pop!</i>, and the Giggling Idol giggles off to bother somebody else.</p>
+  <div class="hud-stats" style="justify-content:center" id="winStats"></div>
+  <div id="winAwards" style="font-size:20px;font-weight:800;margin-top:10px"></div>
+  <div class="menu" id="menuWin" style="text-align:left"></div>
+</div></section>
+
+<div id="touchWarn"><div class="panel" style="text-align:center"><h2 style="font-size:38px;margin:0">Controller or keyboard required</h2><p class="subtitle">Waddle Trouble Deep is a 10-foot, controller-first adventure. Plug in a controller or keyboard to waddle on!</p><div class="menu"><button class="btn primary" id="touchSettings">⚙ Open Settings <small>Tap</small></button></div><p class="foot" style="justify-content:center">No touch controls — by design. Your thumbs deserve a real D-pad.</p></div></div>
+<div id="errorBox"><div class="panel"><h2 style="font-size:36px;margin:0">This duck needs WebGPU 🦆</h2><p class="subtitle" id="errorText">WebGPU is required (no fallback). Try a recent Chrome/Edge on desktop.</p><div class="menu"><button class="btn" id="errorSettings">⚙ Open Settings</button></div></div></div>
+<div id="loading"><div class="panel"><div style="font-size:30px;font-weight:900">Waddling into the island…</div><div class="spin"></div><div id="loadText" style="font-weight:700;color:var(--ink-dim)">Warming up WebGPU…</div></div></div>
+
+<script type="module">import * as THREE from 'three';
+import RAPIER from '@dimforge/rapier3d-compat';
+// Waddle Trouble Deep — original spiritual successor to Deep Duck Trouble Starring Donald Duck.
+// Three.js R180 WebGPURenderer (no fallback) + Rapier 0.19.3 + Gamepad API. Cel-shaded, code audio.
+const $=s=>document.querySelector(s);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+const rand=(a=1,b)=>b===undefined?Math.random()*a:a+Math.random()*(b-a);
+// ---------- Settings ----------
+const DEF={master:0.9,music:0.7,sfx:0.9,invertX:false,invertY:false,shake:true,reduced:false,musicOn:true};
+let settings={...DEF};
+try{const s=JSON.parse(localStorage.getItem('waddle_settings')||'null');if(s)settings={...DEF,...s};}catch(e){}
+function saveSettings(){try{localStorage.setItem('waddle_settings',JSON.stringify(settings));}catch(e){} applyVolumes();}
+let best={score:0,time:0};
+try{best=JSON.parse(localStorage.getItem('waddle_best')||'{"score":0,"time":0}');}catch(e){}
+function saveBest(){try{localStorage.setItem('waddle_best',JSON.stringify(best));}catch(e){}}
+// ---------- Audio: code-written music, SFX, gibberish voice ----------
+let AC=null,masterG,musicG,sfxG,musicTimer=null,musicStep=0,curTrack='title';
+function audioInit(){
+  if(AC) { if(AC.state==='suspended')AC.resume(); return; }
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    masterG=AC.createGain(); masterG.connect(AC.destination);
+    musicG=AC.createGain(); musicG.connect(masterG);
+    sfxG=AC.createGain(); sfxG.connect(masterG);
+    applyVolumes(); startMusic('title');
+  }catch(e){ AC=null; }
+}
+function applyVolumes(){ if(!AC)return; masterG.gain.value=settings.master; musicG.gain.value=settings.musicOn?settings.music*0.5:0; sfxG.gain.value=settings.sfx; }
+function tone(freq,dur,type='sine',vol=0.2,when=0,slideTo=null,dest=null){
+  if(!AC)return; const t=AC.currentTime+when; const o=AC.createOscillator(),g=AC.createGain();
+  o.type=type; o.frequency.setValueAtTime(freq,t); if(slideTo)o.frequency.exponentialRampToValueAtTime(Math.max(20,slideTo),t+dur);
+  g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(vol,t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g); g.connect(dest||sfxG); o.start(t); o.stop(t+dur+0.05);
+}
+function noiseBurst(dur=0.12,vol=0.2,when=0,filterFreq=1200){
+  if(!AC)return; const t=AC.currentTime+when; const len=Math.max(1,(AC.sampleRate*dur)|0);
+  const buf=AC.createBuffer(1,len,AC.sampleRate),d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len);
+  const src=AC.createBufferSource(); src.buffer=buf;
+  const f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=filterFreq; f.Q.value=0.8;
+  const g=AC.createGain(); g.gain.value=vol; src.connect(f); f.connect(g); g.connect(sfxG); src.start(t);
+}
+const SFX={
+  jump(){tone(320,0.16,'square',0.12,0,640);}, double(){tone(520,0.16,'square',0.12,0,920); noiseBurst(0.08,0.08,0,2000);},
+  peck(){noiseBurst(0.07,0.22,0,900); tone(180,0.07,'square',0.12,0,90);},
+  pound(){tone(140,0.22,'sine',0.3,0,45); noiseBurst(0.16,0.25,0,300);},
+  gem(){tone(1180,0.1,'sine',0.16); tone(1760,0.16,'sine',0.14,0.06);},
+  feather(){tone(880,0.12,'triangle',0.16); tone(1320,0.2,'triangle',0.14,0.08);},
+  chili(){tone(300,0.3,'sawtooth',0.12,0,900); noiseBurst(0.25,0.1,0,600);},
+  cream(){[660,880,1100].forEach((f,i)=>tone(f,0.14,'triangle',0.14,i*0.07));},
+  hurt(){tone(220,0.22,'sawtooth',0.18,0,110);}, splash(){noiseBurst(0.28,0.22,0,700); tone(300,0.2,'sine',0.08,0,120);},
+  spring(){tone(240,0.2,'square',0.14,0,880);}, check(){[523,659,784].forEach((f,i)=>tone(f,0.16,'triangle',0.15,i*0.08));},
+  shard(){[523,659,784,1046,1318].forEach((f,i)=>tone(f,0.24,'sine',0.15,i*0.09));},
+  bossHit(){tone(90,0.3,'sine',0.35,0,40); noiseBurst(0.2,0.3,0,400);},
+  kick(){noiseBurst(0.08,0.2,0,500); tone(150,0.1,'square',0.12);},
+  click(){tone(700,0.06,'square',0.1);}, back(){tone(420,0.08,'square',0.1);},
+  win(){[523,659,784,1046,784,1046,1318,1568].forEach((f,i)=>tone(f,0.26,'triangle',0.16,i*0.13));},
+  lose(){[392,330,262,196].forEach((f,i)=>tone(f,0.3,'triangle',0.15,i*0.18));}
+};
+const TRACKS={
+  title:{tempo:132,bass:[130,0,164,0,196,0,164,0],lead:[523,659,784,659,587,659,523,0,440,523,587,659,784,0,659,0],chord:'maj'},
+  jungle:{tempo:138,bass:[110,0,110,131,98,0,98,110],lead:[440,523,659,523,587,659,784,659,523,587,659,587,440,0,392,0],chord:'min'},
+  ruins:{tempo:112,bass:[98,0,98,117,87,0,87,98],lead:[392,466,587,466,523,587,466,392,349,392,466,392,330,0,294,0],chord:'min'},
+  volcano:{tempo:152,bass:[87,87,0,87,104,0,87,131],lead:[349,415,523,415,466,523,622,523,415,466,523,466,349,0,311,0],chord:'min'},
+  boss:{tempo:160,bass:[82,0,82,82,98,0,82,110],lead:[311,311,370,311,294,311,262,0,311,311,370,415,370,311,0,0],chord:'min'}
+};
+function startMusic(name){
+  curTrack=name; if(!AC)return; if(musicTimer)clearInterval(musicTimer); musicStep=0;
+  const tr=TRACKS[name]||TRACKS.jungle; const stepDur=60/tr.tempo/2;
+  musicTimer=setInterval(()=>{
+    if(!AC||document.hidden)return; const tr2=TRACKS[curTrack]||tr; const i=musicStep%16;
+    const b=tr2.bass[i%tr2.bass.length], l=tr2.lead[i%tr2.lead.length];
+    if(b)tone(b,stepDur*1.8,'triangle',0.20,0,null,musicG);
+    if(b&&i%4===0)tone(b*2,stepDur*3,'sine',0.07,0,null,musicG);
+    if(l)tone(l,stepDur*1.6,'square',0.055,0,null,musicG);
+    if(i%2===0)noiseBurst(0.03,0.03,0,6000);
+    if(i%4===2)noiseBurst(0.05,0.05,0,1800);
+    musicStep++;
+  },stepDur*1000);
+}
+let gibberNodes=[];
+function stopGibber(){gibberNodes.forEach(n=>{try{n.stop()}catch(e){}}); gibberNodes=[];}
+function speakGibber(text,base=520){
+  if(!AC)return; stopGibber();
+  const vowels='aeiou'; let t=AC.currentTime+0.02;
+  for(const ch of text){
+    if(ch===' '){t+=0.05;continue;}
+    const isV=vowels.includes(ch.toLowerCase());
+    const dur=isV?0.09:0.06;
+    const o=AC.createOscillator(),g=AC.createGain(),f=AC.createBiquadFilter();
+    o.type='sawtooth'; const p=base*(0.85+Math.random()*0.4)*(isV?1:0.7);
+    o.frequency.setValueAtTime(p,t); o.frequency.linearRampToValueAtTime(p*(0.9+Math.random()*0.25),t+dur);
+    f.type='bandpass'; f.frequency.value=600+Math.random()*900; f.Q.value=2.5;
+    g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.11,t+0.012); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(f); f.connect(g); g.connect(sfxG); o.start(t); o.stop(t+dur+0.02); gibberNodes.push(o);
+    t+=dur*0.82; if(t-AC.currentTime>4)break;
+  }
+}
+// ---------- Input: Gamepad API + keyboard (controller model) ----------
+const keys=new Set(), keyHit=new Set();
+let anyInputAt=performance.now(), attractCountdown=true;
+addEventListener('keydown',e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code))e.preventDefault();
+  if(!e.repeat){keys.add(e.code); keyHit.add(e.code); pokeInput();}
+  audioInit();
+});
+addEventListener('keyup',e=>keys.delete(e.code));
+addEventListener('pointerdown',()=>{pokeInput(); audioInit();});
+function pokeInput(){ anyInputAt=performance.now(); if(G.state==='attract') exitAttract(); }
+function makePadState(){return{btn:[],axes:[0,0,0,0]};}
+const prevPads=[makePadState(),makePadState(),makePadState(),makePadState()];
+function readPad(idx){
+  const pads=navigator.getGamepads?navigator.getGamepads():[];
+  const gp=pads&&pads[idx]; const prev=prevPads[idx];
+  const btn=[], edge=[];
+  for(let i=0;i<16;i++){ const v=!!(gp&&gp.buttons[i]&&gp.buttons[i].pressed); btn.push(v); edge.push(v&&!prev.btn[i]); }
+  const axes=[0,0,0,0];
+  if(gp)for(let i=0;i<4;i++)axes[i]=gp.axes[i]||0;
+  prev.btn=btn.slice(); prev.axes=axes.slice();
+  if(edge.some(Boolean)||Math.abs(axes[0])>0.6||Math.abs(axes[1])>0.6)pokeInput();
+  return{gp:!!gp,btn,edge,axes};
+}
+function playerInput(pi){
+  // pi 0: gamepad0 + WASD cluster; pi 1: gamepad1 + arrows cluster
+  const pad=readPad(pi);
+  let x=0,y=0; const invX=settings.invertX?-1:1, invY=settings.invertY?-1:1;
+  if(pad.gp){ x=pad.axes[0]*invX; y=pad.axes[1]*invY;
+    if(pad.btn[14])x-=1; if(pad.btn[15])x+=1; if(pad.btn[12])y-=1; if(pad.btn[13])y+=1;
+    if(Math.abs(x)<0.18)x=0; if(Math.abs(y)<0.18)y=0;
+  }
+  let jumpP=false,jumpH=false,peckP=false,poundP=false,dashH=false,interP=false,pauseP=false,joinP=false;
+  if(pad.gp){
+    jumpP=pad.edge[0]; jumpH=pad.btn[0]; peckP=pad.edge[2]; poundP=pad.edge[3]; interP=pad.edge[3];
+    dashH=pad.btn[1]||pad.btn[5]; pauseP=pad.edge[9]; joinP=pad.edge[0];
+    // Circle also dashes; Triangle doubles as interact/pound by context (air = pound)
+  }
+  if(pi===0){
+    const L=keys.has('KeyA')||keys.has('ArrowLeft'), R=keys.has('KeyD')||keys.has('ArrowRight');
+    const U=keys.has('KeyW')||keys.has('ArrowUp'), D=keys.has('KeyS')||keys.has('ArrowDown');
+    if(L)x-=1; if(R)x+=1; if(U)y-=1; if(D)y+=1;
+    jumpP=(keyHit.has('Space')||keyHit.has('KeyW')||keyHit.has('KeyK'))||jumpP;
+    jumpH=keys.has('Space')||keys.has('KeyW')||keys.has('KeyK')||jumpH;
+    peckP=keyHit.has('KeyJ')||peckP; poundP=keyHit.has('KeyL')||poundP; interP=keyHit.has('KeyE')||keyHit.has('Enter')||poundP;
+    dashH=keys.has('ShiftLeft')||keys.has('ShiftRight')||dashH;
+    pauseP=keyHit.has('Escape')||keyHit.has('KeyP')||pauseP;
+  } else {
+    const L=keys.has('ArrowLeft'), R=keys.has('ArrowRight'), U=keys.has('ArrowUp'), D=keys.has('ArrowDown');
+    // arrows shared with P1 keyboard fallback only when P2 active and P1 on gamepad; still allow join play
+    if(L)x-=1; if(R)x+=1; if(U)y-=1; if(D)y+=1;
+    jumpP=keyHit.has('Numpad0')||keyHit.has('Comma')||jumpP; jumpH=keys.has('Numpad0')||keys.has('Comma')||jumpH;
+    peckP=keyHit.has('Period')||peckP; poundP=keyHit.has('Slash')||poundP; interP=poundP;
+    joinP=keyHit.has('NumpadEnter')||joinP; // P2 gamepad ✕ joins too; plain Enter stays P1 Talk so solo talks never spawn P2
+  }
+  x=clamp(x,-1,1); y=clamp(y,-1,1);
+  // Keyboard invert (gamepad axes already inverted above): flip once when keyboard-driven
+  if(!pad.gp&&settings.invertX) x=-x;
+  if(!pad.gp&&settings.invertY) y=-y;
+  return{x,y,jumpP,jumpH,peckP,poundP,dashH,interP,pauseP,joinP,pad:pad.gp,rawPad:pad};
+}
+function uiInput(){
+  const p=playerInput(0); // also need pure edges for menus; reuse pad edges via rawPad
+  const rp=p.rawPad; let up=false,down=false,left=false,right=false,ok=false,back=false,pause=false;
+  if(rp.gp){ up=rp.edge[12]|| (rp.axes[1]<-0.6&&!uiInput._sy); down=rp.edge[13]||(rp.axes[1]>0.6&&!uiInput._sy); left=rp.edge[14]; right=rp.edge[15]; ok=rp.edge[0]; back=rp.edge[1]; pause=rp.edge[9];
+    uiInput._sy=Math.abs(rp.axes[1])>0.6; }
+  if(keyHit.has('ArrowUp')||keyHit.has('KeyW'))up=true;
+  if(keyHit.has('ArrowDown')||keyHit.has('KeyS'))down=true;
+  if(keyHit.has('ArrowLeft')||keyHit.has('KeyA'))left=true;
+  if(keyHit.has('ArrowRight')||keyHit.has('KeyD'))right=true;
+  if(keyHit.has('Enter')||keyHit.has('Space'))ok=true;
+  if(keyHit.has('Escape')){back=true;pause=true;}
+  if(keyHit.has('KeyP'))pause=true;
+  return{up,down,left,right,ok,back,pause,x:p.x,y:p.y};
+}
+// ---------- AI Hub (parallel) + probe ----------
+let hubInfo=null, hubInSession=false, hubEnded=false, lastProgressScore=-1;
+function hubReportProgress(){
+  if(!hubInSession||typeof AIHub==='undefined')return;
+  if(G.score!==lastProgressScore){ lastProgressScore=G.score; try{AIHub.progress({score:G.score,label:('Shard '+G.shards+'/4').slice(0,24)});}catch(e){} }
+}
+function hubResult(win){
+  if(!hubInSession||typeof AIHub==='undefined')return;
+  try{
+    const stats={gems:G.gems,shards:G.shards,time:fmtTime(G.time)};
+    const awards=[];
+    if(G.shards>=4)awards.push({title:'Uncle Saver',detail:'All 4 Remedy Shards'});
+    else if(G.gems>=30)awards.push({title:'Gem Gobbler',detail:G.gems+' gems'});
+    if(win) AIHub.result({score:G.score,stats,awards});
+    else AIHub.result({score:G.score,stats,awards});
+  }catch(e){}
+}
+// ---------- Game state ----------
+const G={state:'boot',prevState:'title',time:0,score:0,gems:0,feathers:0,shards:0,shake:0,camX:6,camY:3,sim:0,
+  checkpoint:{x:-18,y:3},zone:'Jungle Trail',startedAt:0,over:false,won:false,dlg:null,dlgI:0,dlgChars:0,bossActive:false,
+  menuFocus:0,settingsFocus:0,hubMode:false,attractT:0,between:0};
+function fmtTime(s){const m=Math.floor(s/60),ss=Math.floor(s%60);return m+':'+String(ss).padStart(2,'0');}
+function addScore(n){G.score+=n; hubReportProgress();}
+function toast(msg,ms=2200){const t=$('#toast');t.textContent=msg;t.classList.add('on');clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove('on'),ms);}
+// Screens & menus
+const SCREENS=['scrTitle','scrHow','scrSettings','scrAbout','scrPause','scrOver','scrWin'];
+function showScreen(id){
+  SCREENS.forEach(s=>$('#'+s).classList.toggle('on',s===id));
+  $('#hud').classList.toggle('on',['play','attract','dialogue','pause'].includes(G.state)||id===null);
+  if(id==='scrTitle')buildTitleMenu(); if(id==='scrPause')buildPauseMenu();
+  if(id==='scrOver')buildOverMenu(); if(id==='scrWin')buildWinMenu();
+}
+function setState(st){ G.state=st; }
+function btnHTML(act,label,small){return `<button class="btn" data-act="${act}">${label}<small>${small||''}</small></button>`;}
+function buildTitleMenu(){
+  $('#menuTitle').innerHTML=
+    btnHTML('start','▶ Start Adventure','Cross / Enter')+
+    btnHTML('how','How to Play','Every move, explained')+
+    btnHTML('settings','Settings','Sound • Invert axes')+
+    btnHTML('about','About & Credits','Story • Tech • Hub')+
+    `<div class="foot" style="margin-top:2px"><span>Local co-op: Player 2 joins mid-game (pad 2 ✕, or , to hop in) • Hub: parallel score race</span></div>`;
+  wireMenu('#menuTitle'); G.menuFocus=0; focusMenu('#menuTitle',0);
+  $('#bestLabel').textContent=best.score?('Best: '+best.score+' pts • '+fmtTime(best.time||0)):'Best: — be the first hero!';
+  $('#aboutBody').innerHTML=aboutHTML();
+}
+function buildPauseMenu(){
+  const inHub=hubInSession;
+  $('#menuPause').innerHTML=
+    btnHTML('resume','Resume','Circle / Options')+
+    btnHTML('settings','Settings','')+btnHTML('how','How to Play','')+
+    btnHTML('restart','Restart Adventure',inHub?'Locked in Hub session':'From Jungle start')+
+    btnHTML('quit','Quit to Title',inHub?'Locked in Hub session':'');
+  wireMenu('#menuPause'); G.menuFocus=0; focusMenu('#menuPause',0);
+  // disable locked in hub
+  if(inHub){document.querySelectorAll('#menuPause [data-act="restart"],#menuPause [data-act="quit"]').forEach(b=>b.disabled=true);}
+}
+function buildOverMenu(){
+  $('#overText').textContent=['The island got the best of you this time.','Those feathers will grow back. Probably.','Uncle waves a tiny flag: “Again! Again!”'][G.gems%3];
+  $('#overStats').innerHTML=`<span><small>SCORE</small>${G.score}</span><span><small>GEMS</small>${G.gems}</span><span><small>SHARDS</small>${G.shards}/4</span><span><small>TIME</small>${fmtTime(G.time)}</span>`;
+  $('#menuOver').innerHTML=btnHTML('retry','Retry from Checkpoint','Keep shards & gems')+btnHTML('quit','Title','');
+  wireMenu('#menuOver'); focusMenu('#menuOver',0);
+}
+function buildWinMenu(){
+  $('#winStats').innerHTML=`<span><small>SCORE</small>${G.score}</span><span><small>GEMS</small>${G.gems}</span><span><small>TIME</small>${fmtTime(G.time)}</span><span><small>FEATHERS</small>${G.feathers}</span>`;
+  const aw=[]; if(G.time<240)aw.push('🏆 Speedy Waddler'); if(G.gems>=40)aw.push('💎 Gem Gobbler'); if(G.feathers>=4)aw.push('🪶 Feather Collector');
+  $('#winAwards').textContent=aw.length?aw.join('  •  '):'Uncle is proud. That counts as treasure.';
+  $('#menuWin').innerHTML=btnHTML('again','Play Again','New island run')+btnHTML('quit','Title','');
+  wireMenu('#menuWin'); focusMenu('#menuWin',0);
+}
+function aboutHTML(){
+return `<p><b>Waddle Trouble Deep</b> — an original spiritual successor to <b>Deep Duck Trouble Starring Donald Duck</b>. Our hero <b>Wally Waddle</b> must cure his <b>Uncle Goldbeak</b>, who touched the Giggling Idol and inflated like a balloon. Written in the source's cheerful, pun-heavy travelogue tone: every sign, splash and squawk is a joke your uncle would groan at.</p>
+<p><b>Story beats:</b> Jungle Trail → Sunken Ruins (swim!) → Chili Volcano → Idol Temple &amp; the Idol Guardian. Collect <b>💎 gems</b>, <b>🪶 golden feathers</b>, <b>🌶 chilies</b> (zoom!), and <b>🍦 ice creams</b> (yum = health).</p>
+<p><b>Source Information</b><br>Date: 2026-10-29 04:40<br>Deep Duck Trouble Starring Donald Duck<br>Tech: Three.js 0.180.0 WebGPURenderer (WebGPU, no fallback), Rapier 0.19.3 (@dimforge/rapier3d-compat), Gamepad API, Web Audio API, AI Hub Session Protocol v1 client 1.3.0 (parallel)<br>Art Direction: Stylized cel-shaded (MeshToonMaterial + gradient, inverted-hull outlines)<br>Animation: Procedural code animation (waddle, glide, slither, boss stomp)<br>Audio: Code-written music/SFX (Web Audio) + Animalese/Simlish gibberish voice<br>Online: AI Hub parallel sessions (1-4) + local 1-2 player co-op; standalone solo<br>Testing: Lightweight — Node syntax check, HTTP serve check, headless Chrome load smoke<br>Environment: Muse Code CLI (headless); Linux; browser unknown<br>Model: Meta, muse-wonder-1.0, reasoning effort max<br>Usage: unknown</p>
+<p><b>Credits:</b> Design, code, art-in-code &amp; music-in-code by Muse Code (muse-wonder-1.0). No Disney assets used; all ducks are original waddlers. Hub protocol © its authors; session.js pasted unmodified.</p>`;
+}
+function wireMenu(sel){
+  document.querySelectorAll(sel+' .btn').forEach((b,i)=>{
+    b.addEventListener('mouseenter',()=>focusMenu(sel,i));
+    b.addEventListener('click',()=>{audioInit(); SFX.click(); menuAction(b.dataset.act);});
+  });
+}
+function focusMenu(sel,idx){
+  const list=[...document.querySelectorAll(sel+' .btn:not(:disabled)')];
+  if(!list.length)return; G.menuFocus=((idx%list.length)+list.length)%list.length;
+  document.querySelectorAll(sel+' .btn').forEach(b=>b.classList.remove('focus'));
+  list[G.menuFocus].classList.add('focus'); // visual focus only: DOM focus would double-fire Enter/Space as button clicks
+}
+function focusSettings(idx){
+  const rows=[...document.querySelectorAll('#setList .row')]; if(!rows.length)return;
+  G.settingsFocus=((idx%rows.length)+rows.length)%rows.length;
+  rows.forEach(r=>r.classList.remove('focus')); rows[G.settingsFocus].classList.add('focus');
+}
+// ---------- Settings UI ----------
+const SETDEF=[
+  {k:'master',lab:'Master Volume',hint:'Everything, turned up to quack',type:'vol'},
+  {k:'music',lab:'Music Volume',hint:'Code-written island tunes',type:'vol'},
+  {k:'sfx',lab:'Effects Volume',hint:'Boings, splashes & squawks',type:'vol'},
+  {k:'musicOn',lab:'Music',hint:'On / Off',type:'bool'},
+  {k:'invertX',lab:'Invert Horizontal',hint:'Fixes swapped left/right pads',type:'bool'},
+  {k:'invertY',lab:'Invert Vertical',hint:'Fixes swapped up/down pads',type:'bool'},
+  {k:'shake',lab:'Screen Shake',hint:'Juicy thumps on pound & hits',type:'bool'},
+  {k:'reduced',lab:'Calm Camera',hint:'Less bob & shake (reduced motion)',type:'bool'}
+];
+function buildSettings(){
+  $('#setList').innerHTML=SETDEF.map((d,i)=>{
+    const v=settings[d.k];
+    const right=d.type==='vol'?`<span class="meter"><i style="width:${Math.round(v*100)}%"></i></span><span class="pill">${Math.round(v*100)}%</span>`:`<span class="pill">${v?'ON':'OFF'}</span>`;
+    return `<div class="row" data-i="${i}"><span class="lab">${d.lab}<small>${d.hint} • ← → adjust • ✕ toggle</small></span><span style="display:flex;gap:10px;align-items:center">${right}</span></div>`;
+  }).join('');
+  document.querySelectorAll('#setList .row').forEach(r=>{
+    r.addEventListener('mouseenter',()=>focusSettings(+r.dataset.i));
+    r.addEventListener('click',()=>{focusSettings(+r.dataset.i); adjustSetting(1);});
+  });
+  focusSettings(G.settingsFocus||0);
+}
+function adjustSetting(dir){
+  const d=SETDEF[G.settingsFocus]; if(!d)return; audioInit();
+  if(d.type==='vol'){ settings[d.k]=clamp(Math.round((settings[d.k]+dir*0.1)*10)/10,0,1); SFX.click(); }
+  else { settings[d.k]=!settings[d.k]; settings[d.k]?SFX.check():SFX.back(); }
+  saveSettings(); buildSettings(); focusSettings(G.settingsFocus);
+}
+// How-to content
+function buildHow(){
+  const rows=[
+    ['Move','Left stick / D-Pad • A D or ← →','Waddle, climb & swim. Hold to run!'],
+    ['Jump','✕ Cross • Space / W','Tap = hop, hold = higher. Press again mid-air to flutter-glide!'],
+    ['Peck / Kick','□ Square • J','Bonks baddies & kicks turtle shells. Shells bonk back!'],
+    ['Ground Pound','△ Triangle in air • L','Butt-stomp cracked blocks, springs & the Guardian\u2019s noggin.'],
+    ['Dash','○ Circle hold • Shift','Hold for a speedy waddle. Chilies make you a feathered rocket!'],
+    ['Climb & Swing','Stick ↑↓ on vines • ↑ / ↓','Grab vines, shimmy up, swing & leap with jump.'],
+    ['Swim','Stick + ✕ in water • WASD + Space','Paddle up, dive down. Ducks never need snorkels.'],
+    ['Talk / Signs','△ near friends • E','Tiki & Uncle jabber in finest gibberish. Listen!'],
+    ['Pause / Settings','Options • Esc','Settings never pauses a Hub host world — here it may pause solo.'],
+    ['Player 2 Join','Pad 2 ✕ • , (comma)','Second duck drops in anytime. Two bills are better than one!']
+  ];
+  $('#howList').innerHTML=rows.map(r=>`<div><b>${r[0]}</b><br><span style="color:var(--accent);font-weight:900">${r[1]}</span><br><span style="color:var(--ink-dim)">${r[2]}</span></div>`).join('');
+}
+// Dialogue (cheerful travelogue tone, gibberish-voiced)
+const DLG={
+  intro:[['WALLY','Oh no, oh no! Uncle, you\u2019re supposed to deflate the beach ball, not become one!'],['UNCLE GOLDBEAK','Mmf! ... (He says the Giggling Idol\u2019s curse needs 4 Remedy Shards. Also, he is stuck in the doorway.)'],['TIKI THE TOUCAN','Tiki at your service! I\u2019ll squawk tips all over the island. Gems for glory, feathers for flair — let\u2019s waddle!']],
+  jungle:[['TIKI','Jungle Trail! Peck snakes, stomp cracks, and mind the gaps. That chili? Pure rocket sauce.']],
+  ruins:[['TIKI','Sunken Ruins! Water\u2019s fine — swim with the stick, tap jump to paddle up. Crabs pinch. Politely avoid.']],
+  volcano:[['TIKI','Chili Volcano! Lava is just very rude soup. Bounce, dash, and don\u2019t lick anything glowing.']],
+  temple:[['TIKI','The Idol Temple! The Guardian loves stomping. When he\u2019s dizzy, pound his head — three times!']],
+  shard:[['TIKI','YES! A Remedy Shard! Uncle just got 25% less balloon. Science!']],
+  bossWin:[['UNCLE GOLDBEAK','POP! Ha! Back to my handsome, compact self! Wally, you magnificent puddle-hopper — dinner\u2019s on me! (Soup. It\u2019s always soup.)']]
+};
+let dlgQueue=[], dlgResolve=null;
+function startDialogue(lines,done){
+  if(G.state==='dialogue')return; G.prevPlayState=G.state; setState('dialogue');
+  dlgQueue=lines.slice(); G.dlgI=0; $('#dialogue').classList.add('on'); dlgResolve=done||null; showDlgLine();
+}
+function showDlgLine(){
+  const [name,text]=dlgQueue[G.dlgI]; $('#dlgName').textContent=name; $('#dlgText').textContent=text;
+  speakGibber(text,name.includes('UNCLE')?300:name.includes('TIKI')?720:520);
+}
+function advanceDialogue(){
+  SFX.click(); G.dlgI++;
+  if(G.dlgI>=dlgQueue.length){ $('#dialogue').classList.remove('on'); stopGibber(); setState('play'); const r=dlgResolve; dlgResolve=null; if(r)r(); }
+  else showDlgLine();
+}
+function menuAction(act){
+  if(act==='start'){ startRun(false); }
+  else if(act==='how'){ G.returnTo=G.state; buildHow(); showScreen('scrHow'); setState('how'); }
+  else if(act==='settings'){ G.returnTo=G.state; buildSettings(); showScreen('scrSettings'); setState('settings'); }
+  else if(act==='about'){ G.returnTo=G.state; showScreen('scrAbout'); setState('about'); }
+  else if(act==='back'){ goBack(); }
+  else if(act==='resume'){ resumePlay(); }
+  else if(act==='restart'){ if(hubInSession)return; startRun(true); }
+  else if(act==='quit'){ if(hubInSession)return; toTitle(); }
+  else if(act==='retry'){ retryFromCheckpoint(); }
+  else if(act==='again'){ startRun(true); }
+}
+function goBack(){
+  SFX.back();
+  if(G.state==='settings'||G.state==='how'||G.state==='about'){
+    if(G.returnTo==='pause'){ showScreen('scrPause'); setState('pause'); }
+    else if(G.returnTo==='play'){ showScreen(null); setState('play'); }
+    else { showScreen('scrTitle'); setState('title'); }
+  } else if(G.state==='pause'){ resumePlay(); }
+}
+function resumePlay(){ showScreen(null); setState('play'); if(AC&&curTrack!==trackForZone())startMusic(trackForZone()); }
+function trackForZone(){ if(G.bossActive)return'boss'; if(G.camX>150)return'volcano'; if(G.camX>88)return'ruins'; return'jungle'; }
+// ---------- Three.js WebGPU + Rapier world ----------
+let renderer, scene, camera, world, gradMap;
+let sunLight, hemiLight;
+const clockDummy={t:0};
+const platforms=[], movers=[], crumbles=[], cracked=[], springs=[], vines=[], swings=[], waters=[], hazards=[], pickups=[], enemies=[], shells=[], projectiles=[], particles=[], signs=[], checkpoints=[], shardsArr=[];
+let boss=null, players=[], camTarget=new THREE.Vector3(6,3,18);
+let templeIdol=null, uncleGroup=null, tikiSpots=[];
+function toonMat(color,opts={}){
+  const m=new THREE.MeshToonMaterial({color,gradientMap:gradMap,...opts});
+  return m;
+}
+function outline(mesh,scale=1.06,color=0x10231E){
+  const o=new THREE.Mesh(mesh.geometry,new THREE.MeshBasicMaterial({color,side:THREE.BackSide}));
+  o.scale.setScalar(scale); o.position.copy(mesh.position); mesh.parent&&mesh.parent.add(o); return o;
+}
+function addOutlineTo(group,scale=1.05){
+  group.traverse(o=>{ if(o.isMesh&&o.material&&o.material.isMeshToonMaterial){ const c=new THREE.Mesh(o.geometry,new THREE.MeshBasicMaterial({color:0x142B24,side:THREE.BackSide})); c.scale.setScalar(scale); c.position.copy(o.position); c.rotation.copy(o.rotation); o.parent.add(c);} });
+}
+function box(w,h,d,mat){ const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat); m.castShadow=true; m.receiveShadow=true; return m; }
+function ball(r,mat,ws=14,hs=10){ const m=new THREE.Mesh(new THREE.SphereGeometry(r,ws,hs),mat); m.castShadow=true; return m; }
+function textSprite(text,color='#FFF7E6',scale=1){
+  const c=document.createElement('canvas'); c.width=512; c.height=128; const x=c.getContext('2d');
+  x.fillStyle='rgba(20,52,43,0.92)'; roundRect(x,6,6,500,116,18); x.fill();
+  x.strokeStyle='#FFC93C'; x.lineWidth=5; roundRect(x,6,6,500,116,18); x.stroke();
+  x.fillStyle=color; x.font='bold 44px Trebuchet MS, sans-serif'; x.textAlign='center'; x.textBaseline='middle';
+  wrapText(x,text,256,64,460,48);
+  const tex=new THREE.CanvasTexture(c); tex.colorSpace=THREE.SRGBColorSpace;
+  const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,depthWrite:false}));
+  sp.scale.set(6*scale,1.5*scale,1); return sp;
+  function roundRect(g,a,b,w,h,r){g.beginPath();g.moveTo(a+r,b);g.arcTo(a+w,b,a+w,b+h,r);g.arcTo(a+w,b+h,a,b+h,r);g.arcTo(a,b+h,a,b,r);g.arcTo(a,b,a+w,b,r);g.closePath();}
+  function wrapText(g,t,cx,cy,maxW,lh){ const words=t.split(' '); let line='',lines=[]; for(const w of words){ const tt=line?line+' '+w:w; if(g.measureText(tt).width>maxW&&line){lines.push(line);line=w;}else line=tt;} lines.push(line); lines.slice(0,2).forEach((ln,i)=>g.fillText(ln,cx,cy+(i-(lines.length-1)/2)*lh)); }
+}
+async function initGraphics(){
+  const canvasHost=$('#app');
+  // WebGPU only, no fallback (per brief). Show honest error + hub fail if unavailable.
+  if(!navigator.gpu) throw new Error('WebGPU unavailable (navigator.gpu missing)');
+  renderer=new THREE.WebGPURenderer({antialias:true,powerPreference:'high-performance'});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setSize(innerWidth,innerHeight);
+  renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFShadowMap;
+  renderer.toneMapping=THREE.ACESFilmicToneMapping; renderer.toneMappingExposure=1.05;
+  await renderer.init();
+  // No fallback (per brief): Three can silently drop to a WebGL2 backend — refuse it and fail honestly.
+  if(!renderer.backend||renderer.backend.isWebGPUBackend!==true) throw new Error('WebGPU backend unavailable (WebGL fallback refused)');
+  canvasHost.appendChild(renderer.domElement);
+  scene=new THREE.Scene(); scene.background=new THREE.Color(0x8ED8E8); scene.fog=new THREE.Fog(0x8ED8E8,55,120);
+  camera=new THREE.PerspectiveCamera(46,innerWidth/innerHeight,0.1,300); camera.position.set(-10,4,18);
+  // cel gradient: 4 hard steps
+  const gdata=new Uint8Array([90,150,210,255]); const gt=new THREE.DataTexture(gdata,4,1,THREE.RedFormat);
+  gt.minFilter=THREE.NearestFilter; gt.magFilter=THREE.NearestFilter; gt.generateMipmaps=false; gt.needsUpdate=true; gradMap=gt;
+  hemiLight=new THREE.HemisphereLight(0xCFF3FF,0x3A6B4A,1.15); scene.add(hemiLight);
+  sunLight=new THREE.DirectionalLight(0xFFF2C4,2.6); sunLight.position.set(18,30,14); sunLight.castShadow=true;
+  sunLight.shadow.mapSize.set(2048,2048); sunLight.shadow.camera.left=-28; sunLight.shadow.camera.right=28;
+  sunLight.shadow.camera.top=22; sunLight.shadow.camera.bottom=-14; sunLight.shadow.camera.far=90; sunLight.shadow.bias=-0.0004;
+  scene.add(sunLight); scene.add(sunLight.target);
+  const amb=new THREE.AmbientLight(0xFFE9B0,0.35); scene.add(amb);
+  addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); });
+}
+function physBox(x,y,w,h,d=2.2,kinematic=false){
+  const desc=kinematic?RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(x,y,0):RAPIER.RigidBodyDesc.fixed().setTranslation(x,y,0);
+  const body=world.createRigidBody(desc);
+  const col=world.createCollider(RAPIER.ColliderDesc.cuboid(w/2,h/2,d/2),body);
+  return{body,col};
+}
+function addPlatform(x,y,w,h,mat,type='ground',d=2.4){
+  const m=box(w,h,d,mat); m.position.set(x,y,0); scene.add(m);
+  const p={x,y,w,h,mesh:m,type,phys:physBox(x,y,w,h,d),home:{x,y},t:Math.random()*10,active:true};
+  platforms.push(p); return p;
+}
+// ---------- Duck factory (procedural, cel-shaded) ----------
+function makeDuck(hatColor,shirtColor){
+  const g=new THREE.Group();
+  const white=toonMat(0xFFFFFF), orange=toonMat(0xFF8A2A), black=toonMat(0x1A1A1A);
+  const body=ball(0.62,white); body.scale.set(1,1.05,0.9); body.position.y=0.75; g.add(body);
+  const belly=ball(0.48,toonMat(0xFFF7E6)); belly.scale.set(0.9,1,0.6); belly.position.set(0,0.68,0.32); g.add(belly);
+  const headG=new THREE.Group(); headG.position.set(0,1.62,0); g.add(headG);
+  const head=ball(0.52,white); headG.add(head);
+  const bill=ball(0.30,orange); bill.scale.set(1.35,0.55,1.0); bill.position.set(0,-0.10,0.48); headG.add(bill);
+  const billLow=ball(0.24,orange); billLow.scale.set(1.2,0.4,0.9); billLow.position.set(0,-0.22,0.46); headG.add(billLow);
+  const e1=ball(0.09,toonMat(0xFFFFFF)); e1.position.set(-0.20,0.16,0.42); headG.add(e1);
+  const e2=ball(0.09,toonMat(0xFFFFFF)); e2.position.set(0.20,0.16,0.42); headG.add(e2);
+  const p1=ball(0.05,black); p1.position.set(-0.20,0.16,0.50); headG.add(p1);
+  const p2=ball(0.05,black); p2.position.set(0.20,0.16,0.50); headG.add(p2);
+  const hat=new THREE.Mesh(new THREE.CylinderGeometry(0.34,0.38,0.22,14),toonMat(hatColor)); hat.position.set(0,0.48,0); hat.castShadow=true; headG.add(hat);
+  const brim=new THREE.Mesh(new THREE.CylinderGeometry(0.52,0.52,0.07,14),toonMat(hatColor)); brim.position.set(0,0.38,0); brim.castShadow=true; headG.add(brim);
+  const shirt=new THREE.Mesh(new THREE.CylinderGeometry(0.52,0.64,0.55,14),toonMat(shirtColor)); shirt.position.y=0.95; shirt.castShadow=true; g.add(shirt);
+  const tail=new THREE.Mesh(new THREE.ConeGeometry(0.26,0.55,10),white); tail.rotation.x=-1.1; tail.position.set(0,0.95,-0.55); tail.castShadow=true; g.add(tail);
+  const wingL=new THREE.Group(); wingL.position.set(-0.58,1.05,0); g.add(wingL);
+  const wmL=ball(0.30,white); wmL.scale.set(0.45,1.15,0.8); wmL.position.y=-0.28; wingL.add(wmL);
+  const wingR=new THREE.Group(); wingR.position.set(0.58,1.05,0); g.add(wingR);
+  const wmR=ball(0.30,white); wmR.scale.set(0.45,1.15,0.8); wmR.position.y=-0.28; wingR.add(wmR);
+  const footL=box(0.42,0.14,0.62,orange); footL.position.set(-0.28,0.07,0.10); g.add(footL);
+  const footR=box(0.42,0.14,0.62,orange); footR.position.set(0.28,0.07,0.10); g.add(footR);
+  g.traverse(o=>{o.castShadow=true;});
+  return{g,headG,wingL,wingR,tail,footL,footR,body};
+}
+function makeToucan(){
+  const g=new THREE.Group(); const body=ball(0.45,toonMat(0x2B2B3A)); body.position.y=0.6; g.add(body);
+  const head=ball(0.34,toonMat(0xFFFFFF)); head.position.set(0,1.15,0.1); g.add(head);
+  const beak=new THREE.Mesh(new THREE.ConeGeometry(0.16,0.85,10),toonMat(0xFF8A2A)); beak.rotation.x=Math.PI/2; beak.position.set(0,1.08,0.62); beak.castShadow=true; g.add(beak);
+  const crest=ball(0.12,toonMat(0xFF6B5E)); crest.position.set(0,1.48,0); g.add(crest);
+  const tail=new THREE.Mesh(new THREE.BoxGeometry(0.16,0.7,0.12),toonMat(0x1FB6A6)); tail.position.set(0,0.35,-0.4); tail.rotation.x=0.5; g.add(tail);
+  g.traverse(o=>o.castShadow=true); return g;
+}
+function makeUncle(){
+  const g=new THREE.Group();
+  // Inflated balloon body gag: huge round body, tiny head/feet dangling
+  const body=ball(1.05,toonMat(0xFFF2C4)); body.position.y=1.25; g.add(body);
+  const patch=ball(0.3,toonMat(0xFF6B5E)); patch.position.set(0.7,1.5,0.75); g.add(patch);
+  const head=ball(0.42,toonMat(0xFFFFFF)); head.position.set(0,2.45,0.15); g.add(head);
+  const bill=ball(0.24,toonMat(0xFF8A2A)); bill.scale.set(1.3,0.55,1); bill.position.set(0,2.32,0.55); g.add(bill);
+  const hat=new THREE.Mesh(new THREE.CylinderGeometry(0.3,0.3,0.5,10),toonMat(0x1A1A1A)); hat.position.set(0,2.9,0.1); g.add(hat);
+  const coin=ball(0.16,toonMat(0xFFC93C,{emissive:0x664400})); coin.position.set(-0.95,1.3,0.4); g.add(coin);
+  g.traverse(o=>o.castShadow=true); return g;
+}
+// Player object wraps physics + visuals + state
+function createPlayer(idx,startX,startY,hat,shirt){
+  const vis=makeDuck(hat,shirt); scene.add(vis.g);
+  const body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(startX,startY,0).lockRotations().setLinearDamping(0.1).setCcdEnabled(true));
+  const col=world.createCollider(RAPIER.ColliderDesc.capsule(0.42,0.42).setFriction(0.0).setRestitution(0.0),body);
+  body.setEnabledTranslations(true,true,false);
+  const pl={idx,vis,body,col,hp:3,maxHp:3,face:1,walk:0,jumps:0,grounded:false,coyote:0,invuln:0,chili:0,climbing:false,pounding:false,swinging:null,peckCd:0,peckT:0,dead:false,respawnT:0,wasInWater:false,active:idx===0,ai:false,aiWp:0,squash:0};
+  players.push(pl); return pl;
+}
+function playerPos(pl){ const t=pl.body.translation(); return{x:t.x,y:t.y}; }
+function teleportPlayer(pl,x,y){ pl.body.setTranslation({x,y,z:0},true); pl.body.setLinvel({x:0,y:0,z:0},true); }
+// ---------- Level building ----------
+let MATS=null;
+function buildLevel(){
+  MATS={
+    grass:toonMat(0x3FA34D), dirt:toonMat(0x8B5A2B), wood:toonMat(0xA67C52), stone:toonMat(0x9AA3A8),
+    sand:toonMat(0xD9C99A), ruin:toonMat(0xC9B78A), dark:toonMat(0x4A3F3A), gold:toonMat(0xFFC93C,{emissive:0x553300}),
+    leaf:toonMat(0x2E8B57), trunk:toonMat(0x6B4226), lava:toonMat(0xFF5A1F,{emissive:0xFF3300,emissiveIntensity:1.4}),
+    water:new THREE.MeshToonMaterial({color:0x1FA8C9,gradientMap:gradMap,transparent:true,opacity:0.62}),
+    gem:toonMat(0x22D3EE,{emissive:0x0A5A66,emissiveIntensity:0.9}), feather:toonMat(0xFFD93D,{emissive:0x665500}),
+    chili:toonMat(0xE6392E,{emissive:0x550000}), cream:toonMat(0xFFAFCC)
+  };
+  // Sky backdrop: far mountains, sun disc, clouds (parallax layers)
+  const mMat=toonMat(0x5B8DB8), mMat2=toonMat(0x7FB069);
+  [[-30,-24,26],[10,-28,34],[60,-25,28],[120,-27,36],[175,-26,30],[215,-24,26]].forEach(([x,z,s])=>{
+    const cone=new THREE.Mesh(new THREE.ConeGeometry(s*0.55,s*0.7,7),x>140?toonMat(0x8A7A6B):mMat2); cone.position.set(x,s*0.22,z); scene.add(cone);
+    const cap=new THREE.Mesh(new THREE.ConeGeometry(s*0.22,s*0.25,7),toonMat(0xFFFFFF)); cap.position.set(x,s*0.52,z); scene.add(cap);
+  });
+  const sunDisc=ball(3.2,toonMat(0xFFE66D,{emissive:0xAA8800})); sunDisc.position.set(40,22,-30); scene.add(sunDisc);
+  for(let i=0;i<14;i++){ const cl=new THREE.Group(); const cm=toonMat(0xFFFFFF);
+    for(let j=0;j<4;j++){ const b=ball(rand(1,2.2),cm); b.position.set(j*1.4-2,rand(-0.3,0.4),0); b.scale.y=0.6; cl.add(b); }
+    cl.position.set(rand(-30,225),rand(10,19),rand(-16,-10)); cl.userData.drift=rand(0.1,0.35); scene.add(cl); clouds.push(cl); }
+  // Ground & platforms — Jungle Trail (-24..68)
+  addPlatform(-12,-1,26,2,MATS.grass); addPlatform(6,0.4,7,1,MATS.wood); addPlatform(16,-1,13,2,MATS.grass);
+  addPlatform(27,1.2,6,1,MATS.wood); addPlatform(36,-1,13,2,MATS.grass); addPlatform(47,3.8,9,1.1,MATS.grass);
+  addPlatform(58,-1,14,2,MATS.grass); addPlatform(66,1.6,6,1,MATS.wood);
+  // Stone Steps (68..88) bridge to ruins
+  addPlatform(74,-0.2,6,1.2,MATS.stone); addPlatform(81,0.8,6,1.2,MATS.stone); addPlatform(88,-1,10,2,MATS.sand);
+  // Sunken Ruins (88..144): islands over water
+  addPlatform(94,-2.2,10,1.6,MATS.ruin); addPlatform(104,-0.6,7,1.2,MATS.ruin); addPlatform(112,-2.2,10,1.6,MATS.ruin);
+  addPlatform(121,0.6,7,1.2,MATS.ruin); addPlatform(130,-2.2,10,1.6,MATS.ruin); addPlatform(138,-1,10,2,MATS.sand);
+  // Chili Volcano slopes (144..188)
+  addPlatform(148,-1,11,2,MATS.dark); addPlatform(157,1.2,7,1.2,MATS.dark); addPlatform(165,-1,11,2,MATS.dark);
+  addPlatform(173,2.2,7,1.2,MATS.stone); addPlatform(181,-1,11,2,MATS.dark);
+  // Idol Temple arena (188..222)
+  addPlatform(204,-1,30,2,MATS.sand); addPlatform(196,2.4,6,1,MATS.ruin); addPlatform(212,2.4,6,1,MATS.ruin);
+  // Cracked blocks (pound to break, hide shortcuts/gems)
+  [[22,0.6],[52,4.9],[118, -1.2],[170,3.4]].forEach(([x,y])=>{ const m=box(2.2,1,2.2,toonMat(0xB08968)); m.position.set(x,y,0); scene.add(m);
+    const c={x,y,mesh:m,phys:physBox(x,y,2.2,1),broken:false}; cracked.push(c); });
+  // Moving platforms (kinematic)
+  makeMover(31,2.6,4.6,0.7,'x',3.2,0.55); makeMover(98,1.8,4.6,0.7,'y',1.6,0.8); makeMover(152,3.0,4.6,0.7,'x',3.4,0.7); makeMover(188,1.8,4.2,0.7,'y',1.5,0.9);
+  // Crumble platforms
+  [[42,1.8],[108,1.6],[160,3.6],[200,4.2]].forEach(([x,y])=>{ const m=box(3.6,0.6,2.2,toonMat(0xD9C99A)); m.position.set(x,y,0); scene.add(m);
+    const c={x,y,mesh:m,phys:physBox(x,y,3.6,0.6,2.2,true),state:'idle',timer:0}; c.phys.body.setNextKinematicTranslation({x,y,z:0}); crumbles.push(c); });
+  // Springs (mushroom bounce)
+  [[10,0.6],[72,0.4],[155,-0.2],[206,0.6]].forEach(([x,y])=>{ const g=new THREE.Group(); g.position.set(x,y,0);
+    const stem=new THREE.Mesh(new THREE.CylinderGeometry(0.22,0.3,0.5,10),toonMat(0xFFF7E6)); stem.position.y=0.25; g.add(stem);
+    const cap=new THREE.Mesh(new THREE.SphereGeometry(0.62,14,8,0,Math.PI*2,0,Math.PI/2),toonMat(0xFF6B5E)); cap.position.y=0.5; cap.scale.y=0.7; g.add(cap); scene.add(g);
+    springs.push({x,y:y+0.8,mesh:g}); });
+  // Vines to climb (visual + zone)
+  [[44,0,5.2],[100,-1,3.4],[168,-0.5,4.6],[196,0,3.6]].forEach(([x,yb,yt])=>{ const h=yt-yb; const v=new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.09,h,6),toonMat(0x2E8B57)); v.position.set(x,yb+h/2,0.3); scene.add(v);
+    for(let i=0;i<5;i++){ const lf=ball(0.22,MATS.leaf); lf.scale.set(1.4,0.5,0.8); lf.position.set(x+rand(-0.3,0.3),yb+0.6+i*(h/5),0.35); scene.add(lf); }
+    vines.push({x,yBot:yb,yTop:yt,mesh:v}); });
+  // Swing ropes over gaps
+  [[28,5.5],[78,5.5],[142,5.8]].forEach(([x,topY])=>{ const anchor=new THREE.Group(); anchor.position.set(x,topY,0); scene.add(anchor);
+    const rope=new THREE.Mesh(new THREE.CylinderGeometry(0.06,0.06,3.4,6),toonMat(0x8B5A2B)); rope.position.y=-1.7; anchor.add(rope);
+    const knob=ball(0.22,MATS.wood); knob.position.y=-3.4; anchor.add(knob);
+    swings.push({x,topY,anchor,phase:rand(0,6),rider:null}); });
+  // Water & hazards
+  const wmesh=box(54,3.6,3.2,MATS.water); wmesh.position.set(116,-1.4,0); wmesh.castShadow=false; scene.add(wmesh);
+  waters.push({x1:89,x2:143,yTop:0.4,yBot:-3.2,mesh:wmesh});
+  [[151,158],[168,175]].forEach(([x1,x2])=>{ const lm=box(x2-x1,0.5,3,MATS.lava); lm.position.set((x1+x2)/2,-0.15,0); scene.add(lm); hazards.push({x1,x2,y:-0.1,kind:'lava',mesh:lm}); });
+  [[60,63],[124,127],[184,187]].forEach(([x1,x2])=>{ const n=3; for(let i=0;i<n;i++){ const sp=new THREE.Mesh(new THREE.ConeGeometry(0.28,0.9,6),toonMat(0xD9D9D9)); sp.position.set(x1+0.6+i*0.9,0.45,0); scene.add(sp);} hazards.push({x1,x2,y:0.6,kind:'spike'}); });
+  buildDecor(); buildPickups(); buildEnemies(); buildNPCs(); buildBoss();
+  // Checkpoints (flags)
+  [[-18,'Jungle Trail'],[54,'Jungle Trail'],[90,'Sunken Ruins'],[146,'Chili Volcano'],[190,'Idol Temple']].forEach(([x,zone])=>makeCheckpoint(x,zone));
+  // Tutorial signs
+  const signData=[[-16,1.3,'✕ JUMP! Hold for higher'],[-4,1.3,'□ PECK the snake!'],[8,1.8,'SPRING! Boing!'],[24,2.2,'△ POUND cracks!'],[32,3.6,'SWING! Jump to fly!'],[43,1.2,'VINE! ↑↓ to climb'],[92,1.2,'SWIM! Stick + ✕'],[147,1.2,'🌶 CHILI = ZOOM!'],[195,1.2,'BOSS: Pound his head x3!']];
+  for(const [x,y,t] of signData){ const s=textSprite(t,'#FFF7E6',0.95); s.position.set(x,y+1.6,0.6); scene.add(s); signs.push({x,y,mesh:s,text:t}); }
+}
+const clouds=[];
+function makeMover(x,y,w,h,axis,range,speed){
+  const m=box(w,h,2.2,toonMat(0xFFC93C)); m.position.set(x,y,0); scene.add(m);
+  const phys=physBox(x,y,w,h,2.2,true); phys.body.setNextKinematicTranslation({x,y,z:0});
+  const mv={x,y,w,h,mesh:m,phys,axis,range,speed,home:{x,y},t:rand(0,6),dx:0,dy:0,px:x,py:y}; movers.push(mv); return mv;
+}
+function makeCheckpoint(x,zone){
+  const g=new THREE.Group(); g.position.set(x,0,0.4);
+  const pole=new THREE.Mesh(new THREE.CylinderGeometry(0.07,0.07,3.2,8),toonMat(0x8B5A2B)); pole.position.y=1.6; g.add(pole);
+  const flag=new THREE.Mesh(new THREE.BoxGeometry(1.1,0.7,0.06),toonMat(0xFF6B5E)); flag.position.set(0.58,2.7,0); g.add(flag);
+  const lamp=new THREE.PointLight(0xFFC93C,0,9); lamp.position.y=3; g.add(lamp); scene.add(g);
+  checkpoints.push({x,zone,mesh:g,flag,lamp,got:false});
+}
+function buildDecor(){
+  // Trees (jungle), pillars (ruins), volcano, temple — layered near/mid/far
+  for(let i=0;i<26;i++){ const x=-24+i*3.4+rand(-0.8,0.8); if(x>86&&x<144)continue; const z=rand(-6,-3.5);
+    const tr=new THREE.Group(); tr.position.set(x,0,z);
+    const trunk=new THREE.Mesh(new THREE.CylinderGeometry(0.22,0.32,2.6,8),MATS.trunk); trunk.position.y=1.3; trunk.castShadow=true; tr.add(trunk);
+    for(let j=0;j<3;j++){ const lf=ball(rand(0.9,1.5),MATS.leaf); lf.position.set(rand(-0.6,0.6),2.8+j*0.55,rand(-0.3,0.3)); lf.scale.y=0.75; tr.add(lf); }
+    scene.add(tr);
+  }
+  for(let i=0;i<9;i++){ const x=92+i*6+rand(-1,1); const h=rand(2.5,4.5);
+    const p=new THREE.Mesh(new THREE.CylinderGeometry(0.55,0.65,h,10),MATS.ruin); p.position.set(x,h/2-0.5,rand(-4,-2.5)); p.castShadow=true; scene.add(p);
+    const cap=box(1.6,0.35,1.6,MATS.sand); cap.position.set(x,h-0.3,p.position.z); scene.add(cap);
+  }
+  const volc=new THREE.Mesh(new THREE.ConeGeometry(11,10,9),toonMat(0x6B5A4E)); volc.position.set(168,4,-20); scene.add(volc);
+  const lavaTop=ball(2.2,MATS.lava); lavaTop.scale.y=0.4; lavaTop.position.set(168,9.2,-20); scene.add(lavaTop);
+  // Temple steps + idol statue at far right
+  for(let i=0;i<4;i++){ const s=box(10-i*1.6,0.7,5,MATS.ruin); s.position.set(216,0.35+i*0.7,-4.5); scene.add(s); }
+  const idolG=new THREE.Group(); idolG.position.set(216,3.6,-4.2);
+  const idolBody=box(1.8,2.4,1.2,toonMat(0xFFC93C,{emissive:0x664400})); idolG.add(idolBody);
+  const idolHead=ball(0.8,toonMat(0xFFC93C,{emissive:0x664400})); idolHead.position.y=1.7; idolG.add(idolHead);
+  const idolBill=ball(0.4,toonMat(0xFF8A2A)); idolBill.scale.set(1.3,0.55,1); idolBill.position.set(0,1.55,0.7); idolG.add(idolBill);
+  scene.add(idolG); templeIdol=idolG;
+  // Torches with real point lights (ruins + temple)
+  [[96,2],[120,2],[148,2],[190,2],[204,3],[216,2]].forEach(([x,y])=>{ const L=new THREE.PointLight(0xFF9A3C,12,11,1.6); L.position.set(x,y+1.6,1.2); scene.add(L);
+    const fl=ball(0.18,toonMat(0xFFC93C,{emissive:0xFF8800,emissiveIntensity:2})); fl.position.copy(L.position); scene.add(fl); fl.userData.flicker=true; flickers.push(fl); });
+  // Foreground grass tufts & flowers for depth
+  for(let i=0;i<70;i++){ const x=rand(-24,220); const f=ball(0.14,toonMat([0xFF6B9D,0xFFD93D,0xFFFFFF,0xFF8A2A][i%4])); f.position.set(x,0.25,rand(1.8,2.8)); f.scale.y=1.3; scene.add(f); }
+}
+const flickers=[];
+function addPickup(kind,x,y){
+  let mesh;
+  if(kind==='gem'){ mesh=new THREE.Mesh(new THREE.OctahedronGeometry(0.34),MATS.gem); }
+  else if(kind==='feather'){ mesh=new THREE.Group(); const q=new THREE.Mesh(new THREE.ConeGeometry(0.22,0.85,8),MATS.feather); q.rotation.z=0.5; mesh.add(q); const b=ball(0.12,MATS.feather); b.position.y=-0.3; mesh.add(b); }
+  else if(kind==='chili'){ mesh=new THREE.Group(); const c=new THREE.Mesh(new THREE.ConeGeometry(0.24,0.8,9),MATS.chili); c.rotation.z=2.6; mesh.add(c); const s=ball(0.13,toonMat(0x2E8B57)); s.position.set(-0.3,0.25,0); mesh.add(s); }
+  else if(kind==='cream'){ mesh=new THREE.Group(); const cone=new THREE.Mesh(new THREE.ConeGeometry(0.3,0.65,9),toonMat(0xD9A05A)); cone.rotation.x=Math.PI; cone.position.y=-0.2; mesh.add(cone); const sc=ball(0.32,MATS.cream); sc.position.y=0.22; mesh.add(sc); const ch=ball(0.1,toonMat(0xE6392E)); ch.position.y=0.5; mesh.add(ch); }
+  else if(kind==='shard'){ mesh=new THREE.Mesh(new THREE.OctahedronGeometry(0.62),toonMat(0xB388FF,{emissive:0x442288,emissiveIntensity:1.1})); mesh.scale.y=1.7; }
+  mesh.position.set(x,y,0); mesh.castShadow=true; scene.add(mesh);
+  const pk={kind,x,y,mesh,taken:false,baseY:y,phase:rand(0,6)}; pickups.push(pk); return pk;
+}
+function buildPickups(){
+  const gemLines=[[-8,1.6,5],[12,1.6,4],[18,1.6,5],[34,1.6,4],[48,5.2,4],[60,1.6,5],[76,1.8,4],[95,0.8,4],[106,1.6,4],[115,0.8,4],[132,1.6,4],[149,1.6,4],[159,3.2,4],[167,1.6,4],[183,1.6,4],[198,1.6,4],[210,1.6,4]];
+  for(const [sx,sy,n] of gemLines) for(let i=0;i<n;i++) addPickup('gem',sx+i*1.15,sy+Math.sin(i*0.9)*0.18+(Math.random()-0.5)*0.2);
+  // Underwater bonus gems (swim reward)
+  for(let i=0;i<6;i++) addPickup('gem',100+i*2.2,-1.6);
+  addPickup('feather',49,6.6); addPickup('feather',109,3.2); addPickup('feather',174,4.6); addPickup('feather',201,5.6);
+  addPickup('chili',26,1.4); addPickup('chili',146,1.4); addPickup('chili',180,1.4);
+  addPickup('cream',55,1.4); addPickup('cream',122,2.0); addPickup('cream',172,3.8); addPickup('cream',204,1.4);
+  // 3 world shards; 4th comes from the Guardian
+  const s1=addPickup('shard',64,2.2); s1.mesh.material=toonMat(0x7BE495,{emissive:0x1A6644,emissiveIntensity:1.1});
+  const s2=addPickup('shard',140,2.4); s2.mesh.material=toonMat(0x22D3EE,{emissive:0x0A4466,emissiveIntensity:1.1});
+  const s3=addPickup('shard',186,2.2); s3.mesh.material=toonMat(0xFF8A5E,{emissive:0x662200,emissiveIntensity:1.1});
+  shardsArr.push(s1,s2,s3);
+}
+function buildEnemies(){
+  const defs=[
+    ['snake',2,0.6],['snake',20,0.6],['snake',38,0.6],['snake',132,0.6],['snake',182,0.6],
+    ['bee',30,4.2],['bee',84,4.0],['bee',158,4.4],['bee',198,4.2],
+    ['turtle',16,0.7],['turtle',68,0.7],['turtle',120,1.4],['turtle',176,0.7],
+    ['monkey',62,3.4],['monkey',126,2.8],
+    ['crab',106,-1.8],['crab',128,-1.8]
+  ];
+  for(const [kind,x,y] of defs) makeEnemy(kind,x,y);
+}
+function makeEnemy(kind,x,y){
+  const g=new THREE.Group(); let en={kind,x,y,home:{x,y},mesh:g,alive:true,t:rand(0,6),dir:1,hp:1,throwCd:rand(1,2)};
+  if(kind==='snake'){ for(let i=0;i<4;i++){ const s=ball(0.26-i*0.03,toonMat(i%2?0x2E8B57:0x7BE495)); s.position.set(-i*0.42,0.1,0); g.add(s);} const hd=ball(0.28,toonMat(0x2E8B57)); hd.position.set(0.25,0.22,0); g.add(hd);
+    const eye=ball(0.05,toonMat(0x1A1A1A)); eye.position.set(0.4,0.3,0.15); g.add(eye); en.r=0.9; }
+  else if(kind==='bee'){ const b=ball(0.34,toonMat(0xFFD93D)); g.add(b); const st=new THREE.Mesh(new THREE.ConeGeometry(0.1,0.35,7),toonMat(0x1A1A1A)); st.rotation.z=1.2; st.position.set(-0.4,0,0); g.add(st);
+    for(const sx of [-1,1]){ const w=ball(0.2,toonMat(0xFFFFFF)); w.scale.set(1,0.3,0.6); w.position.set(sx*0.15,0.35,0); g.add(w); en['w'+sx]=w; } en.r=0.7; }
+  else if(kind==='turtle'){ const sh=ball(0.5,toonMat(0x2E8B57)); sh.scale.y=0.6; sh.position.y=0.15; g.add(sh); const hd=ball(0.2,toonMat(0x7BE495)); hd.position.set(0.55,0.2,0); g.add(hd); en.r=0.8; en.turtle=true; }
+  else if(kind==='monkey'){ const b=ball(0.45,toonMat(0x8B5A2B)); b.position.y=0.45; g.add(b); const hd=ball(0.34,toonMat(0xD9A05A)); hd.position.set(0,1.05,0.1); g.add(hd);
+    const ear1=ball(0.13,toonMat(0xD9A05A)); ear1.position.set(-0.34,1.1,0); g.add(ear1); const ear2=ball(0.13,toonMat(0xD9A05A)); ear2.position.set(0.34,1.1,0); g.add(ear2); en.r=0.9; }
+  else if(kind==='crab'){ const b=ball(0.42,toonMat(0xFF6B5E)); b.scale.set(1.2,0.7,0.9); g.add(b);
+    for(const sx of [-1,1]){ const cl=new THREE.Mesh(new THREE.ConeGeometry(0.16,0.4,7),toonMat(0xE6392E)); cl.position.set(sx*0.6,0.15,0.2); cl.rotation.z=sx*0.8; g.add(cl);} en.r=0.8; }
+  g.position.set(x,y,0); g.traverse(o=>o.castShadow=true); scene.add(g); enemies.push(en); return en;
+}
+function buildNPCs(){
+  uncleGroup=makeUncle(); uncleGroup.position.set(-19,0.2,0.8); scene.add(uncleGroup);
+  const tikiDefs=[[-14,0,'intro'],[56,0,'jungle'],[92,-1,'ruins'],[148,0,'volcano'],[192,0,'temple']];
+  for(const [x,y,key] of tikiDefs){ const t=makeToucan(); t.position.set(x,y+0.2,0.7); scene.add(t); tikiSpots.push({x,y:y+1,mesh:t,key,talked:false}); }
+}
+function buildBoss(){
+  const g=new THREE.Group();
+  const stone=toonMat(0x8A8D93), stoneD=toonMat(0x5F646B), goldM=toonMat(0xFFC93C,{emissive:0x553300});
+  const bodyB=box(2.6,3.0,1.8,stone); bodyB.position.y=1.5; g.add(bodyB);
+  const headB=ball(1.05,stone); headB.position.set(0,3.6,0); g.add(headB);
+  const billB=ball(0.55,goldM); billB.scale.set(1.35,0.55,1); billB.position.set(0,3.35,0.95); g.add(billB);
+  const crown=new THREE.Mesh(new THREE.ConeGeometry(0.6,1.0,6),goldM); crown.position.y=4.7; g.add(crown);
+  for(const sx of [-1,1]){ const arm=box(0.6,2.0,0.7,stoneD); arm.position.set(sx*1.6,1.8,0); g.add(arm); const eye=ball(0.13,toonMat(0xFF3B30,{emissive:0xFF0000,emissiveIntensity:2})); eye.position.set(sx*0.38,3.8,0.9); g.add(eye); }
+  const starG=new THREE.Group(); starG.position.y=5.0;
+  for(let i=0;i<3;i++){ const st=ball(0.14,goldM); st.position.set(Math.cos(i*2.1)*0.7,Math.sin(i*2.1)*0.25,0); starG.add(st); }
+  starG.visible=false; g.add(starG);
+  g.position.set(206,0,0); g.traverse(o=>o.castShadow=true); scene.add(g);
+  // Stone physics body (kinematic; moved by boss AI)
+  const body=world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(206,1.8,0));
+  const col=world.createCollider(RAPIER.ColliderDesc.cuboid(1.3,1.8,0.9),body);
+  boss={mesh:g,body,col,hp:3,state:'sleep',timer:2,x:206,y:1.8,vx:0,vy:0,stars:starG,flash:0};
+}
+function spawnParticles(x,y,color,n=10,speed=3.5,life=0.6,size=0.12){
+  for(let i=0;i<n;i++){
+    let p=particles.find(q=>!q.alive);
+    if(!p){ if(particles.length>240)break; const m=ball(size,toonMat(0xFFFFFF)); m.castShadow=false; scene.add(m); p={mesh:m,alive:false,vx:0,vy:0,life:0,max:1}; particles.push(p); }
+    p.alive=true; p.mesh.visible=true; p.mesh.material.color.set(color); p.mesh.position.set(x,y,rand(-0.3,0.5));
+    const a=rand(0,Math.PI*2), s=rand(speed*0.3,speed); p.vx=Math.cos(a)*s; p.vy=Math.abs(Math.sin(a)*s)+1.5; p.life=p.max=life*rand(0.6,1.2);
+  }
+}
+function burstConfetti(x,y){ [0xFF6B5E,0xFFC93C,0x22D3EE,0x7BE495,0xFFAFCC,0xFFAFCC].forEach(c=>spawnParticles(x,y,c,8,4.5,1.0,0.13)); }
+// ---------- Run management ----------
+function resetWorld(){
+  for(const pk of pickups){ pk.taken=false; pk.mesh.visible=true; }
+  for(const e of enemies){ e.alive=true; e.mesh.visible=true; e.x=e.home.x; e.y=e.home.y; e.mesh.position.set(e.x,e.y,0); }
+  for(const s of shells){ scene.remove(s.mesh); if(s.body)world.removeRigidBody(s.body); } shells.length=0;
+  for(const pr of projectiles){ scene.remove(pr.mesh); } projectiles.length=0;
+  for(const c of cracked){ if(c.broken){ c.broken=false; c.mesh.visible=true; c.phys.col.setEnabled(true); } }
+  for(const cp of checkpoints){ cp.got=false; cp.flag.material.color.set(0xFF6B5E); cp.lamp.intensity=0; }
+  if(boss){ boss.hp=3; boss.state='sleep'; boss.timer=2; boss.x=206; boss.y=1.8; boss.mesh.position.set(206,0,0); boss.body.setNextKinematicTranslation({x:206,y:1.8,z:0}); boss.stars.visible=false; $('#bossWrap').classList.remove('on'); G.bossActive=false; }
+  for(const c of crumbles){ c.state='idle'; c.timer=0; c.mesh.visible=true; c.phys.body.setNextKinematicTranslation({x:c.x,y:c.y,z:0}); c.phys.col.setEnabled(true); }
+}
+function startRun(fromRestart){
+  audioInit(); resetWorld(); wipes=0;
+  G.score=0; G.gems=0; G.feathers=0; G.shards=0; G.time=0; G.over=false; G.won=false; lastProgressScore=-1;
+  G.checkpoint={x:-18,y:3}; G.zone='Jungle Trail'; G.bossActive=false;
+  const p1=players[0]; p1.hp=3; p1.dead=false; p1.invuln=0; p1.chili=0; teleportPlayer(p1,-18,2.5);
+  if(players[1]){ players[1].hp=3; players[1].dead=false; teleportPlayer(players[1],-16.5,2.5); players[1].vis.g.visible=players[1].active; }
+  checkpoints[0].got=true; checkpoints[0].flag.material.color.set(0x7BE495); checkpoints[0].lamp.intensity=14;
+  showScreen(null); setState('play'); $('#hud').classList.add('on'); $('#attractBadge').classList.remove('on');
+  startMusic('jungle'); updateHUD();
+  if(hubInSession){ toast('Hub race — most gems & shards wins!'); }
+  else if(!fromRestart) startDialogue(DLG.intro);
+  else toast('Fresh feathers, fresh start!');
+}
+function retryFromCheckpoint(){
+  wipes=0; const p1=players[0]; p1.hp=3; p1.dead=false; teleportPlayer(p1,G.checkpoint.x,G.checkpoint.y+1);
+  if(players[1]&&players[1].active){ players[1].hp=3; players[1].dead=false; teleportPlayer(players[1],G.checkpoint.x+1.5,G.checkpoint.y+1); }
+  showScreen(null); setState('play'); $('#hud').classList.add('on'); SFX.check();
+}
+function toTitle(){
+  showScreen('scrTitle'); setState('title'); $('#hud').classList.remove('on'); $('#dialogue').classList.remove('on');
+  $('#attractBadge').classList.remove('on'); if(AC)startMusic('title'); anyInputAt=performance.now();
+  const p1=players[0]; if(p1)teleportPlayer(p1,-18,2.5);
+}
+function gameOver(){
+  if(G.over)return; G.over=true; SFX.lose(); hubResult(false);
+  if(!hubInSession&&G.score>best.score){ best.score=G.score; best.time=G.time; saveBest(); }
+  showScreen('scrOver'); setState('over');
+}
+function victory(){
+  if(G.won)return; G.won=true; G.score+=Math.max(0,1200-Math.floor(G.time)*2); addScore(0);
+  SFX.win(); burstConfetti(216,5); burstConfetti(210,4);
+  if(!hubInSession&&G.score>best.score){ best.score=G.score; best.time=G.time; saveBest(); }
+  hubResult(true);
+  startDialogue(DLG.bossWin,()=>{ showScreen('scrWin'); setState('win'); });
+  toast('Uncle Goldbeak is cured!');
+}
+function exitAttract(){ if(G.state!=='attract')return; keyHit.clear(); $('#attractBadge').classList.remove('on'); players[0].ai=false; if(players[0])players[0].hp=3; toTitle(); }
+function enterAttract(){
+  resetWorld(); G.score=0; G.gems=0; G.shards=0; G.time=0;
+  const p1=players[0]; p1.hp=99; p1.ai=true; p1.aiWp=0; p1.dead=false; teleportPlayer(p1,-18,2.5);
+  showScreen(null); setState('attract'); $('#hud').classList.add('on'); $('#attractBadge').classList.add('on');
+  if(AC&&curTrack!=='jungle')startMusic('jungle');
+}
+// Attract waypoints: visit every system (gaps, spring, swing, vine, swim, volcano, boss view)
+const ATTRACT_WPS=[[-8,1],[6,1],[12,2],[22,1],[31,3],[38,1],[44,5],[58,1],[64,2],[74,1],[88,1],[98,2],[110,0],[126,2],[140,2],[152,3],[166,1],[178,1],[192,1],[206,1],[216,2]];
+function attractInput(pl,dt){
+  const pos=playerPos(pl); const wp=ATTRACT_WPS[pl.aiWp%ATTRACT_WPS.length];
+  const dx=wp[0]-pos.x; if(Math.abs(dx)<1.2&&Math.abs(wp[1]-pos.y)<2.2){ pl.aiWp++; }
+  const nx=ATTRACT_WPS[pl.aiWp%ATTRACT_WPS.length];
+  let x=Math.sign(nx[0]-pos.x); let jump=false,pound=false,peck=false;
+  const vel=pl.body.linvel();
+  // Jump gaps / rise to waypoint; pound when high above cracked/boss zone; peck near enemies
+  if((nx[1]>pos.y+1.2||Math.abs(nx[0]-pos.x)>3&&vel.y<0.2)&&pl.grounded)jump=true;
+  if(!pl.grounded&&vel.y<-2&&(pos.y> (nx[1]+2)))pound=false; // keep smooth; pound only over cracks
+  for(const c of cracked){ if(!c.broken&&Math.abs(pos.x-c.x)<0.6&&pos.y>c.y+1&&vel.y<0)pound=true; }
+  for(const e of enemies){ if(e.alive&&Math.abs(e.x-pos.x)<1.4&&Math.abs(e.y-pos.y)<1)peck=true; }
+  if(pos.y<-6)teleportPlayer(pl,G.checkpoint.x,G.checkpoint.y+2);
+  return{x,y:0,jumpP:jump,jumpH:jump,peckP:peck,poundP:pound,dashH:Math.abs(dx)>6,interP:false,pauseP:false,ai:true};
+}
+// ---------- Player physics & actions (Rapier dynamic capsule) ----------
+function isInWater(pl){ const p=playerPos(pl); return waters.some(w=>p.x>w.x1&&p.x<w.x2&&p.y<w.yTop&&p.y>w.yBot-2); }
+function groundCheck(pl){
+  const p=playerPos(pl);
+  const ray=new RAPIER.Ray({x:p.x,y:p.y-0.8}, {x:0,y:-1});
+  const hit=world.castRay(ray,0.45,true,undefined,undefined,pl.col);
+  return !!hit;
+}
+function damagePlayer(pl,srcX,kind){
+  if(pl.invuln>0||pl.dead||G.state==='attract')return;
+  pl.hp--; pl.invuln=1.4; SFX.hurt(); G.shake=settings.reduced?0.15:0.45;
+  $('#vignette').classList.add('hit'); setTimeout(()=>$('#vignette').classList.remove('hit'),180);
+  const p=playerPos(pl); spawnParticles(p.x,p.y+1,0xFF6B5E,10,3.5,0.6);
+  const dir=srcX!==undefined?Math.sign(p.x-srcX)||1: -pl.face;
+  const v=pl.body.linvel(); pl.body.setLinvel({x:dir*4.5,y:6,z:0},true);
+  updateHUD();
+  if(pl.hp<=0){ pl.dead=true; pl.respawnT=1.0; toast(pl.idx===0?'Wally is wiped out!':'Player 2 is wiped out!'); }
+}
+function healPlayer(pl,n){ pl.hp=Math.min(pl.maxHp,pl.hp+n); updateHUD(); }
+function stompCheck(pl,en){
+  const p=playerPos(pl), v=pl.body.linvel();
+  return v.y<-1 && p.y>en.y+0.7;
+}
+function defeatEnemy(en,byPound){
+  if(!en.alive)return;
+  if(en.kind==='turtle'){
+    // Turtle becomes a kickable shell instead of dying
+    en.alive=false; en.mesh.visible=false; spawnShell(en.x,en.y+0.3); SFX.kick(); addScore(150); return;
+  }
+  en.alive=false; en.mesh.visible=false; SFX.peck(); addScore(200);
+  const p=en; spawnParticles(en.x,en.y+0.5,en.kind==='bee'?0xFFD93D:0x7BE495,12,3.5,0.7);
+  if(Math.random()<0.22) addPickup('gem',en.x,en.y+1.2).mesh.visible=true;
+}
+function spawnShell(x,y){
+  const mesh=ball(0.5,toonMat(0x2E8B57)); mesh.scale.y=0.6; mesh.position.set(x,y,0); scene.add(mesh);
+  const body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,y,0).lockRotations());
+  const col=world.createCollider(RAPIER.ColliderDesc.ball(0.5).setFriction(0.4).setRestitution(0.3),body);
+  shells.push({mesh,body,col,vx:0,life:14});
+  // shells are visual+physics-lite; slide is driven in updateShells for reliability
+}
+function updatePlayer(pl,inp,dt){
+  if(!pl.active){ pl.vis.g.visible=false; return; }
+  pl.vis.g.visible=!pl.dead;
+  if(pl.dead){ pl.respawnT-=dt; if(pl.respawnT<=0){ if(pl.idx===0&&G.state==='play'){ wipes++; if(wipes>=3){ gameOver(); return; } toast('Back in action! Wipes: '+wipes+'/3 — one more and naptime!'); } pl.dead=false; pl.hp=pl.maxHp; const anchor=(players[0]&&players[0].active&&!players[0].dead&&pl.idx===1)?playerPos(players[0]):G.checkpoint; teleportPlayer(pl,(anchor.x!==undefined?anchor.x:G.checkpoint.x)+pl.idx*1.5,G.checkpoint.y+1.5); pl.invuln=2; updateHUD(); } return; }
+  const pos=playerPos(pl); const vel=pl.body.linvel();
+  const inWater=isInWater(pl);
+  if(inWater&&!pl.wasInWater){ SFX.splash(); spawnParticles(pos.x,pos.y+0.5,0x22D3EE,12,3,0.6); }
+  if(!inWater&&pl.wasInWater) spawnParticles(pos.x,pos.y,0x22D3EE,6,2,0.4);
+  pl.wasInWater=inWater;
+  pl.invuln=Math.max(0,pl.invuln-dt); pl.peckCd=Math.max(0,pl.peckCd-dt); pl.peckT=Math.max(0,pl.peckT-dt);
+  if(pl.chili>0){ pl.chili-=dt; if(Math.random()<0.5)spawnParticles(pos.x,pos.y+0.4,0xFF8A2A,1,1.2,0.4,0.14); }
+  pl.grounded=groundCheck(pl); if(pl.grounded){ pl.coyote=0.12; pl.jumps=0; if(pl.pounding){ pl.pounding=false; landPound(pl,pos); } } else pl.coyote-=dt;
+  // Climbing vines
+  const nearVine=vines.find(v=>Math.abs(pos.x-v.x)<0.85&&pos.y>v.yBot-0.5&&pos.y<v.yTop+0.5);
+  if(nearVine&&(Math.abs(inp.y)>0.4||pl.climbing)){
+    if(Math.abs(inp.y)>0.2)pl.climbing=true;
+  } else pl.climbing=false;
+  if(inp.jumpP&&pl.climbing){ pl.climbing=false; pl.body.setLinvel({x:inp.x*4,y:8,z:0},true); SFX.jump(); }
+  // Swing ropes: grab when airborne near knob
+  if(!pl.swinging&&!pl.grounded){ for(const sw of swings){ const kx=sw.x+Math.sin(sw.phase)*1.2, ky=sw.topY-3.4+Math.cos(sw.phase)*0.2;
+    if(Math.abs(pos.x-kx)<0.8&&Math.abs(pos.y-ky)<1.1){ pl.swinging=sw; sw.rider=pl; toast('Swing! Jump to let go!'); break; } } }
+  let vx=vel.x, vy=vel.y;
+  const baseSpeed=pl.chili>0?10.5:(inp.dashH?8.2:5.8);
+  if(pl.swinging){
+    const sw=pl.swinging; sw.phase+=dt*1.9;
+    const kx=sw.x+Math.sin(sw.phase)*2.0, ky=sw.topY-3.3+Math.cos(sw.phase)*0.35;
+    teleportPlayer(pl,kx,ky); // pendulum carry (kinematic moment)
+    pl.body.setLinvel({x:Math.cos(sw.phase)*3.5,y:0,z:0},true);
+    if(inp.jumpP){ const boost=Math.cos(sw.phase)*5; pl.swinging.rider=null; pl.swinging=null; pl.body.setLinvel({x:boost+inp.x*2,y:7.5,z:0},true); SFX.spring(); }
+    syncDuckVisual(pl,dt,inp,true); return;
+  }
+  if(pl.climbing&&nearVine){
+    vx=inp.x*1.2; vy=-inp.y*3.4; // y stick: up is negative -> climb up
+    pl.body.setLinvel({x:vx,y:vy,z:0},true); pl.body.setTranslation({x:lerp(pos.x,nearVine.x,0.35),y:pos.y,z:0},true);
+    syncDuckVisual(pl,dt,inp); return;
+  }
+  if(inWater){
+    vx=lerp(vx,inp.x*4.2,0.18); vy=lerp(vy,clamp(-inp.y*3.6,-3.4,3.8),0.16);
+    if(inp.jumpP)vy=4.6; // paddle up
+    vy+=Math.sin(G.sim*3+pl.idx)*0.15;
+    pl.body.setLinvel({x:vx,y:vy,z:0},true);
+  } else if(pl.pounding){
+    vx=lerp(vx,0,0.3); vy=-19; pl.body.setLinvel({x:vx,y:vy,z:0},true);
+  } else {
+    const accel=pl.grounded?0.35:0.16;
+    vx=lerp(vx,inp.x*baseSpeed,accel);
+    if(inp.jumpP){
+      if(pl.grounded||pl.coyote>0){ vy=11.2; pl.coyote=0; pl.jumps=1; SFX.jump(); spawnParticles(pos.x,pos.y-0.7,0xFFFFFF,5,1.6,0.35); }
+      else if(pl.jumps<2){ vy=9.6; pl.jumps=2; SFX.double(); }
+    }
+    // Variable jump + flutter-glide: hold jump while falling after double jump
+    if(!pl.grounded&&vy<0&&inp.jumpH&&pl.jumps>=2) vy=Math.max(vy,-2.1);
+    if(inp.poundP&&!pl.grounded&&!pl.pounding){ pl.pounding=true; SFX.pound(); vy=-6; }
+    // Peck attack
+    if(inp.peckP&&pl.peckCd<=0){ pl.peckCd=0.32; pl.peckT=0.22; SFX.peck(); peckAttack(pl); }
+    pl.body.setLinvel({x:vx,y:vy,z:0},true);
+  }
+  if(pos.x<-26)pl.body.setTranslation({x:-26,y:pos.y,z:0},true);
+  if(pos.y<-7){ if(G.state==='attract'){ teleportPlayer(pl,G.checkpoint.x,G.checkpoint.y+2); } else { damagePlayer(pl,pos.x,'fall'); if(!pl.dead)teleportPlayer(pl,G.checkpoint.x,G.checkpoint.y+1.5); else teleportPlayer(pl,G.checkpoint.x,G.checkpoint.y+1.5); } }
+  syncDuckVisual(pl,dt,inp);
+}
+function landPound(pl,pos){
+  SFX.pound(); G.shake=settings.reduced?0.12:0.5; spawnParticles(pos.x,pos.y-0.6,0xD9C99A,14,4,0.6);
+  // Break cracked block below
+  for(const c of cracked){ if(!c.broken&&Math.abs(pos.x-c.x)<1.6&&Math.abs((pos.y-1)-c.y)<1.4){ c.broken=true; c.mesh.visible=false; c.phys.col.setEnabled(false); SFX.bossHit(); spawnParticles(c.x,c.y,0xB08968,16,4,0.8); addScore(150); toast('Cracked it! Secret sparkle!'); addPickup('gem',c.x,c.y+1); } }
+  // Bounce on enemies below / boss head handled in enemy checks; springs boost
+  const v=pl.body.linvel(); pl.body.setLinvel({x:v.x,y:5.5,z:0},true);
+}
+function peckAttack(pl){
+  const pos=playerPos(pl); const hx=pos.x+pl.face*1.15, hy=pos.y+0.3;
+  for(const en of enemies){ if(!en.alive)continue; if(Math.abs(en.x-hx)<1.0&&Math.abs(en.y-hy)<1.1){ if(en.kind==='turtle'||en.kind==='snake'||en.kind==='crab'||en.kind==='bee')defeatEnemy(en,false); else if(en.kind==='monkey'){ en.alive=false; en.mesh.visible=false; SFX.peck(); addScore(250); spawnParticles(en.x,en.y+0.6,0xFFD93D,12,3.5,0.7);} return; } }
+  for(const sh of shells){ const sp=sh.body.translation(); if(Math.abs(sp.x-hx)<1.1&&Math.abs(sp.y-hy)<1.1){ sh.vx=pl.face*11; SFX.kick(); addScore(50); } }
+  // Boss head peck does nothing (must pound) — give feedback
+  if(boss&&(boss.state==='dizzy')&&Math.abs(pos.x-boss.x)<2.2&&Math.abs(pos.y-boss.y)<3.2) toast('Pound his head! △ in the air!');
+}
+function syncDuckVisual(pl,dt,inp,inSwing=false){
+  const pos=playerPos(pl); const vel=pl.body.linvel(); const g=pl.vis.g;
+  g.position.set(pos.x,pos.y-0.85,0);
+  const speed=Math.abs(vel.x); const inWater=isInWater(pl);
+  if(Math.abs(inp.x)>0.1||(pl.ai&&speed>0.4)) pl.face=inp.x!==0?Math.sign(inp.x):pl.face;
+  if(pl.ai&&Math.abs(vel.x)>0.3)pl.face=Math.sign(vel.x);
+  g.scale.x=pl.face>=0?1:-1;
+  pl.walk+=dt*(2+speed*1.6);
+  const wob=settings.reduced?0.35:1;
+  if(inWater){ g.rotation.z=Math.sin(G.sim*4)*0.08; g.rotation.x=0.35; pl.vis.wingL.rotation.z=Math.sin(G.sim*10)*0.7-0.4; pl.vis.wingR.rotation.z=-Math.sin(G.sim*10)*0.7+0.4; }
+  else if(pl.climbing){ g.rotation.z=0; pl.vis.wingL.rotation.z=Math.sin(pl.walk*2)*0.5; pl.vis.wingR.rotation.z=-Math.sin(pl.walk*2)*0.5; }
+  else if(!pl.grounded){ g.rotation.z=clamp(-vel.x*0.016,-0.25,0.25)*wob; const glide=vel.y<0&&pl.jumps>=2;
+    pl.vis.wingL.rotation.z=glide?Math.sin(G.sim*26)*0.9+1.15:-0.25+Math.sin(G.sim*10)*0.15;
+    pl.vis.wingR.rotation.z=glide?-Math.sin(G.sim*26)*0.9-1.15:0.25-Math.sin(G.sim*10)*0.15; }
+  else if(speed>0.4){ g.rotation.z=Math.sin(pl.walk*2)*0.07*wob; g.position.y+=Math.abs(Math.sin(pl.walk*2))*0.08; pl.vis.wingL.rotation.z=Math.sin(pl.walk*2)*0.45; pl.vis.wingR.rotation.z=-Math.sin(pl.walk*2)*0.45; }
+  else { g.rotation.z=Math.sin(G.sim*2+pl.idx*2)*0.03; pl.vis.wingL.rotation.z=Math.sin(G.sim*2.2)*0.08; pl.vis.wingR.rotation.z=-Math.sin(G.sim*2.2)*0.08; }
+  if(pl.pounding)g.rotation.x=0.6;
+  else if(!inWater)g.rotation.x=0;
+  pl.vis.tail.rotation.z=Math.sin(pl.walk*3)*0.25; pl.vis.headG.rotation.y=clamp(vel.x*0.03,-0.3,0.3);
+  pl.vis.headG.position.y=1.62+(pl.peckT>0?-0.08:Math.sin(pl.walk*2)*0.03);
+  if(pl.peckT>0){ pl.vis.headG.position.z=0.32*(pl.peckT/0.22); } else pl.vis.headG.position.z=0;
+  // invulnerability blink
+  g.visible=pl.invuln>0?(Math.floor(G.sim*14)%2===0):true;
+  if(pl.chili>0)g.position.z+=Math.sin(G.sim*30)*0.02;
+}
+// ---------- World updates: enemies, shells, projectiles, boss, pickups ----------
+function updateEnemies(dt){
+  for(const en of enemies){
+    if(!en.alive)continue; en.t+=dt;
+    if(en.kind==='snake'){ en.x=en.home.x+Math.sin(en.t*0.9)*1.6; en.mesh.position.set(en.x,en.home.y+Math.sin(en.t*6)*0.05,0); en.mesh.rotation.y=Math.cos(en.t*0.9)>0?0:Math.PI; }
+    else if(en.kind==='bee'){ en.x=en.home.x+Math.sin(en.t*0.8)*2.2; en.y=en.home.y+Math.sin(en.t*2.4)*0.55; en.mesh.position.set(en.x,en.y,0); if(en['w-1'])en['w-1'].rotation.z=Math.sin(en.t*28)*0.6; if(en['w1'])en['w1'].rotation.z=-Math.sin(en.t*28)*0.6; }
+    else if(en.kind==='crab'){ en.x=en.home.x+Math.sin(en.t*1.1)*1.8; en.mesh.position.set(en.x,en.home.y,0); }
+    else if(en.kind==='turtle'){ en.x=en.home.x+Math.sin(en.t*0.6)*1.3; en.mesh.position.set(en.x,en.home.y,0); }
+    else if(en.kind==='monkey'){ en.mesh.position.set(en.home.x,en.home.y+Math.sin(en.t*2)*0.08,0); en.mesh.rotation.z=Math.sin(en.t*1.5)*0.08;
+      en.throwCd-=dt; const p1=players[0]; const pp=p1?playerPos(p1):{x:0,y:0};
+      if(en.throwCd<=0&&Math.abs(pp.x-en.home.x)<13&&G.state==='play'){ en.throwCd=rand(2.2,3.4); throwCoconut(en.home.x,en.home.y+1.4,pp.x); } }
+    // Player contact
+    for(const pl of players){ if(!pl.active||pl.dead)continue; const pp=playerPos(pl);
+      if(Math.abs(pp.x-en.x)<(en.r+0.55)&&Math.abs(pp.y-en.y)<1.05){
+        if(stompCheck(pl,en)||pl.pounding){ defeatEnemy(en,true); const v=pl.body.linvel(); pl.body.setLinvel({x:v.x,y:pl.pounding?7:8.5,z:0},true); pl.pounding=false; }
+        else if(pl.peckT>0){ defeatEnemy(en,false); }
+        else damagePlayer(pl,en.x,en.kind);
+      } }
+  }
+  // Projectiles (monkey coconuts)
+  for(let i=projectiles.length-1;i>=0;i--){ const pr=projectiles[i]; pr.vy-=14*dt; pr.x+=pr.vx*dt; pr.y+=pr.vy*dt; pr.mesh.position.set(pr.x,pr.y,0); pr.mesh.rotation.z+=dt*6; pr.life-=dt;
+    let dead=pr.life<=0||pr.y<-4;
+    for(const pl of players){ if(pl.active&&!pl.dead&&Math.abs(playerPos(pl).x-pr.x)<0.7&&Math.abs(playerPos(pl).y-pr.y)<0.9){ damagePlayer(pl,pr.x,'coconut'); dead=true; } }
+    if(dead){ scene.remove(pr.mesh); projectiles.splice(i,1); } }
+  // Shells slide & bonk enemies
+  for(let i=shells.length-1;i>=0;i--){ const sh=shells[i]; sh.life-=dt; const sp=sh.body.translation();
+    sh.body.setLinvel({x:sh.vx,y:sh.body.linvel().y,z:0},true); sh.vx*=Math.pow(0.55,dt); if(Math.abs(sh.vx)<0.2)sh.vx=0;
+    sh.mesh.position.set(sp.x,sp.y,0); sh.mesh.rotation.z-=sh.vx*dt*1.4;
+    for(const en of enemies){ if(en.alive&&Math.abs(en.x-sp.x)<1&&Math.abs(en.y-sp.y)<1&&Math.abs(sh.vx)>2){ defeatEnemy(en,false); sh.vx=-sh.vx*0.7; addScore(100); } }
+    for(const pl of players){ if(pl.active&&!pl.dead&&Math.abs(playerPos(pl).x-sp.x)<0.8&&Math.abs(playerPos(pl).y-sp.y)<0.9&&Math.abs(sh.vx)>4) damagePlayer(pl,sp.x,'shell'); }
+    if(sh.life<=0||sp.y<-6){ scene.remove(sh.mesh); world.removeRigidBody(sh.body); shells.splice(i,1); } }
+}
+function throwCoconut(x,y,targetX){
+  const mesh=ball(0.26,toonMat(0x6B4226)); mesh.position.set(x,y,0); scene.add(mesh);
+  const dx=targetX-x; projectiles.push({mesh,x,y,vx:clamp(dx*0.55,-4,4),vy:4.2,life:4});
+  SFX.peck();
+}
+function updateBoss(dt){
+  if(!boss)return; const p1=players[0]; const pp=p1?playerPos(p1):{x:0,y:0};
+  if(boss.state==='sleep'){ boss.mesh.position.set(boss.x,0,0); if(pp.x>194&&G.state!=='title'){ boss.state='idle'; boss.timer=1.2; G.bossActive=true; $('#bossWrap').classList.add('on'); startMusic('boss'); toast('The Idol Guardian wakes!'); } return; }
+  if(boss.state==='dead'){ boss.mesh.rotation.z=lerp(boss.mesh.rotation.z,1.35,dt*2); boss.mesh.position.y=lerp(boss.mesh.position.y,-0.6,dt*2); return; }
+  boss.timer-=dt; boss.flash=Math.max(0,boss.flash-dt);
+  // Kinematic body follows boss.x/y (y is center)
+  boss.body.setNextKinematicTranslation({x:boss.x,y:boss.y,z:0}); boss.mesh.position.set(boss.x,boss.y-1.8,0);
+  if(boss.flash>0)boss.mesh.traverse(o=>{if(o.isMesh&&o.material&&o.material.emissive!==undefined){}});
+  if(boss.state==='idle'){ boss.x+=Math.sign(pp.x-boss.x)*dt*1.1; boss.x=clamp(boss.x,196,216); if(boss.timer<=0){ boss.state='jump'; boss.vy=10.5; boss.vx=clamp((pp.x-boss.x)*0.7,-4.5,4.5); SFX.pound(); } }
+  else if(boss.state==='jump'){ boss.vy-=22*dt; boss.x+=boss.vx*dt; boss.y+=boss.vy*dt; if(boss.y<=1.8&&boss.vy<0){ boss.y=1.8; boss.state='stompPause'; boss.timer=0.7; G.shake=settings.reduced?0.15:0.6; SFX.bossHit(); spawnParticles(boss.x,0.3,0xD9C99A,18,4.5,0.7);
+    // Shockwave damage if player grounded nearby
+    for(const pl of players){ if(pl.active&&!pl.dead&&pl.grounded&&Math.abs(playerPos(pl).x-boss.x)<3.4) damagePlayer(pl,boss.x,'shock'); }
+    // Become dizzy briefly after every stomp — the pound window!
+    boss.state='dizzy'; boss.timer=2.2; boss.stars.visible=true; } }
+  else if(boss.state==='dizzy'){ boss.stars.rotation.y+=dt*4; boss.mesh.rotation.z=Math.sin(G.sim*10)*0.03; if(boss.timer<=0){ boss.stars.visible=false; boss.mesh.rotation.z=0; boss.state='idle'; boss.timer=rand(1,1.8); } }
+  else if(boss.state==='stompPause'){ if(boss.timer<=0){ boss.state='idle'; boss.timer=rand(0.8,1.6); } }
+  // Player vs boss: pound on head while dizzy = damage; otherwise contact hurts
+  for(const pl of players){ if(!pl.active||pl.dead)continue; const p=playerPos(pl); const v=pl.body.linvel();
+    const headY=boss.y+1.8, onHead=p.y>headY+0.6&&Math.abs(p.x-boss.x)<1.5&&v.y<0;
+    if(onHead&&(pl.pounding||v.y<-3)){
+      if(boss.state==='dizzy'){ boss.hp--; boss.flash=0.3; SFX.bossHit(); G.shake=0.7; $('#bossFill').style.width=(boss.hp/3*100)+'%'; spawnParticles(boss.x,headY+1,0xFFC93C,18,4.5,0.8); pl.body.setLinvel({x:v.x,y:10,z:0},true); pl.pounding=false; addScore(500);
+        toast(boss.hp>0?('Guardian cracked! '+boss.hp+' to go!'):'Guardian crumbles!');
+        if(boss.hp<=0){ boss.state='dead'; boss.stars.visible=false; $('#bossWrap').classList.remove('on'); G.bossActive=false; addScore(1000); burstConfetti(boss.x,4);
+          // Award final shard with fanfare, then cure after short delay
+          G.shards=4; SFX.shard(); updateHUD(); setTimeout(()=>{ if(G.state==='play')victory(); },900); }
+        else { boss.state='idle'; boss.timer=1.2; boss.stars.visible=false; }
+      } else { // bounce off while awake, no damage to boss
+        pl.body.setLinvel({x:v.x,y:9,z:0},true); if(pl.pounding){pl.pounding=false; toast('He\u2019s too sturdy — wait for dizzy stars!');}
+      }
+    } else if(Math.abs(p.x-boss.x)<1.7&&Math.abs(p.y-boss.y)<2.4&&boss.state!=='dizzy'){ damagePlayer(pl,boss.x,'boss'); }
+  }
+  $('#bossFill').style.width=(Math.max(0,boss.hp)/3*100)+'%';
+}
+function updatePickupsAndZones(dt){
+  const p1=players[0];
+  for(const pk of pickups){ if(pk.taken)continue; pk.mesh.rotation.y+=dt*2.2; pk.mesh.position.y=pk.baseY+Math.sin(G.sim*2.4+pk.phase)*0.16;
+    for(const pl of players){ if(!pl.active||pl.dead)continue; const pp=playerPos(pl);
+      if(Math.abs(pp.x-pk.x)<0.95&&Math.abs(pp.y-pk.y)<1.25){
+        pk.taken=true; pk.mesh.visible=false;
+        if(pk.kind==='gem'){ G.gems++; addScore(100); SFX.gem(); spawnParticles(pk.x,pk.y,0x22D3EE,7,2.6,0.5); }
+        else if(pk.kind==='feather'){ G.feathers++; addScore(250); SFX.feather(); toast('Golden feather! Fancy!'); spawnParticles(pk.x,pk.y,0xFFD93D,10,3,0.7); }
+        else if(pk.kind==='chili'){ pl.chili=5; SFX.chili(); toast('CHILI ZOOM! Hold on to your tail!'); addScore(50); }
+        else if(pk.kind==='cream'){ healPlayer(pl,1); SFX.cream(); toast('Ice cream! +1 heart. Brain freeze worth it.'); addScore(50); }
+        else if(pk.kind==='shard'){ G.shards=Math.min(4,G.shards+1); addScore(1000); SFX.shard(); burstConfetti(pk.x,pk.y); updateHUD();
+          startDialogue(DLG.shard,()=>{ toast('Remedy Shards: '+G.shards+'/4'); }); }
+        updateHUD(); break;
+      } } }
+  // Springs
+  for(const pl of players){ if(!pl.active||pl.dead)continue; const pp=playerPos(pl); const v=pl.body.linvel();
+    for(const sp of springs){ if(Math.abs(pp.x-sp.x)<0.85&&Math.abs(pp.y-sp.y)<0.9&&v.y<=0.5){ pl.body.setLinvel({x:v.x,y:15.5,z:0},true); SFX.spring(); sp.mesh.scale.y=0.85; setTimeout(()=>sp.mesh.scale.y=1,140); spawnParticles(sp.x,sp.y,0xFF6B5E,6,2.4,0.45); } }
+    // Hazards
+    for(const hz of hazards){ if(pp.x>hz.x1&&pp.x<hz.x2&&Math.abs(pp.y-hz.y)<1.15){ if(hz.kind==='lava'){ damagePlayer(pl,pp.x,'lava'); pl.body.setLinvel({x:pl.body.linvel().x,y:9,z:0},true); } else damagePlayer(pl,(hz.x1+hz.x2)/2,'spike'); } }
+    // Checkpoints
+    for(const cp of checkpoints){ if(!cp.got&&Math.abs(pp.x-cp.x)<1.2){ cp.got=true; cp.flag.material.color.set(0x7BE495); cp.lamp.intensity=14; G.checkpoint={x:cp.x,y:2.5}; G.zone=cp.zone; SFX.check(); toast('Checkpoint! '+cp.zone); updateHUD();
+      const key=cp.zone==='Sunken Ruins'?'ruins':cp.zone==='Chili Volcano'?'volcano':cp.zone==='Idol Temple'?'temple':null;
+      if(key&&DLG[key]){ const spot=tikiSpots.find(t=>t.key===key); if(spot&&!spot.talked){ spot.talked=true; startDialogue(DLG[key]); } }
+      if(AC)startMusic(trackForZone()); } }
+    // NPC talk prompt handled in main prompt logic; zone label
+  }
+  // Movers (kinematic platforms carry player via physics friction/step)
+  for(const mv of movers){ mv.t+=dt*mv.speed; const off=Math.sin(mv.t)*mv.range; const nx=mv.home.x+(mv.axis==='x'?off:0), ny=mv.home.y+(mv.axis==='y'?off:0);
+    mv.dx=nx-mv.px; mv.dy=ny-mv.py; mv.px=nx; mv.py=ny; mv.x=nx; mv.y=ny; mv.mesh.position.set(nx,ny,0); mv.phys.body.setNextKinematicTranslation({x:nx,y:ny,z:0}); }
+  for(const c of crumbles){
+    let stood=false; for(const pl of players){ if(pl.active&&!pl.dead&&pl.grounded&&Math.abs(playerPos(pl).x-c.x)<1.9&&Math.abs(playerPos(pl).y-(c.y+0.9))<0.7)stood=true; }
+    if(c.state==='idle'&&stood){ c.state='shake'; c.timer=0.55; }
+    else if(c.state==='shake'){ c.timer-=dt; c.mesh.position.x=c.x+Math.sin(G.sim*40)*0.05; if(c.timer<=0){ c.state='gone'; c.timer=2.2; c.mesh.visible=false; c.phys.col.setEnabled(false); } }
+    else if(c.state==='gone'){ c.timer-=dt; if(c.timer<=0){ c.state='idle'; c.mesh.visible=true; c.mesh.position.x=c.x; c.phys.col.setEnabled(true); c.phys.body.setNextKinematicTranslation({x:c.x,y:c.y,z:0}); } }
+  }
+  for(const sw of swings){ if(sw.rider===null||sw.rider===undefined){ /* free pendulum in updateVisuals */ } sw.anchor.rotation.z=Math.sin(sw.phase)*0.28; if(!sw.rider)sw.phase+=dt*0.9; }
+  for(const p of particles){ if(!p.alive)continue; p.life-=dt; if(p.life<=0){ p.alive=false; p.mesh.visible=false; continue; } p.vy-=5*dt; p.mesh.position.x+=p.vx*dt; p.mesh.position.y+=p.vy*dt; p.mesh.scale.setScalar(Math.max(0.2,p.life/p.max)); }
+  for(const f of flickers){ f.scale.setScalar(1+Math.sin(G.sim*13+f.position.x)*0.25); }
+  for(const cl of clouds){ cl.position.x+=cl.userData.drift*dt; if(cl.position.x>235)cl.position.x=-32; }
+  if(uncleGroup){ uncleGroup.position.y=0.2+Math.sin(G.sim*1.6)*0.16; uncleGroup.rotation.z=Math.sin(G.sim*1.1)*0.05; }
+  for(const t of tikiSpots){ t.mesh.position.y=t.y-1+0.2+Math.sin(G.sim*2.4+t.x)*0.09; t.mesh.rotation.y=Math.sin(G.sim*0.9+t.x)*0.25; }
+  if(templeIdol){ templeIdol.rotation.y+=dt*0.4; templeIdol.position.y=3.6+Math.sin(G.sim*1.8)*0.12; }
+}
+// ---------- HUD, camera, prompts ----------
+function updateHUD(){
+  const p1=players[0]; const hearts=$('#hearts');
+  if(p1){ let h=''; for(let i=0;i<p1.maxHp;i++)h+=i<p1.hp?'<span>❤️</span>':'<span class="off">🖤</span>'; hearts.innerHTML=h; }
+  $('#statGems').textContent=G.gems; $('#statScore').textContent=G.score; $('#statTime').textContent=fmtTime(G.time);
+  $('#zoneLabel').textContent=G.zone;
+  $('#objLabel').textContent=G.shards>=4?'Cure Uncle at the Temple!':('Remedy Shards '+G.shards+'/4 — '+(G.zone==='Idol Temple'?'Pound the Guardian!':'Keep waddling →'));
+  const sh=$('#shards'); const cols=['#7BE495','#22D3EE','#FF8A5E','#FFD93D'];
+  sh.innerHTML=[0,1,2,3].map(i=>`<span class="shard ${i<G.shards?'got':''}" style="background:${i<G.shards?cols[i]:'#2A2A2A'};color:${cols[i]}"></span>`).join('');
+  const p2=players[1]; const p2h=$('#p2Hud');
+  if(p2&&p2.active){ p2h.style.display='block'; let h='P2 '; for(let i=0;i<p2.maxHp;i++)h+=i<p2.hp?'❤️':'🖤'; p2h.textContent=h+(p2.chili>0?' 🌶 ZOOM!':''); }
+  else p2h.style.display='none';
+  if(hubInSession)$('#hubLabel').textContent='Hub parallel • '+(hubInfo?(hubInfo.players.length+' player(s)'):'')+' • Score race';
+}
+function updateCamera(dt){
+  const act=players.filter(p=>p.active&&!p.dead);
+  let tx=G.camX, ty=3.2;
+  if(act.length){ let sx=0,sy=0; for(const p of act){ const pp=playerPos(p); sx+=pp.x; sy+=pp.y; } tx=sx/act.length; ty=sy/act.length*0.55+2.4;
+    // lookahead by facing/velocity of P1
+    const v=players[0].body.linvel(); tx+=clamp(v.x*0.55,-2.5,2.5); }
+  tx=clamp(tx,-6,214); ty=clamp(ty,1.8,7.5);
+  const calm=settings.reduced?0.45:1;
+  G.camX=lerp(G.camX,tx,1-Math.pow(0.0015,dt)); G.camY=lerp(G.camY,ty,1-Math.pow(0.002,dt));
+  G.shake=Math.max(0,G.shake-dt*1.8);
+  const shx=(Math.random()-0.5)*G.shake*0.5*calm, shy=(Math.random()-0.5)*G.shake*0.4*calm;
+  const dist=act.length>1?clamp(15+Math.abs(playerPos(players[0]).x-playerPos(players[1]).x)*0.55,16,24):16.5;
+  camera.position.set(G.camX+shx,G.camY+2.2+shy,dist);
+  camera.lookAt(G.camX+shx,G.camY+0.6,0);
+  sunLight.position.set(G.camX+14,26,12); sunLight.target.position.set(G.camX,0,0);
+  // Sky follows subtly for parallax feel
+  scene.background.setHSL(0.52,0.55,clamp(0.72-(G.camX/240)*0.08,0.6,0.75));
+}
+function nearestTalk(){
+  const pp=playerPos(players[0]);
+  for(const t of tikiSpots){ if(Math.abs(pp.x-t.x)<2.4)return{type:'tiki',spot:t}; }
+  if(Math.abs(pp.x-(-19))<3)return{type:'uncle'};
+  for(const s of signs){ if(Math.abs(pp.x-s.x)<1.6)return{type:'sign',sign:s}; }
+  return null;
+}
+// ---------- Main state handling & loop ----------
+let lastNow=performance.now(), probeInput={x:0,y:0,fire:false}, firstFrameDone=false;
+function frame(){
+  const now=performance.now(); let dt=Math.min(0.05,(now-lastNow)/1000); lastNow=now;
+  try{ stepGame(dt); }catch(err){ console.error(err); }
+  keyHit.clear();
+  if(renderer)renderer.render(scene,camera);
+  requestAnimationFrame(frame);
+}
+function stepGame(dt){
+  G.sim+=dt;
+  const st=G.state;
+  // Attract trigger: 10s idle on title/menu screens only
+  if((st==='title'||st==='how'||st==='about'||st==='settings')&&st!=='settings'){
+    if(performance.now()-anyInputAt>10000&&!hubInSession) enterAttract();
+  }
+  if(st==='title'||st==='how'||st==='about'||st==='over'||st==='win'){
+    const ui=uiInput();
+    const sel=st==='title'?'#menuTitle':st==='over'?'#menuOver':st==='win'?'#menuWin':null;
+    if(sel){ if(ui.down)focusMenu(sel,G.menuFocus+1); if(ui.up)focusMenu(sel,G.menuFocus-1);
+      if(ui.ok){ const list=[...document.querySelectorAll(sel+' .btn:not(:disabled)')]; if(list[G.menuFocus]){ SFX.click(); menuAction(list[G.menuFocus].dataset.act); } } }
+    else { if(ui.back)goBack(); if(ui.ok&&(st==='how'||st==='about'))goBack(); }
+    // Idle world drifts behind title: gentle camera pan + physics idle step
+    G.camX=lerp(G.camX,-8+Math.sin(G.sim*0.12)*3,0.01); G.camY=lerp(G.camY,3.4,0.02);
+    camera.position.set(G.camX,G.camY+2.2,17); camera.lookAt(G.camX,G.camY+0.6,0);
+    world.step(); syncIdleVisuals(dt);
+    probeInput={x:ui.x||0,y:ui.y||0,fire:!!ui.ok}; return;
+  }
+  if(st==='settings'){
+    const ui=uiInput();
+    if(ui.up)focusSettings(G.settingsFocus-1); if(ui.down)focusSettings(G.settingsFocus+1);
+    if(ui.left)adjustSetting(-1); if(ui.right||ui.ok)adjustSetting(1);
+    if(ui.back||ui.pause)goBack();
+    world.step(); syncIdleVisuals(dt); probeInput={x:ui.x||0,y:ui.y||0,fire:!!ui.ok}; return;
+  }
+  if(st==='pause'){
+    const ui=uiInput();
+    if(ui.down)focusMenu('#menuPause',G.menuFocus+1); if(ui.up)focusMenu('#menuPause',G.menuFocus-1);
+    if(ui.ok){ const list=[...document.querySelectorAll('#menuPause .btn:not(:disabled)')]; if(list[G.menuFocus])menuAction(list[G.menuFocus].dataset.act); }
+    if(ui.back||ui.pause)resumePlay();
+    probeInput={x:0,y:0,fire:false}; return; // solo pause freezes world (Hub parallel may pause own run per spec)
+  }
+  if(st==='dialogue'){
+    const ui=uiInput(); const p1=playerInput(0);
+    if(ui.ok||p1.jumpP||p1.interP)advanceDialogue();
+    world.step(); // world breathes behind dialogue (frozen players: no updatePlayer)
+    for(const pl of players)if(pl.active)syncDuckVisual(pl,dt,{x:0,y:0});
+    updateCamera(dt); probeInput={x:0,y:0,fire:true}; return;
+  }
+  // play / attract
+  const isAttract=st==='attract';
+  if(isAttract){ playerInput(0); playerInput(1); if(G.state!=='attract')return; } // poll pads so any gamepad press exits attract (pokeInput -> exitAttract)
+  if(hubInSession&&typeof AIHub!=='undefined'&&AIHub.time()<0){ world.step(); updateCamera(dt); probeInput={x:0,y:0,fire:false}; return; } // Hub 3-2-1 countdown
+  if(hubEnded){ probeInput={x:0,y:0,fire:false}; return; }
+  G.time+=dt;
+  // Pause toggle (Esc/Options) — in play only; settings over game per Hub rules
+  const pauseEdge=keyHit.has('Escape')||keyHit.has('KeyP');
+  // Gamepad pause read without consuming player pads twice: check raw pads directly
+  let padPause=false; try{ const gps=navigator.getGamepads(); for(const gp of gps){ if(gp&&gp.buttons[9]&&gp.buttons[9].pressed&&!stepGame._pp)padPause=true; } stepGame._pp=[...(navigator.getGamepads()||[])].some(gp=>gp&&gp.buttons[9]&&gp.buttons[9].pressed); }catch(e){}
+  if((pauseEdge||padPause)&&!isAttract){ showScreen('scrPause'); setState('pause'); SFX.back(); probeInput={x:0,y:0,fire:false}; return; }
+  // Player inputs
+  let in1,in2;
+  if(isAttract){ in1=attractInput(players[0],dt); in2={x:0,y:0,jumpP:false,jumpH:false,peckP:false,poundP:false,dashH:false,interP:false,pauseP:false}; }
+  else { in1=playerInput(0); in2=playerInput(1);
+    // P2 join anytime (standalone + hub parallel local guest shares P1 score)
+    if(players[1]&&!players[1].active&&(in2.joinP||in2.jumpP)){ players[1].active=true; players[1].hp=3; teleportPlayer(players[1],playerPos(players[0]).x+1.5,playerPos(players[0]).y+1); toast('Player 2 joined! Two bills, double trouble!'); SFX.check(); updateHUD(); }
+    // Interact / talk
+    if(in1.interP){ const talk=nearestTalk(); if(talk){ if(talk.type==='tiki'){ startDialogue(DLG[talk.spot.key]||DLG.jungle); } else if(talk.type==='uncle'){ startDialogue(DLG.intro); } else if(talk.type==='sign'){ toast(talk.sign.text); speakGibber(talk.sign.text,600); } } }
+  }
+  probeInput={x:in1.x,y:in1.y,fire:!!(in1.peckP||in1.jumpP)};
+  updatePlayer(players[0],in1,dt);
+  if(players[1])updatePlayer(players[1],players[1].active?in2:{x:0,y:0,jumpP:false,jumpH:false,peckP:false,poundP:false,dashH:false,interP:false,pauseP:false},dt);
+  world.step();
+  // Lock Z after step for 2.5D (Rapier translations constrained, keep visuals clean)
+  for(const pl of players){ if(!pl.active)continue; const t=pl.body.translation(); if(t.z!==0)pl.body.setTranslation({x:t.x,y:t.y,z:0},true); const v=pl.body.linvel(); if(v.z!==0)pl.body.setLinvel({x:v.x,y:v.y,z:0},true); }
+  updateEnemies(dt); updateBoss(dt); updatePickupsAndZones(dt);
+  // Prompt
+  const talk=(!isAttract&&G.state==='play')?nearestTalk():null;
+  const pr=$('#prompt');
+  if(talk){ pr.textContent=talk.type==='sign'?'△ / E — Read sign':'△ / E — Talk'; pr.classList.add('on'); } else pr.classList.remove('on');
+  // Death -> game over when P1 hearts empty and respawn spent (P2 can carry? P1 death = over after grace)
+  if(players[0].hp<=0&&players[0].dead&&players[0].respawnT<=0.05&&G.state==='play'){ /* handled by respawn; only over on fall-loop guard below */ }
+  if(players[0].hp<=0&&!players[0].dead&&G.state==='play'){ /* hp refill on respawn keeps adventure friendly */ }
+  // Friendly fail state: if P1 died 3 times at same checkpoint without progress, offer game over screen via hp system:
+  // Our respawn refills hearts; game over occurs when player chooses? Instead: lava/spike chip + fall uses hearts; when dead timer ends we respawn.
+  // To give a true lose condition: track deaths — after 4 deaths in one run, game over.
+  updateCamera(dt); updateHUDTime();
+  // Zone music follow (not during boss/dialogue fanfare)
+  if(AC&&!G.bossActive&&G.state==='play'){ const want=trackForZone(); if(curTrack!==want&&curTrack!=='title')startMusic(want); }
+  // Hub time-up handled via event; also safety: if hub limit reached, finish
+  if(firstFrameDone===false)firstFrameDone=true;
+}
+function syncIdleVisuals(dt){
+  for(const p of particles){ if(!p.alive)continue; p.life-=dt; if(p.life<=0){p.alive=false;p.mesh.visible=false;continue;} p.mesh.position.y+=p.vy*dt; }
+  for(const cl of clouds){ cl.position.x+=cl.userData.drift*dt; if(cl.position.x>235)cl.position.x=-32; }
+  if(uncleGroup){ uncleGroup.position.y=0.2+Math.sin(G.sim*1.6)*0.16; }
+  if(players[0])syncDuckVisual(players[0],dt,{x:0,y:0});
+  if(boss)boss.mesh.position.y=Math.sin(G.sim*0.8)*0.05;
+}
+function updateHUDTime(){ $('#statTime').textContent=fmtTime(G.time); }
+// Lose condition: 3 full wipes (hearts emptied) in one run = game over. Retry continues from checkpoint with wipes reset.
+let wipes=0;
+// ---------- Boot ----------
+function mapProbeScene(){
+  if(G.state==='title'||G.state==='how'||G.state==='about')return'title';
+  if(G.state==='pause'||G.state==='settings')return'menu';
+  if(G.state==='over')return'over'; if(G.state==='win')return'over';
+  if(G.state==='boot')return'title';
+  return'play';
+}
+async function boot(){
+  const loadText=$('#loadText');
+  try{
+    loadText.textContent='Warming up WebGPU…';
+    await RAPIER.init();
+    world=new RAPIER.World({x:0,y:-22,z:0}); world.timestep=1/60;
+    await initGraphics();
+    loadText.textContent='Planting the jungle…';
+    buildLevel();
+    createPlayer(0,-18,2.5,0x2B5EA7,0x2B5EA7);
+    const p2=createPlayer(1,-16.5,2.5,0xE85D8A,0x1FB6A6); p2.active=false; p2.vis.g.visible=false;
+    buildHow(); buildSettings();
+    // Static screen buttons (Back / touch / error)
+    document.querySelectorAll('[data-act="back"]').forEach(b=>b.addEventListener('click',()=>{audioInit(); goBack();}));
+    $('#touchSettings').addEventListener('click',()=>{ audioInit(); $('#touchWarn').classList.remove('on'); G.returnTo='title'; buildSettings(); showScreen('scrSettings'); setState('settings'); });
+    $('#errorSettings').addEventListener('click',()=>{ $('#errorBox').classList.remove('on'); G.returnTo='title'; buildSettings(); showScreen('scrSettings'); setState('settings'); });
+    addEventListener('gamepadconnected',()=>{ $('#touchWarn').classList.remove('on'); toast('Controller connected! Waddle on!'); pokeInput(); });
+    // Hub probe (in and out of session)
+    if(typeof AIHub!=='undefined'&&AIHub.probe){ AIHub.probe(()=>({scene:mapProbeScene(),menu:(G.state==='pause'||G.state==='settings'),world:G.sim,input:{x:probeInput.x||0,y:probeInput.y||0,fire:!!probeInput.fire}})); }
+    // Touch-only notice: no touch controls by design
+    const touchOnly=('ontouchstart'in window)&&navigator.maxTouchPoints>0&&window.matchMedia&&window.matchMedia('(pointer: coarse)').matches&&!window.matchMedia('(pointer: fine)').matches;
+    if(touchOnly)$('#touchWarn').classList.add('on');
+    $('#loading').style.display='none';
+    // AI Hub session (parallel) vs standalone title
+    let inHub=false;
+    if(typeof AIHub!=='undefined'&&AIHub.active){
+      try{
+        const info=await AIHub.connect({mode:'parallel',seats:[1,4]});
+        if(info){ inHub=true; hubInfo=info; hubInSession=true;
+          AIHub.on('time-up',()=>{ if(!G.won&&!G.over)hubResult(false); });
+          AIHub.on('end',()=>{ hubEnded=true; if(musicTimer)clearInterval(musicTimer); if(AC)masterG.gain.value=0; $('#prompt').classList.remove('on'); toast('Hub round ended'); });
+          AIHub.on('leave',()=>{ /* parallel: round goes on */ });
+          startRun(true); // skip title/attract in session; seeded Math.random already applied by client
+          if(info.splash){ AIHub.ready(); } else { toast('Press any key when ready'); const kick=()=>{ AIHub.ready(); removeEventListener('keydown',kick); removeEventListener('pointerdown',kick); }; addEventListener('keydown',kick); addEventListener('pointerdown',kick); }
+        }
+      }catch(e){ inHub=false; }
+    }
+    if(!inHub){ hubInSession=false; showScreen('scrTitle'); setState('title'); anyInputAt=performance.now(); }
+    updateHUD();
+    requestAnimationFrame(frame);
+  }catch(err){
+    console.error(err);
+    $('#loading').style.display='none';
+    $('#errorText').textContent='WebGPU is required (no fallback). '+(err&&err.message?err.message:'')+' Try recent Chrome/Edge on desktop with WebGPU enabled.';
+    $('#errorBox').classList.add('on');
+    if(typeof AIHub!=='undefined'&&AIHub.active){ try{AIHub.fail('WebGPU unavailable: '+(err&&err.message||err));}catch(e){} }
+    // Still register a probe so the harness can see the failure state
+    if(typeof AIHub!=='undefined'&&AIHub.probe){ try{AIHub.probe(()=>({scene:'title',menu:false,world:0,input:{x:0,y:0,fire:false}}));}catch(e){} }
+  }
+}
+boot();
+
+
+
+
+
+
+
+
+
+
+
+
+
+</script>
+</body>
+</html>

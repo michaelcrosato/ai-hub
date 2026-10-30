@@ -1,0 +1,996 @@
+<!--
+SOURCE INFORMATION
+Date: 2026-10-29 08:49
+Source: SiN (1998), developed by Ritual Entertainment. SiNchrome is an original spiritual successor, not an official SiN product.
+Tech: Three.js r180 WebGPURenderer with WebGPU required and no WebGL fallback; Rapier 3D 0.19.3; Web Audio API; Gamepad API; AI Hub Session Protocol v1 client 1.3.0; MQTT 3.1.1 over WebSocket for standalone rooms. Mission placements are editable in level.json in the development folder.
+Art direction: Original procedural, faceted cel-shaded neon industrial noir.
+Animation: Procedural transforms for characters, weapon, doors, pickups, effects and the scripted attract replay.
+Audio: Original code-generated electronic music, synthesized sound effects and gibberish radio voices with subtitles.
+Online: AI Hub parallel sessions for 1–4 players; standalone 1–4 player side-by-side score races over the public EMQX MQTT relay. Players run separate copies of the mission. Internet access is required for the CDN libraries and online rooms.
+Testing: Lightweight functional checks; no FPS target or optimization requirement. Tested with Chrome 154.0.8037.57 on Linux using headless WebGPU/SwiftShader, an emulated standard gamepad, the AI Hub harness and two live relay clients.
+Environment: Codex CLI (headless); Linux; end-user browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort max.
+Usage: Estimated API cost unknown; total tokens unknown; session time approximately 22 minutes.
+
+TESTING FEEDBACK
+Issues caught: 3: a standalone lobby initialization bug, a tilted first-person camera and a clipped title menu. All were fixed.
+Critical / game-breaking issues: 1, the lobby initialization bug, which prevented standalone multiplayer from joining properly.
+Most helpful test: A two-client live relay test, which found the lobby bug and then verified room creation, joining, synchronized start and score updates.
+Least helpful test: A normal headless WebGPU screenshot; the browser compositor produced blank captures even for a minimal cube. An offscreen WebGPU texture readback was useful instead.
+Testing limits: No physical DualSense controller, remote human playtest or normal desktop GPU presentation was available. Mission progression was accelerated with development test controls.
+
+ENGINE FEEDBACK
+Most liked: Three.js makes procedural 3D art approachable, and Rapier provides a useful kinematic character controller.
+Stuck or guessed wrong: The first guessed Rapier CDN filename returned 404; the published 0.19.3 module is rapier.mjs. Headless WebGPU presentation also required an offscreen readback for visual inspection.
+Most important thing built: The mission, combat, controller-first interface and multiplayer integration around the renderer and physics engine.
+Hardest part: Combining strict WebGPU initialization, first-person physics and two multiplayer contexts in one shareable HTML file.
+Remove or overhaul: The renderer's implicit WebGL fallback when a game explicitly requires WebGPU.
+One change: Provide a public, documented strict-WebGPU-only initialization option and clearer device-loss feedback.
+
+PROMPT FEEDBACK
+Most liked: The specific controller-first, attract-mode and single-file requirements.
+Confusing: The standalone multiplayer format was not specified; this demo uses synchronized side-by-side score races.
+Hardest: Delivering a complete mission, accessible controls, attract mode and both multiplayer contexts together.
+One more test: A full playthrough with physical DualSense controllers and remote players on actual WebGPU-capable devices.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<script type="importmap">
+{
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+
+<meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="5">
+<meta name="hub:session-goal" content="Score the most points in the biotech raid">
+<meta name="hub:session-howto" content="Move LS, aim RS, fire R2, interact Cross, reload Square">
+<meta name="hub:webgpu" content="required">
+<title>SiNchrome | Operation Glasshouse</title>
+<link rel="icon" href="data:,">
+<style>@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800;900&family=IBM+Plex+Mono:wght@400;600;700&display=swap');
+:root{color-scheme:dark;--ink:#e9f6f3;--dim:#a3b2bc;--cyan:#60f5e7;--gold:#f7d55f;--orange:#ff754f;--panel:rgba(10,17,25,.94);--font:'Barlow Condensed',Impact,'Arial Narrow',sans-serif;--mono:'IBM Plex Mono',monospace}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#071018;color:var(--ink);font-family:var(--font);user-select:none}button,input{font:inherit}button{color:inherit;cursor:pointer}#viewport,#viewport canvas{position:absolute;inset:0;width:100%;height:100%;display:block}#viewport:after{content:'';position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(4,10,16,.47),transparent 45%),linear-gradient(0deg,rgba(2,7,13,.38),transparent 30%)}.screen{position:absolute;inset:0}.hidden{display:none!important}.menu-backdrop{background:linear-gradient(90deg,rgba(5,11,17,.99) 0%,rgba(7,15,21,.93) 38%,rgba(7,15,21,.55) 61%,rgba(5,13,19,.1) 100%)}.rule{height:3px;background:linear-gradient(90deg,var(--cyan) 0 74%,transparent 74% 77%,var(--orange) 77% 85%,transparent 85%);width:100%}.eyebrow{font:700 clamp(12px,1.1vw,17px)/1.2 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--cyan)}.title-left{position:absolute;left:6.8vw;top:7vh;bottom:6vh;width:min(48vw,690px);display:flex;flex-direction:column}.brandline{display:flex;align-items:center;gap:14px;letter-spacing:.22em;color:#d7e8e7;font:700 14px var(--mono)}.brandmark{width:30px;height:30px;border:3px solid var(--cyan);transform:skew(-15deg);position:relative}.brandmark:after{content:'';position:absolute;inset:5px;background:var(--cyan)}.logo{margin:3vh 0 0;font-size:clamp(76px,10vw,158px);font-weight:900;line-height:.82;letter-spacing:-.065em;text-transform:uppercase;font-style:italic;text-shadow:5px 5px 0 rgba(67,240,222,.15)}.logo span{color:var(--cyan)}.logo-sub{margin:16px 0 0;font:700 clamp(12px,1.05vw,16px) var(--mono);letter-spacing:.23em;color:#c2d0ce}.title-copy{margin:4vh 0 2vh;max-width:530px}.title-copy h1{font-size:clamp(32px,3.1vw,49px);line-height:.94;margin:0 0 12px;text-transform:uppercase;letter-spacing:.01em}.title-copy p{margin:0;color:#adbfbe;font:400 clamp(16px,1.3vw,20px)/1.35 var(--font);max-width:450px}.menu-list{display:grid;gap:7px;width:min(100%,440px);margin-top:2vh}.menu-btn,.action-btn{min-height:48px;border:1px solid rgba(160,199,198,.25);background:rgba(7,17,23,.74);text-align:left;padding:8px 17px;text-transform:uppercase;font-weight:800;font-size:clamp(19px,1.45vw,25px);letter-spacing:.04em;transition:background .12s,color .12s,border-color .12s;display:flex;align-items:center;justify-content:space-between}.menu-btn:after{content:'›';font-size:27px;color:var(--cyan)}button.selected,button:focus-visible,button:hover{outline:0;background:var(--cyan);border-color:var(--cyan);color:#07151b}.menu-btn.selected:after,.menu-btn:hover:after{color:#07151b}.menu-btn.primary{background:var(--cyan);color:#06141a;border-color:var(--cyan)}.menu-btn.primary.selected,.menu-btn.primary:hover{background:#fff5be;border-color:#fff5be}.menu-btn.primary:after{color:#06141a}.title-foot{margin-top:auto;padding-top:15px;font:600 clamp(10px,.85vw,13px) var(--mono);color:#7c9298;letter-spacing:.12em}.right-stamp{position:absolute;right:5vw;top:7vh;width:220px;text-align:right;text-transform:uppercase}.right-stamp strong{font-size:30px;display:block;color:#fff}.right-stamp span{font:600 12px/1.7 var(--mono);color:var(--cyan);letter-spacing:.12em}.corner-mark{position:absolute;right:5vw;bottom:7vh;border-right:4px solid var(--orange);padding-right:17px;text-align:right;font:700 12px/1.6 var(--mono);letter-spacing:.12em;color:#d3dcda}.corner-mark b{display:block;color:var(--orange);font:900 clamp(28px,4vw,56px)/1 var(--font)}.modal-wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(3,9,14,.83);backdrop-filter:blur(7px);padding:3vh 4vw}.panel{width:min(760px,92vw);max-height:91vh;overflow:auto;background:#0e1b22;border:1px solid #45605e;box-shadow:0 24px 80px #000a;padding:clamp(20px,3vw,42px);position:relative}.panel.wide{width:min(1000px,92vw)}.panel:before{content:'';position:absolute;top:0;left:0;width:33%;height:4px;background:var(--cyan)}.panel h2{font-size:clamp(36px,3.7vw,56px);line-height:.9;text-transform:uppercase;margin:12px 0 20px;letter-spacing:.02em}.panel p,.panel li{font-size:clamp(18px,1.4vw,23px);line-height:1.25;color:#c4d2d0}.panel p{margin:10px 0}.panel .menu-list{max-width:none;width:100%;margin-top:22px}.panel .menu-btn{min-height:52px}.panel .note{font:500 13px/1.5 var(--mono);color:#91a6a4}.control-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 28px}.control-grid div{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid #34474b;font-size:20px}.control-grid b{color:var(--cyan);font-family:var(--mono);font-size:14px;text-align:right}.settings-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:55px;border-bottom:1px solid #34474b;font-size:23px}.settings-row button{min-width:130px;text-align:center;display:block}.settings-row label small{display:block;color:#839994;font:12px var(--mono)}.credits{max-height:48vh;overflow:auto;border-block:1px solid #334647;padding:14px 0}.credits p{font-size:17px;line-height:1.4}.credits b{color:var(--cyan)}.digit-row{display:flex;gap:8px;margin:18px 0}.digit-row button{flex:1;text-align:center;justify-content:center;font:700 clamp(28px,3vw,42px) var(--mono);min-width:0;min-height:62px}.room-code{font:700 clamp(32px,4vw,58px) var(--mono);color:var(--cyan);letter-spacing:.18em}.room-status{min-height:2.8em}.room-roster{color:#ecf3d9!important}.tag{font:700 12px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--cyan)}#hud{position:absolute;inset:0;pointer-events:none;text-transform:uppercase}.hud-top{position:absolute;left:3.2vw;top:4vh;display:flex;gap:14px;align-items:flex-start}.hud-number{font:900 clamp(38px,4vw,62px)/.8 var(--font);color:var(--cyan)}.hud-objective{border-left:2px solid var(--cyan);padding-left:14px;max-width:490px}.hud-objective .tag{display:block}.hud-objective strong{font-size:clamp(22px,2vw,30px);line-height:1}.hud-objective small{display:block;color:#c4d3d0;font:600 12px var(--mono);margin-top:6px}.hud-score{position:absolute;right:3vw;top:4vh;text-align:right;font:700 14px/1.6 var(--mono);color:var(--cyan)}.hud-score strong{display:block;font:900 clamp(26px,3vw,42px)/1 var(--font);color:#edf6f2}.bottom-left,.bottom-right{position:absolute;bottom:4vh;display:flex;align-items:end;gap:18px}.bottom-left{left:3vw}.bottom-right{right:3vw;text-align:right}.stat strong,.ammo strong{font:900 clamp(43px,4.5vw,68px)/.8 var(--font)}.stat small,.ammo small{display:block;font:700 12px var(--mono);letter-spacing:.11em;margin-top:8px;color:#a7bab7}.stat.hp strong{color:#fff}.stat.armour strong{color:var(--cyan)}.ammo strong{color:var(--gold)}.ammo .reserve{font-size:.55em;color:#a7bab7}.weapon-name{font:700 14px var(--mono);color:#c4d5d1;letter-spacing:.08em;margin-bottom:7px}.hud-bar{height:4px;width:90px;margin-top:9px;background:#283a40}.hud-bar i{display:block;height:100%;background:var(--cyan)}.crosshair{position:absolute;left:50%;top:50%;width:23px;height:23px;transform:translate(-50%,-50%)}.crosshair:before,.crosshair:after{content:'';position:absolute;background:#f1fff9;box-shadow:0 0 6px #78fff3}.crosshair:before{left:10px;top:0;width:2px;height:22px}.crosshair:after{top:10px;left:0;width:22px;height:2px}.crosshair.hit:before,.crosshair.hit:after{background:var(--orange)}.interaction{position:absolute;left:50%;top:60%;transform:translateX(-50%);background:rgba(5,13,20,.88);border-left:3px solid var(--gold);padding:9px 16px;min-width:230px;text-align:center;font:700 15px var(--mono);color:#fff}.interaction b{color:var(--gold)}.subtitle{position:absolute;left:50%;bottom:14vh;transform:translateX(-50%);width:min(620px,70vw);text-align:center;font-size:clamp(19px,1.6vw,25px);font-weight:700;text-shadow:0 2px 8px #000,0 2px 8px #000}.subtitle b{color:var(--cyan);font:700 12px var(--mono);letter-spacing:.12em;display:block;margin-bottom:4px}.objective-marker{position:absolute;transform:translate(-50%,-50%);color:var(--gold);font:700 12px var(--mono);text-align:center;text-shadow:0 2px 3px #000}.objective-marker:before{content:'◆';display:block;font-size:22px}.hurt{position:absolute;inset:0;box-shadow:inset 0 0 100px 30px rgba(255,59,49,.55);pointer-events:none;opacity:0}.flash{position:absolute;inset:0;background:rgba(255,245,189,.4);opacity:0;pointer-events:none}.attract-label{position:absolute;top:3vh;left:50%;transform:translateX(-50%);background:#f6d55e;color:#111c20;padding:8px 18px;font:700 14px var(--mono);text-transform:uppercase;letter-spacing:.15em;white-space:nowrap}.message{position:absolute;top:20%;left:50%;transform:translateX(-50%);text-align:center;color:#fff;font:900 clamp(24px,3vw,42px) var(--font);text-transform:uppercase;text-shadow:0 2px 8px #000}.message span{display:block;color:var(--gold);font:700 13px var(--mono);letter-spacing:.13em}.connection-badge{position:absolute;right:3vw;top:15vh;text-align:right;font:600 12px/1.5 var(--mono);color:#c4d5d1}.connection-badge b{color:var(--gold)}#boot{position:absolute;inset:0;display:grid;place-items:center;background:#08121a;z-index:20}.boot-inner{width:min(500px,80vw)}.boot-inner h1{font:900 52px/.9 var(--font);font-style:italic;margin:20px 0}.boot-inner p{font:14px/1.5 var(--mono);color:#a9c1bd}.bar-anim{height:4px;background:linear-gradient(90deg,var(--cyan),var(--orange),var(--cyan));background-size:200% 100%;animation:move 2s linear infinite}@keyframes move{to{background-position:200%}}#touch-notice{position:absolute;inset:0;background:rgba(5,13,19,.96);z-index:19;display:flex;align-items:center;justify-content:center;text-align:center}.touch-inner{max-width:540px;padding:30px}.touch-inner h2{font-size:42px;text-transform:uppercase}.touch-inner .menu-btn{margin:22px auto;min-width:230px}#error{z-index:21}.compact .title-left{top:5vh}.compact .logo{font-size:clamp(60px,8vw,115px)}@media(max-height:700px){.title-left{top:4vh;bottom:3vh}.logo{font-size:clamp(65px,8vw,110px)}.title-copy{margin:2vh 0 1vh}.menu-list{gap:4px;margin-top:1vh}.menu-btn{min-height:40px}.title-foot{padding-top:5px}.panel{max-height:96vh}.credits{max-height:40vh}}@media(max-width:800px){.title-left{width:82vw}.right-stamp,.corner-mark{display:none}.title-copy p{max-width:70vw}.control-grid{grid-template-columns:1fr}.panel p{font-size:18px}.hud-objective strong{font-size:20px}}
+#modal{z-index:20}#boot{z-index:22}
+@media(max-height:820px){.title-left{top:4vh;bottom:3vh}.logo{font-size:clamp(68px,8vw,112px);margin-top:2vh}.title-copy{margin:2vh 0 1vh}.title-copy h1{font-size:clamp(30px,2.7vw,42px)}.title-copy p{font-size:17px}.menu-list{margin-top:1vh;gap:5px}.menu-btn{min-height:43px}.title-foot{padding-top:7px}}
+.credits{white-space:pre-wrap;font-size:18px;line-height:1.45;color:#c4d2d0}
+</style>
+</head>
+<body>
+<div id="viewport"></div>
+<div id="title" class="screen menu-backdrop hidden">
+  <div class="title-left">
+    <div class="brandline"><span class="brandmark"></span><span>HARDLINE SECURITY &nbsp;/&nbsp; OPERATIONS</span></div>
+    <div class="logo">SiN<span>chrome</span></div>
+    <div class="logo-sub">A NIGHT IN NERVE CITY</div>
+    <div class="title-copy"><div class="eyebrow">CASE 09 &nbsp; / &nbsp; OPERATION GLASSHOUSE</div><h1>One bad dose.<br>One worse cop.</h1><p>A biotech shipment is about to make a very permanent impression on the city. Go make one of your own.</p></div>
+    <div class="menu-list" id="title-buttons">
+      <button class="menu-btn primary" data-action="start">Begin operation</button>
+      <button class="menu-btn" data-action="online">Online score race</button>
+      <button class="menu-btn" data-action="manual">Field manual</button>
+      <button class="menu-btn" data-action="settings">Settings</button>
+      <button class="menu-btn" data-action="about">About / credits</button>
+    </div>
+    <div class="title-foot">CONTROLLER RECOMMENDED &nbsp; • &nbsp; WEBGPU REQUIRED</div>
+  </div>
+  <div class="right-stamp"><span>THE CITY DOESN'T SLEEP</span><strong>NEITHER DO WE.</strong><span>PRIVATE RESPONSE / EST. 2094</span></div>
+  <div class="corner-mark">YOUR JURISDICTION<b>THE WHOLE DAMN CITY.</b>01 / DOCKSIDE DISTRICT</div>
+</div>
+<div id="hud" class="hidden">
+  <div class="hud-top"><div class="hud-number" id="chapter">01</div><div class="hud-objective"><span class="tag">ACTIVE ASSIGNMENT</span><strong id="objective">Breach dock security</strong><small id="objectiveSub">FIND THE SECURITY TERMINAL</small></div></div>
+  <div class="hud-score">CASE SCORE<strong id="score">000000</strong><span id="killCount">0 HOSTILES NEUTRALIZED</span></div>
+  <div class="connection-badge hidden" id="onlineBadge"></div>
+  <div class="crosshair" id="crosshair"></div><div id="interaction" class="interaction hidden"></div>
+  <div id="marker" class="objective-marker hidden"></div>
+  <div class="bottom-left"><div class="stat hp"><strong id="hp">100</strong><small>VITALS</small><div class="hud-bar"><i id="hpbar"></i></div></div><div class="stat armour"><strong id="armor">50</strong><small>ARMOR</small><div class="hud-bar"><i id="armorbar"></i></div></div></div>
+  <div class="bottom-right"><div><div class="weapon-name" id="weaponName">VIGIL-9 / AUTO</div><div class="ammo"><strong><span id="ammo">24</span> <span class="reserve">/ <span id="reserve">144</span></span></strong><small>MAGAZINE &nbsp; / &nbsp; RESERVE</small></div></div></div>
+  <div id="subtitle" class="subtitle hidden"></div><div id="message" class="message hidden"></div><div id="hurt" class="hurt"></div><div id="flash" class="flash"></div>
+</div>
+<div id="attract" class="attract-label hidden">DEMO REEL &nbsp; // &nbsp; ANY INPUT TO RETURN</div>
+<div id="modal" class="modal-wrap hidden"><div id="panel" class="panel" role="dialog" aria-modal="true"></div></div>
+<div id="touch-notice" class="hidden"><div class="touch-inner"><div class="eyebrow">INPUT REQUIRED</div><h2>Controller or keyboard required</h2><p>Connect a controller or use a keyboard to enter Nerve City.</p><p id="touch-system-note" class="note"></p><button class="menu-btn" data-action="settings">Settings</button></div></div>
+<div id="boot"><div class="boot-inner"><div class="eyebrow">HARDLINE SECURITY / BOOT SEQUENCE</div><h1>SiN<span style="color:#60f5e7">CHROME</span></h1><div class="bar-anim"></div><p id="bootText">Preparing the operation…</p></div></div>
+<div id="error" class="modal-wrap hidden"><div class="panel"><div class="eyebrow">SYSTEM NOTICE</div><h2>Unable to deploy</h2><p id="errorText"></p><p class="note">WebGPU and an internet connection for the game libraries are required. Try a current WebGPU-enabled browser in a secure context (HTTPS or localhost).</p></div></div>
+<script type="module">// SiNchrome: procedural first-person action, authored for WebGPU and Rapier.
+const $ = (id) => document.getElementById(id);
+const el = { title:$('title'), hud:$('hud'), modal:$('modal'), panel:$('panel'), touch:$('touch-notice') };
+const hub = window.AIHub;
+const hubPromise = hub.active ? hub.connect({ mode:'parallel', seats:[1,4] }) : Promise.resolve(null);
+const REPORT_TEXT = "SOURCE INFORMATION\nDate: 2026-10-29 08:49\nSource: SiN (1998), developed by Ritual Entertainment. SiNchrome is an original spiritual successor, not an official SiN product.\nTech: Three.js r180 WebGPURenderer with WebGPU required and no WebGL fallback; Rapier 3D 0.19.3; Web Audio API; Gamepad API; AI Hub Session Protocol v1 client 1.3.0; MQTT 3.1.1 over WebSocket for standalone rooms. Mission placements are editable in level.json in the development folder.\nArt direction: Original procedural, faceted cel-shaded neon industrial noir.\nAnimation: Procedural transforms for characters, weapon, doors, pickups, effects and the scripted attract replay.\nAudio: Original code-generated electronic music, synthesized sound effects and gibberish radio voices with subtitles.\nOnline: AI Hub parallel sessions for 1\u20134 players; standalone 1\u20134 player side-by-side score races over the public EMQX MQTT relay. Players run separate copies of the mission. Internet access is required for the CDN libraries and online rooms.\nTesting: Lightweight functional checks; no FPS target or optimization requirement. Tested with Chrome 154.0.8037.57 on Linux using headless WebGPU/SwiftShader, an emulated standard gamepad, the AI Hub harness and two live relay clients.\nEnvironment: Codex CLI (headless); Linux; end-user browser unknown.\nModel: OpenAI, gpt-6.1-terra, reasoning effort max.\nUsage: Estimated API cost unknown; total tokens unknown; session time approximately 22 minutes.\n\nTESTING FEEDBACK\nIssues caught: 3: a standalone lobby initialization bug, a tilted first-person camera and a clipped title menu. All were fixed.\nCritical / game-breaking issues: 1, the lobby initialization bug, which prevented standalone multiplayer from joining properly.\nMost helpful test: A two-client live relay test, which found the lobby bug and then verified room creation, joining, synchronized start and score updates.\nLeast helpful test: A normal headless WebGPU screenshot; the browser compositor produced blank captures even for a minimal cube. An offscreen WebGPU texture readback was useful instead.\nTesting limits: No physical DualSense controller, remote human playtest or normal desktop GPU presentation was available. Mission progression was accelerated with development test controls.\n\nENGINE FEEDBACK\nMost liked: Three.js makes procedural 3D art approachable, and Rapier provides a useful kinematic character controller.\nStuck or guessed wrong: The first guessed Rapier CDN filename returned 404; the published 0.19.3 module is rapier.mjs. Headless WebGPU presentation also required an offscreen readback for visual inspection.\nMost important thing built: The mission, combat, controller-first interface and multiplayer integration around the renderer and physics engine.\nHardest part: Combining strict WebGPU initialization, first-person physics and two multiplayer contexts in one shareable HTML file.\nRemove or overhaul: The renderer's implicit WebGL fallback when a game explicitly requires WebGPU.\nOne change: Provide a public, documented strict-WebGPU-only initialization option and clearer device-loss feedback.\n\nPROMPT FEEDBACK\nMost liked: The specific controller-first, attract-mode and single-file requirements.\nConfusing: The standalone multiplayer format was not specified; this demo uses synchronized side-by-side score races.\nHardest: Delivering a complete mission, accessible controls, attract mode and both multiplayer contexts together.\nOne more test: A full playthrough with physical DualSense controllers and remote players on actual WebGPU-capable devices.";
+const LEVEL = {"name": "Operation Glasshouse", "spawn": [0, 7], "cover": [[-9, 3], [8, 2], [-8, -8], [8, -20], [-9, -25], [8, -46], [-8, -55], [8, -67]], "crates": [[3, -4, "ammo"], [-5, -21, "armor"], [5, -48, "health"], [-7, -63, "ammo"]], "barrels": [[-5, -6], [6, -24], [-6, -50]], "terminals": [[8, -8, "gate"], [-8, -29, "lab"], [0, -73, "extract"], [-10, 5, "supply"]], "pickups": [[-3, 3, "armor"], [10, -20, "ammo"], [4, -33, "health"], [-4, -44, "ammo"], [10, -62, "health"]], "enemies": [[-2, -5, "guard"], [5, -10, "guard"], [4, -22, "guard"], [-4, -25, "guard"], [5, -32, "mutant"], [-5, -34, "guard"], [-4, -48, "mutant"], [5, -51, "guard"], [0, -60, "boss"]]};
+const defaults = { volume:65, sensitivity:65, moveX:false, moveY:false, lookX:false, lookY:false, assist:true };
+let settings = { ...defaults };
+try { settings = { ...defaults, ...JSON.parse(localStorage.getItem('sinchrome-settings') || '{}') }; } catch (_) {}
+let THREE, RAPIER, renderer, scene, camera, world, controller, playerBody, playerCollider;
+let screen='boot', modalKind='', focus=0, previousScreen='title', run=null, titleIdle=0, elapsed=0, last=performance.now();
+let hubInfo=null, endedByHub=false, resultSent=false, hudMessageUntil=0, subtitleUntil=0, hitUntil=0;
+let selectedDigit=0, roomDigits=[0,0,0,0,0,0], network=null, netPeers=new Map(), roomCode='', roomHost=false;
+let objects=[], solids=[], enemies=[], pickups=[], terminals=[], doors=[], effects=[], bodies=[], triggers=[];
+let padPrevious=[], padAxesPrevious=[0,0,0,0], menuRepeat=0, mouseDown=false, lastInput={x:0,y:0,fire:false}, keyState={};
+let suppressDrawing=false, bootFailed=false;
+let currentInteract=null, scoreReported=-1, audioCtx=null, master=null, nextMusic=0, musicStep=0, noiseBuffer=null;
+const CFG={floorY:0, eye:1.58, speed:5.4};
+const rngInt=(n)=>crypto.getRandomValues(new Uint32Array(1))[0]%n;
+const saveSettings=()=>{try{localStorage.setItem('sinchrome-settings',JSON.stringify(settings))}catch(_){}};
+function show(node,on=true){node.classList.toggle('hidden',!on)}
+function currentButtons(){ return [...(modalKind?el.panel:el.title).querySelectorAll('button:not([disabled])')].filter(b=>b.offsetParent!==null); }
+function selectFocus(i){const b=currentButtons();if(!b.length)return;focus=(i+b.length)%b.length;b.forEach((x,j)=>x.classList.toggle('selected',j===focus));if(modalKind)b[focus].scrollIntoView({block:'nearest'});}
+function navigate(delta){selectFocus(focus+delta);sound('nav')}
+function activateFocused(){const b=currentButtons()[focus];if(b)b.click()}
+function panel(title,kicker,body,wide=false){el.panel.classList.toggle('wide',wide);el.panel.innerHTML=`<div class="eyebrow">${kicker}</div><h2>${title}</h2>${body}`;show(el.modal);focus=0;selectFocus(0)}
+function closeModal(){modalKind='';show(el.modal,false);if(screen==='title')selectFocus(0);if(document.pointerLockElement) document.exitPointerLock();}
+function openPanel(kind){
+  previousScreen=screen; modalKind=kind; mouseDown=false;
+  if(document.pointerLockElement)document.exitPointerLock();
+  if(kind==='settings') renderSettings();
+  else if(kind==='manual') panel('Field manual','HARDLINE / OPERATORS ONLY',`<div class="control-grid"><div>Move <b>LEFT STICK / WASD</b></div><div>Aim <b>RIGHT STICK / MOUSE</b></div><div>Fire <b>R2 / LEFT CLICK</b></div><div>Aim down sights <b>L2 / RIGHT CLICK</b></div><div>Use / jump <b>CROSS / E / SPACE</b></div><div>Reload <b>SQUARE / R</b></div><div>Swap weapon <b>R1 / Q</b></div><div>Dash <b>L1 / SHIFT</b></div><div>Settings <b>OPTIONS / ESC</b></div></div><p>Get close to terminals and press use. The yellow diamond points to your next objective. Shoot fuel canisters and smash crates for supplies. Headshots pay extra.</p><p>At the lab terminal, choose how to handle the formula. Armor absorbs damage; pickups restore it. Keep moving when the Warden charges.</p><div class="menu-list"><button class="menu-btn" data-action="back">Back</button></div>`,true);
+  else if(kind==='about'){panel('About / credits','CASE FILE / DOCUMENTATION',`<p class="note">UP / DOWN TO SCROLL THE CASE FILE</p><div class="credits" id="creditsText"></div><div class="menu-list"><button class="menu-btn" data-action="back">Back</button></div>`,true);$('creditsText').textContent=REPORT_TEXT;}
+  else if(kind==='online') panel('Online score race','SIDE BY SIDE / 1–4 OPERATORS',`<p>Run the same raid on your own screen and compare scores in real time. One player creates a room; everyone else joins with its six-digit code.</p><p class="note">Uses a public relay. Scores and room traffic are visible to anyone with the code. No account or chat.</p><div class="menu-list"><button class="menu-btn primary" data-action="createRoom">Create room</button><button class="menu-btn" data-action="enterRoom">Join room</button><button class="menu-btn" data-action="back">Back</button></div>`);
+  else if(kind==='join') renderJoin();
+  else if(kind==='room') renderRoom();
+  else if(kind==='choice') panel('The formula','MIRA / LAB ACCESS',`<p>“You can wipe the batch or copy the formula. One saves the neighborhood. The other makes Internal Affairs very interested in us.”</p><div class="menu-list"><button class="menu-btn primary" data-action="purge">Purge the batch <small>safer route</small></button><button class="menu-btn" data-action="copy">Copy the formula <small>bonus score · more trouble</small></button></div>`);
+  else if(kind==='pause') renderSettings();
+  else if(kind==='over') renderEnd();
+}
+function renderSettings(){
+  const on=v=>v?'INVERTED':'NORMAL';
+  panel('Settings','LOCAL DEVICE / PRESS OPTIONS OR ESC TO CLOSE',`<div class="settings-row"><label>Volume</label><button class="action-btn" data-setting="volume">${settings.volume}%</button></div><div class="settings-row"><label>Look sensitivity</label><button class="action-btn" data-setting="sensitivity">${settings.sensitivity}%</button></div><div class="settings-row"><label>Move horizontal</label><button class="action-btn" data-setting="moveX">${on(settings.moveX)}</button></div><div class="settings-row"><label>Move vertical</label><button class="action-btn" data-setting="moveY">${on(settings.moveY)}</button></div><div class="settings-row"><label>Look horizontal</label><button class="action-btn" data-setting="lookX">${on(settings.lookX)}</button></div><div class="settings-row"><label>Look vertical</label><button class="action-btn" data-setting="lookY">${on(settings.lookY)}</button></div><div class="settings-row"><label>Aim assist<small>Controller only</small></label><button class="action-btn" data-setting="assist">${settings.assist?'ON':'OFF'}</button></div><div class="menu-list"><button class="menu-btn" data-action="back">Close settings</button>${screen==='play'&&!hub.active&&!network?'<button class="menu-btn" data-action="restart">Restart operation</button><button class="menu-btn" data-action="title">Return to title</button>':''}</div>`);
+}
+function changeSetting(key, direction=1){
+  if(key==='volume')settings.volume=(settings.volume+direction*10+110)%110;
+  else if(key==='sensitivity')settings.sensitivity=Math.min(100,Math.max(20,settings.sensitivity+direction*10));
+  else settings[key]=!settings[key];
+  saveSettings(); if(master)master.gain.setTargetAtTime(settings.volume/100*.28,audioCtx.currentTime,.05);
+  let f=focus;renderSettings();selectFocus(f);sound('nav');
+}
+function renderJoin(){panel('Join a room','ENTER THE SIX-DIGIT CODE',`<p>Select each digit and use up/down, left/right, or press Cross to change it. Keyboard: type the six digits.</p><div class="digit-row">${roomDigits.map((n,i)=>`<button class="action-btn" data-digit="${i}" aria-label="Digit ${i+1}: ${n}">${n}</button>`).join('')}</div><div class="menu-list"><button class="menu-btn primary" data-action="joinRoom">Join race</button><button class="menu-btn" data-action="online">Back</button></div>`);selectFocus(selectedDigit)}
+function renderRoom(){
+  const oldFocus=focus;
+  const live=[...netPeers.values()].filter(p=>Date.now()-p.seen<8000); let names=['YOU',...live.map((_,i)=>`OPERATOR ${i+2}`)];
+  panel('Race lobby','SIDEBYSIDE / ONLINE',`<div class="tag">ROOM CODE</div><div class="room-code">${roomCode}</div><p class="room-status">${network?.status||'Connecting to relay…'}</p><p class="room-roster">${names.join(' &nbsp; / &nbsp; ')} &nbsp; <span class="tag">(${names.length}/4)</span></p><p class="note">Share the code with up to three friends. The host starts everyone together.</p><div class="menu-list">${roomHost?'<button class="menu-btn primary" data-action="launchRoom">Start race</button>':'<button class="menu-btn" disabled>Waiting for host</button>'}<button class="menu-btn" data-action="leaveRoom">Leave room</button></div>`);selectFocus(oldFocus);
+}
+function renderEnd(){const win=run?.won;panel(win?'Case closed':'Operation ended',win?'MISSION COMPLETE':'HARDLINE / REPORT',`<p>${win?(run.choice==='copy'?'The evidence is out. So is a copy of the formula. Mira says the audit will be “interesting.”':'The batch is gone and the evidence is safe. For once, the city gets a clean bill.'): 'Nerve City keeps its secrets for another night.'}</p><div class="room-code">${String(run?.score||0).padStart(6,'0')}</div><p>CASE SCORE &nbsp; / &nbsp; ${run?.kills||0} HOSTILES &nbsp; / &nbsp; ${run?.headshots||0} HEADSHOTS</p>${hub.active?'<p class="note">Waiting for the hub to finish the round.</p>':`<div class="menu-list"><button class="menu-btn primary" data-action="restart">Run it again</button><button class="menu-btn" data-action="title">Return to title</button></div>`}`)}
+function setTitle(){
+  if(network)disconnectRoom();run=null;screen='title';modalKind='';show(el.modal,false);show(el.title);show(el.hud,false);show($('attract'),false);titleIdle=0;resultSent=false;buildWorld();selectFocus(0);
+}
+function doAction(action){
+  unlockAudio();titleIdle=0;
+  if(action==='start'||action==='restart'){if(network)disconnectRoom();closeModal();startRun(false);}
+  else if(action==='title'){closeModal();setTitle()}
+  else if(action==='back'){if(modalKind==='join')openPanel('online');else closeModal()}
+  else if(['manual','settings','about','online'].includes(action))openPanel(action);
+  else if(action==='enterRoom'){roomDigits=[0,0,0,0,0,0];selectedDigit=0;openPanel('join')}
+  else if(action==='createRoom'){roomCode=String(100000+rngInt(900000));roomHost=true;connectRoom(roomCode);openPanel('room')}
+  else if(action==='joinRoom'){roomCode=roomDigits.join('');roomHost=false;connectRoom(roomCode);openPanel('room')}
+  else if(action==='leaveRoom'){disconnectRoom();openPanel('online')}
+  else if(action==='launchRoom'){if(network?.connected){let start=Date.now()+4500;network.startAt=start;sendNet({t:'start',at:start});beginRoomCountdown(start)}}
+  else if(action==='purge'||action==='copy'){closeModal();resolveLabChoice(action)}
+}
+document.addEventListener('click',e=>{
+  const target=e.target.closest('button');if(!target)return;
+  if(target.dataset.action)doAction(target.dataset.action);
+  else if(target.dataset.setting)changeSetting(target.dataset.setting);
+  else if(target.dataset.digit!==undefined){selectedDigit=+target.dataset.digit;roomDigits[selectedDigit]=(roomDigits[selectedDigit]+1)%10;renderJoin()}
+});
+// Audio: all music, effects and voices are synthesized in real time.
+function unlockAudio(){
+  if(!audioCtx){try{audioCtx=new AudioContext();master=audioCtx.createGain();master.gain.value=settings.volume/100*.28;master.connect(audioCtx.destination);noiseBuffer=audioCtx.createBuffer(1,audioCtx.sampleRate*.25,audioCtx.sampleRate);let d=noiseBuffer.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1}catch(_){return}}
+  if(audioCtx.state==='suspended')audioCtx.resume().catch(()=>{});
+}
+function tone(freq,duration,vol,type='sawtooth',endFreq=freq,when=0){if(!audioCtx||!master)return;const t=audioCtx.currentTime+when,o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type=type;o.frequency.setValueAtTime(Math.max(20,freq),t);o.frequency.exponentialRampToValueAtTime(Math.max(20,endFreq),t+duration);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.0002,vol),t+.008);g.gain.exponentialRampToValueAtTime(.0001,t+duration);o.connect(g);g.connect(master);o.start(t);o.stop(t+duration+.02)}
+function noise(duration,vol,cut=1300){if(!audioCtx||!noiseBuffer)return;let s=audioCtx.createBufferSource(),g=audioCtx.createGain(),f=audioCtx.createBiquadFilter(),t=audioCtx.currentTime;s.buffer=noiseBuffer;f.type='lowpass';f.frequency.value=cut;g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(.0001,t+duration);s.connect(f);f.connect(g);g.connect(master);s.start();s.stop(t+duration)}
+function sound(kind){if(!audioCtx)return;if(kind==='shoot'){tone(120,.12,.27,'sawtooth',42);noise(.11,.18,2000)}else if(kind==='shotgun'){tone(95,.22,.4,'sawtooth',30);noise(.2,.32,1100)}else if(kind==='hit'){tone(750,.075,.11,'square',320)}else if(kind==='hurt'){tone(130,.25,.14,'square',56);noise(.18,.1,700)}else if(kind==='boom'){tone(85,.45,.35,'sawtooth',24);noise(.25,.35,800)}else if(kind==='pick'){tone(470,.08,.13,'square',700);tone(730,.12,.1,'sine',1000,.07)}else if(kind==='reload'){noise(.07,.12,4500);tone(260,.08,.07,'square',180,.16)}else if(kind==='dash'){tone(180,.2,.14,'sawtooth',500);noise(.13,.1,2000)}else if(kind==='nav')tone(470,.05,.05,'square',540);else if(kind==='open'){tone(200,.3,.15,'sawtooth',65)}else if(kind==='jump')tone(250,.1,.07,'triangle',430)}
+function voice(text,speaker='MIRA'){
+  const sub=$('subtitle');sub.innerHTML=`<b>${speaker} / COMMS</b>${text}`;show(sub);subtitleUntil=elapsed+5.6;
+  if(audioCtx){for(let i=0;i<9;i++){let t=audioCtx.currentTime+i*.085,d=.075,c=text.charCodeAt(i%text.length),o=audioCtx.createOscillator(),g=audioCtx.createGain(),f1=audioCtx.createBiquadFilter(),f2=audioCtx.createBiquadFilter();o.type='sawtooth';o.frequency.setValueAtTime(145+(c%8)*18,t);o.frequency.exponentialRampToValueAtTime(185+(c%6)*20,t+d);f1.type=f2.type='bandpass';f1.frequency.value=480+(c%4)*110;f2.frequency.value=1100+(c%5)*140;f1.Q.value=4;f2.Q.value=3;g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.17,t+.012);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.connect(f1);o.connect(f2);f1.connect(g);f2.connect(g);g.connect(master);o.start(t);o.stop(t+d+.01)}}
+}
+function musicTick(){if(!audioCtx||audioCtx.state!=='running'||!run||screen!=='play')return;const t=audioCtx.currentTime;if(t<nextMusic)return;nextMusic=t+.15;let step=musicStep++%16;let notes=[55,55,65.41,55,73.42,65.41,49,55,55,55,82.41,73.42,65.41,55,49,49];if(step%2===0)tone(notes[step]*2,.13,.09,'sawtooth',notes[step]*.98);if(step%4===0){tone(95,.18,.16,'sine',35);noise(.055,.04,500)}if(step%4===2)noise(.055,.055,3000);if(step%4===3)tone(notes[step]*4,.09,.025,'square',notes[step]*3)}
+// Standalone side-by-side rooms use MQTT 3.1.1 over a public WSS relay.
+// Only an anonymous id, room code, score and round state are transmitted.
+const enc=new TextEncoder(), dec=new TextDecoder();
+function mqttString(s){let b=enc.encode(s);return [b.length>>8,b.length&255,...b]}
+function mqttPacket(type,data){let n=data.length,head=[type];do{let d=n%128;n=Math.floor(n/128);head.push(d|(n?128:0))}while(n);return new Uint8Array([...head,...data])}
+function mqttSend(bytes){if(network?.ws?.readyState===WebSocket.OPEN)network.ws.send(bytes)}
+function sendNet(payload){if(!network?.connected)return;let data=enc.encode(JSON.stringify({...payload,id:network.id}));mqttSend(mqttPacket(0x30,[...mqttString(network.topic),...data]))}
+function connectRoom(code){
+  const wasHost=roomHost;disconnectRoom();roomCode=code;roomHost=wasHost;const id=Array.from(crypto.getRandomValues(new Uint8Array(5)),x=>x.toString(16).padStart(2,'0')).join('');
+  netPeers=new Map();network={id,topic:'sinchrome/20261029/room/'+code,connected:false,status:'Connecting to relay…',lastBeat:0,lastPing:0,startAt:0,ws:null};
+  try{
+    const ws=new WebSocket('wss://broker.emqx.io:8084/mqtt',['mqtt']);network.ws=ws;ws.binaryType='arraybuffer';
+    ws.onopen=()=>mqttSend(mqttPacket(0x10,[...mqttString('MQTT'),4,2,0,30,...mqttString('sc'+id)]));
+    ws.onmessage=ev=>{let a=new Uint8Array(ev.data),i=1,mult=1,len=0,d;do{d=a[i++];len+=(d&127)*mult;mult*=128}while(d&128&&i<a.length);let kind=a[0]>>4;
+      if(kind===2){if(a[i+1]!==0){network.status='Relay rejected the connection.';return}network.connected=true;network.status=roomHost?'Connected. Share the code and start when ready.':'Connected. Waiting for the host.';mqttSend(mqttPacket(0x82,[0,1,...mqttString(network.topic),0]));sendNet({t:'hello',score:run?.score||0,host:roomHost});if(modalKind==='room')renderRoom()}
+      else if(kind===3){let size=(a[i]<<8)|a[i+1];i+=2+size;try{receiveNet(JSON.parse(dec.decode(a.slice(i,i+len))))}catch(_){}}
+    };
+    ws.onerror=()=>{if(network){network.status='Relay unavailable. Try again, or play solo.';if(modalKind==='room')renderRoom()}};
+    ws.onclose=()=>{if(network&&network.ws===ws){network.connected=false;network.status='Connection lost. Leave the room to reconnect.';if(modalKind==='room')renderRoom()}};
+  }catch(_){network.status='Could not open the relay connection.'}
+}
+function disconnectRoom(){if(network){sendNet({t:'leave'});let ws=network.ws;network=null;if(ws){ws.onclose=null;ws.close()}}netPeers.clear();roomCode='';roomHost=false;show($('onlineBadge'),false)}
+function receiveNet(m){if(!network||!m||m.id===network.id||typeof m.id!=='string'||m.id.length!==10)return;
+  if(m.t==='leave'){netPeers.delete(m.id);if(modalKind==='room')renderRoom();return}
+  if(!['hello','state','start','done'].includes(m.t))return;
+  const existed=netPeers.has(m.id);if(!existed&&netPeers.size>=3)return;
+  netPeers.set(m.id,{score:Number.isFinite(+m.score)?Math.max(0,Math.min(99999999,+m.score)):0,seen:Date.now(),done:m.t==='done',host:!!m.host});
+  if(!existed&&modalKind==='room')renderRoom();
+  if((m.t==='start'||(m.host&&m.startAt))&&!roomHost&&!network.startAt){const at=Number(m.at||m.startAt);if(Number.isFinite(at)&&at>Date.now()-15000){network.startAt=at;beginRoomCountdown(at)}}
+}
+function beginRoomCountdown(at){closeModal();startRun(false,at);sendNet({t:'state',score:0,host:roomHost,startAt:at})}
+function networkTick(){if(!network?.connected)return;let now=Date.now();if(now-network.lastBeat>1500){network.lastBeat=now;sendNet({t:run?.over?'done':'state',score:run?.score||0,host:roomHost,startAt:network.startAt||0});for(let [id,p] of netPeers)if(now-p.seen>8000)netPeers.delete(id);if(modalKind==='room')renderRoom()}
+  if(now-network.lastPing>12000){network.lastPing=now;mqttSend(new Uint8Array([0xc0,0]))}
+  if(run&&screen==='play'){let vals=[{score:run.score,self:true},...[...netPeers.values()].map(p=>({score:p.score}))].sort((a,b)=>b.score-a.score);let place=vals.findIndex(v=>v.self)+1;let b=$('onlineBadge');b.innerHTML=`ROOM ${roomCode} / ${place}${['ST','ND','RD','TH'][place-1]||'TH'}<br><b>${vals.map(v=>String(v.score).padStart(5,'0')).join(' &nbsp; / &nbsp; ')}</b>`;show(b)}
+}
+function reportProgress(){if(!run)return;if(hub.active&&hubInfo&&run.score!==scoreReported){scoreReported=run.score;hub.progress({score:run.score,label:`${run.kills} hostiles`})}}
+function finishRun(won=false){if(!run||run.over)return;run.over=true;run.won=won;screen='over';mouseDown=false;show($('interaction'),false);if(document.pointerLockElement)document.exitPointerLock();if(hub.active&&hubInfo&&!resultSent){resultSent=true;hub.result({score:run.score,stats:{Hostiles:run.kills,Headshots:run.headshots,Outcome:won?'Extracted':'Incomplete'}})}if(network)sendNet({t:'done',score:run.score,host:roomHost});openPanel('over')}
+hub.on('time-up',()=>{if(run&&!run.over)finishRun(false)});
+hub.on('end',()=>{endedByHub=true;mouseDown=false;if(audioCtx&&audioCtx.state==='running')audioCtx.suspend().catch(()=>{});if(run&&!run.over)finishRun(false)});
+hub.probe(()=>({scene:screen==='boot'?'ready':screen==='title'?'title':screen==='over'?'over':'play',menu:modalKind==='settings'||modalKind==='pause',world:run?.sim||0,input:lastInput}));
+
+// Faceted, outlined world art and Rapier colliders.
+let palette={}, gradient;
+function makePalette(){
+  const grad=new Uint8Array([45,92,155,220]);gradient=new THREE.DataTexture(grad,4,1,THREE.RedFormat);gradient.minFilter=THREE.NearestFilter;gradient.magFilter=THREE.NearestFilter;gradient.needsUpdate=true;
+  const toon=(c,e=0)=>new THREE.MeshToonMaterial({color:c,gradientMap:gradient,emissive:e,emissiveIntensity:.4});
+  palette={wall:toon(0x344851),dark:toon(0x15252d),floor:toon(0x263b40),metal:toon(0x556b6a),light:toon(0xa8bfb3),black:toon(0x101a20),red:toon(0xc44c3e),yellow:toon(0xe5bd4f),green:toon(0x5eaa73),purple:toon(0x6b627f),skin:toon(0xcaa182),blue:toon(0x3f8291),white:new THREE.MeshBasicMaterial({color:0xc8fdf1}),cyan:new THREE.MeshBasicMaterial({color:0x56eee0}),orange:new THREE.MeshBasicMaterial({color:0xff7250}),gold:new THREE.MeshBasicMaterial({color:0xffd556}),lime:new THREE.MeshBasicMaterial({color:0xa6ff83})};
+}
+function outlined(mesh,color=0x102027,opacity=.75){let edges=new THREE.EdgesGeometry(mesh.geometry,35);let line=new THREE.LineSegments(edges,new THREE.LineBasicMaterial({color,transparent:true,opacity}));mesh.add(line);return mesh}
+function box(x,y,z,w,h,d,mat,collide=false,edge=false){let m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);m.position.set(x,y,z);if(edge)outlined(m);scene.add(m);objects.push(m);if(collide){let c=world.createCollider(RAPIER.ColliderDesc.cuboid(w/2,h/2,d/2).setTranslation(x,y,z));m.userData.collider=c;solids.push(m)}return m}
+function cylinder(x,y,z,r,h,mat,collide=false){let m=new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,10),mat);m.position.set(x,y,z);outlined(m);scene.add(m);objects.push(m);if(collide){let c=world.createCollider(RAPIER.ColliderDesc.cylinder(h/2,r).setTranslation(x,y,z));m.userData.collider=c;solids.push(m)}return m}
+function panelText(text,x,y,z,w,h,color='#8df9e8',bg='#102a30',size=54){let c=document.createElement('canvas');c.width=1024;c.height=256;let ctx=c.getContext('2d');ctx.fillStyle=bg;ctx.fillRect(0,0,1024,256);ctx.strokeStyle=color;ctx.lineWidth=9;ctx.strokeRect(6,6,1012,244);ctx.fillStyle=color;ctx.font=`900 ${size}px sans-serif`;ctx.textAlign='center';ctx.textBaseline='middle';let lines=text.split('\n');lines.forEach((l,i)=>ctx.fillText(l,512,128+(i-(lines.length-1)/2)*72));let tex=new THREE.CanvasTexture(c);tex.colorSpace=THREE.SRGBColorSpace;let mesh=new THREE.Mesh(new THREE.PlaneGeometry(w,h),new THREE.MeshBasicMaterial({map:tex,side:THREE.DoubleSide}));mesh.position.set(x,y,z);scene.add(mesh);objects.push(mesh);return mesh}
+function staticCollider(x,y,z,w,h,d){return world.createCollider(RAPIER.ColliderDesc.cuboid(w/2,h/2,d/2).setTranslation(x,y,z))}
+function wall(x,y,z,w,h,d){box(x,y,z,w,h,d,palette.wall,true,true);box(x,y+h/2-.16,z,w+.02,.12,d+.02,palette.metal,false);}
+function door(z,index){
+  const group=new THREE.Group();scene.add(group);let l=new THREE.Mesh(new THREE.BoxGeometry(2.95,4.3,.5),palette.dark),r=l.clone();l.position.set(-1.49,2.15,z);r.position.set(1.49,2.15,z);outlined(l);outlined(r);group.add(l,r);
+  for(let side of [-1,1]){let strip=new THREE.Mesh(new THREE.BoxGeometry(.12,3.7,.07),palette.orange);strip.position.set(side*.17,2.2,z+.29);group.add(strip)}
+  let collider=staticCollider(0,2.15,z,5.9,4.3,.65);let o={group,l,r,collider,z,open:false,amount:0};doors[index]=o;solids.push(l,r);return o;
+}
+function openDoor(i){let d=doors[i];if(!d||d.open)return;d.open=true;world.removeCollider(d.collider,true);solids=solids.filter(x=>x!==d.l&&x!==d.r);sound('open')}
+function makeTerminal(x,z,type){
+  const group=new THREE.Group();group.position.set(x,0,z);scene.add(group);
+  const add=(geometry,mat,x,y,z)=>{let m=new THREE.Mesh(geometry,mat);m.position.set(x,y,z);group.add(m);return m};
+  outlined(add(new THREE.BoxGeometry(1.35,1.15,.9),palette.dark,0,.6,0));outlined(add(new THREE.BoxGeometry(1.65,.9,.3),palette.metal,0,1.48,-.17));add(new THREE.BoxGeometry(1.42,.64,.05),palette.cyan,0,1.5,.02);
+  for(let i=0;i<4;i++)add(new THREE.BoxGeometry(.19,.035,.07),palette.black,-.45+i*.28,1.32,.06);
+  const label=type==='gate'?'DOCK ACCESS':type==='lab'?'GENE BANK':type==='extract'?'EXTRACTION':'SUPPLY CACHE';let sign=panelText(label,x,2.18,z-.1,2.1,.48,'#72fff0','#10272a',100);
+  let obj={x,z,type,group,sign,used:false};terminals.push(obj);return obj;
+}
+function addPickup(x,z,type){let group=new THREE.Group();group.position.set(x,.48,z);scene.add(group);let m=new THREE.Mesh(new THREE.OctahedronGeometry(.42,0),type==='health'?palette.red:type==='armor'?palette.cyan:palette.gold);group.add(m);let ring=new THREE.Mesh(new THREE.TorusGeometry(.48,.035,6,12),palette.white);ring.rotation.x=Math.PI/2;group.add(ring);pickups.push({x,z,type,group,base:.48});}
+function makeCrate(x,z,loot='ammo'){
+  let m=box(x,.65,z,1.25,1.3,1.25,palette.metal,false,true);let rb=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.65,z));let col=world.createCollider(RAPIER.ColliderDesc.cuboid(.625,.65,.625).setMass(18),rb);m.userData.entity={kind:'crate',mesh:m,rb,col,hp:30,loot,dead:false};solids.push(m);bodies.push({mesh:m,rb});
+  let bar=new THREE.Mesh(new THREE.BoxGeometry(.09,1.5,.06),palette.dark);bar.position.z=.66;bar.rotation.z=.7;m.add(bar);let bar2=bar.clone();bar2.rotation.z=-.7;m.add(bar2);return m;
+}
+function makeBarrel(x,z){
+  let m=cylinder(x,.68,z,.48,1.36,palette.red);let rb=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.68,z));let col=world.createCollider(RAPIER.ColliderDesc.cylinder(.68,.48).setMass(12),rb);m.userData.entity={kind:'barrel',mesh:m,rb,col,hp:20,dead:false};solids.push(m);bodies.push({mesh:m,rb});let band=new THREE.Mesh(new THREE.CylinderGeometry(.5,.5,.18,10),palette.gold);band.position.y=.05;m.add(band);return m;
+}
+function human(x,z,type='guard'){
+  let group=new THREE.Group();scene.add(group);group.position.set(x,0,z);let entity={kind:'enemy',group,x,z,type,hp:type==='boss'?320:type==='mutant'?90:58,max:type==='boss'?320:type==='mutant'?90:58,dead:false,phase:Math.random()*7,fire:1+Math.random()*2,hit:0,zone:z>-14?0:z>-38?1:2,movePhase:Math.random()*6};
+  const bodyMat=type==='boss'?palette.red:type==='mutant'?palette.green:palette.blue,scale=type==='boss'?1.7:type==='mutant'?1.15:1;
+  group.scale.setScalar(scale);
+  function part(w,h,d,x,y,z,mat,head=false){let m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);m.position.set(x,y,z);outlined(m);m.userData.entity=entity;m.userData.head=head;group.add(m);solids.push(m);return m}
+  part(.74,.82,.4,0,1.25,0,bodyMat);part(.9,.18,.5,0,1.65,0,type==='mutant'?palette.green:palette.metal);part(.43,.47,.42,0,1.97,0,type==='mutant'?palette.green:palette.skin,true);
+  part(.48,.16,.45,0,2.16,0,type==='mutant'?palette.green:palette.dark,true);part(.37,.11,.05,0,1.99,.225,type==='mutant'?palette.orange:palette.cyan,true);
+  entity.armL=part(.25,.7,.28,-.5,1.2,0,bodyMat);entity.armR=part(.25,.7,.28,.5,1.2,0,bodyMat);entity.legL=part(.27,.72,.32,-.2,.42,0,palette.dark);entity.legR=part(.27,.72,.32,.2,.42,0,palette.dark);
+  if(type!=='mutant'){part(.24,.22,.65,.52,1.08,.32,palette.black);part(.12,.12,.12,.52,1.08,.7,palette.orange)}
+  if(type==='boss'){part(.92,.25,.3,0,1.4,.24,palette.black);part(.55,.11,.05,0,1.42,.41,palette.orange);}
+  enemies.push(entity);return entity;
+}
+function makeWeapon(){
+  let gun=new THREE.Group();camera.add(gun);gun.position.set(.4,-.32,-.67);gun.rotation.set(.03,-.08,0);
+  function p(w,h,d,x,y,z,mat){let m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);m.position.set(x,y,z);outlined(m,0x091519,.95);gun.add(m);return m}
+  p(.23,.19,.58,0,0,0,palette.dark);p(.16,.12,.48,0,.1,-.05,palette.metal);p(.12,.13,.25,0,.05,-.39,palette.black);p(.1,.16,.22,0,.07,-.48,palette.metal);p(.15,.28,.19,.01,-.18,.15,palette.black);p(.1,.25,.12,0,-.12,-.13,palette.dark);p(.05,.025,.3,0,.18,-.02,palette.cyan);p(.06,.05,.03,0,.15,-.36,palette.orange);p(.07,.09,.02,0,.03,.3,palette.cyan);
+  let hand=p(.19,.19,.22,.1,-.23,.15,palette.skin);hand.rotation.z=.3;
+  return gun;
+}
+function buildWorld(){
+  if(world){try{world.free()}catch(_){}}
+  if(scene){scene.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material&&!Object.values(palette).includes(o.material)){if(o.material.map)o.material.map.dispose();o.material.dispose()}})}
+  objects=[];solids=[];enemies=[];pickups=[];terminals=[];doors=[];effects=[];bodies=[];triggers=[];
+  world=new RAPIER.World({x:0,y:-18,z:0});controller=world.createCharacterController(.03);controller.enableSnapToGround(.15);
+  scene=new THREE.Scene();scene.background=new THREE.Color(0x101b28);scene.fog=new THREE.Fog(0x182c34,32,110);
+  camera=new THREE.PerspectiveCamera(68,innerWidth/innerHeight,.035,180);scene.add(camera);
+  scene.add(new THREE.HemisphereLight(0x9cd9d5,0x18202b,2));let sun=new THREE.DirectionalLight(0xc8e6df,2.1);sun.position.set(-10,25,10);scene.add(sun);
+  for(let z of [3,-19,-43,-65]){let light=new THREE.PointLight(z===-43?0x68ffb5:0x5cffee,26,22);light.position.set(z===-19?8:-8,5,z);scene.add(light)}
+  // Ground, boundaries, and the two security bulkheads.
+  box(0,-.25,-34,28,.5,90,palette.floor,true);
+  wall(-14,3,-34,.8,6,90);wall(14,3,-34,.8,6,90);wall(0,3,11,28,6,.8);wall(0,3,-79,28,6,.8);
+  for(let z of [-14,-38]){wall(-8.6,2.7,z,10.8,5.4,.65);wall(8.6,2.7,z,10.8,5.4,.65);box(0,5,z,6,.6,.65,palette.metal);for(let x of [-3.2,3.2])box(x,2.5,z,.35,5,.9,palette.yellow,false,true)}
+  door(-14,0);door(-38,1);
+  // Deck seams, safety rails, lights and overhead pipework.
+  for(let z=8;z>=-76;z-=4){box(0,.016,z,27,.025,.055,palette.dark);for(let x of [-11,11]){box(x,.04,z,.28,.05,1.6,palette.yellow);box(x,.08,z-.2,.11,.04,.22,palette.black)}}
+  for(let z=6;z>=-74;z-=8){for(let x of [-13.45,13.45]){box(x,2.9,z,.2,5.5,.35,palette.dark);box(x,4.6,z,.1,.25,2.8,z<-38?palette.lime:palette.cyan);}}
+  for(let x of [-9.8,9.8]){let pipe=new THREE.Mesh(new THREE.CylinderGeometry(.22,.22,84,8),palette.red);pipe.rotation.x=Math.PI/2;pipe.position.set(x,5.3,-33);scene.add(pipe);for(let z=5;z>-75;z-=8){box(x,5.25,z,.7,.4,.25,palette.metal)}}
+  for(let z of [-7,-30,-51,-70]){box(0,5.7,z,26,.25,.4,palette.dark);for(let x of [-7,0,7]){box(x,5.5,z,2.1,.08,.2,palette.white);}}
+  // City skyline silhouettes beyond the walls.
+  for(let i=0;i<19;i++){let x=(i%2?-1:1)*(19+(i%4)*3),z=12-i*5.5,h=7+(i*7%15);box(x,h/2-1,z,4+(i%3),h,4,palette.dark);for(let k=0;k<3;k++)box(x+(i%2?2.1:-2.1),2+k*2.3,z,.05,.55,.6,(i+k)%3?palette.blue:palette.gold)}
+  panelText('NERVE CITY  /  DOCK 09',0,4.15,-13.55,8,1,'#85f7ea','#10272b',95);
+  panelText('HELI X  /  BIOTECH',0,4.1,-37.55,8,1,'#b7ff9e','#173026',100);
+  panelText('CLEAN FUTURE. DIRTY WORK.',0,4.3,-78.5,10,1,'#ffb470','#311d24',80);
+  panelText('HARDLINE\nSECURITY',-13.5,3.2,3,4,1.5,'#81fff0','#153b3d',80).rotation.y=Math.PI/2;
+  panelText('NO WITNESSES\nNO LIABILITY',13.5,3.1,-25,4,1.5,'#fff1a6','#463b25',72).rotation.y=-Math.PI/2;
+  // Dock dressing, lab tanks, cover and destructible supplies.
+  for(let [x,z] of LEVEL.cover){box(x,.8,z,2.4,1.6,1.6,palette.dark,true,true);box(x,1.68,z,2.4,.08,1.6,palette.yellow);}
+  for(let [x,z,loot] of LEVEL.crates)makeCrate(x,z,loot);
+  for(let [x,z] of LEVEL.barrels)makeBarrel(x,z);
+  for(let z of [-22,-30,-48,-60])for(let x of [-11,11]){cylinder(x,1.55,z,1.05,3.1,palette.dark,true);cylinder(x,1.58,z,1.08,2.05,z<-38?palette.lime:palette.cyan);cylinder(x,2.9,z,1.12,.35,palette.metal);cylinder(x,.2,z,1.12,.4,palette.metal);}
+  for(let [x,z,type] of LEVEL.terminals)makeTerminal(x,z,type);
+  for(let [x,z,type] of LEVEL.pickups)addPickup(x,z,type);
+  for(let [x,z,type] of LEVEL.enemies)human(x,z,type);
+  playerBody=world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(LEVEL.spawn[0],.91,LEVEL.spawn[1]));playerCollider=world.createCollider(RAPIER.ColliderDesc.capsule(.5,.38),playerBody);
+  world.step();const gun=makeWeapon();scene.userData.gun=gun;
+  camera.position.set(6,7,10);camera.lookAt(0,1,-10);
+}
+function startRun(demo=false,startAt=0){
+  buildWorld();run={health:100,armor:50,score:0,kills:0,headshots:0,stage:0,choice:'',over:false,won:false,demo,sim:0,yaw:0,pitch:0,vy:0,grounded:false,dash:0,dashCooldown:0,reload:0,fireCooldown:0,weapon:0,ammo:[24,8],reserve:[144,40],startAt,demoTime:0,flags:{},lastHit:0,killCombo:0};
+  screen='play';modalKind='';show(el.title,false);show(el.modal,false);show(el.hud);show($('attract'),demo);show($('onlineBadge'),!!network);show($('marker'));show($('touch-notice'),false);titleIdle=0;resultSent=false;scoreReported=-1;updateHUD();
+  if(!demo)voice('Dockside says the shipment is legal. Dockside also says it has never seen a mutant.', 'MIRA');
+  reportProgress();
+}
+function objective(){if(!run)return null;if(run.stage===0)return {...terminals.find(t=>t.type==='gate'),title:'Breach dock security',sub:'FIND THE SECURITY TERMINAL'};if(run.stage===1)return{...terminals.find(t=>t.type==='lab'),title:'Get the Helix ledger',sub:'ACCESS THE GENE BANK'};if(run.stage===2){let boss=enemies.find(e=>e.type==='boss');return {x:boss?.x||0,z:boss?.z||-60,title:'Neutralize the Warden',sub:'SHUT DOWN THE LAB ENFORCER'}}return{...terminals.find(t=>t.type==='extract'),title:'Extract the evidence',sub:'REACH THE EXTRACTION CONSOLE'}}
+function updateHUD(){if(!run)return;let o=objective();$('objective').textContent=o.title;$('objectiveSub').textContent=o.sub;$('chapter').textContent=String(Math.min(run.stage+1,3)).padStart(2,'0');$('score').textContent=String(Math.floor(run.score)).padStart(6,'0');$('killCount').textContent=run.kills+' HOSTILES NEUTRALIZED';$('hp').textContent=Math.ceil(run.health);$('armor').textContent=Math.ceil(run.armor);$('hpbar').style.width=Math.max(0,run.health)+'%';$('armorbar').style.width=Math.max(0,run.armor)+'%';$('ammo').textContent=run.ammo[run.weapon];$('reserve').textContent=run.reserve[run.weapon];$('weaponName').textContent=run.weapon===0?'VIGIL-9 / AUTO':'BREACHER / SHOTGUN';}
+function addScore(points){run.score+=points;updateHUD();reportProgress()}
+function message(title,sub='',duration=2.4){$('message').innerHTML=`${title}<span>${sub}</span>`;show($('message'));hudMessageUntil=elapsed+duration}
+function resolveLabChoice(choice){
+  if(!run||run.stage!==1)return;run.choice=choice;run.stage=2;let t=terminals.find(t=>t.type==='lab');t.used=true;openDoor(1);addScore(choice==='copy'?1500:750);
+  if(choice==='copy'){human(8,-41,'mutant');human(-8,-46,'mutant');voice('You kept the formula? Great. I hope your conscience has a good lawyer.')}else voice('Batch purged. Somewhere, a shareholder just felt a disturbance in the force.');
+  message(choice==='copy'?'FORMULA COPIED':'BATCH PURGED','WARDEN CHAMBER UNLOCKED');updateHUD();
+}
+function interact(){if(!run||!currentInteract||run.over)return;let t=currentInteract;
+  if(t.type==='gate'&&run.stage===0){t.used=true;run.stage=1;openDoor(0);addScore(500);voice('Door is open. Remember: the lab coat is not a diplomatic immunity vest.');message('CHECKPOINT OPEN','FIND THE GENE BANK');}
+  else if(t.type==='lab'&&run.stage===1){if(run.demo)resolveLabChoice('purge');else openPanel('choice')}
+  else if(t.type==='extract'&&run.stage>=3){addScore(2000);voice('Evidence secured. The city owes you one. Do not try to collect.');finishRun(true)}
+  else if(t.type==='supply'&&!t.used){t.used=true;run.reserve[0]+=48;run.reserve[1]+=8;run.armor=Math.min(100,run.armor+20);addScore(250);sound('pick');message('SUPPLY CACHE','AMMO + ARMOR')}
+  updateHUD();
+}
+let shotRay, tmpV, tmpW;
+function tracer(a,b,color=0xffdf83){let vec=new THREE.Vector3().subVectors(b,a),len=vec.length();if(len<.05)return;let m=new THREE.Mesh(new THREE.CylinderGeometry(.016,.016,len,5),new THREE.MeshBasicMaterial({color,transparent:true,opacity:.9}));m.position.copy(a).add(b).multiplyScalar(.5);m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),vec.normalize());scene.add(m);effects.push({mesh:m,life:.12,max:.12,type:'line'})}
+function burst(pos,color=0xffc561,count=8){for(let i=0;i<count;i++){let m=new THREE.Mesh(new THREE.BoxGeometry(.07,.07,.07),new THREE.MeshBasicMaterial({color}));m.position.copy(pos);scene.add(m);effects.push({mesh:m,life:.3+Math.random()*.25,max:.55,type:'spark',velocity:new THREE.Vector3((Math.random()-.5)*4,Math.random()*4,(Math.random()-.5)*4)})}}
+function explode(pos){
+  sound('boom');let m=new THREE.Mesh(new THREE.IcosahedronGeometry(.7,1),new THREE.MeshBasicMaterial({color:0xff9c45,transparent:true,opacity:.75}));m.position.copy(pos);scene.add(m);effects.push({mesh:m,life:.4,max:.4,type:'explosion'});burst(pos,0xffc25c,16);
+  for(let e of enemies)if(!e.dead){let d=Math.hypot(e.x-pos.x,e.z-pos.z);if(d<5)damageEnemy(e,Math.round((5-d)*25),false)}
+  if(run&&!run.demo){let p=playerBody.translation(),d=Math.hypot(p.x-pos.x,p.z-pos.z);if(d<3.5)damagePlayer(Math.round((3.5-d)*9))}
+  for(let b of bodies){let p=b.rb.translation(),d=Math.hypot(p.x-pos.x,p.z-pos.z);if(d<6&&d>.01)b.rb.applyImpulse({x:(p.x-pos.x)/d*35,y:25,z:(p.z-pos.z)/d*35},true)}
+}
+function breakObject(ent){if(ent.dead)return;ent.dead=true;let pos=ent.mesh.position.clone();solids=solids.filter(m=>m!==ent.mesh);scene.remove(ent.mesh);world.removeRigidBody(ent.rb);bodies=bodies.filter(b=>b.rb!==ent.rb);if(ent.kind==='barrel')explode(pos);else{burst(pos,0xe2c875,10);addPickup(pos.x,pos.z,ent.loot);sound('hit')}}
+function damageEnemy(e,damage,headshot){if(e.dead)return;e.hp-=damage;e.hit=.2;burst(new THREE.Vector3(e.x,headshot?2:1.4,e.z),headshot?0xffd45a:0x7af5e6,4);sound('hit');if(e.hp<=0){e.dead=true;e.group.rotation.z=1.4;e.group.position.y=.15;solids=solids.filter(m=>m.userData.entity!==e);run.kills++;if(headshot)run.headshots++;addScore((e.type==='boss'?3000:e.type==='mutant'?350:250)+(headshot?150:0));if(e.type==='boss'&&run.stage===2){run.stage=3;voice('Warden is down. Get the ledger to the extraction point, before their legal team gets there first.');message('WARDEN NEUTRALIZED','REACH EXTRACTION');updateHUD()}}}
+function damagePlayer(amount){if(!run||run.demo||run.over)return;let absorbed=Math.min(run.armor,amount*.55);run.armor-=absorbed;run.health=Math.max(0,run.health-(amount-absorbed));run.lastHit=.65;sound('hurt');updateHUD();if(run.health<=0)finishRun(false)}
+function shotDirection(){
+  let dir=new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion).normalize();
+  if(settings.assist&&lastInput.pad){let origin=camera.position,best=null,bestDot=.989;for(let e of enemies){if(e.dead)continue;let dest=new THREE.Vector3(e.x,1.65*(e.type==='boss'?1.7:1),e.z),v=dest.sub(origin),d=v.length(),dot=v.normalize().dot(dir);if(d<36&&dot>bestDot){best=v;bestDot=dot}}if(best)dir.lerp(best,.55).normalize()}
+  return dir;
+}
+function shoot(){
+  if(!run||run.over||run.fireCooldown>0||run.reload>0)return;const w=run.weapon;
+  if(run.ammo[w]<=0){reload();return}run.ammo[w]--;run.fireCooldown=w===0?.14:.62;run.kick=w===0?.12:.25;sound(w===0?'shoot':'shotgun');$('flash').style.opacity='.15';run.flash=.06;
+  camera.updateMatrixWorld(true);scene.updateMatrixWorld(true);let origin=camera.getWorldPosition(new THREE.Vector3()),direction=shotDirection(),end;
+  for(let i=0;i<(w===0?1:7);i++){
+    let dir=direction.clone();let spread=w===0?.003:.033;dir.x+=(Math.random()-.5)*spread;dir.y+=(Math.random()-.5)*spread;dir.z+=(Math.random()-.5)*spread;dir.normalize();shotRay.set(origin,dir);shotRay.far=60;let hits=shotRay.intersectObjects(solids,false);let hit=hits[0];end=hit?hit.point:origin.clone().addScaledVector(dir,60);
+    if(hit){let ent=hit.object.userData.entity;if(ent?.kind==='enemy'){damageEnemy(ent,w===0?19:13,!!hit.object.userData.head);hitUntil=elapsed+.14}else if(ent?.kind==='crate'||ent?.kind==='barrel'){ent.hp-=w===0?15:15;if(ent.hp<=0)breakObject(ent)}else burst(hit.point,0x8ce5d8,3)}
+    if(i===0)tracer(origin.clone().add(new THREE.Vector3(.18,-.12,0)),end,w===0?0xffe1a0:0xffa767);
+  }
+  updateHUD();
+}
+function reload(){if(!run||run.reload>0)return;let w=run.weapon,cap=w?8:24;if(run.ammo[w]>=cap||run.reserve[w]<=0)return;run.reload=w?1.25:1.05;sound('reload');message('RELOADING','',1)}
+function swapWeapon(){if(!run||run.reload>0)return;run.weapon=1-run.weapon;run.fireCooldown=.2;sound('nav');updateHUD()}
+function jump(){if(run?.grounded){run.vy=7.1;run.grounded=false;sound('jump')}}
+function dash(){if(!run||run.dashCooldown>0)return;run.dash=.2;run.dashCooldown=2.2;sound('dash')}
+function collectPickups(){let p=playerBody.translation();for(let item of pickups){if(item.taken||Math.hypot(p.x-item.x,p.z-item.z)>1.15)continue;if(item.type==='health'&&run.health>=100)continue;if(item.type==='armor'&&run.armor>=100)continue;item.taken=true;scene.remove(item.group);if(item.type==='health')run.health=Math.min(100,run.health+35);else if(item.type==='armor')run.armor=Math.min(100,run.armor+30);else{run.reserve[0]+=36;run.reserve[1]+=6}addScore(75);sound('pick');message(item.type==='health'?'MED KIT':item.type==='armor'?'ARMOR PLATE':'AMMO CACHE','SUPPLIES ACQUIRED',1.1);updateHUD()}}
+function enemyCanSee(e,p){let a=new THREE.Vector3(e.x,e.type==='boss'?2.4:1.5,e.z),b=new THREE.Vector3(p.x,1.2,p.z),dir=b.clone().sub(a),distance=dir.length();dir.normalize();shotRay.set(a,dir);shotRay.far=distance;let hits=shotRay.intersectObjects(solids,false);return !hits.some(h=>!h.object.userData.entity||['crate','barrel'].includes(h.object.userData.entity.kind))}
+function updateEnemies(dt){if(!run)return;let p=playerBody.translation();scene.updateMatrixWorld(true);
+  for(let e of enemies){if(e.dead)continue;e.phase+=dt*6;e.fire-=dt;e.hit=Math.max(0,e.hit-dt);let dx=p.x-e.x,dz=p.z-e.z,dist=Math.hypot(dx,dz);let active=e.type!=='boss'||p.z<-42||run.demo;
+    e.group.rotation.y=Math.atan2(dx,dz);let walk=false;
+    if(active&&dist<23&&dist>1.2){let desired=e.type==='mutant'?2:e.type==='boss'?8:9;if(dist>desired){let speed=e.type==='mutant'?2.1:e.type==='boss'?1.05:.85;e.x+=dx/dist*speed*dt;e.z+=dz/dist*speed*dt;walk=true}else if(e.type==='guard'){e.movePhase+=dt;let side=Math.sin(e.movePhase*.8);e.x+=dz/dist*side*.55*dt;e.z-=dx/dist*side*.55*dt;walk=true}
+      e.x=Math.max(-12,Math.min(12,e.x));let range=e.zone===0?[-12.8,9]:e.zone===1?[-36.8,-15.3]:[-76,-39.3];e.z=Math.max(range[0],Math.min(range[1],e.z));}
+    e.group.position.x=e.x;e.group.position.z=e.z;let swing=walk?Math.sin(e.phase)*.45:Math.sin(e.phase*.25)*.06;e.legL.rotation.x=swing;e.legR.rotation.x=-swing;e.armL.rotation.x=-swing*.7;e.armR.rotation.x=swing*.7;e.group.position.y=e.hit>0?.08:0;
+    if(!active||run.demo||!run||run.over)continue;
+    if(e.type==='mutant'&&dist<2.2&&e.fire<=0){e.fire=1.1;damagePlayer(13);burst(new THREE.Vector3(p.x,1.1,p.z),0xff7050,5)}
+    else if(e.type!=='mutant'&&dist<23&&e.fire<=0&&enemyCanSee(e,p)){e.fire=e.type==='boss'?1.1:2.2+Math.random();let a=new THREE.Vector3(e.x,e.type==='boss'?2.3:1.4,e.z),b=new THREE.Vector3(p.x,1.3,p.z);tracer(a,b,0xff6250);if(Math.random()<(e.type==='boss'?.75:.58))damagePlayer(e.type==='boss'?11:6)}
+  }
+}
+function updatePhysics(dt,input){
+  if(!run||run.demo)return;let p=playerBody.translation(),yaw=run.yaw;let speed=CFG.speed*(run.dash>0?2.8:1),mx=input.x,mz=input.y,mag=Math.hypot(mx,mz);if(mag>1){mx/=mag;mz/=mag}
+  let dx=(Math.cos(yaw)*mx+Math.sin(yaw)*mz)*speed*dt,dz=(-Math.sin(yaw)*mx+Math.cos(yaw)*mz)*speed*dt;run.vy=Math.max(-18,run.vy-18*dt);let move={x:dx,y:run.vy*dt,z:dz};
+  controller.computeColliderMovement(playerCollider,move);let actual=controller.computedMovement();run.grounded=controller.computedGrounded();if(run.grounded&&run.vy<0)run.vy=0;playerBody.setNextKinematicTranslation({x:p.x+actual.x,y:p.y+actual.y,z:p.z+actual.z});
+  world.timestep=dt;world.step();for(let b of bodies){let t=b.rb.translation(),q=b.rb.rotation();b.mesh.position.set(t.x,t.y,t.z);b.mesh.quaternion.set(q.x,q.y,q.z,q.w)}
+}
+function updateInteraction(){if(!run||run.demo||run.over){currentInteract=null;show($('interaction'),false);return}let p=playerBody.translation();currentInteract=null;let dist=3;for(let t of terminals){let enabled=(t.type==='gate'&&run.stage===0)||(t.type==='lab'&&run.stage===1)||(t.type==='extract'&&run.stage===3)||(t.type==='supply'&&!t.used);let d=Math.hypot(p.x-t.x,p.z-t.z);if(enabled&&d<dist){dist=d;currentInteract=t}}
+  if(currentInteract){let label={gate:'OPEN CHECKPOINT',lab:'ACCESS GENE BANK',extract:'EXTRACT EVIDENCE',supply:'OPEN SUPPLY CACHE'}[currentInteract.type];$('interaction').innerHTML=`<b>✕ / E</b> &nbsp; ${label}`;show($('interaction'))}else show($('interaction'),false);
+}
+function updateMarker(){if(!run||run.over)return;let o=objective(),p=playerBody.translation();let v=new THREE.Vector3(o.x,2.8,o.z).project(camera);let behind=v.z>1;if(behind){v.x=-v.x;v.y=-v.y}let x=Math.min(.9,Math.max(-.9,v.x)),y=Math.min(.78,Math.max(-.78,v.y));let marker=$('marker');marker.style.left=((x+1)*50)+'%';marker.style.top=((1-y)*50)+'%';marker.innerHTML=`${Math.round(Math.hypot(p.x-o.x,p.z-o.z))} M`;show(marker)}
+function updateEffects(dt){for(let i=effects.length-1;i>=0;i--){let e=effects[i];e.life-=dt;if(e.type==='spark'){e.mesh.position.addScaledVector(e.velocity,dt);e.velocity.y-=9*dt}else if(e.type==='explosion'){let f=1+(1-e.life/e.max)*5;e.mesh.scale.setScalar(f);e.mesh.material.opacity=Math.max(0,e.life/e.max*.65)}else if(e.type==='line')e.mesh.material.opacity=Math.max(0,e.life/e.max);if(e.life<=0){scene.remove(e.mesh);e.mesh.geometry.dispose();e.mesh.material.dispose();effects.splice(i,1)}}}
+function demoUpdate(dt){
+  run.demoTime+=dt;let t=run.demoTime;const path=[[0,0,7],[8,6,-7],[14,0,-17],[22,-7,-28],[30,0,-42],[38,0,-52],[46,1,-63],[52,0,-73]];let a=path[0],b=path[path.length-1];for(let i=0;i<path.length-1;i++)if(t>=path[i][0]&&t<path[i+1][0]){a=path[i];b=path[i+1];break}let k=Math.min(1,Math.max(0,(t-a[0])/(b[0]-a[0]))),x=a[1]+(b[1]-a[1])*k,z=a[2]+(b[2]-a[2])*k;playerBody.setTranslation({x,y:.91,z},true);playerBody.setNextKinematicTranslation({x,y:.91,z});run.yaw=Math.sin(t*.5)*.13;run.pitch=-.025;
+  if(t>7&&!run.flags.gate){run.flags.gate=true;currentInteract=terminals.find(o=>o.type==='gate');interact()}
+  if(t>21&&!run.flags.lab){run.flags.lab=true;resolveLabChoice('purge')}
+  if(t>43&&!run.flags.boss){run.flags.boss=true;let e=enemies.find(o=>o.type==='boss');if(e)damageEnemy(e,999,false)}
+  if(t>1&&Math.floor(t*2)%3===0&&run.fireCooldown<=0){let candidates=enemies.filter(e=>!e.dead&&Math.hypot(e.x-x,e.z-z)<15).sort((a,b)=>Math.hypot(a.x-x,a.z-z)-Math.hypot(b.x-x,b.z-z));if(candidates.length){let e=candidates[0],from=new THREE.Vector3(x,1.58,z),to=new THREE.Vector3(e.x,1.5,e.z);tracer(from,to);sound('shoot');run.fireCooldown=.35;damageEnemy(e,40,false)}}
+  if(t>53)startRun(true);
+}
+function exitAttract(){if(run?.demo){setTitle();return true}return false}
+function touchInputAccepted(){if(!el.touch.classList.contains('hidden')){show(el.touch,false);if(bootFailed)show($('error'));return true}return false}
+document.addEventListener('keydown',e=>{
+  if(e.repeat&&['Escape','Enter','Space','KeyE','KeyR','KeyQ','ShiftLeft','ShiftRight'].includes(e.code))return;
+  unlockAudio();
+  if(exitAttract()){e.preventDefault();return}touchInputAccepted();titleIdle=0;keyState[e.code]=true;
+  const isMenu=!!modalKind||screen==='title'||screen==='over';
+  if(e.code==='Escape'){e.preventDefault();if(modalKind)closeModal();else openPanel('settings');return}
+  if(isMenu){
+    if(modalKind==='about'&&(e.code==='ArrowDown'||e.code==='ArrowUp'||e.code==='KeyS'||e.code==='KeyW')){ $('creditsText').scrollBy(0,(e.code==='ArrowDown'||e.code==='KeyS')?110:-110);e.preventDefault();return }
+    if(modalKind==='join'&&/^Digit[0-9]$/.test(e.code)){roomDigits[selectedDigit]=Number(e.code.slice(5));selectedDigit=Math.min(5,selectedDigit+1);renderJoin();e.preventDefault();return}
+    if(e.code==='ArrowDown'||e.code==='KeyS'){navigate(1);e.preventDefault()}
+    else if(e.code==='ArrowUp'||e.code==='KeyW'){navigate(-1);e.preventDefault()}
+    else if(e.code==='ArrowLeft'||e.code==='ArrowRight'){let b=currentButtons()[focus];if(b?.dataset.setting)changeSetting(b.dataset.setting,e.code==='ArrowRight'?1:-1);else if(b?.dataset.digit!==undefined){selectedDigit=+b.dataset.digit;roomDigits[selectedDigit]=(roomDigits[selectedDigit]+(e.code==='ArrowRight'?1:9))%10;renderJoin()}else navigate(e.code==='ArrowRight'?1:-1);e.preventDefault()}
+    else if(e.code==='Enter'||e.code==='Space'){activateFocused();e.preventDefault()}
+    return;
+  }
+  if(screen==='play'&&!endedByHub){if(e.code==='KeyE')interact();else if(e.code==='Space')jump();else if(e.code==='KeyR')reload();else if(e.code==='KeyQ'||e.code==='Digit1'||e.code==='Digit2')swapWeapon();else if(e.code==='ShiftLeft'||e.code==='ShiftRight')dash();if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault()}
+});
+document.addEventListener('keyup',e=>{keyState[e.code]=false});
+window.addEventListener('blur',()=>{keyState={};mouseDown=false});
+document.addEventListener('mousedown',e=>{if(exitAttract()){e.preventDefault();return}titleIdle=0;if(screen==='play'&&!modalKind&&!run?.demo){unlockAudio();if(e.button===0){mouseDown=true;if(document.pointerLockElement!==renderer.domElement)renderer.domElement.requestPointerLock?.()}if(e.button===2)keyState.AimMouse=true}});
+document.addEventListener('mouseup',e=>{if(e.button===0)mouseDown=false;if(e.button===2)keyState.AimMouse=false});
+document.addEventListener('contextmenu',e=>e.preventDefault());
+document.addEventListener('wheel',()=>{if(!exitAttract())titleIdle=0},{passive:true});
+document.addEventListener('touchstart',()=>{if(!exitAttract())titleIdle=0},{passive:true});
+document.addEventListener('mousemove',e=>{if(run?.demo&&(e.movementX||e.movementY)){exitAttract();return}if(screen==='title'&&(e.movementX||e.movementY))titleIdle=0;if(screen==='play'&&!modalKind&&document.pointerLockElement===renderer.domElement&&run&&!run.demo){let scale=settings.sensitivity/65*.0021;run.yaw-=e.movementX*scale*(settings.lookX?-1:1);run.pitch-=e.movementY*scale*(settings.lookY?-1:1);run.pitch=Math.max(-1.25,Math.min(1.25,run.pitch))}});
+let padHeld=[];
+function pollPad(dt){
+  let pad;try{pad=[...(navigator.getGamepads?.()||[])].find(p=>p&&p.connected)}catch(_){}if(!pad){padPrevious=[];padHeld=[];return null}
+  const held=pad.buttons.map(b=>b.pressed||b.value>.45),just=i=>!!held[i]&&!padPrevious[i];let axes=pad.axes.map(v=>Math.abs(v)<.16?0:v),active=held.some(Boolean)||axes.some(v=>Math.abs(v)>.25);
+  if(active){if(exitAttract()){padPrevious=held;return null}if(touchInputAccepted()){padPrevious=held;return null}titleIdle=0;unlockAudio()}
+  if(just(9)&&!held[8]){if(modalKind)closeModal();else openPanel('settings')}
+  let isMenu=!!modalKind||screen==='title'||screen==='over';
+  if(isMenu){
+    if(just(1)){if(modalKind==='join')openPanel('online');else if(modalKind)closeModal()}
+    let vertical=(held[13]||axes[1]>.55)?1:(held[12]||axes[1]<-.55)?-1:0;let horizontal=(held[15]||axes[0]>.55)?1:(held[14]||axes[0]<-.55)?-1:0;
+    menuRepeat-=dt;if((vertical||horizontal)&&menuRepeat<=0){menuRepeat=.22;let b=currentButtons()[focus];if(modalKind==='about'&&vertical){$('creditsText').scrollBy(0,vertical*110)}else if(modalKind==='join'&&b?.dataset.digit!==undefined&&vertical){selectedDigit=+b.dataset.digit;roomDigits[selectedDigit]=(roomDigits[selectedDigit]+(vertical<0?1:9))%10;renderJoin()}else if(b?.dataset.setting&&horizontal)changeSetting(b.dataset.setting,horizontal);else navigate(vertical||horizontal)}if(!vertical&&!horizontal)menuRepeat=0;
+    if(just(0))activateFocused();
+  }else if(screen==='play'&&!endedByHub){if(just(0)){if(currentInteract)interact();else jump()}if(just(2))reload();if(just(5)||just(3))swapWeapon();if(just(4))dash()}
+  padPrevious=held;padHeld=held;padAxesPrevious=axes;return {pad,held,axes};
+}
+function readInput(pad,dt){
+  let x=(keyState.KeyD||keyState.ArrowRight?1:0)-(keyState.KeyA||keyState.ArrowLeft?1:0),y=(keyState.KeyS||keyState.ArrowDown?1:0)-(keyState.KeyW||keyState.ArrowUp?1:0);let fromPad=false;
+  if(pad){x+=pad.axes[0]||0;y+=pad.axes[1]||0;fromPad=pad.axes.some(a=>Math.abs(a)>.16)||pad.held.some(Boolean);let lookX=(pad.axes[2]||0)*(settings.lookX?-1:1),lookY=(pad.axes[3]||0)*(settings.lookY?-1:1);run.yaw-=lookX*2.5*dt*settings.sensitivity/65;run.pitch-=lookY*2.1*dt*settings.sensitivity/65;run.pitch=Math.max(-1.25,Math.min(1.25,run.pitch))}
+  x*=settings.moveX?-1:1;y*=settings.moveY?-1:1;let fire=mouseDown||!!pad?.held[7],aim=!!keyState.AimMouse||!!pad?.held[6];return {x,y,fire,aim,action:!!pad?.held[0],pad:fromPad};
+}
+function setCamera(dt,input){let p=playerBody.translation();camera.rotation.order='YXZ';camera.position.set(p.x,p.y+.68,p.z);camera.rotation.y=run.yaw;camera.rotation.x=run.pitch;camera.rotation.z=0;let gun=scene.userData.gun,walking=Math.hypot(input?.x||0,input?.y||0);run.bob=(run.bob||0)+dt*(walking?9:2);run.kick=Math.max(0,(run.kick||0)-dt*.8);gun.position.set(.4+Math.sin(run.bob)*.015*walking,-.32+Math.abs(Math.cos(run.bob))*.018*walking,-.67+(run.kick||0));gun.rotation.x=.03+(run.kick||0);gun.scale.set(run.weapon?1.25:1,1,1);let target=input?.aim?53:68;camera.fov+=(target-camera.fov)*Math.min(1,dt*10);camera.updateProjectionMatrix()}
+function animate(now){requestAnimationFrame(animate);let rawDt=Math.max(0,(now-last)/1000),dt=Math.min(.05,rawDt);last=now;elapsed+=dt;let pad=pollPad(dt);networkTick();
+  if(screen==='title'&&!modalKind){titleIdle+=rawDt;camera.position.set(6+Math.sin(elapsed*.12)*1.2,7,10);camera.lookAt(0,1,-12);if(titleIdle>=10)startRun(true)}
+  if(screen==='play'&&run&&!run.over&&!endedByHub){let waitHub=hub.active&&hubInfo&&hub.time()<0,waitRoom=network&&run.startAt&&Date.now()<run.startAt;
+    if(waitHub||waitRoom){let ms=waitHub?hub.time():Date.now()-run.startAt;message(ms===-Infinity?'READY':String(Math.max(1,Math.ceil(-ms/1000))),'STAND BY',.2)}
+    else if(!modalKind){run.sim+=dt;run.fireCooldown=Math.max(0,run.fireCooldown-dt);run.dash=Math.max(0,run.dash-dt);run.dashCooldown=Math.max(0,run.dashCooldown-dt);run.lastHit=Math.max(0,run.lastHit-dt);
+      if(run.reload>0){run.reload-=dt;if(run.reload<=0){let w=run.weapon,needed=(w?8:24)-run.ammo[w],n=Math.min(needed,run.reserve[w]);run.ammo[w]+=n;run.reserve[w]-=n;updateHUD()}}
+      if(run.demo){demoUpdate(dt);setCamera(dt,{x:0,y:1});updateEnemies(dt)}
+      else {let input=readInput(pad,dt);lastInput={x:input.x,y:input.y,fire:input.fire,action:input.action,pad:input.pad};updatePhysics(dt,input);setCamera(dt,input);updateInteraction();collectPickups();updateEnemies(dt);if(input.fire)shoot();if(network&&Date.now()-run.startAt>=300000)finishRun(false)}
+      for(let d of doors){if(d.open&&d.amount<1){d.amount=Math.min(1,d.amount+dt*.65);d.l.position.x=-1.49-d.amount*2.8;d.r.position.x=1.49+d.amount*2.8}}
+      for(let item of pickups)if(!item.taken){item.group.rotation.y+=dt;item.group.position.y=item.base+Math.sin(elapsed*3+item.x)*.1}
+      updateEffects(dt);updateMarker();musicTick();
+    } else lastInput={x:0,y:0,fire:false,action:false};
+    $('hurt').style.opacity=String(Math.min(1,run.lastHit||0));if(run.flash>0){run.flash-=dt;if(run.flash<=0)$('flash').style.opacity='0'}
+  }
+  if(elapsed>subtitleUntil)show($('subtitle'),false);if(elapsed>hudMessageUntil)show($('message'),false);$('crosshair').classList.toggle('hit',elapsed<hitUntil);
+  if(renderer&&scene&&camera&&!suppressDrawing)renderer.render(scene,camera);
+}
+window.addEventListener('resize',()=>{if(!renderer||!camera)return;renderer.setSize(innerWidth,innerHeight);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix()});
+async function captureTestFrame(){
+  if(run)setCamera(.016,{x:0,y:0});
+  const w=1024,h=576,target=new THREE.RenderTarget(w,h,{type:THREE.UnsignedByteType});
+  renderer.setRenderTarget(target);renderer.render(scene,camera);renderer.setRenderTarget(null);
+  const pixels=await renderer.readRenderTargetPixelsAsync(target,0,0,w,h);target.dispose();
+  const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
+  canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(pixels.slice(0,w*h*4)),w,h),0,0);
+  return canvas.toDataURL();
+}
+async function boot(){if(matchMedia('(pointer: coarse)').matches&&!matchMedia('(any-hover: hover)').matches)show(el.touch);try{
+  if(!navigator.gpu)throw new Error('This browser does not expose WebGPU.');
+  let adapter=await navigator.gpu.requestAdapter();if(!adapter)throw new Error('No WebGPU adapter is available.');
+  [THREE,RAPIER]=await Promise.all([import('/lib/vendor/three/0.180.0/build/three.webgpu.js'),import('/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs').then(m=>m.default)]);
+  await RAPIER.init();renderer=new THREE.WebGPURenderer({antialias:true});renderer._getFallback=null;await renderer.init();renderer.onDeviceLost=info=>{if(endedByHub)return;bootFailed=true;$('errorText').textContent='The WebGPU device was lost. Reload the page to reconnect it.';show($('error'));if(hub.active)hub.fail('WebGPU device lost: '+(info.message||'unknown'))};if(!renderer.backend.isWebGPUBackend)throw new Error('A WebGPU backend is required.');renderer.setPixelRatio(Math.min(devicePixelRatio||1,1.5));renderer.setSize(innerWidth,innerHeight);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.05;$('viewport').appendChild(renderer.domElement);
+  makePalette();shotRay=new THREE.Raycaster();buildWorld();hubInfo=await hubPromise;
+  show($('boot'),false);
+  if(hub.active&&hubInfo){startRun(false);hub.ready();}
+  else{screen='title';show(el.title);selectFocus(0);if(matchMedia('(pointer: coarse)').matches&&!matchMedia('(any-hover: hover)').matches)show(el.touch)}
+  if(new URLSearchParams(location.search).has('test'))window.__sinchromeTest={get:()=>({screen,stage:run?.stage,health:run?.health,score:run?.score,kills:run?.kills,choice:run?.choice,ammo:run?.ammo.slice(),x:playerBody.translation().x,z:playerBody.translation().z,renderer:renderer.backend.isWebGPUBackend,room:network?.status}),travel:(x,z)=>{playerBody.setTranslation({x,y:.91,z},true);playerBody.setNextKinematicTranslation({x,y:.91,z});updateInteraction()},use:()=>interact(),choose:c=>resolveLabChoice(c),hurt:(n)=>damagePlayer(n),shoot:()=>shoot(),killBoss:()=>{let e=enemies.find(x=>x.type==='boss');if(e)damageEnemy(e,9999,false)},start:()=>startRun(false),demo:()=>startRun(true),capture:captureTestFrame,skipDrawing:v=>{suppressDrawing=v},enemies:()=>enemies.map(e=>({type:e.type,hp:e.hp,dead:e.dead})),aim:()=>{let p=playerBody.translation(),e=enemies.filter(x=>!x.dead).sort((a,b)=>Math.hypot(a.x-p.x,a.z-p.z)-Math.hypot(b.x-p.x,b.z-p.z))[0];if(e){let dx=e.x-p.x,dz=e.z-p.z;run.yaw=Math.atan2(-dx,-dz);run.pitch=Math.atan2(1.25-(p.y+.68),Math.hypot(dx,dz));setCamera(.016,{x:0,y:0})}}};
+  requestAnimationFrame(animate);
+}catch(e){console.error(e);bootFailed=true;show($('boot'),false);$('errorText').textContent=e?.message||String(e);if(el.touch.classList.contains('hidden'))show($('error'));else $('touch-system-note').textContent='WebGPU could not start on this device.';if(hub.active)hub.fail('WebGPU or a required library could not initialize: '+(e?.message||String(e)))} }
+boot();
+</script>
+</body>
+</html>

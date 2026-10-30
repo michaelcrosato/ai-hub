@@ -1,0 +1,1044 @@
+<!doctype html>
+<!--
+Source Information
+Date: 2026-10-29 09:21
+Source: Rock n' Roll Racing
+Tech: Three.js R180 WebGPU; Rapier 0.19.3; Gamepad API; Web Audio; PeerJS 1.5.5; AI Hub session protocol.
+Art Direction: original procedural, cel-shaded arcade racing.
+Animation: procedural mesh and physics-driven animation.
+Audio: original synthesized music, effects, and gibberish announcer via Web Audio.
+Online: AI Hub parallel sessions and standalone PeerJS room-code racing.
+Testing: lightweight headless browser and syntax checks; performance targets out of scope.
+Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort ultra.
+Usage: unknown.
+Testing Feedback: One startup issue caught and fixed; one critical. Most helpful: browser smoke test. Least helpful: syntax check. Headless WebGPU produced a blank canvas even in a minimal Three.js scene; real-GPU visuals remain unverified.
+Engine Feedback: Three.js scene graph is expressive. An event callback initially assumed the core was initialized. Racing rules, AI and controls were built here. WebGPU integration was hardest. Overhaul: adapter/render diagnostics. Change: make WebGPU failures clearer.
+Prompt Feedback: The arcade inspiration and controller-first direction were useful. The meaning of a complete vertical slice was broad. Multiplayer interoperability was hardest. A real four-player controller session would be the most useful additional test.
+-->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"><meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="2-8"><meta name="hub:session-goal" content="Finish three laps as fast as you can"><meta name="hub:session-howto" content="Steer with left stick, accelerate with R2, fire with Cross, boost with Circle"><meta name="hub:webgpu" content="required">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<title>Rumble Road Rebels</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=Space+Mono:wght@400;700&display=swap');
+:root{--cream:#fff1d2;--ink:#161320;--pink:#ff4d78;--yellow:#ffc744;--cyan:#68f4e5}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#181323;color:var(--cream);font-family:'Barlow Condensed',Impact,sans-serif}button,input{font:inherit}button{cursor:pointer}canvas{position:absolute;inset:0;width:100%;height:100%;display:block}#shade{position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(18,14,26,.86),transparent 67%),linear-gradient(0deg,rgba(17,12,24,.45),transparent 36%)}#shade.racing{background:linear-gradient(0deg,rgba(17,12,24,.32),transparent 25%)}#app{position:absolute;inset:0;pointer-events:none}#app button,#app input{pointer-events:auto}.screen{position:absolute;inset:0;padding:5vh 5vw}.topline{display:flex;align-items:center;gap:14px;color:var(--yellow);font-family:'Space Mono',monospace;font-size:clamp(10px,1vw,15px);letter-spacing:.16em;font-weight:700;text-transform:uppercase}.topline:before{content:'';width:38px;height:4px;background:var(--pink)}.logo{font-size:clamp(62px,8.8vw,145px);line-height:.73;letter-spacing:-.055em;font-weight:900;font-style:italic;text-transform:uppercase;margin:5vh 0 0;filter:drop-shadow(5px 6px 0 #ba3057)}.logo span{color:var(--yellow)}.tag{font-family:'Space Mono',monospace;text-transform:uppercase;font-size:clamp(10px,1vw,15px);letter-spacing:.2em;margin:3vh 0;color:#fbd8c5}.menu{display:flex;flex-direction:column;align-items:flex-start;gap:5px;margin-top:3vh}.menu button,.action{border:0;background:rgba(25,21,36,.85);color:var(--cream);text-align:left;font-weight:800;font-size:clamp(20px,2vw,32px);letter-spacing:.04em;text-transform:uppercase;padding:7px 24px;min-width:290px;transform:skew(-8deg);border-left:5px solid transparent}.menu button.selected,.menu button:hover,.action:hover{background:var(--yellow);color:var(--ink);border-left-color:var(--pink)}.menu button span{display:inline-block;transform:skew(8deg)}.foot{position:absolute;bottom:4vh;left:5vw;font:700 clamp(10px,1vw,14px) 'Space Mono',monospace;letter-spacing:.08em;color:#d8c8c4}.foot b{color:var(--cyan)}.stamp{position:absolute;right:5vw;bottom:5vh;text-align:right;font:700 12px 'Space Mono',monospace;letter-spacing:.12em;color:var(--cream);opacity:.8}.stamp strong{display:block;font:900 italic clamp(30px,3.5vw,58px) 'Barlow Condensed',sans-serif;color:var(--yellow);letter-spacing:-.03em}.panel{position:absolute;left:5vw;top:7vh;width:min(690px,85vw);max-height:80vh;background:rgba(24,20,34,.96);border:2px solid #574156;box-shadow:10px 10px 0 rgba(0,0,0,.25);padding:clamp(20px,3vw,42px);overflow:auto;pointer-events:auto}.eyebrow{font:700 12px 'Space Mono',monospace;letter-spacing:.2em;color:var(--pink);text-transform:uppercase}.panel h1{font-size:clamp(40px,5vw,72px);line-height:.85;text-transform:uppercase;font-style:italic;margin:12px 0 20px;color:var(--yellow)}.panel p,.panel li{font-size:clamp(17px,1.4vw,23px);line-height:1.2;margin:.5em 0}.panel ul{padding-left:1.2em}.panel .menu{margin-top:20px}.panel .menu button{font-size:22px;min-width:230px}.hint{color:#beaeb7;font:12px 'Space Mono',monospace!important;line-height:1.5!important}.row{display:flex;justify-content:space-between;align-items:center;gap:20px;border-bottom:1px solid #514050;padding:12px 0;font-size:22px;font-weight:700}.row button{background:#382c3e;border:1px solid #76576a;color:var(--cream);padding:5px 18px}.row button.selected{background:var(--yellow);color:var(--ink)}input{background:#1b1723;color:white;border:2px solid #806979;padding:8px;font:18px 'Space Mono';width:220px;text-transform:uppercase}.hud{position:absolute;inset:0}.hud-top{position:absolute;top:3vh;left:3vw;right:3vw;display:flex;justify-content:space-between;align-items:flex-start}.hud-card{background:rgba(24,20,34,.88);border-left:5px solid var(--yellow);padding:10px 18px;min-width:145px;transform:skew(-7deg)}.hud-card>*{transform:skew(7deg)}.hud-label{font:700 11px 'Space Mono';letter-spacing:.15em;color:#c9b6bb}.hud-big{font-size:clamp(30px,4vw,60px);line-height:.95;font-weight:900;font-style:italic}.hud-big em{font-style:normal;color:var(--yellow)}.hud-bottom{position:absolute;bottom:4vh;left:3vw;right:3vw;display:flex;justify-content:space-between;align-items:flex-end}.meters{background:rgba(24,20,34,.9);padding:12px 16px;width:240px}.meter-label{display:flex;justify-content:space-between;font:700 11px 'Space Mono';letter-spacing:.08em}.bar{height:8px;background:#513b4a;margin:5px 0 10px}.bar i{display:block;height:100%;background:var(--cyan)}.bar.health i{background:var(--pink)}.weapon{text-align:right;background:rgba(24,20,34,.9);padding:10px 20px;border-right:5px solid var(--pink)}.weapon strong{display:block;font-size:27px;font-style:italic}.weapon small{font:700 10px 'Space Mono';color:var(--yellow)}.toast{position:absolute;left:50%;top:16%;transform:translateX(-50%);text-align:center;font-weight:900;font-style:italic;font-size:clamp(36px,5vw,70px);color:var(--yellow);text-shadow:4px 4px #bd3159}.demo{position:absolute;top:4vh;left:50%;transform:translateX(-50%);background:var(--pink);color:white;padding:7px 20px;font:700 12px 'Space Mono';letter-spacing:.2em}.center{text-align:center}.error{position:absolute;inset:0;display:grid;place-items:center;background:#181323}.error div{max-width:600px;padding:40px}.error h1{font-size:48px;color:var(--yellow);text-transform:uppercase}.error p{font-size:22px}.hide{display:none!important}@media(max-width:700px){.stamp{display:none}.logo{font-size:65px}.panel{top:3vh;max-height:88vh}.hud-card{min-width:100px}.meters{width:170px}}
+</style></head><body><div id="stage"></div><div id="shade"></div><div id="app"><div class="screen" id="title"><div class="topline">Copperhead Speedway / Arcade Combat Racing</div><div class="logo">Rumble<br><span>Road</span><br>Rebels</div><div class="tag">Fast cars. Loud guitars. No mercy.</div><div class="menu" id="mainMenu"></div><div class="foot"><b>✕ / ENTER</b> SELECT &nbsp;&nbsp; <b>↑ ↓ / D-PAD</b> NAVIGATE</div><div class="stamp">TONIGHT'S MAIN EVENT<strong>3 LAPS OF MAYHEM</strong>ONE TRACK. FOUR REBELS.</div></div><div id="overlay"></div><div id="hud" class="hud hide"><div class="hud-top"><div class="hud-card"><div class="hud-label">POSITION</div><div class="hud-big" id="position">1<em>ST</em></div></div><div class="hud-card center"><div class="hud-label">LAP</div><div class="hud-big" id="lap">1 <em>/ 3</em></div></div><div class="hud-card" style="text-align:right"><div class="hud-label">RACE TIME</div><div class="hud-big" id="time">0:00</div></div></div><div class="hud-bottom"><div class="meters"><div class="meter-label"><span>ARMOR</span><span id="healthText">100</span></div><div class="bar health"><i id="healthBar"></i></div><div class="meter-label"><span>BOOST</span><span id="boostText">100</span></div><div class="bar"><i id="boostBar"></i></div></div><div class="weapon"><small>✕ FIRE &nbsp; / &nbsp; ○ BOOST</small><strong id="weapon">CANNON READY</strong></div></div><div class="toast hide" id="toast"></div><div class="demo hide" id="demo">ATTRACT MODE · PRESS ANY BUTTON</div></div></div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+// The Copperhead Speedway: all meshes are procedural and use a small cel palette.
+function buildWorld(THREE, scene) {
+  const group = new THREE.Group();
+  scene.add(group);
+  const toon = (color) => new THREE.MeshToonMaterial({ color });
+  const mat = {
+    ground: toon(0x242035), earth: toon(0x57364a), road: toon(0x34354c), roadInset: toon(0x3e4058),
+    curbA: toon(0xffc64d), curbB: toon(0x222038), paint: toon(0xffe5a8),
+    dark: toon(0x171728), metal: toon(0x606077), cyan: toon(0x29e5db), pink: toon(0xff5286),
+    white: toon(0xfff0ce), red: toon(0xf66751), orange: toon(0xffad45), stand: toon(0x4d3a53),
+    shadow: toon(0x251d2f), grass: toon(0x595548)
+  };
+  const mesh = (geo, material, x=0, y=0, z=0, ry=0) => {
+    const m = new THREE.Mesh(geo, material); m.position.set(x,y,z); m.rotation.y=ry;
+    m.receiveShadow=true; m.castShadow=true; group.add(m); return m;
+  };
+  const box = (w,h,d, material,x,y,z,ry=0) => mesh(new THREE.BoxGeometry(w,h,d),material,x,y,z,ry);
+  const cylinder = (rt,rb,h,material,x,y,z,n=8) => mesh(new THREE.CylinderGeometry(rt,rb,h,n),material,x,y,z);
+  // Elliptical bands share their angles, so the track stays smooth and easily adjustable.
+  const ring = (rx, rz, width, material, y, segments=160) => {
+    const verts=[], idx=[];
+    for(let i=0;i<=segments;i++) {
+      const a=i/segments*Math.PI*2, c=Math.cos(a), s=Math.sin(a);
+      verts.push((rx-width/2)*c,y,(rz-width/2)*s,(rx+width/2)*c,y,(rz+width/2)*s);
+      if(i<segments){const k=i*2;idx.push(k,k+2,k+1,k+1,k+2,k+3)}
+    }
+    const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));g.setIndex(idx);g.computeVertexNormals();
+    const m=mesh(g,material);m.castShadow=false;return m;
+  };
+  const disk = (rx,rz,material,y) => {const g=new THREE.CircleGeometry(1,96);g.rotateX(-Math.PI/2);g.scale(rx,1,rz);const m=mesh(g,material,0,y,0);m.castShadow=false;return m};
+  box(180,1,150,mat.ground,0,-.75,0);
+  disk(49,34,mat.earth,-.2);
+  disk(47.3,32.3,mat.dark,-.08);
+  ring(40,25,13,mat.road,0);
+  ring(40,25,9.7,mat.roadInset,.012);
+  disk(33.5,18.5,mat.earth,.01);
+  disk(31.8,16.8,mat.grass,.02);
+  // Alternating rumble strips along both edges.
+  for(let i=0;i<100;i++) {
+    let a=i*Math.PI*2/100, b=(i+1)*Math.PI*2/100;
+    for(const edge of [-1,1]) {
+      const r1=6.0*edge, r2=6.55*edge;
+      const v=[(40+r1)*Math.cos(a),.07,(25+r1)*Math.sin(a),(40+r2)*Math.cos(a),.07,(25+r2)*Math.sin(a),(40+r1)*Math.cos(b),.07,(25+r1)*Math.sin(b),(40+r2)*Math.cos(b),.07,(25+r2)*Math.sin(b)];
+      const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(v,3));g.setIndex(edge<0?[0,1,2,1,3,2]:[0,2,1,1,2,3]);g.computeVertexNormals();mesh(g,i%2?mat.curbA:mat.curbB).castShadow=false;
+    }
+  }
+  // Painted dashed center line.
+  for(let i=0;i<52;i++) {
+    const a=(i+.5)*Math.PI*2/52, x=40*Math.cos(a),z=25*Math.sin(a);
+    const tangent=Math.atan2(-40*Math.sin(a),-25*Math.cos(a));
+    box(.2,.035,1.55,mat.paint,x,.06,z,tangent).castShadow=false;
+  }
+  // Checkered start line across the eastern straight.
+  for(let z=-5;z<=5;z++)for(let x=0;x<2;x++){
+    box(.85,.045,1,(x+z)%2?mat.white:mat.dark,40+(x-.5)*.85,.09,z).castShadow=false;
+  }
+  // Outer low retaining wall: deliberately segmented for a chunky arcade silhouette.
+  for(let i=0;i<64;i++) {
+    const a=i*Math.PI*2/64, b=(i+1)*Math.PI*2/64;
+    const x=(47.3*Math.cos(a)+47.3*Math.cos(b))/2,z=(32.3*Math.sin(a)+32.3*Math.sin(b))/2;
+    const dx=47.3*(Math.cos(b)-Math.cos(a)),dz=32.3*(Math.sin(b)-Math.sin(a));
+    box(Math.hypot(dx,dz)+.1,.75,.48,i%4===0?mat.pink:mat.metal,x,.38,z,-Math.atan2(dz,dx));
+  }
+  // Infield set dressing: service depot, tower, pipes and crates.
+  box(13,2.6,6,mat.shadow,0,1.3,0);
+  box(12,2.25,5.7,mat.stand,0,1.5,0);
+  box(13.3,.35,6.4,mat.dark,0,2.8,0);
+  for(let i=-2;i<=2;i++)box(1.7,1,.08,i%2?mat.cyan:mat.orange,i*2.2,1.75,2.87);
+  box(4,.35,1,mat.orange,0,3.04,0);
+  cylinder(1.2,1.4,6,mat.dark,-12,3,-3,8);
+  cylinder(1.55,1.55,.5,mat.orange,-12,6.15,-3,8);
+  cylinder(.4,.4,1.3,mat.cyan,-12,7,-3,8);
+  for(let i=0;i<4;i++){
+    const x=11+i*2.1,z=4+(i%2)*1.8;
+    box(1.7,1.7,1.7,i%2?mat.orange:mat.metal,x,.85,z);
+    box(1.72,.13,.15,mat.dark,x,1.2,z+.87);
+  }
+  for(let i=0;i<6;i++) {
+    let a=i*Math.PI/3+.18,x=23*Math.cos(a),z=11.5*Math.sin(a);
+    box(2.6,.25,1.8,mat.dark,x,.18,z,a);
+    cylinder(.6,.8,1.4,i%2?mat.orange:mat.pink,x,.9,z,6);
+  }
+  // Grandstands at the long sides. Each stand is built in steps and punctuated by pennants.
+  for(const side of [-1,1]) {
+    const z=side*40;
+    for(let step=0;step<5;step++) box(46,.8,2.5,step%2?mat.stand:mat.shadow,0,.5+step*.8,z+side*step*2.3);
+    for(let x=-21;x<=21;x+=3) for(let row=0;row<4;row++) {
+      const crowd=[mat.cyan,mat.orange,mat.pink,mat.white][Math.abs((x+row*3)/3)%4];
+      cylinder(.23,.3,.65,crowd,x,1.35+row*.8,z+side*(row*2.3),5);
+    }
+    for(let x=-23;x<=23;x+=46) {
+      box(.35,8,.35,mat.metal,x,4,z+side*9);
+      box(4,.22,.35,mat.orange,x+2,7.6,z+side*9);
+      box(3,1.25,.12,side>0?mat.pink:mat.cyan,x+2,6.85,z+side*9);
+    }
+  }
+  // Industrial towers and scenery frame the circuit without obscuring the road.
+  for(const side of [-1,1]) for(const x of [-55,55]) {
+    const z=side*35;
+    box(5,7,5,mat.shadow,x,3.5,z);
+    box(4.5,1,4.5,mat.stand,x,7.4,z);
+    box(5.5,.35,5.5,mat.dark,x,8,z);
+    for(let k=-1;k<=1;k++)box(.55,2,.08,mat.cyan,x+k*1.3,5,z+2.52);
+    cylinder(.45,.7,2,mat.orange,x,9,z,6);
+  }
+  // Light poles and graphic ad boards.
+  const makeLabel=(text,bg,fg) => {
+    const canvas=document.createElement('canvas');canvas.width=512;canvas.height=128;
+    const c=canvas.getContext('2d'); c.fillStyle=bg;c.fillRect(0,0,512,128); c.strokeStyle=fg;c.lineWidth=6;c.strokeRect(5,5,502,118);
+    c.fillStyle=fg;c.font='900 56px sans-serif';c.textAlign='center';c.textBaseline='middle';c.fillText(text,256,66);
+    const texture=new THREE.CanvasTexture(canvas);texture.colorSpace=THREE.SRGBColorSpace;
+    return new THREE.MeshBasicMaterial({map:texture,side:THREE.DoubleSide});
+  };
+  const labels=[makeLabel('FULL THROTTLE','#fbbd43','#211a2b'),makeLabel('NO BRAKES','#fa5180','#211a2b'),makeLabel('AMPED UP','#2ee1d7','#211a2b')];
+  for(let i=0;i<4;i++) {
+    let x=i<2?-52:52,z=i%2?-15:15;
+    box(.4,7,.4,mat.metal,x,3.5,z);
+    box(1,.3,3.2,mat.dark,x,7,z);
+    box(.9,.25,2.8,mat.white,x,6.8,z);
+    let panel=mesh(new THREE.PlaneGeometry(9,2.2),labels[i%3],x+(x<0?2:-2),3,z,Math.PI/2);
+    panel.castShadow=false;
+  }
+  // Overhead finish gantry.
+  for(const z of [-8,8])box(.5,7,.5,mat.metal,40,3.5,z);
+  box(.65,.65,16.8,mat.dark,40,7,0);
+  for(let i=0;i<5;i++)cylinder(.35,.35,.3,i<3?mat.red:mat.cyan,40,6.55,-3+i*1.5,8).rotation.z=Math.PI/2;
+  return {group, centerX:40, centerZ:25, roadWidth:12};
+}
+
+// Self-contained arcade race simulation; coordinates use x/z as the ground plane.
+function createGameCore({ THREE, RAPIER, scene, onEvent = () => {} }) {
+  const RX = 40, RZ = 25, WIDTH = 12, TAU = Math.PI * 2;
+  const track = { rx: RX, rz: RZ, width: WIDTH };
+  const world = new RAPIER.World({ x: 0, y: 0, z: 0 });
+  const group = new THREE.Group(); scene.add(group);
+  const fxGroup = new THREE.Group(); scene.add(fxGroup);
+  const colors = [0xffc629, 0xf34c65, 0x37dce0, 0x9676ff];
+  const names = ['YOU', 'ROXY RIOT', 'VOLT VIPER', 'METAL MICK'];
+  const racers = [];
+  const projectiles = [], mines = [], pickups = [], effects = [];
+  const state = { time: 0, finished: false, winner: null, laps: 3 };
+  const mat = color => new THREE.MeshToonMaterial({ color });
+  const dark = mat(0x171b29), tire = mat(0x10121a), chrome = mat(0xbad6d4), glass = mat(0x96eaff);
+  function box(parent, w, h, d, material, x, y, z) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+    mesh.position.set(x, y, z); mesh.castShadow = true; mesh.receiveShadow = true; parent.add(mesh); return mesh;
+  }
+  function createCar(color, id) {
+    const car = new THREE.Group(), paint = mat(color);
+    box(car, 2.05, .65, 3.4, paint, 0, .7, 0);
+    box(car, 1.65, .55, 1.5, paint, 0, 1.23, -.35);
+    box(car, 1.48, .35, .1, glass, 0, 1.28, .43);
+    box(car, 2.15, .22, .25, chrome, 0, .62, 1.72);
+    box(car, 2.18, .22, .25, dark, 0, .65, -1.75);
+    box(car, 1.85, .16, .5, dark, 0, 1.06, 1.24);
+    box(car, .32, .18, .8, chrome, 0, 1.2, 1.5);
+    for (const x of [-1.08, 1.08]) for (const z of [-1.08, 1.08]) {
+      const wheel = new THREE.Mesh(new THREE.CylinderGeometry(.48, .48, .42, 10), tire);
+      wheel.rotation.z = Math.PI / 2; wheel.position.set(x, .48, z); wheel.castShadow = true; car.add(wheel);
+      const hub = new THREE.Mesh(new THREE.CylinderGeometry(.22, .22, .44, 8), chrome);
+      hub.rotation.z = Math.PI / 2; hub.position.copy(wheel.position); car.add(hub);
+    }
+    for (const x of [-.65, .65]) box(car, .34, .18, .08, mat(0xffec8b), x, .79, 1.73);
+    const shadow = new THREE.Mesh(new THREE.CircleGeometry(1.7, 20), new THREE.MeshBasicMaterial({color:0x090915, transparent:true, opacity:.28, depthWrite:false}));
+    shadow.rotation.x = -Math.PI/2; shadow.scale.set(1, 1.5, 1); shadow.position.y = .035; car.add(shadow);
+    group.add(car); return car;
+  }
+  function makeRacer(i) {
+    const a = -.08 - Math.floor(i/2)*.15, lane = i%2 ? 2.4 : -2.4;
+    const x = (RX+lane)*Math.cos(a), z = (RZ+lane)*Math.sin(a);
+    const body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,0,z).lockRotations().setLinearDamping(.1));
+    world.createCollider(RAPIER.ColliderDesc.ball(1.25).setRestitution(.25).setFriction(.4), body);
+    return { id:i, name:names[i], mesh:createCar(colors[i],i), body, heading:Math.atan2(-RX*Math.sin(a), RZ*Math.cos(a)),
+      health:100, ammo:12, mines:3, boost:100, lap:1, progress:a, lastAngle:a, place:i+1, speed:0,
+      finished:false, invuln:0, fireCooldown:0, mineCooldown:0, boostSound:0, aiFire:2+i, lane,
+      deaths:0, kills:0 };
+  }
+  for (let i=0;i<4;i++) racers.push(makeRacer(i));
+  const player = racers[0];
+  function pickupAt(angle, type) {
+    const p = new THREE.Group();
+    const material = mat(type === 'repair' ? 0x75f2a4 : type === 'ammo' ? 0xffc448 : 0x56d8ff);
+    const gem = new THREE.Mesh(new THREE.OctahedronGeometry(.8), material); gem.position.y=1.1; gem.castShadow=true; p.add(gem);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(1.02,.08,6,16), material); ring.rotation.x=Math.PI/2; ring.position.y=.18; p.add(ring);
+    p.position.set(RX*Math.cos(angle),0,RZ*Math.sin(angle)); group.add(p);
+    pickups.push({mesh:p,type,timer:0,angle});
+  }
+  [['ammo',.46],['repair',1.25],['boost',2.1],['ammo',3.0],['repair',3.85],['boost',4.75],['ammo',5.5]].forEach(([t,a]) => pickupAt(a,t));
+  function clearObjects() {
+    for (const p of projectiles) group.remove(p.mesh);
+    for (const m of mines) group.remove(m.mesh);
+    for (const e of effects) fxGroup.remove(e.mesh);
+    projectiles.length=0; mines.length=0; effects.length=0;
+  }
+  function reset() {
+    clearObjects(); state.time=0; state.finished=false; state.winner=null;
+    racers.forEach((r,i)=>{
+      const a=-.08-Math.floor(i/2)*.15, lane=i%2?2.4:-2.4;
+      r.body.setTranslation({x:(RX+lane)*Math.cos(a),y:0,z:(RZ+lane)*Math.sin(a)},true); r.body.setLinvel({x:0,y:0,z:0},true);
+      Object.assign(r,{heading:Math.atan2(-RX*Math.sin(a),RZ*Math.cos(a)),health:100,ammo:12,mines:3,boost:100,lap:1,progress:a,lastAngle:a,place:i+1,speed:0,finished:false,invuln:0,fireCooldown:0,mineCooldown:0,boostSound:0,aiFire:2+i,deaths:0,kills:0});
+    });
+    for (const p of pickups) {p.timer=0;p.mesh.visible=true;}
+  }
+  function burst(x,z,color=0xffa72e) {
+    const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(1,0), new THREE.MeshBasicMaterial({color,transparent:true,opacity:.9}));
+    mesh.position.set(x,1,z); fxGroup.add(mesh); effects.push({mesh,life:.45});
+  }
+  function hurt(r, amount, attacker) {
+    if(r.invuln>0 || r.finished) return;
+    r.health=Math.max(0,r.health-amount); const pos=r.body.translation(); burst(pos.x,pos.z,0xffa12a); onEvent('hit',{racer:r,attacker});
+    if(r.health<=0) {
+      r.deaths++; if(attacker && attacker!==r) attacker.kills++;
+      onEvent('explode',{racer:r,attacker}); burst(pos.x,pos.z,0xffe25e);
+      r.health=100; r.speed=0; r.invuln=2.4;
+      const a=r.lastAngle-.06;
+      r.body.setTranslation({x:RX*Math.cos(a),y:0,z:RZ*Math.sin(a)},true); r.body.setLinvel({x:0,y:0,z:0},true);
+      r.heading=Math.atan2(-RX*Math.sin(a),RZ*Math.cos(a));
+    }
+  }
+  function shoot(r) {
+    if(r.fireCooldown>0 || r.ammo<=0 || r.finished) return;
+    r.fireCooldown=.42; r.ammo--;
+    const pos=r.body.translation(), dx=Math.sin(r.heading), dz=Math.cos(r.heading);
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(.25,8,6),new THREE.MeshBasicMaterial({color:0xffe674}));
+    mesh.position.set(pos.x+dx*2.4,1,pos.z+dz*2.4); group.add(mesh);
+    projectiles.push({mesh,dx,dz,owner:r,life:1.15}); onEvent('shot',{racer:r});
+  }
+  function dropMine(r) {
+    if(r.mineCooldown>0 || r.mines<=0 || r.finished) return;
+    r.mineCooldown=1; r.mines--;
+    const pos=r.body.translation(); const mesh=new THREE.Mesh(new THREE.CylinderGeometry(.65,.8,.32,8),mat(0xff536e));
+    mesh.position.set(pos.x-Math.sin(r.heading)*2.5,.25,pos.z-Math.cos(r.heading)*2.5); group.add(mesh);
+    mines.push({mesh,owner:r,life:18,arm:.7}); onEvent('mine',{racer:r});
+  }
+  function aiInput(r) {
+    const p=r.body.translation(), a=Math.atan2(p.z/RZ,p.x/RX), target=a+.22;
+    const tx=(RX+r.lane)*Math.cos(target), tz=(RZ+r.lane)*Math.sin(target);
+    const desired=Math.atan2(tx-p.x,tz-p.z); let diff=desired-r.heading;
+    while(diff>Math.PI) diff-=TAU; while(diff< -Math.PI) diff+=TAU;
+    return { throttle:1, brake:Math.abs(diff)>1.05 ? .4 : 0, steer:Math.max(-1,Math.min(1,diff*2.3)), fire:r.aiFire<=0, boost:r.boost>35&&Math.abs(diff)<.25, drop:false };
+  }
+  function update(dt,input={}) {
+    dt=Math.min(.05,Math.max(0,dt)); if(!dt) return; state.time+=dt;
+    for(const r of racers) {
+      const p=r.body.translation(); const a=Math.atan2(p.z/RZ,p.x/RX);
+      let da=a-r.lastAngle; if(da>Math.PI) da-=TAU; if(da< -Math.PI) da+=TAU;
+      if(Math.abs(da)<.4 && !r.finished) r.progress+=da;
+      r.lastAngle=a;
+      const nextLap=Math.min(3,Math.max(1,Math.floor(Math.max(0,r.progress)/TAU)+1));
+      if(nextLap>r.lap) {r.lap=nextLap;onEvent('lap',{racer:r,lap:r.lap});}
+      if(r.progress>=TAU*3 && !r.finished) {r.finished=true; if(!state.winner) state.winner=r; onEvent('finish',{racer:r}); if(r===player) state.finished=true;}
+      r.invuln=Math.max(0,r.invuln-dt); r.fireCooldown=Math.max(0,r.fireCooldown-dt); r.mineCooldown=Math.max(0,r.mineCooldown-dt); r.boostSound=Math.max(0,r.boostSound-dt); r.aiFire-=dt;
+      const c=(r.id===0 && !input.autopilot && !r.finished) ? input : aiInput(r);
+      const throttle=Math.max(0,Math.min(1,c.throttle||0)), brake=Math.max(0,Math.min(1,c.brake||0)), steer=Math.max(-1,Math.min(1,c.steer||0));
+      const boosting=!!c.boost && r.boost>0 && throttle>.1;
+      if(boosting) {r.boost=Math.max(0,r.boost-dt*17); if(r.boostSound<=0){r.boostSound=1;onEvent('boost',{racer:r});}}
+      else r.boost=Math.min(100,r.boost+dt*2.6);
+      const desiredSpeed=(boosting?31:22)*throttle-10*brake;
+      r.speed+=(desiredSpeed-r.speed)*Math.min(1,dt*(brake?2.5:1.25));
+      r.heading+=steer*dt*2.25*Math.max(.22,Math.min(1,Math.abs(r.speed)/10))*(r.speed < -1 ? -1 : 1);
+      const v=r.body.linvel(), targetX=Math.sin(r.heading)*r.speed, targetZ=Math.cos(r.heading)*r.speed;
+      r.body.setLinvel({x:v.x+(targetX-v.x)*Math.min(1,dt*5),y:0,z:v.z+(targetZ-v.z)*Math.min(1,dt*5)},true);
+      if(c.fire) { shoot(r); if(r.id && r.aiFire<=0)r.aiFire=2+Math.random()*3; }
+      if(c.drop) dropMine(r);
+    }
+    world.timestep=dt; world.step();
+    for(const r of racers) {
+      const p=r.body.translation();
+      // Constrain the car to the band around the oval, retaining a forgiving shoulder.
+      const angle=Math.atan2(p.z/RZ,p.x/RX), cx=RX*Math.cos(angle), cz=RZ*Math.sin(angle);
+      let nx=Math.cos(angle)/RX, nz=Math.sin(angle)/RZ; const n=Math.hypot(nx,nz); nx/=n;nz/=n;
+      const lateral=(p.x-cx)*nx+(p.z-cz)*nz;
+      if(Math.abs(lateral)>WIDTH*.58) {
+        const d=lateral-Math.sign(lateral)*WIDTH*.58;
+        r.body.setTranslation({x:p.x-nx*d,y:0,z:p.z-nz*d},true); r.speed*=.94;
+      }
+      const q=r.body.translation(); r.mesh.position.set(q.x,0,q.z); r.mesh.rotation.y=r.heading;
+      r.mesh.visible=!(r.invuln>0 && Math.floor(r.invuln*9)%2===0);
+    }
+    const sorted=[...racers].sort((a,b)=>b.progress-a.progress); sorted.forEach((r,i)=>r.place=i+1);
+    for(let i=projectiles.length-1;i>=0;i--) {
+      const b=projectiles[i]; b.life-=dt; b.mesh.position.x+=b.dx*44*dt; b.mesh.position.z+=b.dz*44*dt;
+      for(const r of racers) {const p=r.body.translation(); if(r!==b.owner && Math.hypot(p.x-b.mesh.position.x,p.z-b.mesh.position.z)<1.7){hurt(r,24,b.owner);b.life=0;break;}}
+      if(b.life<=0){group.remove(b.mesh);projectiles.splice(i,1);}
+    }
+    for(let i=mines.length-1;i>=0;i--) {
+      const m=mines[i];m.life-=dt;m.arm-=dt; m.mesh.rotation.y+=dt*2;
+      if(m.arm<=0) for(const r of racers){const p=r.body.translation();if(r!==m.owner && Math.hypot(p.x-m.mesh.position.x,p.z-m.mesh.position.z)<2){hurt(r,40,m.owner);m.life=0;break;}}
+      if(m.life<=0){group.remove(m.mesh);mines.splice(i,1);}
+    }
+    for(const p of pickups) {
+      p.mesh.rotation.y+=dt*1.5;
+      if(p.timer>0){p.timer-=dt;if(p.timer<=0)p.mesh.visible=true;continue;}
+      for(const r of racers){const q=r.body.translation();if(Math.hypot(q.x-p.mesh.position.x,q.z-p.mesh.position.z)<2.5){
+        if(p.type==='repair')r.health=Math.min(100,r.health+40);if(p.type==='ammo'){r.ammo=Math.min(24,r.ammo+6);r.mines=Math.min(5,r.mines+1);}if(p.type==='boost')r.boost=Math.min(100,r.boost+45);
+        p.timer=8;p.mesh.visible=false;onEvent('pickup',{racer:r,type:p.type});break;
+      }}
+    }
+    for(let i=effects.length-1;i>=0;i--){const e=effects[i];e.life-=dt;e.mesh.scale.setScalar(1+(1-e.life/.45)*2);e.mesh.material.opacity=Math.max(0,e.life/.45);if(e.life<=0){fxGroup.remove(e.mesh);effects.splice(i,1);}}
+  }
+  reset(); update(.001,{});
+  return {update,reset,player,racers,track,state,world};
+}
+
+/* Race networking adapter. Include PeerJS only for stand-alone rooms. */
+window.RaceNetwork = (() => {
+  const colors = ['#e8443a', '#3b82f6', '#22c55e', '#f5b700'];
+  const codeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const peerPrefix = 'rumble-road-rebels-';
+  let peerScript;
+  function loadPeer() {
+    if (window.Peer) return Promise.resolve();
+    if (!peerScript) peerScript = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
+      script.onload = resolve;
+      script.onerror = () => { peerScript = null; reject(new Error('Could not load online service')); };
+      document.head.appendChild(script);
+    });
+    return peerScript;
+  }
+  function randomCode() {
+    const bytes = new Uint8Array(6);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => codeAlphabet[b % codeAlphabet.length]).join('');
+  }
+  function listeners() {
+    const events = { message: [], leave: [], roster: [], error: [] };
+    return {
+      onMessage(fn) { events.message.push(fn); },
+      onLeave(fn) { events.leave.push(fn); },
+      onRoster(fn) { events.roster.push(fn); },
+      onError(fn) { events.error.push(fn); },
+      emit(type, ...args) { for (const fn of events[type]) fn(...args); }
+    };
+  }
+  function hub(info) {
+    const events = listeners();
+    const net = Object.assign(events, {
+      me: info.me, host: info.host, isHost: info.isHost,
+      players: info.players.map(p => ({ ...p })), code: '',
+      send(data, opts = {}) { AIHub.send(data, opts); },
+      close() {}
+    });
+    AIHub.on('message', (data, from) => events.emit('message', data, from));
+    AIHub.on('leave', ({ id }) => {
+      net.players = net.players.filter(p => p.id !== id);
+      events.emit('leave', id);
+      events.emit('roster', net.players);
+    });
+    return net;
+  }
+  async function host() {
+    await loadPeer();
+    return new Promise((resolve, reject) => {
+      const code = randomCode();
+      const peer = new Peer(peerPrefix + code, { debug: 0 });
+      const events = listeners();
+      const links = new Map();
+      const net = Object.assign(events, {
+        me: 0, host: 0, isHost: true, code,
+        players: [{ id: 0, name: 'PLAYER 1', color: colors[0] }],
+        send(data, opts = {}) {
+          for (const [id, conn] of links) {
+            if (conn.open && (opts.to == null || opts.to === id)) conn.send({ t: 'data', from: 0, data });
+          }
+        },
+        close() { peer.destroy(); links.clear(); }
+      });
+      let opened = false;
+      const roster = () => {
+        for (const conn of links.values()) if (conn.open) conn.send({ t: 'roster', players: net.players });
+        events.emit('roster', net.players);
+      };
+      peer.on('open', () => { opened = true; resolve(net); });
+      peer.on('error', err => opened ? events.emit('error', err.message) : reject(err));
+      peer.on('connection', conn => {
+        let id = null;
+        conn.on('open', () => {
+          id = [1, 2, 3].find(n => !links.has(n));
+          if (id == null) { conn.send({ t: 'full' }); setTimeout(() => conn.close(), 300); return; }
+          links.set(id, conn);
+          net.players.push({ id, name: 'PLAYER ' + (id + 1), color: colors[id] });
+          net.players.sort((a, b) => a.id - b.id);
+          conn.send({ t: 'welcome', me: id, players: net.players });
+          roster();
+        });
+        conn.on('data', msg => {
+          if (id == null || !msg || msg.t !== 'data') return;
+          if (msg.to == null || msg.to === 0) events.emit('message', msg.data, id);
+          for (const [other, link] of links) {
+            if (other !== id && link.open && (msg.to == null || msg.to === other)) link.send({ t: 'data', from: id, data: msg.data });
+          }
+        });
+        conn.on('close', () => {
+          if (id == null || links.get(id) !== conn) return;
+          links.delete(id);
+          net.players = net.players.filter(p => p.id !== id);
+          for (const link of links.values()) if (link.open) link.send({ t: 'leave', id });
+          events.emit('leave', id);
+          roster();
+        });
+      });
+    });
+  }
+  async function join(rawCode) {
+    await loadPeer();
+    const code = String(rawCode).toUpperCase().replace(/[^A-Z2-9]/g, '');
+    if (code.length !== 6) throw new Error('Enter the six-character room code');
+    return new Promise((resolve, reject) => {
+      const peer = new Peer(undefined, { debug: 0 });
+      const events = listeners();
+      let conn, settled = false;
+      const net = Object.assign(events, {
+        me: null, host: 0, isHost: false, code, players: [],
+        send(data, opts = {}) { if (conn && conn.open) conn.send({ t: 'data', to: opts.to, data }); },
+        close() { peer.destroy(); }
+      });
+      const fail = message => {
+        if (!settled) { settled = true; peer.destroy(); reject(new Error(message)); }
+        else events.emit('error', message);
+      };
+      const timeout = setTimeout(() => fail('Room connection timed out'), 12000);
+      peer.on('open', () => {
+        conn = peer.connect(peerPrefix + code, { reliable: true });
+        conn.on('data', msg => {
+          if (!msg || typeof msg.t !== 'string') return;
+          if (msg.t === 'full') return fail('Room is full');
+          if (msg.t === 'welcome') {
+            clearTimeout(timeout); net.me = msg.me; net.players = msg.players;
+            if (!settled) { settled = true; resolve(net); }
+          } else if (msg.t === 'roster') {
+            net.players = msg.players; events.emit('roster', net.players);
+          } else if (msg.t === 'data') events.emit('message', msg.data, msg.from);
+          else if (msg.t === 'leave') events.emit('leave', msg.id);
+        });
+        conn.on('close', () => { clearTimeout(timeout); if (settled) events.emit('leave', 0); else fail('Host disconnected'); });
+        conn.on('error', err => fail(err.message));
+      });
+      peer.on('error', err => { clearTimeout(timeout); fail(err.type === 'peer-unavailable' ? 'Room not found' : err.message); });
+    });
+  }
+  return { hub, host, join };
+})();
+
+const $=id=>document.getElementById(id);
+const app=$('app'), title=$('title'), overlay=$('overlay'), hud=$('hud'), shade=$('shade');
+let renderer,scene,camera,core,network,mode='title',menuIndex=0,menuButtons=[],lastInput=performance.now(),lastFrame=performance.now(),elapsed=0,attract=false,paused=false,finishSent=false,hubWaiting=false,hubEnded=false;
+let settings=JSON.parse(localStorage.getItem('rrr-settings')||'{}');settings={invertX:false,invertY:false,music:true,sound:true,...settings};
+const touchOnly=matchMedia('(pointer: coarse)').matches&&!matchMedia('(any-pointer: fine)').matches;
+const keys={};let padPrev=[],axisLatch=false;let toastTimer=0;let audio;
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function save(){localStorage.setItem('rrr-settings',JSON.stringify(settings))}
+function showToast(text,duration=1.5){$('toast').textContent=text;$('toast').classList.remove('hide');toastTimer=duration}
+function initAudio(){if(audio){audio.ctx.resume();return}const ctx=new AudioContext();let master=ctx.createGain();master.gain.value=.22;master.connect(ctx.destination);audio={ctx,master,next:ctx.currentTime,step:0};}
+function tone(freq,duration,type='square',volume=.15,slide=1){if(!audio||!settings.sound)return;let t=audio.ctx.currentTime,o=audio.ctx.createOscillator(),g=audio.ctx.createGain();o.type=type;o.frequency.setValueAtTime(freq,t);o.frequency.exponentialRampToValueAtTime(Math.max(30,freq*slide),t+duration);g.gain.setValueAtTime(volume,t);g.gain.exponentialRampToValueAtTime(.001,t+duration);o.connect(g).connect(audio.master);o.start(t);o.stop(t+duration)}
+function voice(){if(!audio||!settings.sound)return;for(let i=0;i<4;i++)setTimeout(()=>tone(220+Math.random()*240,.07,'sawtooth',.08,.7),i*75)}
+function music(){if(!audio||!settings.music||paused)return;let {ctx}=audio;if(audio.next<ctx.currentTime-.5)audio.next=ctx.currentTime;while(audio.next<ctx.currentTime+.15){let step=audio.step++,t=audio.next;let notes=[82.4,82.4,110,82.4,123.5,110,98,73.4,82.4,82.4,110,146.8,123.5,110,98,73.4];let o=ctx.createOscillator(),g=ctx.createGain();o.type='sawtooth';o.frequency.value=notes[step%16];g.gain.setValueAtTime(.045,t);g.gain.exponentialRampToValueAtTime(.001,t+.16);o.connect(g).connect(audio.master);o.start(t);o.stop(t+.17);if(step%4===0){let b=ctx.createOscillator(),v=ctx.createGain();b.frequency.setValueAtTime(130,t);b.frequency.exponentialRampToValueAtTime(42,t+.1);v.gain.setValueAtTime(.18,t);v.gain.exponentialRampToValueAtTime(.001,t+.13);b.connect(v).connect(audio.master);b.start(t);b.stop(t+.14)}audio.next+=.16}if(audio.next<ctx.currentTime-.5)audio.next=ctx.currentTime}
+function setMenu(items,container){container.innerHTML='';menuButtons=[];menuIndex=0;items.forEach(([label,fn])=>{let b=document.createElement('button');b.innerHTML='<span>'+label+'</span>';b.onclick=()=>{wake();fn()};container.appendChild(b);menuButtons.push({b,fn})});select(0)}
+function select(i){if(!menuButtons.length)return;menuIndex=(i+menuButtons.length)%menuButtons.length;menuButtons.forEach((x,n)=>x.b.classList.toggle('selected',n===menuIndex));menuButtons[menuIndex].b.scrollIntoView({block:'nearest'})}
+function wake(){lastInput=performance.now();initAudio();if(attract){stopRace();return true}return false}
+function mainMenu(){mode='title';paused=false;attract=false;title.classList.remove('hide');hud.classList.add('hide');shade.classList.remove('racing');overlay.innerHTML='';if(touchOnly){title.innerHTML='<div class="topline">Rumble Road Rebels</div><div class="logo">Controller<br><span>required</span></div><p class="tag">Controller or keyboard required</p><div class="menu" id="mainMenu"></div>';setMenu([['Settings',settingsMenu]],$('mainMenu'));return}setMenu([['Race now',()=>startRace(false)],['How to play',howto],['Online race',onlineMenu],['Settings',settingsMenu],['About / credits',about]],$('mainMenu'))}
+function panel(label,heading,content,items){title.classList.add('hide');overlay.innerHTML=`<div class="panel"><div class="eyebrow">${label}</div><h1>${heading}</h1>${content}<div class="menu" id="panelMenu"></div><p class="hint">D-PAD / ARROWS TO NAVIGATE &nbsp; · &nbsp; ✕ / ENTER TO SELECT &nbsp; · &nbsp; ○ / ESC TO GO BACK</p></div>`;setMenu(items,$('panelMenu'))}
+function howto(){mode='howto';panel('The rules of the road','Race dirty.<br>Finish first.',`<p>Three laps. Four rebels. One very loud winner.</p><div class="row"><span>STEER</span><span>LEFT STICK / ← →</span></div><div class="row"><span>GAS / BRAKE</span><span>R2 / L2 &nbsp; · &nbsp; ↑ / ↓</span></div><div class="row"><span>FIRE CANNON</span><span>✕ / SPACE</span></div><div class="row"><span>BOOST</span><span>○ / SHIFT</span></div><div class="row"><span>DROP MINE</span><span>R1 / M</span></div><p>Smash rivals with your cannon. Collect glowing pickups to repair armor or refill boost. Leave the road and you’ll lose speed. Wrecked cars respawn, so keep the pedal down.</p>`,[['Let’s race',()=>startRace(false)],['Back',mainMenu]])}
+function settingsMenu(){let from=mode==='race'||mode==='pause'?'pause':'title';mode='settings';function draw(){panel('Tune your ride','Settings',`<p>Choose a setting to toggle it. Axis inversion applies to the gamepad.</p><div class="row"><span>HORIZONTAL AXIS</span><span>${settings.invertX?'INVERTED':'NORMAL'}</span></div><div class="row"><span>VERTICAL AXIS</span><span>${settings.invertY?'INVERTED':'NORMAL'}</span></div><div class="row"><span>MUSIC</span><span>${settings.music?'ON':'OFF'}</span></div><div class="row"><span>SOUND & VOICE</span><span>${settings.sound?'ON':'OFF'}</span></div>`,[['Horizontal: '+(settings.invertX?'inverted':'normal'),()=>{settings.invertX=!settings.invertX;save();draw()}],['Vertical: '+(settings.invertY?'inverted':'normal'),()=>{settings.invertY=!settings.invertY;save();draw()}],['Music: '+(settings.music?'on':'off'),()=>{settings.music=!settings.music;save();draw()}],['Sound: '+(settings.sound?'on':'off'),()=>{settings.sound=!settings.sound;save();draw()}],['Back',()=>from==='pause'?pauseMenu():mainMenu()]])}draw()}
+function about(){mode='about';panel('The liner notes','About / credits',`<p><b>RUMBLE ROAD REBELS</b> is an original arcade combat racer inspired by Rock n’ Roll Racing.</p><p>Built 2026-10-29 09:21 with Three.js R180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio, PeerJS and the AI Hub session protocol. Procedural cel-shaded art and animation; original synthesized music, effects and gibberish voice.</p><p>Online: standalone room-code racing and AI Hub parallel sessions. Testing: lightweight headless browser and syntax checks; performance targets out of scope. Environment: Codex CLI (headless), Linux, browser unknown. Model: OpenAI gpt-6.1-terra, ultra. Usage: unknown.</p><p><b>Testing feedback:</b> One game-breaking startup error was caught and fixed. The browser smoke test was most helpful; a syntax check was least helpful. Headless WebGPU produced a blank canvas even in a minimal Three.js scene, so visual rendering on a real GPU remains unverified.</p><p><b>Engine feedback:</b> Three.js makes expressive scenes approachable. The initial event callback was a wrong guess about initialization order. Racing rules, AI and controls had to be built here. WebGPU integration and diagnostics were hardest; clearer adapter and rendering diagnostics would be the first thing to overhaul.</p><p><b>Prompt feedback:</b> The arcade inspiration and controller-first direction were compelling. The meaning of a complete vertical slice was broad; multiplayer interoperability was the hardest part. A real four-player controller session would be the most useful additional test.</p>`,[['Back',mainMenu]])}
+function pauseMenu(){mode='pause';paused=true;panel('Pit stop','Paused',`<p>Take a breath. The track will still be there.</p>`,[['Resume',()=>{mode='race';paused=false;overlay.innerHTML='';hud.classList.remove('hide')}],['Settings',settingsMenu],['Quit to menu',stopRace]])}
+function stopRace(){if(network)network.close();network=null;if(core)core.reset();mainMenu()}
+let joinCode='AAAAAA',joinDigit=0;
+function onlineMenu(){mode='online';panel('Link up','Online race',`<p>Race up to three friends. The host shares a six-character room code, then starts the race.</p><div class="row"><span>ROOM CODE</span><input id="room" maxlength="6" value="${joinCode}" aria-label="Room code"></div><p class="hint" id="netstatus">PeerJS signaling is required. Use the code dial with a controller.</p>`,[['Host room',hostRoom],['Join room',joinRoom],['Code dial',codeDial],['Back',mainMenu]])}
+function codeDial(){mode='code';const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';function draw(){panel('Room code dial','Set the code',`<p>Change the highlighted character, then move to the next. Match the host’s code.</p><div class="row"><span>CHARACTER ${joinDigit+1} OF 6</span><span>${esc(joinCode.slice(0,joinDigit))}<b style="color:#ffdc62">${joinCode[joinDigit]}</b>${esc(joinCode.slice(joinDigit+1))}</span></div>`,[['Change character',()=>{let a=joinCode.split('');a[joinDigit]=chars[(chars.indexOf(a[joinDigit])+1)%chars.length];joinCode=a.join('');draw()}],['Next character',()=>{joinDigit=(joinDigit+1)%6;draw()}],['Previous character',()=>{joinDigit=(joinDigit+5)%6;draw()}],['Done',onlineMenu]])}draw()}
+function netStatus(s){let el=$('netstatus');if(el)el.textContent=s}
+function attachNetwork(net){
+  const ghosts=new Map();let sendTimer=0;
+  function removeGhost(id){const ghost=ghosts.get(id);if(ghost){scene.remove(ghost.mesh);ghosts.delete(id)}}
+  const oldClose=net.close.bind(net);net.close=()=>{for(const id of ghosts.keys())removeGhost(id);oldClose()};
+  net.onLeave(id=>{removeGhost(id);if(id===net.host&&!net.isHost){showToast('HOST LEFT THE ROOM',3);if(mode==='lobby')onlineMenu()}else if(mode==='lobby')lobby()});
+  net.onRoster(()=>{if(mode==='lobby')lobby()});
+  net.onError(message=>{showToast('ONLINE: '+message,3)});
+  net.onMessage((message,from)=>{
+    if(!message||typeof message!=='object')return;
+    if(message.t==='start'&&!net.isHost){startRace(false,true);return}
+    if(message.t!=='car'||!Array.isArray(message.p)||message.p.length!==4||!message.p.every(Number.isFinite)||!core?.player?.mesh)return;
+    let ghost=ghosts.get(from);
+    if(!ghost){const mesh=core.player.mesh.clone(true);mesh.traverse(o=>{if(o.isMesh&&o.material){o.material=o.material.clone();if(o.material.color)o.material.color.set(net.players.find(p=>p.id===from)?.color||'#3b82f6')}});scene.add(mesh);ghost={mesh,target:new THREE.Vector3(),yaw:0};ghosts.set(from,ghost)}
+    ghost.target.set(message.p[0],message.p[1],message.p[2]);ghost.yaw=message.p[3];ghost.progress=Number.isFinite(message.progress)?message.progress:0;
+  });
+  net.update=(game,dt)=>{
+    sendTimer-=dt;const m=game.player.mesh;
+    if(m&&sendTimer<=0){sendTimer=.067;net.send({t:'car',p:[m.position.x,m.position.y,m.position.z,m.rotation.y],progress:game.player.progress||0},{reliable:false})}
+    for(const ghost of ghosts.values()){ghost.mesh.position.lerp(ghost.target,Math.min(1,dt*10));let d=Math.atan2(Math.sin(ghost.yaw-ghost.mesh.rotation.y),Math.cos(ghost.yaw-ghost.mesh.rotation.y));ghost.mesh.rotation.y+=d*Math.min(1,dt*10);const body=game.player.body;if(body){const p=body.translation(),dx=p.x-ghost.target.x,dz=p.z-ghost.target.z,dist=Math.hypot(dx,dz);if(dist>.01&&dist<2.5){const push=(2.5-dist)*.3;body.setTranslation({x:p.x+dx/dist*push,y:p.y,z:p.z+dz/dist*push},true)}}}game.player.place=1+game.racers.filter(r=>r!==game.player&&r.progress>game.player.progress).length+[...ghosts.values()].filter(g=>g.progress>game.player.progress).length;
+  };
+  return net;
+}
+function lobby(){if(!network)return onlineMenu();mode='lobby';const count=network.players.length;panel('Online garage',network.isHost?'Room '+network.code:'Connected',`<p>${network.isHost?'Share this code with your rivals. Start when everyone is in.':'Waiting for the host to start the race.'}</p><div class="row"><span>DRIVERS CONNECTED</span><span>${count} / 4</span></div><p class="hint">Room code: ${esc(network.code)}</p>`,network.isHost?[['Start race',()=>{network.send({t:'start'});startRace(false,true)}],['Leave room',()=>{network.close();network=null;onlineMenu()}]]:[['Leave room',()=>{network.close();network=null;onlineMenu()}]])}
+async function hostRoom(){try{netStatus('OPENING ROOM…');network=attachNetwork(await RaceNetwork.host());lobby()}catch(e){netStatus('CONNECTION FAILED · '+e.message)}}
+async function joinRoom(){try{let code=$('room').value.trim();if(!code){netStatus('ENTER THE HOST’S ROOM CODE FIRST');return}joinCode=code.toUpperCase();netStatus('CONNECTING…');network=attachNetwork(await RaceNetwork.join(code));lobby()}catch(e){netStatus('CONNECTION FAILED · '+e.message)}}
+function finishRace(){if(mode!=='race')return;mode='result';paused=true;let place=core.player.place||1;let seconds=elapsed.toFixed(1);voice();tone(440,.5,'sawtooth',.15,1.5);if(window.AIHub?.active&&!finishSent){AIHub.result({time:elapsed*1000});finishSent=true}panel('The dust settles',place===1?'You rock!':'Race complete',`<p>${place===1?'You brought the noise and took the crown.':'You survived Copperhead. Now come back louder.'}</p><div class="row"><span>YOUR PLACE</span><span>${place} / ${4+(network?.players.length||1)-1}</span></div><div class="row"><span>TIME</span><span>${seconds} SEC</span></div>`,[['Race again',()=>startRace(false)],['Main menu',stopRace]])}
+function startRace(demo=false,keepNetwork=false){if(!core)return;if(!keepNetwork&&network){network.close();network=null}core.reset();elapsed=0;finishSent=false;attract=demo;paused=false;mode='race';title.classList.add('hide');overlay.innerHTML='';hud.classList.remove('hide');shade.classList.add('racing');$('demo').classList.toggle('hide',!demo);showToast(demo?'THE REBELS ARE ROLLING':'GO! GO! GO!',2);if(!demo){voice();tone(550,.25,'sawtooth',.1,1.3)}}
+function keyAction(e){if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Enter','Escape','Shift'].includes(e.key))e.preventDefault();let wasAttract=attract;if(wake()&&wasAttract)return;keys[e.code]=true;if(e.repeat)return;if(mode==='race'){if(e.code==='Escape'){pauseMenu()}return}if(e.code==='Escape'||e.code==='Backspace'){if(mode==='pause'){mode='race';paused=false;overlay.innerHTML=''}else if(mode==='settings'&&paused)pauseMenu();else if(mode==='lobby'){network?.close();network=null;onlineMenu()}else mainMenu();return}if(e.code==='ArrowUp'||e.code==='KeyW')select(menuIndex-1);if(e.code==='ArrowDown'||e.code==='KeyS')select(menuIndex+1);if(e.code==='Enter'||e.code==='Space'){tone(600,.07);menuButtons[menuIndex]?.fn()}}
+window.addEventListener('keydown',keyAction);window.addEventListener('keyup',e=>keys[e.code]=false);window.addEventListener('pointerdown',()=>{if(attract)wake();else {lastInput=performance.now();initAudio()}});
+function gamepad(){let p=navigator.getGamepads?.()[0];if(!p){padPrev=[];return null}let b=p.buttons.map(x=>x.pressed),pressed=i=>b[i]&&!padPrev[i];let x=(p.axes[0]||0)*(settings.invertX?-1:1),y=(p.axes[1]||0)*(settings.invertY?-1:1);if(Math.abs(x)<.16)x=0;if(Math.abs(y)<.16)y=0;let any=b.some(Boolean)||Math.abs(x)>.4||Math.abs(y)>.4;if(any&&attract){wake();padPrev=b;return null}if(any)lastInput=performance.now();if(pressed(9)){if(mode==='race')pauseMenu();else if(mode==='pause'){mode='race';paused=false;overlay.innerHTML=''}}if(mode!=='race'){let dir=(b[13]||y>.6)?1:(b[12]||y<-.6)?-1:0;if(dir&&!axisLatch){select(menuIndex+dir);axisLatch=true}else if(!dir)axisLatch=false;if(pressed(0)){initAudio();menuButtons[menuIndex]?.fn()}if(pressed(1)){if(mode==='pause'){mode='race';paused=false;overlay.innerHTML=''}else if(mode==='settings'&&paused)pauseMenu();else if(mode==='lobby'){network?.close();network=null;onlineMenu()}else mainMenu()}}padPrev=b;return {x,y,gas:Math.max(p.buttons[7]?.value||0,y<0?-y:0),brake:Math.max(p.buttons[6]?.value||0,y>0?y:0),fire:b[0],boost:b[1],drop:b[5]}}
+function updateHUD(){let s=core.state,p=core.player;let pos=p.place||1;$('position').innerHTML=pos+'<em>'+(pos===1?'ST':pos===2?'ND':pos===3?'RD':'TH')+'</em>';$('lap').innerHTML=Math.min(3,p.lap||1)+' <em>/ 3</em>';$('time').textContent=Math.floor(elapsed/60)+':'+String(Math.floor(elapsed%60)).padStart(2,'0');let h=Math.max(0,Math.min(100,p.health??100)),b=Math.max(0,Math.min(100,p.boost??100));$('healthBar').style.width=h+'%';$('healthText').textContent=Math.round(h);$('boostBar').style.width=b+'%';$('boostText').textContent=Math.round(b);$('weapon').textContent='CANNON '+(p.ammo===undefined?'READY':p.ammo+' ROUNDS')+' · '+p.mines+' MINES'}
+async function init(){try{if(!navigator.gpu)throw new Error('WebGPU is unavailable');await RAPIER.init();scene=new THREE.Scene();scene.background=new THREE.Color(0x201b30);scene.fog=new THREE.Fog(0x201b30,110,250);camera=new THREE.PerspectiveCamera(42,innerWidth/innerHeight,.1,400);renderer=new THREE.WebGPURenderer({antialias:true});await renderer.init();if(!renderer.backend.isWebGPUBackend)throw new Error('A WebGPU adapter is required');renderer.setSize(innerWidth,innerHeight);renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.shadowMap.enabled=true;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.25;$('stage').appendChild(renderer.domElement);scene.add(new THREE.HemisphereLight(0xc6eaff,0x60405c,2));let sun=new THREE.DirectionalLight(0xffdfae,3);sun.position.set(-35,65,30);scene.add(sun);buildWorld(THREE,scene);core=createGameCore({THREE,RAPIER,scene,onEvent:(type,data)=>{if(!core||data.racer!==core.player)return;if(type==='shot')tone(210,.09,'square',.07,.45);if(type==='hit')tone(100,.18,'sawtooth',.12,.4);if(type==='explode'){tone(70,.4,'sawtooth',.2,.4);showToast('WRECKED!',1.2)}if(type==='pickup'){tone(660,.18,'triangle',.12,1.5)}if(type==='lap'){voice();showToast('LAP COMPLETE!',1.5)}}});mainMenu();if(window.AIHub?.active){await AIHub.connect({mode:'parallel',seats:[1,4]});startRace(false);paused=true;hubWaiting=true;AIHub.on('time-up',()=>{if(!finishSent){AIHub.result({score:core.player.progress});finishSent=true}});AIHub.on('end',()=>{hubEnded=true;hubWaiting=false;paused=true;if(audio)audio.ctx.suspend()});AIHub.ready();AIHub.probe(()=>({scene:mode,menu:mode==='race'?null:mode,world:{lap:core.player.lap,position:core.player.place},input:{x:0,y:0,fire:false}}));}requestAnimationFrame(frame)}catch(e){console.error(e);$('app').innerHTML='<div class="error"><div><h1>Engine offline</h1><p>WebGPU is required. Use a current WebGPU-enabled browser and check your connection to the game libraries.</p><p class="hint">'+esc(e.message)+'</p></div></div>'}}
+function frame(now){let dt=Math.min(.05,(now-lastFrame)/1000);lastFrame=now;let pad=gamepad();music();if(mode==='title'&&!touchOnly&&now-lastInput>10000)startRace(true);if(window.AIHub?.active&&mode==='race'&&hubWaiting&&!hubEnded&&AIHub.time()>=0){hubWaiting=false;paused=false;showToast('GO! GO! GO!',2)}if(mode==='race'&&!paused){elapsed+=dt;let input={steer:(keys.ArrowRight||keys.KeyD?1:0)-(keys.ArrowLeft||keys.KeyA?1:0),throttle:keys.ArrowUp||keys.KeyW?1:0,brake:keys.ArrowDown||keys.KeyS?1:0,fire:!!(keys.Space||keys.KeyX),boost:!!(keys.ShiftLeft||keys.ShiftRight||keys.KeyC),drop:!!keys.KeyM};if(pad){input.steer=pad.x||input.steer;input.throttle=Math.max(input.throttle,pad.gas);input.brake=Math.max(input.brake,pad.brake);input.fire||=pad.fire;input.boost||=pad.boost;input.drop||=pad.drop}if(attract)input.autopilot=true;core.update(dt,input);if(network)network.update?.(core,dt);updateHUD();if(window.AIHub?.active)AIHub.progress({score:core.player.lap||1,label:'Lap '+(core.player.lap||1)+'/3'});if(core.state.finished){if(attract)startRace(true);else finishRace()}}if(toastTimer>0){toastTimer-=dt;if(toastTimer<=0)$('toast').classList.add('hide')}if(core){let p=core.player;let pos=p.mesh?.position||p.position||new THREE.Vector3(40,0,0);let target=new THREE.Vector3(pos.x,0,pos.z);if(mode==='title'||mode==='howto'||mode==='online'||mode==='about'||mode==='settings'&&!paused){target.set(0,0,0);camera.position.lerp(new THREE.Vector3(78,80,95),.025)}else{camera.position.lerp(new THREE.Vector3(target.x+38,50,target.z+48),.07)}camera.lookAt(target)}renderer.render(scene,camera);requestAnimationFrame(frame)}
+window.addEventListener('resize',()=>{if(renderer){renderer.setSize(innerWidth,innerHeight);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix()}});
+if(touchOnly)mainMenu();else init();
+
+</script></body></html>

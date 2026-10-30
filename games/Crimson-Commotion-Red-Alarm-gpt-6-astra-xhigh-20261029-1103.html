@@ -1,0 +1,3415 @@
+<!DOCTYPE html>
+<!-- CRIMSON COMMOTION — SOURCE INFORMATION, TESTING, ENGINE FEEDBACK & PROMPT FEEDBACK
+
+SOURCE
+Date: 2026-10-29 11:43 (America/Vancouver). Requested filename stamp: 20261029-1103.
+Source: Red Alarm (T&E Soft, 1995). An original spiritual successor; no original game assets or audio are used. Reference: https://www.virtual-boy.com/games/red-alarm/
+Title selection: Crimson Commotion, selected using Python secrets.randbelow from 50 silently generated candidates. The draw is recorded in title-selection.json.
+Tech: Three.js 0.180.0 (R180), WebGPU only; Rapier 3D compat 0.19.3; native Gamepad API; HTML/CSS/JavaScript; Web Audio API; PeerJS 1.5.5; AI Hub session client 1.3.0 / protocol v1. CDN dependencies require an internet connection.
+Art direction: Original procedural low-poly cel shading, ink edges, warm ivory and coral spacecraft, teal industrial architecture, faceted orbital scenery.
+Animation: Procedural flight banking, quaternion projectile orientation, kinematic enemy motion, rotating machinery, particle explosions and recorded flight telemetry replay.
+Audio: Code-written adaptive arpeggiated synth music, oscillator/noise sound effects and filtered-oscillator gibberish radio voice. No recorded speech or sampled music.
+Online: AI Hub 1–4 player parallel score attack, synchronized start/progress/results. Standalone room-code score attack via PeerJS signaling and WebRTC data channels. No player chat or voice.
+Testing parameters: Efficient, lightweight checks: static JavaScript parse; visual browser smoke; 17 fixed-step mission assertions; three official hub runs (72 checks total); emulated standard gamepad; live two-client standalone WebRTC room.
+Environment: Codex CLI (headless); Linux / WSL2. Tested in Google Chrome 154.0.8037.57 under Xvfb with software Vulkan/WebGPU. The player’s browser is unknown.
+Model: OpenAI, gpt-6-astra, reasoning effort xhigh.
+Usage: API cost: unknown. Token count and breakdown: unknown. Elapsed session time: approximately 39 minutes.
+
+TESTING
+Issues caught: Two implementation issues: brief controller taps were missed during slow rendering, and disconnected standalone clients needed a heartbeat timeout. Also resolved a test-environment WebGPU device-loss problem by using Xvfb and the explicit software Vulkan adapter.
+Critical / game breaking: One potentially blocking controller-input issue on stalled rendering; resolved. The initial GPU test configuration also blocked rendering, including a minimal cube. No remaining critical issue was found by the completed checks.
+Most helpful test: The official AI Hub harness with an emulated DualSense. It exposed missed short input pulses and then passed all 24 checks in each of the one-player, two-player and player-leave runs.
+Least helpful test: The first default-headless screenshot run could not validate the game because the environment lost its WebGPU device. A minimal-cube repro isolated that setup problem.
+Coverage and limits: 17 mission assertions and 72 official hub checks passed. Live standalone WebRTC launch and disconnect cleanup were verified with two clients. Final UI checks covered controller-only launch, both inversion settings and all 10 credits pages. Physical controllers and a four-player cross-network run remain untested.
+
+ENGINE
+What worked best?: Three.js node-based toon materials and procedural geometry made it straightforward to build a coherent illustrated flight environment. Rapier supplies physical wall collisions and weapon ray queries.
+Did you get stuck or guess wrong?: R180 enables an implicit WebGL fallback, so its fallback hook is disabled. Browser automation initially lost the WebGPU device even on a minimal cube; explicit software Vulkan and Xvfb resolved it.
+Most important custom system: The mission director, controller UI and transport lifecycle: branching routes, relay gates, boss phases, checkpoints, score, extraction, replay and room synchronization. Editable JSON supplies encounter and pickup data.
+Hardest engine task: Coordinating free-flight cameras and target selection with a fixed-step physics world and a controller-first interface.
+What would you overhaul?: The implicit renderer fallback behavior should be an explicit backend policy.
+One engine improvement: A documented strict WebGPU initialization option with clear device-loss recovery would simplify shipping GPU-only games.
+
+PROMPT
+What worked best?: The clear source, controller-first interface, attract-mode requirement and specified single-file deliverable gave the slice a strong identity.
+What was confusing?: The hub normally recommends a WebGL fallback, while this prompt prohibits it. The game declares hub:webgpu=required and uses WebGPU exclusively.
+Hardest requirement: Making a complete free-flight mission, standalone rooms and hub lifecycle work together in one shareable file.
+One additional test: A full four-player run on physical DualSense controllers across different home networks, including a player disconnect during the boss fight.
+ -->
+<html lang="en"><head><meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#102e39">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="6"><meta name="hub:session-goal" content="Destroy the defense core. Highest mission score wins."><meta name="hub:session-howto" content="Steer: left stick/WASD. Fire: R2/Space. Missiles: L2/E. Settings: Options/Esc."><meta name="hub:webgpu" content="required">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Cpath fill=%27%23ff624d%27 d=%27M16 2L30 30H21L16 20L11 30H2Z%27/%3E%3C/svg%3E"><title>Crimson Commotion • Red Alarm</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+:root{--paper:#fff1d6;--ink:#0c2832;--red:#ff624d;--cyan:#6de2cf;--muted:#b4c6bd}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--ink);color:var(--paper);font-family:'Space Grotesk',sans-serif}button{font:inherit;color:inherit;cursor:pointer}canvas#scene{position:absolute;inset:0;width:100%;height:100%;display:block}#grain{position:absolute;inset:0;pointer-events:none;opacity:.035;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' opacity='.8' filter='url(%23n)'/%3E%3C/svg%3E")}#vignette{position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,#08212cee,transparent 72%),linear-gradient(0deg,#0a263b88,transparent 35%)}body.playing #vignette{background:radial-gradient(ellipse,transparent 45%,#061f3155)}#frame{position:absolute;inset:25px;border:1px solid #fff1d62b;pointer-events:none;clip-path:polygon(0 0,100% 0,100% 100%,0 100%)}#frame:before,#frame:after{content:'';position:absolute;width:32px;height:32px;border-color:var(--paper);border-style:solid}#frame:before{top:0;left:0;border-width:2px 0 0 2px}#frame:after{bottom:0;right:0;border-width:0 2px 2px 0}#brand{position:absolute;top:46px;left:4.7%;display:flex;align-items:center;gap:12px;font-size:12px;font-weight:700;letter-spacing:3px}#brand .mark{width:26px;height:27px;background:var(--red);clip-path:polygon(50% 0,100% 100%,65% 100%,50% 62%,35% 100%,0 100%)}#topright{position:absolute;right:4.5%;top:47px;font-size:11px;letter-spacing:2px;color:var(--muted)}.dot{display:inline-block;width:6px;height:6px;background:var(--cyan);border-radius:50%;margin-right:8px;box-shadow:0 0 12px var(--cyan)}#menu{position:absolute;inset:0;padding:100px 6% 70px;display:flex;align-items:center;pointer-events:none}#menu>*{pointer-events:auto}.menu-main{width:min(610px,55vw)}.eyebrow{font-size:12px;letter-spacing:4px;font-weight:700;color:var(--cyan);margin-bottom:15px}.eyebrow:before{content:'// ';color:var(--red)}h1{font-family:'Barlow Condensed',Impact,sans-serif;font-weight:900;font-style:italic;font-size:clamp(68px,7.9vw,135px);line-height:.81;letter-spacing:-1px;margin:0 0 28px;text-transform:uppercase;text-shadow:4px 5px 0 #071c29}h1 span{color:var(--red);display:block}h2{font-family:'Barlow Condensed',Impact,sans-serif;font-size:56px;line-height:1;margin:0 0 20px;text-transform:uppercase}h3{font-family:'Barlow Condensed',sans-serif;font-size:28px;margin:0 0 14px;text-transform:uppercase}.lede{font-size:16px;line-height:1.65;color:#d4d9c9;max-width:445px;margin:0 0 28px}.mission-tag{display:flex;gap:10px;align-items:center;font-size:10px;letter-spacing:2px;margin-bottom:25px}.mission-tag span{padding:6px 9px;border:1px solid #a0c3b54f}.menu-buttons{display:flex;flex-direction:column;gap:5px;max-width:355px}button.nav{display:flex;align-items:center;justify-content:space-between;text-align:left;border:1px solid transparent;background:#0b26354d;padding:12px 18px;font-weight:600;font-size:17px;min-height:47px;transition:background .12s,transform .12s;color:var(--paper)}button.nav .keycap{border:1px solid #ffffff55;font-size:12px;padding:1px 5px}button.nav.selected,button.nav:focus-visible{background:var(--paper);color:var(--ink);border-color:var(--paper);outline:0;transform:translateX(7px);box-shadow:-7px 0 var(--red)}button.nav.primary:not(.selected){background:var(--red);color:var(--ink)}.nav small{font-size:13px;color:inherit;opacity:.75}.bottom{position:absolute;left:4.7%;right:4.5%;bottom:43px;display:flex;justify-content:space-between;gap:12px;align-items:center;color:#a6c2bd;font-size:11px;letter-spacing:1px}kbd{display:inline-flex;min-width:23px;justify-content:center;align-items:center;font:600 11px 'Space Grotesk',sans-serif;color:var(--paper);border:1px solid #b2c3bd77;border-radius:3px;padding:4px 5px;margin:0 5px}.stamp{position:absolute;right:7%;bottom:18%;text-align:right;pointer-events:none;font-size:11px;color:#bfd7cc;letter-spacing:2px}.stamp strong{display:block;font:600 35px 'Barlow Condensed';color:var(--paper);letter-spacing:4px;margin:5px 0}.stamp:before{content:'';display:block;width:65px;height:2px;background:var(--red);margin:0 0 14px auto}.panel{background:#0b2533f2;border:1px solid #85b3a54d;padding:32px 38px;max-width:830px;width:min(830px,90vw);box-shadow:12px 12px 0 #091e2580}.panel{max-height:calc(100vh - 125px);overflow-y:auto;scrollbar-color:var(--red) #153540}.panel .menu-buttons{max-width:none}.panel .lede{max-width:none}.panel.center{margin:auto}.panel.two .content{display:grid;grid-template-columns:1fr 1fr;gap:30px}.setting-row{font-size:16px}.note{font-size:12px;color:#a9beb5;line-height:1.65}.control-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;border-bottom:1px solid #edf1cc22;padding:11px 0;font-size:15px}.control-row b{color:var(--cyan)}.crew{display:flex;gap:12px;margin:20px 0}.crew span{background:#24424a;padding:13px 15px;border-top:3px solid var(--cyan)}.code{font-family:'Barlow Condensed';font-size:75px;letter-spacing:15px;color:var(--cyan)}.keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.keypad button.nav{justify-content:center;font-size:25px}.report{font-size:14px;line-height:1.7;color:#cad8cd;max-height:43vh;overflow:auto;scrollbar-color:var(--red) #153540;padding-right:15px}.report b{color:var(--paper)}.report p{margin:0 0 13px}#hud{position:absolute;inset:0;pointer-events:none;display:none}.hudtop{position:absolute;top:42px;left:4.7%;right:4.5%;display:flex;justify-content:space-between}.hudlabel{font-size:10px;letter-spacing:3px;color:var(--cyan);font-weight:700}.hudsquad{font:700 24px 'Barlow Condensed';letter-spacing:1px;margin-top:4px}.score{text-align:right}.score strong{font:700 36px 'Barlow Condensed';letter-spacing:3px}.hudbottom{position:absolute;bottom:48px;left:4.7%;right:4.5%;display:flex;align-items:flex-end;justify-content:space-between}.gauge{width:210px;margin-top:9px;height:7px;background:#041b2ddd;border:1px solid #ffffff20;transform:skewX(-15deg)}.gauge>div{height:100%;background:var(--cyan);width:100%;transition:width .15s}.shield-num{font:700 37px 'Barlow Condensed';margin:5px 0}.shield-num small{font:500 12px 'Space Grotesk';color:var(--muted)}.weapons{text-align:right}.weapons strong{font:700 28px 'Barlow Condensed';color:var(--paper)}#throttle{font-size:12px;letter-spacing:2px;margin-top:15px}#hint{position:absolute;bottom:50px;left:50%;transform:translateX(-50%);font-size:11px;letter-spacing:.5px;color:#c1d0c1;text-align:center;white-space:nowrap}.crosshair{position:absolute;left:50%;top:50%;width:45px;height:45px;transform:translate(-50%,-50%);border:1px solid #caffef55;border-radius:50%}.crosshair:before,.crosshair:after{content:'';position:absolute;background:#ccffea99}.crosshair:before{left:21px;top:17px;width:1px;height:9px}.crosshair:after{left:17px;top:21px;width:9px;height:1px}#lock{position:absolute;width:70px;height:70px;border:2px solid var(--red);display:none;transform:translate(-50%,-50%);box-shadow:0 0 0 5px #ff624d13}#lock:after{content:attr(data-label);position:absolute;top:77px;left:50%;transform:translateX(-50%);font-size:11px;letter-spacing:2px;color:var(--paper);white-space:nowrap}#objective{position:absolute;top:112px;left:4.7%;font-size:14px;color:var(--paper)}#objective:before{content:'◇ ';color:var(--red)}#radar{position:absolute;bottom:156px;left:4.7%;width:125px;height:125px;opacity:.9}#comms{position:absolute;left:50%;top:17%;transform:translateX(-50%);max-width:560px;min-width:360px;text-align:center;transition:opacity .4s}#comms .call{font-size:10px;font-weight:700;color:var(--cyan);letter-spacing:3px;margin-bottom:7px}#comms .message{font:600 23px 'Barlow Condensed';letter-spacing:1px;text-shadow:0 2px 5px #001321}#banner{position:absolute;top:38%;left:0;width:100%;text-align:center;pointer-events:none}#banner strong{display:block;font:800 italic 65px 'Barlow Condensed';letter-spacing:4px;text-shadow:4px 4px #0b2739}#banner small{font-size:12px;letter-spacing:4px;color:var(--cyan)}#boss{position:absolute;top:93px;left:32%;right:32%;display:none;text-align:center}#boss .gauge{width:100%;height:8px}#boss .gauge>div{background:var(--red)}#boss span{font-size:11px;letter-spacing:3px}#damage{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 150px #ff482d;opacity:0}#attract{position:absolute;bottom:20%;left:0;right:0;text-align:center;display:none;pointer-events:none}#attract strong{font:700 24px 'Barlow Condensed';letter-spacing:7px;background:#092734b5;padding:10px 24px}#attract p{font-size:12px;letter-spacing:2px}#network-hud{position:absolute;top:145px;right:4.5%;font-size:12px;line-height:1.8;text-align:right;color:var(--cyan)}#boot{position:absolute;inset:0;display:grid;place-content:center;text-align:center;background:#0b2634;z-index:20}#boot .spinner{width:42px;height:42px;border:2px solid #335151;border-top-color:var(--red);margin:0 auto 24px;animation:spin 1s linear infinite}#boot h2{font-size:42px}#boot p{font-size:14px;color:var(--muted);max-width:530px;line-height:1.7}#boot button{background:var(--paper);color:var(--ink);padding:12px 25px;border:0}#touchNotice{position:absolute;top:80px;right:4.5%;display:none;background:#102c35e8;padding:10px 14px;font-size:12px}#touchNotice button{margin-left:10px;border:1px solid #fff8;background:none;padding:7px}#menuShade{position:absolute;inset:0;background:#041d2d88;display:none;backdrop-filter:blur(4px)}.result-score{font:800 75px 'Barlow Condensed';color:var(--cyan);margin:12px 0}.result-stats{display:flex;gap:25px;margin-bottom:28px}.result-stats span{font-size:11px;color:#b8d2c3}.result-stats b{font:700 26px 'Barlow Condensed';display:block;color:var(--paper)}.mission-strip{display:flex;gap:0;margin:20px 0 25px}.mission-strip div{border-left:2px solid var(--red);padding:0 20px;font:600 20px 'Barlow Condensed'}.mission-strip small{display:block;font:500 10px 'Space Grotesk';letter-spacing:2px;color:var(--cyan);margin-bottom:6px}@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-height:720px){#menu{padding-top:80px;padding-bottom:65px}h1{font-size:83px;margin-bottom:20px}.lede{font-size:14px;margin-bottom:16px}.mission-tag{margin-bottom:17px}.menu-buttons{gap:1px}button.nav{padding:9px 15px;min-height:39px;font-size:15px}.panel{padding:24px 30px}h2{font-size:44px}.bottom{bottom:36px}#brand,#topright{top:40px}.eyebrow{margin-bottom:12px}.stamp{bottom:20%}}
+@media(max-width:800px){#frame{inset:12px}.menu-main{width:68vw}h1{font-size:72px}#topright{display:none}.panel.two .content{gap:15px}.stamp{right:4%;bottom:25%;font-size:9px}.stamp strong{font-size:23px}.gauge{width:140px}.hudbottom{bottom:36px}#hint{bottom:14px;font-size:9px}.bottom{font-size:9px}.panel{padding:20px}.control-row{font-size:12px}#radar{width:90px;height:90px;bottom:145px}}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head><body>
+<canvas id="scene"></canvas><div id="vignette"></div><div id="grain"></div><div id="frame"></div>
+<div id="brand"><i class="mark"></i><span>CC / FLIGHT DIVISION</span></div><div id="topright"><i class="dot"></i>ORBITAL DEFENSE / 2065</div>
+<div id="hud"><div class="hudtop"><div><div class="hudlabel" id="zone-label">01 / THE APPROACH</div><div class="hudsquad">KITE-01 <span style="color:var(--red)">╱</span> <span id="camera-label">CHASE</span></div></div><div class="score"><div class="hudlabel">MISSION SCORE</div><strong id="score">000000</strong><div id="combo" class="hudlabel"></div></div></div><div id="objective"></div><canvas id="radar" width="250" height="250"></canvas><div class="crosshair"></div><div id="lock"></div><div id="boss"><span id="boss-name">WARDEN / ARMOR LINKS</span><div class="gauge"><div id="boss-fill"></div></div></div><div id="comms"><div class="call">CONTROL / INBOUND</div><div class="message"></div></div><div id="banner"></div><div class="hudbottom"><div><div class="hudlabel">SHIELD INTEGRITY</div><div class="shield-num"><span id="shield">100</span><small> / 100</small></div><div class="gauge"><div id="shield-fill"></div></div><div id="throttle">CRUISE / 02</div></div><div class="weapons"><div class="hudlabel">VULCAN / <span id="weapon-level">I</span></div><strong id="missiles">08 SEEKERS</strong><div class="gauge"><div id="boost-fill"></div></div><div class="hudlabel" style="margin-top:9px">AFTERBURNER</div></div></div><div id="hint"></div><div id="network-hud"></div></div>
+<div id="damage"></div><div id="attract"><strong>AUTOPILOT DEMONSTRATION</strong><p>ANY INPUT TO RETURN TO FLIGHT DECK</p></div><div id="menuShade"></div><div id="menu"></div><div id="touchNotice">Controller or keyboard required <button id="touchSettings">Settings</button></div>
+<div class="bottom" id="footer"><span id="input-hint"><kbd>↑ ↓</kbd> SELECT <kbd>ENTER</kbd> CONFIRM</span><span id="footer-note">SINGLE SORTIE / COMPLETE VERTICAL SLICE</span></div>
+<div id="boot"><div class="spinner"></div><h2>Crimson Commotion</h2><p id="boot-status">Bringing the flight deck online…</p></div>
+<script type="module">const $ = (id) => document.getElementById(id);
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const lerp = (a, b, t) => a + (b - a) * t;
+const REPORT = {"source": [["Date", "2026-10-29 11:43 (America/Vancouver). Requested filename stamp: 20261029-1103."], ["Source", "Red Alarm (T&E Soft, 1995). An original spiritual successor; no original game assets or audio are used. Reference: https://www.virtual-boy.com/games/red-alarm/"], ["Title selection", "Crimson Commotion, selected using Python secrets.randbelow from 50 silently generated candidates. The draw is recorded in title-selection.json."], ["Tech", "Three.js 0.180.0 (R180), WebGPU only; Rapier 3D compat 0.19.3; native Gamepad API; HTML/CSS/JavaScript; Web Audio API; PeerJS 1.5.5; AI Hub session client 1.3.0 / protocol v1. CDN dependencies require an internet connection."], ["Art direction", "Original procedural low-poly cel shading, ink edges, warm ivory and coral spacecraft, teal industrial architecture, faceted orbital scenery."], ["Animation", "Procedural flight banking, quaternion projectile orientation, kinematic enemy motion, rotating machinery, particle explosions and recorded flight telemetry replay."], ["Audio", "Code-written adaptive arpeggiated synth music, oscillator/noise sound effects and filtered-oscillator gibberish radio voice. No recorded speech or sampled music."], ["Online", "AI Hub 1–4 player parallel score attack, synchronized start/progress/results. Standalone room-code score attack via PeerJS signaling and WebRTC data channels. No player chat or voice."], ["Testing parameters", "Efficient, lightweight checks: static JavaScript parse; visual browser smoke; 17 fixed-step mission assertions; three official hub runs (72 checks total); emulated standard gamepad; live two-client standalone WebRTC room."], ["Environment", "Codex CLI (headless); Linux / WSL2. Tested in Google Chrome 154.0.8037.57 under Xvfb with software Vulkan/WebGPU. The player’s browser is unknown."], ["Model", "OpenAI, gpt-6-astra, reasoning effort xhigh."], ["Usage", "API cost: unknown. Token count and breakdown: unknown. Elapsed session time: approximately 39 minutes."]], "testing": [["Issues caught", "Two implementation issues: brief controller taps were missed during slow rendering, and disconnected standalone clients needed a heartbeat timeout. Also resolved a test-environment WebGPU device-loss problem by using Xvfb and the explicit software Vulkan adapter."], ["Critical / game breaking", "One potentially blocking controller-input issue on stalled rendering; resolved. The initial GPU test configuration also blocked rendering, including a minimal cube. No remaining critical issue was found by the completed checks."], ["Most helpful test", "The official AI Hub harness with an emulated DualSense. It exposed missed short input pulses and then passed all 24 checks in each of the one-player, two-player and player-leave runs."], ["Least helpful test", "The first default-headless screenshot run could not validate the game because the environment lost its WebGPU device. A minimal-cube repro isolated that setup problem."], ["Coverage and limits", "17 mission assertions and 72 official hub checks passed. Live standalone WebRTC launch and disconnect cleanup were verified with two clients. Final UI checks covered controller-only launch, both inversion settings and all 10 credits pages. Physical controllers and a four-player cross-network run remain untested."]], "engine": [["What worked best?", "Three.js node-based toon materials and procedural geometry made it straightforward to build a coherent illustrated flight environment. Rapier supplies physical wall collisions and weapon ray queries."], ["Did you get stuck or guess wrong?", "R180 enables an implicit WebGL fallback, so its fallback hook is disabled. Browser automation initially lost the WebGPU device even on a minimal cube; explicit software Vulkan and Xvfb resolved it."], ["Most important custom system", "The mission director, controller UI and transport lifecycle: branching routes, relay gates, boss phases, checkpoints, score, extraction, replay and room synchronization. Editable JSON supplies encounter and pickup data."], ["Hardest engine task", "Coordinating free-flight cameras and target selection with a fixed-step physics world and a controller-first interface."], ["What would you overhaul?", "The implicit renderer fallback behavior should be an explicit backend policy."], ["One engine improvement", "A documented strict WebGPU initialization option with clear device-loss recovery would simplify shipping GPU-only games."]], "prompt": [["What worked best?", "The clear source, controller-first interface, attract-mode requirement and specified single-file deliverable gave the slice a strong identity."], ["What was confusing?", "The hub normally recommends a WebGL fallback, while this prompt prohibits it. The game declares hub:webgpu=required and uses WebGPU exclusively."], ["Hardest requirement", "Making a complete free-flight mission, standalone rooms and hub lifecycle work together in one shareable file."], ["One additional test", "A full four-player run on physical DualSense controllers across different home networks, including a player disconnect during the boss fight."]]};
+const GAME_TITLE = "Crimson Commotion";
+const MISSION = {"id": "quiet-hours", "title": "Operation: Quiet Hours", "seed": 2065, "waves": [{"type": "drone", "positions": [[0, 0, -120], [22, 9, -190], [-19, -8, -260], [12, 3, -340], [-14, 12, -420], [39, 8, -650], [-40, 9, -720], [43, -10, -860], [-42, 6, -910], [20, 12, -1030], [-25, -2, -1080]]}, {"type": "turret", "positions": [[36, -27, -240], [-36, -27, -390], [45, -26, -580], [-48, -25, -850], [53, -26, -1030], [-55, -26, -1200], [52, -26, -1280]]}, {"type": "relay", "positions": [[-44, 4, -950], [0, 18, -975], [44, 4, -950]]}], "pickups": [{"position": [-44, 10, -850], "type": "weapon"}, {"position": [44, 0, -810], "type": "shield"}, {"position": [0, 0, -480], "type": "weapon"}, {"position": [0, 4, -1020], "type": "ammo"}, {"position": [18, 8, -1240], "type": "shield"}], "branchRings": [{"position": [-43, 5, -690], "secret": true}, {"position": [-43, 12, -800], "secret": true}, {"position": [44, 4, -740], "secret": false}], "checkpoints": [{"stage": 1, "position": [0, 3, -530]}, {"stage": 2, "position": [0, 3, -1130]}], "sectorLabels": ["01 / THE APPROACH", "02 / RELAY TRENCH", "03 / DANGER ZONE", "04 / EXTRACTION"]};
+let THREE,
+	RAPIER,
+	renderer,
+	scene,
+	camera,
+	world,
+	eventQueue,
+	level,
+	player,
+	ship,
+	hero,
+	stars;
+let entities = [],
+	bullets = [],
+	particles = [],
+	rings = [],
+	pickups = [],
+	moving = [],
+	bodies = new Map(),
+	obstacles = [];
+let state = "loading",
+	screen = "title",
+	previous = "title",
+	selected = 0,
+	menuItems = [],
+	time = 0,
+	simTime = 0,
+	lastInput = performance.now(),
+	hudAt = 0;
+let yaw = 0,
+	pitch = 0,
+	bank = 0,
+	roll = 0,
+	rollCD = 0,
+	shotCD = 0,
+	missileCD = 0,
+	invuln = 0,
+	damageFlash = 0,
+	camMode = 0,
+	throttle = 2;
+let hp = 100,
+	energy = 100,
+	ammo = 8,
+	weapon = 1,
+	score = 0,
+	kills = 0,
+	combo = 0,
+	comboTime = 0,
+	shots = 0,
+	hits = 0,
+	secrets = 0;
+let stage = 0,
+	bossPhase = 0,
+	bossHP = 360,
+	core = null,
+	relayKills = 0,
+	links = 0,
+	missionTime = 0,
+	escapeTime = 0,
+	bannerUntil = 0,
+	commsUntil = 0;
+let runSeed = 2065,
+	checkpoint = null,
+	attract = false,
+	isReplay = false,
+	replayFrames = [],
+	replaySource = [],
+	replayAt = 0,
+	replayRecordAt = 0;
+let lastTarget = null,
+	lockTime = 0,
+	worldStarted = false,
+	hubInfo = null,
+	hubEnded = false,
+	hubReported = false,
+	hubReadyPending = false;
+let held = {},
+	prevButtons = [],
+	padPresent = false,
+	menuRepeat = 0,
+	actions = {},
+	input = {
+		x: 0,
+		y: 0,
+		sx: 0,
+		sy: 0,
+		fire: false,
+		missile: false,
+		boost: false,
+		brake: false,
+	};
+let settings = {
+	volume: 65,
+	music: 60,
+	invertX: false,
+	invertY: false,
+	sensitivity: 100,
+	shake: true,
+	difficulty: 1,
+};
+let best = 0;
+try {
+	settings = {
+		...settings,
+		...JSON.parse(localStorage.getItem("cc-settings") || "{}"),
+	};
+	best = +localStorage.getItem("cc-best") || 0;
+} catch {}
+const C = {
+	ink: 0x102a38,
+	dark: 0x193d49,
+	cream: 0xffedc9,
+	coral: 0xff624d,
+	cyan: 0x6be3cd,
+	gold: 0xffbd5b,
+	slate: 0x4d747c,
+};
+let materials = {},
+	geo = {},
+	rng;
+function seeded(n) {
+	return function () {
+		n |= 0;
+		n = (n + 0x6d2b79f5) | 0;
+		let t = Math.imul(n ^ (n >>> 15), 1 | n);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+function save() {
+	try {
+		localStorage.setItem("cc-settings", JSON.stringify(settings));
+		localStorage.setItem("cc-best", best);
+	} catch {}
+}
+function toast(text, duration = 4) {
+	$("comms").querySelector(".message").textContent = text;
+	commsUntil = simTime + duration;
+	audio.voice();
+}
+function banner(title, subtitle = "", duration = 3) {
+	$("banner").innerHTML =
+		"<strong>" + title + "</strong><small>" + subtitle + "</small>";
+	bannerUntil = simTime + duration;
+}
+function addScore(n) {
+	score += Math.round(n * (1 + Math.min(combo, 20) * 0.05));
+	combo++;
+	comboTime = 7;
+	if (hubInfo)
+		AIHub.progress({
+			score,
+			label: ["Approach", "Relay trench", "Danger zone", "Extraction"][stage],
+		});
+}
+const audio = {
+	ctx: null,
+	master: null,
+	musicBus: null,
+	sfx: null,
+	tick: 0,
+	next: 0,
+	muted: false,
+	start() {
+		if (!this.ctx) {
+			this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+			this.master = this.ctx.createGain();
+			this.master.connect(this.ctx.destination);
+			this.musicBus = this.ctx.createGain();
+			this.musicBus.connect(this.master);
+			this.sfx = this.ctx.createGain();
+			this.sfx.gain.value = 0.75;
+			this.sfx.connect(this.master);
+			this.next = this.ctx.currentTime;
+		}
+		if (this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
+		this.level();
+	},
+	level() {
+		if (this.master) {
+			this.master.gain.setTargetAtTime(
+				this.muted ? 0 : (settings.volume / 100) * 0.5,
+				this.ctx.currentTime,
+				0.1,
+			);
+			this.musicBus.gain.value = (settings.music / 100) * 0.45;
+		}
+	},
+	tone(freq, dur, type = "square", vol = 0.12, bend = 0, at = 0, bus) {
+		if (!this.ctx || this.muted) return;
+		const t = at || this.ctx.currentTime,
+			o = this.ctx.createOscillator(),
+			g = this.ctx.createGain();
+		o.type = type;
+		o.frequency.setValueAtTime(freq, t);
+		if (bend)
+			o.frequency.exponentialRampToValueAtTime(Math.max(20, bend), t + dur);
+		g.gain.setValueAtTime(0.001, t);
+		g.gain.linearRampToValueAtTime(vol, t + 0.008);
+		g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+		o.connect(g);
+		g.connect(bus || this.sfx);
+		o.start(t);
+		o.stop(t + dur + 0.02);
+	},
+	noise(dur = 0.3, vol = 0.2) {
+		if (!this.ctx || this.muted) return;
+		const n = this.ctx.createBuffer(
+				1,
+				this.ctx.sampleRate * dur,
+				this.ctx.sampleRate,
+			),
+			d = n.getChannelData(0);
+		for (let i = 0; i < d.length; i++)
+			d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 2);
+		const s = this.ctx.createBufferSource(),
+			f = this.ctx.createBiquadFilter(),
+			g = this.ctx.createGain();
+		s.buffer = n;
+		f.type = "lowpass";
+		f.frequency.value = 1600;
+		g.gain.value = vol;
+		s.connect(f);
+		f.connect(g);
+		g.connect(this.sfx);
+		s.start();
+	},
+	fire() {
+		this.tone(720, 0.09, "sawtooth", 0.09, 180);
+	},
+	boom() {
+		this.noise(0.5, 0.5);
+		this.tone(90, 0.35, "triangle", 0.3, 24);
+	},
+	pick() {
+		this.tone(523, 0.13, "sine", 0.22);
+		this.tone(
+			784,
+			0.2,
+			"sine",
+			0.2,
+			0,
+			this.ctx ? this.ctx.currentTime + 0.1 : 0,
+		);
+	},
+	click() {
+		this.tone(620, 0.045, "sine", 0.12);
+	},
+	voice() {
+		if (!this.ctx || this.muted) return;
+		const t = this.ctx.currentTime;
+		for (let i = 0; i < 7; i++) {
+			const o = this.ctx.createOscillator(),
+				f = this.ctx.createBiquadFilter(),
+				g = this.ctx.createGain(),
+				at = t + i * 0.085;
+			o.type = "sawtooth";
+			o.frequency.setValueAtTime([210, 275, 185, 330, 245, 170, 260][i], at);
+			f.type = "bandpass";
+			f.frequency.value = [900, 1450, 700, 1800, 1100, 650, 1200][i];
+			f.Q.value = 4;
+			g.gain.setValueAtTime(0.001, at);
+			g.gain.linearRampToValueAtTime(0.11, at + 0.015);
+			g.gain.exponentialRampToValueAtTime(0.001, at + 0.075);
+			o.connect(f);
+			f.connect(g);
+			g.connect(this.sfx);
+			o.start(at);
+			o.stop(at + 0.08);
+		}
+	},
+	update() {
+		if (!this.ctx || this.muted || this.ctx.state !== "running") return;
+		const now = this.ctx.currentTime;
+		if (this.next < now - 0.5) this.next = now;
+		while (this.next < now + 0.12) {
+			const n = this.tick++,
+				beat = n % 16,
+				base = [110, 87.31, 130.81, 98][Math.floor(n / 32) % 4],
+				t = this.next;
+			this.tone(
+				base * (beat % 4 === 2 ? 2 : 1),
+				0.18,
+				"triangle",
+				0.27,
+				0,
+				t,
+				this.musicBus,
+			);
+			if (beat % 4 === 0)
+				this.tone(120, 0.14, "sine", 0.5, 35, t, this.musicBus);
+			if (beat % 4 === 2)
+				this.tone(180, 0.07, "triangle", 0.13, 48, t, this.musicBus);
+			this.tone(4800, 0.025, "square", 0.018, 2500, t, this.musicBus);
+			if (n % 2 === 0)
+				this.tone(
+					base * [4, 6, 8, 9, 6, 4, 3, 6][Math.floor(n / 2) % 8],
+					0.17,
+					"sine",
+					bossPhase > 0 ? 0.16 : 0.09,
+					0,
+					t,
+					this.musicBus,
+				);
+			this.next += 60 / (bossPhase > 0 ? 138 : 116) / 4;
+		}
+	},
+};
+function mat(name, color) {
+	return (
+		materials[name] ||
+		(materials[name] = new THREE.MeshToonNodeMaterial({
+			color,
+			gradientMap: materials.gradient,
+		}))
+	);
+}
+function mesh(g, m, parent = level, pos = null, scale = null, edge = true) {
+	const o = new THREE.Mesh(g, m);
+	if (pos) o.position.set(...pos);
+	if (scale) o.scale.set(...scale);
+	o.castShadow = true;
+	o.receiveShadow = true;
+	if (edge) {
+		let eg = geo["edge" + g.uuid];
+		if (!eg) eg = geo["edge" + g.uuid] = new THREE.EdgesGeometry(g, 27);
+		if (eg.attributes.position.count) {
+			const e = new THREE.LineSegments(eg, materials.line);
+			o.add(e);
+		}
+	}
+	parent.add(o);
+	return o;
+}
+function box(pos, size, color = C.slate, parent = level, collide = false) {
+	const o = mesh(geo.box, mat("c" + color, color), parent, pos, size);
+	if (collide) {
+		const col = world.createCollider(
+			RAPIER.ColliderDesc.cuboid(
+				size[0] / 2,
+				size[1] / 2,
+				size[2] / 2,
+			).setTranslation(...pos),
+		);
+		obstacles.push(col);
+	}
+	return o;
+}
+function glow(pos, size, color = C.cyan, parent = level) {
+	return mesh(
+		geo.box,
+		materials["g" + color] ||
+			(materials["g" + color] = new THREE.MeshBasicNodeMaterial({ color })),
+		parent,
+		pos,
+		size,
+		false,
+	);
+}
+function makeShip(tint = C.cream) {
+	const g = new THREE.Group();
+	const body = mesh(
+		geo.cone,
+		mat("ship" + tint, tint),
+		g,
+		[0, 0, -0.2],
+		[1.15, 5.3, 1],
+		true,
+	);
+	body.rotation.x = -Math.PI / 2;
+	mesh(geo.octa, mat("canopy", C.ink), g, [0, 0.6, -0.8], [0.62, 0.55, 1.7]);
+	const wingShape = new THREE.BufferGeometry();
+	wingShape.setAttribute(
+		"position",
+		new THREE.Float32BufferAttribute(
+			[
+				-1, 0, -1, -5, 0, 2, -1, 0, 1, 1, 0, -1, 1, 0, 1, 5, 0, 2, -1, 0, -1,
+				-1, 0.25, 1, -5, 0, 2, 1, 0, -1, 5, 0, 2, 1, 0.25, 1,
+			],
+			3,
+		),
+	);
+	wingShape.computeVertexNormals();
+	mesh(wingShape, mat("wing" + tint, tint), g);
+	for (const s of [-1, 1]) {
+		box([s * 2.2, 0, 1], [1.2, 0.38, 2], C.coral, g);
+		const eng = mesh(
+			geo.cylinder,
+			mat("engine", C.ink),
+			g,
+			[s * 1.5, -0.2, 1.6],
+			[0.48, 1.7, 0.48],
+		);
+		eng.rotation.x = Math.PI / 2;
+		const fin = box([s * 1.0, 0.65, 1.25], [0.18, 1.5, 1.45], C.coral, g);
+		fin.rotation.z = -s * 0.35;
+		const flame = mesh(
+			geo.cone,
+			materials.flame,
+			g,
+			[s * 1.5, -0.2, 3],
+			[0.36, 2, 0.36],
+			false,
+		);
+		flame.rotation.x = Math.PI / 2;
+		flame.name = "flame";
+	}
+	glow([0, 0.1, -2.6], [0.18, 0.18, 0.3], C.coral, g);
+	return g;
+}
+function addCollider(e, radius) {
+	e.body = world.createRigidBody(
+		RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(
+			e.mesh.position.x,
+			e.mesh.position.y,
+			e.mesh.position.z,
+		),
+	);
+	e.col = world.createCollider(
+		RAPIER.ColliderDesc.ball(radius).setSensor(true),
+		e.body,
+	);
+	bodies.set(e.col.handle, e);
+}
+function makeEnemy(type, x, y, z) {
+	const g = new THREE.Group();
+	level.add(g);
+	g.position.set(x, y, z);
+	let hp = type === "relay" ? 90 : type === "turret" ? 32 : 20;
+	const e = {
+		type,
+		mesh: g,
+		hp,
+		maxHP: hp,
+		base: new THREE.Vector3(x, y, z),
+		phase: rng() * 6.28,
+		cd: 1 + rng() * 2,
+		alive: true,
+		radius: type === "relay" ? 4 : type === "turret" ? 3 : 2.5,
+	};
+	if (type === "drone") {
+		mesh(geo.octa, mat("drone", C.coral), g, null, [2.7, 1.1, 2]);
+		for (const s of [-1, 1]) {
+			box([s * 3, 0, 0.5], [2, 0.35, 1.5], C.ink, g);
+			glow([s * 1, 0.2, -1], [0.6, 0.5, 0.6], C.gold, g);
+		}
+	} else if (type === "turret") {
+		mesh(geo.cylinder, mat("turret", C.slate), g, null, [3, 2, 3]);
+		mesh(geo.octa, mat("t-gun", C.coral), g, [0, 2, 0], [2, 1.8, 2]);
+		box([0, 2, -2], [0.65, 0.65, 4], C.cream, g);
+	} else {
+		mesh(geo.octa, mat("relay", C.gold), g, null, [4, 6, 4]);
+		const halo = mesh(geo.torus, mat("halo", C.cream), g, null, [5, 5, 5]);
+		halo.rotation.y = Math.PI / 2;
+		glow([0, 0, 0], [2, 7, 2], C.cyan, g);
+	}
+	addCollider(e, e.radius);
+	entities.push(e);
+	return e;
+}
+function makePickup(x, y, z, type) {
+	const g = new THREE.Group();
+	level.add(g);
+	g.position.set(x, y, z);
+	mesh(
+		geo.octa,
+		mat(
+			"pickup" + type,
+			type === "shield" ? C.cyan : type === "weapon" ? C.gold : C.cream,
+		),
+		g,
+		null,
+		[2, 2, 2],
+	);
+	const ring = mesh(
+		geo.torus,
+		materials.bright,
+		g,
+		null,
+		[3.2, 3.2, 3.2],
+		false,
+	);
+	ring.rotation.y = 0.5;
+	pickups.push({ mesh: g, type, alive: true, baseY: y });
+}
+function makeRing(x, y, z, secret = false) {
+	const g = new THREE.Group();
+	level.add(g);
+	g.position.set(x, y, z);
+	mesh(
+		geo.torus,
+		secret ? mat("secret", C.gold) : mat("ring", C.cyan),
+		g,
+		null,
+		[8, 8, 8],
+	);
+	for (let k = 0; k < 4; k++) {
+		const a = (k * Math.PI) / 2;
+		box([Math.cos(a) * 9, Math.sin(a) * 9, 0], [2, 2, 1.6], C.cream, g);
+	}
+	rings.push({ mesh: g, alive: true, secret });
+}
+function createWorld(seed = 2065) {
+	if (eventQueue) eventQueue.free();
+	if (world) world.free();
+	world = new RAPIER.World({ x: 0, y: 0, z: 0 });
+	eventQueue = new RAPIER.EventQueue(true);
+	if (level) scene.remove(level);
+	level = new THREE.Group();
+	scene.add(level);
+	entities = [];
+	bullets = [];
+	particles = [];
+	rings = [];
+	pickups = [];
+	moving = [];
+	bodies = new Map();
+	obstacles = [];
+	rng = seeded(seed);
+	// The mission is data-driven: landmarks, waves, pickups and triggers share world coordinates.
+
+	for (let z = 120; z > -1690; z -= 32) {
+		const branch = z < -580 && z > -920;
+		const wide = z < -1080;
+		const width = wide ? 160 : branch ? 145 : 112;
+		box(
+			[0, -36, z],
+			[width, 4, 31],
+			z % 64 === 0 ? C.dark : C.ink,
+			level,
+			true,
+		);
+		for (const x of [-width / 2, width / 2]) {
+			box([x, -19, z], [6, 32, 15], C.slate, level, true);
+			box([x, -1, z], [9, 4, 18], C.cream, level, true);
+			glow(
+				[x > 0 ? x - 4 : x + 4, 0, z],
+				[0.5, 0.7, 12],
+				z < -1080 ? C.coral : C.cyan,
+			);
+			if (((z % 96) + 96) % 96 === 24) {
+				box([x, 20, z], [4, 40, 6], C.slate, level, true);
+				box([0, 39, z], [width, 3, 5], C.dark, level, true);
+				glow([0, 36.8, z], [width * 0.8, 0.6, 0.5], C.coral);
+			}
+		}
+		for (let side of [-1, 1]) {
+			const h = 10 + rng() * 55;
+			box(
+				[side * (width / 2 + 20 + rng() * 20), -36 + h / 2, z],
+				[12 + rng() * 12, h, 18],
+				rng() > 0.6 ? C.coral : C.dark,
+			);
+			if (rng() > 0.55)
+				glow([side * (width / 2 + 14), h - 39, z], [0.5, 2, 8], C.gold);
+		}
+		for (let x of [-15, 15]) glow([x, -33.8, z], [0.35, 0.1, 17], C.cyan);
+	}
+	for (let z = -600; z > -920; z -= 32) {
+		box([0, -2, z], [29, 65, 30], C.dark, level, true);
+		box([0, 32, z], [34, 2, 31], C.coral);
+		glow([-15, 5, z], [0.5, 2, 14], C.gold);
+		glow([15, 5, z], [0.5, 2, 14], C.cyan);
+	}
+	for (let i = 0; i < 7; i++)
+		makeRing(Math.sin(i * 0.8) * 19, Math.cos(i * 0.7) * 9, 10 - i * 70);
+	for (const r of MISSION.branchRings) makeRing(...r.position, r.secret);
+	for (const p of MISSION.pickups) makePickup(...p.position, p.type);
+	for (const wave of MISSION.waves)
+		for (const p of wave.positions) makeEnemy(wave.type, ...p);
+	// Relay door, removed by the three physical relay targets.
+	const gate = box([0, 1, -1085], [160, 75, 3], C.coral, level, true);
+	gate.name = "relay-door";
+	for (let i = -3; i <= 3; i++)
+		glow([i * 20, 0, -1082], [0.5, 55, 0.8], C.gold, gate.parent);
+	gate.userData.collider = obstacles.at(-1);
+	gate.material = new THREE.MeshToonNodeMaterial({
+		color: C.coral,
+		transparent: true,
+		opacity: 0.22,
+	});
+	for (let i = 0; i < 14; i++) {
+		const a = (i / 14) * Math.PI * 2;
+		const o = mesh(
+			geo.octa,
+			mat("rock", C.slate),
+			level,
+			[Math.cos(a) * 165, Math.sin(a) * 100 - 10, -1400 - rng() * 300],
+			[15 + rng() * 10, 10 + rng() * 15, 20 + rng() * 15],
+		);
+		o.rotation.set(rng(), rng(), rng());
+	}
+	core = new THREE.Group();
+	level.add(core);
+	core.position.set(0, 7, -1430);
+	mesh(geo.ico, mat("bossArmor", C.dark), core, null, [17, 17, 17]);
+	const inner = mesh(
+		geo.octa,
+		mat("bossCore", C.coral),
+		core,
+		null,
+		[12, 12, 12],
+	);
+	inner.name = "heart";
+	for (let j = 0; j < 3; j++) {
+		const ring = mesh(
+			geo.torus,
+			mat("bossRing" + j, j === 1 ? C.cream : C.coral),
+			core,
+			null,
+			[23 + j * 4, 23 + j * 4, 23 + j * 4],
+		);
+		ring.rotation.set(j * 0.8, j * 0.6, j * 0.4);
+		moving.push({
+			mesh: ring,
+			axis: j === 1 ? "y" : "z",
+			speed: 0.12 + j * 0.08,
+		});
+	}
+	const be = {
+		type: "boss",
+		mesh: core,
+		hp: 360,
+		maxHP: 360,
+		alive: true,
+		radius: 18,
+		base: core.position.clone(),
+		cd: 1,
+		phase: 0,
+	};
+	addCollider(be, 18);
+	entities.push(be);
+	for (let i = 0; i < 3; i++) {
+		const a = (i / 3) * Math.PI * 2;
+		const e = makeEnemy("link", Math.cos(a) * 32, 7 + Math.sin(a) * 32, -1410);
+		e.hp = e.maxHP = 65;
+		e.radius = 4;
+		e.orbit = a;
+	}
+	for (let j = 0; j < 3; j++) {
+		const o = mesh(
+			geo.torus,
+			mat("exit", C.cyan),
+			level,
+			[0, 0, -1630 - j * 6],
+			[23 - j, 23 - j, 23 - j],
+		);
+		moving.push({ mesh: o, axis: "z", speed: 0.1 });
+	}
+	const pbody = world.createRigidBody(
+		RAPIER.RigidBodyDesc.dynamic()
+			.setTranslation(0, 0, 80)
+			.setLinearDamping(0)
+			.setGravityScale(0)
+			.setCcdEnabled(true)
+			.lockRotations(),
+	);
+	const col = world.createCollider(
+		RAPIER.ColliderDesc.ball(1.45)
+			.setRestitution(0.15)
+			.setFriction(0)
+			.setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS),
+		pbody,
+	);
+	player = {
+		body: pbody,
+		col,
+		pos: new THREE.Vector3(0, 0, 80),
+		vel: new THREE.Vector3(),
+	};
+	ship = makeShip();
+	level.add(ship);
+	ship.position.copy(player.pos);
+	world.timestep = 1 / 60;
+	world.step(eventQueue);
+	worldStarted = true;
+}
+function explode(pos, color = C.coral, size = 1) {
+	audio.boom();
+	for (let i = 0; i < 22; i++) {
+		const p = mesh(
+			geo.tetra,
+			mat("particle" + color, i % 3 === 0 ? C.cream : color),
+			level,
+			pos.toArray(),
+			[0.4 * size, 0.4 * size, 0.4 * size],
+			false,
+		);
+		particles.push({
+			mesh: p,
+			vel: new THREE.Vector3(
+				(Math.random() - 0.5) * 22,
+				(Math.random() - 0.5) * 22,
+				(Math.random() - 0.5) * 22,
+			),
+			life: 0.6 + Math.random() * 0.5,
+			max: 1,
+		});
+	}
+	const flash = mesh(
+		geo.ico,
+		materials.flash,
+		level,
+		pos.toArray(),
+		[size, size, size],
+		false,
+	);
+	particles.push({
+		mesh: flash,
+		vel: new THREE.Vector3(),
+		life: 0.25,
+		max: 0.25,
+		blast: true,
+	});
+}
+function kill(e) {
+	if (!e.alive) return;
+	e.alive = false;
+	e.mesh.visible = false;
+	world.removeRigidBody(e.body);
+	bodies.delete(e.col.handle);
+	explode(e.mesh.position, C.coral, e.type === "boss" ? 8 : 2);
+	kills++;
+	addScore(
+		e.type === "relay"
+			? 600
+			: e.type === "link"
+				? 900
+				: e.type === "boss"
+					? 5000
+					: 180,
+	);
+	if (e.type === "relay") {
+		relayKills++;
+		toast("RELAY " + relayKills + "/3 SILENCED.");
+		if (relayKills === 3) {
+			const gate = level.getObjectByName("relay-door");
+			gate.visible = false;
+			world.removeCollider(gate.userData.collider, true);
+			toast("BULKHEAD RELEASED. CORE SIGNAL AHEAD.", 5);
+		}
+	}
+	if (e.type === "link") {
+		links++;
+		if (links === 3) {
+			bossPhase = 2;
+			toast("ARMOR LINKS DOWN. CORE EXPOSED.");
+			banner("BREAK THE CORE", "KEEP MOVING. WATCH THE CROSS-FIRE.", 3);
+		}
+	}
+	if (e.type === "boss") {
+		stage = 3;
+		bossPhase = 4;
+		escapeTime = 38;
+		toast("CORE FAILURE! EXIT VECTOR STRAIGHT AHEAD.", 6);
+		banner("GET OUT", "AFTERBURNER TO THE EXTRACTION GATE", 3);
+		bullets
+			.filter((b) => b.enemy)
+			.forEach((b) => {
+				b.life = 0;
+			});
+	}
+	if (kills % 5 === 0 && e.type !== "boss")
+		makePickup(e.mesh.position.x, e.mesh.position.y, e.mesh.position.z, "ammo");
+}
+function hurtEnemy(e, amount) {
+	if (!e || !e.alive) return;
+	if (e.type === "boss" && links < 3) {
+		audio.tone(220, 0.07, "triangle", 0.1);
+		return;
+	}
+	e.hp -= amount;
+	hits++;
+	if (e.type === "boss") {
+		bossHP = e.hp;
+		if (bossPhase === 2 && e.hp <= 180) {
+			bossPhase = 3;
+			toast("WARDEN OVERDRIVE. ALL GUNS, ALL DIRECTIONS.", 5);
+			banner("OVERDRIVE", "ROLL THROUGH THE RED FIRE", 2);
+		}
+	}
+	if (e.hp <= 0) kill(e);
+	else {
+		const spark = mesh(
+			geo.octa,
+			materials.flash,
+			level,
+			e.mesh.position.toArray(),
+			[2, 2, 2],
+			false,
+		);
+		particles.push({
+			mesh: spark,
+			vel: new THREE.Vector3(),
+			life: 0.1,
+			max: 0.1,
+			blast: true,
+		});
+	}
+}
+function damage(n) {
+	if (attract || isReplay || invuln > 0 || state !== "play") return;
+	hp = Math.max(
+		0,
+		hp -
+			n *
+				(settings.difficulty === 0
+					? 0.55
+					: settings.difficulty === 2
+						? 1.35
+						: 1),
+	);
+	invuln = 0.65;
+	damageFlash = 0.75;
+	combo = 0;
+	audio.noise(0.18, 0.35);
+	if (padPresent && settings.shake) {
+		const p = navigator.getGamepads().find((p) => p && p.connected);
+		p?.vibrationActuator
+			?.playEffect("dual-rumble", {
+				duration: 120,
+				strongMagnitude: 0.4,
+				weakMagnitude: 0.5,
+			})
+			.catch(() => {});
+	}
+	if (hp <= 0) finish(false);
+}
+function getForward() {
+	return new THREE.Vector3(
+		-Math.sin(yaw) * Math.cos(pitch),
+		Math.sin(pitch),
+		-Math.cos(yaw) * Math.cos(pitch),
+	);
+}
+function nearestTarget(maxDist = 210, cone = 0.94) {
+	const f = getForward();
+	let bestTarget = null,
+		value = -Infinity;
+	for (const e of entities) {
+		if (!e.alive || (e.type === "boss" && links < 3)) continue;
+		const d = e.mesh.position.clone().sub(player.pos),
+			len = d.length(),
+			dot = d.normalize().dot(f);
+		if (len < maxDist && dot > cone) {
+			const s = dot - len * 0.00018;
+			if (s > value) {
+				bestTarget = e;
+				value = s;
+			}
+		}
+	}
+	return bestTarget;
+}
+function spawnBolt(pos, dir, enemy = false, target = null, missile = false) {
+	const g = mesh(
+		geo.box,
+		enemy ? materials.enemyBolt : missile ? materials.missile : materials.bolt,
+		level,
+		pos.toArray(),
+		missile ? [0.4, 0.4, 2] : enemy ? [0.65, 0.65, 2] : [0.22, 0.22, 4],
+		false,
+	);
+	g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), dir);
+	bullets.push({
+		mesh: g,
+		vel: dir.clone().multiplyScalar(enemy ? 38 : missile ? 95 : 225),
+		enemy,
+		target,
+		missile,
+		life: enemy ? 7 : 3,
+		damage: missile ? 55 : weapon === 3 ? 13 : 9,
+	});
+}
+function fire() {
+	if (shotCD > 0) return;
+	shotCD = weapon === 3 ? 0.085 : 0.12;
+	shots++;
+	audio.fire();
+	const forward = getForward(),
+		target = nearestTarget(210, 0.975),
+		direction = target
+			? target.mesh.position.clone().sub(player.pos).normalize()
+			: forward;
+	const side = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+	for (const s of [-1, 1]) {
+		const pos = player.pos
+			.clone()
+			.addScaledVector(forward, 4)
+			.addScaledVector(side, s * 1.5);
+		spawnBolt(pos, direction);
+	}
+	if (weapon > 1) {
+		for (const s of [-1, 1])
+			spawnBolt(
+				player.pos.clone().addScaledVector(forward, 4),
+				direction
+					.clone()
+					.addScaledVector(side, s * 0.055)
+					.normalize(),
+			);
+	}
+}
+function launchMissile() {
+	if (missileCD > 0 || ammo <= 0) return;
+	const target = nearestTarget(260, 0.91);
+	if (!target || lockTime < 0.4) return;
+	ammo--;
+	missileCD = 0.6;
+	audio.tone(190, 0.3, "sawtooth", 0.18, 750);
+	spawnBolt(
+		player.pos.clone().addScaledVector(getForward(), 4),
+		getForward(),
+		false,
+		target,
+		true,
+	);
+}
+function nav(label, fn, value = "", primary = false) {
+	menuItems.push({ fn, label });
+	return (
+		'<button class="nav ' +
+		(primary ? "primary" : "") +
+		'" data-index="' +
+		(menuItems.length - 1) +
+		'"><span>' +
+		label +
+		"</span><small>" +
+		value +
+		"</small></button>"
+	);
+}
+function refreshFocus() {
+	const buttons = $("menu").querySelectorAll("button.nav");
+	buttons.forEach((b, i) => {
+		b.classList.toggle("selected", i === selected);
+		b.tabIndex = i === selected ? 0 : -1;
+		if (i === selected && screen !== "title" && screen !== "controls")
+			b.scrollIntoView({ block: "nearest" });
+	});
+}
+function select(i) {
+	if (!menuItems.length) return;
+	selected = (i + menuItems.length) % menuItems.length;
+	refreshFocus();
+	audio.click();
+}
+function activate() {
+	menuItems[selected]?.fn();
+	audio.click();
+}
+function renderMenu(which = screen, keep = false) {
+	screen = which;
+	const old = selected;
+	selected = 0;
+	menuItems = [];
+	let html = "";
+	$("menuShade").style.display = which === "title" ? "none" : "block";
+	$("menu").style.display = "flex";
+	$("brand").style.display = which === "title" ? "flex" : "none";
+	$("topright").style.display = which === "title" ? "block" : "none";
+	$("footer").style.display = "flex";
+	$("footer-note").textContent =
+		which === "title"
+			? "SINGLE SORTIE / COMPLETE VERTICAL SLICE"
+			: "CRIMSON COMMOTION / FLIGHT DIVISION";
+	if (which === "title") {
+		html =
+			'<section class="menu-main"><div class="eyebrow">A little red. A lot of trouble.</div><h1>Crimson<span>Commotion</span></h1><div class="mission-tag"><span>2065</span><span>OPERATION / QUIET HOURS</span></div><p class="lede">The defense network has lost its mind.<br>One small fighter. One very loud solution.</p><div class="menu-buttons">' +
+			nav("Deploy fighter", () => showBrief(), "✕ / ENTER", true) +
+			nav("Squadron online", () => renderMenu("online"), "1–4 PILOTS") +
+			nav("Flight manual", () => renderMenu("controls"), "CONTROLS") +
+			nav("Settings", () => openSettings(), "OPTIONS") +
+			nav(
+				"About & credits",
+				() => {
+					aboutPage = 0;
+					renderMenu("about");
+				},
+				"FLIGHT LOG",
+			) +
+			'</div></section><div class="stamp">MULTIROLE INTERCEPTOR<strong>KITE—01</strong>VULCAN / SEEKERS / BAD ATTITUDE</div>';
+	} else if (which === "brief") {
+		html =
+			'<section class="panel center"><div class="eyebrow">Mission briefing / 01</div><h2>Pull the plug.</h2><p class="lede">WARDEN has locked the orbital foundry. Enter the relay trench, silence its three transmitters, and break the defense core. Then get clear before the station folds.</p><div class="mission-strip"><div><small>01 / INFILTRATE</small>THE APPROACH</div><div><small>02 / DISCONNECT</small>RELAY TRENCH</div><div><small>03 / SURVIVE</small>DANGER ZONE</div></div><p class="note">Fly freely. Slow down to fight. Green rings restore shields; the left branch hides a weapon upgrade. Three checkpoints keep the mission moving.</p><div class="menu-buttons">' +
+			nav("Launch sortie", () => startRun(false), "✕ / ENTER", true) +
+			nav("Flight manual", () => renderMenu("controls"), "") +
+			nav("Back to flight deck", () => toTitle(), "○ / ESC") +
+			"</div></section>";
+	} else if (which === "settings") {
+		const change = (key, values) => () => {
+			const at = values.indexOf(settings[key]);
+			settings[key] = values[(at + 1) % values.length];
+			save();
+			audio.level();
+			renderMenu("settings", true);
+		};
+		html =
+			'<section class="panel center"><div class="eyebrow">Flight systems</div><h2>' +
+			(previous === "play" ? "Flight paused" : "Settings") +
+			'</h2><div class="menu-buttons">' +
+			nav("Return", () => closeSettings(), "○ / OPTIONS", true) +
+			nav(
+				"Master volume",
+				change("volume", [0, 25, 50, 65, 80, 100]),
+				settings.volume + "%",
+			) +
+			nav(
+				"Music volume",
+				change("music", [0, 25, 40, 60, 80, 100]),
+				settings.music + "%",
+			) +
+			nav(
+				"Invert horizontal axis",
+				change("invertX", [false, true]),
+				settings.invertX ? "ON" : "OFF",
+			) +
+			nav(
+				"Invert vertical axis",
+				change("invertY", [false, true]),
+				settings.invertY ? "ON" : "OFF",
+			) +
+			nav(
+				"Steering sensitivity",
+				change("sensitivity", [65, 80, 100, 125, 150]),
+				settings.sensitivity + "%",
+			) +
+			nav(
+				"Screen shake / rumble",
+				change("shake", [true, false]),
+				settings.shake ? "ON" : "OFF",
+			) +
+			(!hubInfo && !net.running
+				? nav(
+						"Difficulty",
+						change("difficulty", [0, 1, 2]),
+						["CADET", "PILOT", "ACE"][settings.difficulty],
+					)
+				: "") +
+			(!hubInfo && !net.running && previous === "play"
+				? nav(
+						"Restart checkpoint",
+						() => {
+							state = "play";
+							startRun(false, true);
+						},
+						"RETRY",
+					) + nav("Return to flight deck", () => toTitle(), "END SORTIE")
+				: !hubInfo && net.running
+					? nav(
+							"Leave squadron",
+							() => {
+								net.close();
+								toTitle();
+							},
+							"END SORTIE",
+						)
+					: "") +
+			"</div></section>";
+	} else if (which === "controls") {
+		const rows = [
+			["Steer / pitch", "Left stick", "W A S D / arrows"],
+			["Strafe / lift", "Right stick", "J L / I K"],
+			["Vulcan cannon", "R2 / ✕", "Space / mouse 1"],
+			["Lock-on seekers", "Hold L2", "Hold E"],
+			["Boost / brake", "R1 / L1", "Shift / Ctrl"],
+			["Evasive roll", "□", "Q"],
+			["Camera / U-turn", "△ / R3", "V / X"],
+			["Cruise speed", "D-pad ↑ ↓", "+ / −"],
+			["Settings", "Options", "Esc"],
+		];
+		html =
+			'<section class="panel center two"><div class="eyebrow">Pilot handbook</div><h2>Own the air.</h2><div class="content"><div>' +
+			rows
+				.map(
+					(r) =>
+						'<div class="control-row"><span>' +
+						r[0] +
+						"</span><b>" +
+						r[1] +
+						"</b></div>",
+				)
+				.join("") +
+			"</div><div>" +
+			rows
+				.map(
+					(r) =>
+						'<div class="control-row"><span>' +
+						r[0] +
+						"</span><b>" +
+						r[2] +
+						"</b></div>",
+				)
+				.join("") +
+			'</div></div><p class="note">Hold the target in view to lock. Rolls grant a brief invulnerability window. Braking can stop and reverse the fighter. No fuel limit: take your time. Destroy enemies quickly to build your score multiplier.</p><div class="menu-buttons">' +
+			nav(
+				"Understood",
+				() => renderMenu(previous === "brief" ? "brief" : "title"),
+				"○ / ENTER",
+				true,
+			) +
+			"</div></section>";
+	} else if (which === "about") {
+		const pages = [];
+		for (const [title, rows] of [
+			["Source information", REPORT.source],
+			["Testing feedback", REPORT.testing],
+			["Engine feedback", REPORT.engine],
+			["Prompt feedback", REPORT.prompt],
+		])
+			for (let i = 0; i < rows.length; i += 3)
+				pages.push([title, rows.slice(i, i + 3)]);
+		const p = pages[aboutPage];
+		html =
+			'<section class="panel center"><div class="eyebrow">Flight log / ' +
+			(aboutPage + 1) +
+			" of " +
+			pages.length +
+			"</div><h2>" +
+			p[0] +
+			'</h2><div class="report">' +
+			p[1].map((r) => "<p><b>" + r[0] + "</b><br>" + r[1] + "</p>").join("") +
+			'</div><div class="menu-buttons">' +
+			nav(
+				"Next page",
+				() => {
+					aboutPage = (aboutPage + 1) % pages.length;
+					renderMenu("about");
+				},
+				"→",
+				true,
+			) +
+			nav(
+				"Previous page",
+				() => {
+					aboutPage = (aboutPage + pages.length - 1) % pages.length;
+					renderMenu("about");
+				},
+				"←",
+			) +
+			nav("Back to flight deck", () => toTitle(), "○") +
+			"</div></section>";
+	} else if (which === "online") {
+		html =
+			'<section class="panel center"><div class="eyebrow">Squadron / score attack</div><h2>Same mission.<br>Friendly competition.</h2><p class="lede">Up to four pilots fly separate sorties on the same seed and clock. Break the core, escape, and bank the highest score.</p><div class="menu-buttons">' +
+			nav("Create squadron", () => net.hostRoom(), "HOST", true) +
+			nav(
+				"Join squadron",
+				() => {
+					joinCode = "";
+					renderMenu("keypad");
+				},
+				"ROOM CODE",
+			) +
+			nav("Back to flight deck", () => toTitle(), "○") +
+			'</div><p class="note">Online rooms use PeerJS signaling and direct WebRTC data. Share the six-digit code with friends. In AI Hub, the hub creates and scores your squadron automatically.</p></section>';
+	} else if (which === "keypad") {
+		html =
+			'<section class="panel center" style="max-width:540px"><div class="eyebrow">Squadron frequency</div><h2>Enter room code</h2><div class="code">' +
+			joinCode.padEnd(6, "_") +
+			'</div><div class="keypad">' +
+			[1, 2, 3, 4, 5, 6, 7, 8, 9, "⌫", 0, "JOIN"]
+				.map((n) =>
+					nav("" + n, () => {
+						if (n === "⌫") joinCode = joinCode.slice(0, -1);
+						else if (n === "JOIN") {
+							if (joinCode.length === 6) net.joinRoom(joinCode);
+							return;
+						} else if (joinCode.length < 6) joinCode += n;
+						renderMenu("keypad", true);
+					}),
+				)
+				.join("") +
+			'</div><div class="menu-buttons">' +
+			nav("Back", () => renderMenu("online"), "○") +
+			"</div></section>";
+	} else if (which === "lobby") {
+		html =
+			'<section class="panel center"><div class="eyebrow">Squadron / ' +
+			(net.isHost ? "command" : "wingman") +
+			"</div><h2>" +
+			net.status +
+			'</h2><div class="code">' +
+			(net.code || "······") +
+			'</div><div class="crew">' +
+			net.roster
+				.map(
+					(p) =>
+						"<span>KITE—0" +
+						(p.id + 1) +
+						(p.id === net.me ? " / YOU" : "") +
+						"</span>",
+				)
+				.join("") +
+			'</div><p class="lede">' +
+			(net.isHost
+				? "Share the code. Launch when your squadron is assembled."
+				: "The commander will launch the sortie.") +
+			'</p><div class="menu-buttons">' +
+			(net.isHost && net.open
+				? nav("Launch squadron", () => net.launch(), "ALL PILOTS", true)
+				: "") +
+			nav(
+				"Leave squadron",
+				() => {
+					net.close();
+					renderMenu("online");
+				},
+				"○",
+			) +
+			'</div><p class="note">Connection status: ' +
+			net.detail +
+			"</p></section>";
+	} else if (which === "result") {
+		const won = hp > 0 && stage === 3 && escapeTime > 0;
+		const grade =
+			score >= 14000 ? "S" : score >= 10000 ? "A" : score >= 6000 ? "B" : "C";
+		html =
+			'<section class="panel center"><div class="eyebrow">Sortie ' +
+			(won ? "complete" : "debrief") +
+			" / " +
+			(won ? "rank " + grade : "telemetry recovered") +
+			"</div><h2>" +
+			(won
+				? "Silence, at last."
+				: hp <= 0
+					? "Signal lost."
+					: "Mission clock ended.") +
+			'</h2><div class="result-score">' +
+			score.toLocaleString() +
+			' <span style="font-size:22px">PTS</span></div><div class="result-stats"><span>HOSTILES<b>' +
+			kills +
+			"</b></span><span>SECRETS<b>" +
+			secrets +
+			" / 2</b></span><span>FLIGHT TIME<b>" +
+			formatTime(missionTime) +
+			"</b></span><span>BEST<b>" +
+			best.toLocaleString() +
+			'</b></span></div><div id="result-roster" class="note">' +
+			net.standings() +
+			'</div><div class="menu-buttons">' +
+			(!hubInfo && !net.running
+				? (!won
+						? nav(
+								"Retry checkpoint",
+								() => startRun(false, true),
+								"✕ / ENTER",
+								true,
+							)
+						: nav("Fly again", () => startRun(false), "✕ / ENTER", true)) +
+					nav("Flight replay", () => startReplay(), "TELEMETRY") +
+					nav("Return to flight deck", () => toTitle(), "○")
+				: !hubInfo
+					? nav(
+							"Leave squadron",
+							() => {
+								net.close();
+								toTitle();
+							},
+							"○",
+						)
+					: "") +
+			'</div><p class="note">' +
+			(hubInfo
+				? "Results transmitted. Waiting for the hub."
+				: net.running
+					? "Your score is banked. Other pilots may still be flying."
+					: "Explore both branches, chain eliminations, and return for an S rank.") +
+			"</p></section>";
+	}
+	$("menu").innerHTML = html;
+	if (keep) selected = Math.min(old, menuItems.length - 1);
+	refreshFocus();
+	$("menu")
+		.querySelectorAll("button.nav")
+		.forEach((b) => {
+			b.addEventListener("pointerenter", () => {
+				selected = +b.dataset.index;
+				refreshFocus();
+			});
+			b.addEventListener("click", () => {
+				selected = +b.dataset.index;
+				activate();
+			});
+		});
+}
+let aboutPage = 0,
+	joinCode = "",
+	replayOutcome = null,
+	demoLap = 0;
+function stopReplay() {
+	if (replayOutcome) {
+		({ hp, stage, escapeTime, score, kills, secrets, missionTime } =
+			replayOutcome);
+	}
+	isReplay = false;
+	state = "over";
+	$("attract").style.display = "none";
+	renderMenu("result");
+}
+function showBrief() {
+	previous = "brief";
+	state = "menu";
+	renderMenu("brief");
+}
+function hideMenu() {
+	$("menu").style.display = "none";
+	$("menuShade").style.display = "none";
+	$("brand").style.display = "none";
+	$("topright").style.display = "none";
+	$("footer").style.display = "none";
+}
+function openSettings() {
+	if (hubEnded) return;
+	if (attract) {
+		toTitle();
+		return;
+	}
+	if (screen === "settings" && state === "menu") {
+		closeSettings();
+		return;
+	}
+	previous = state === "play" ? "play" : screen;
+	state = "menu";
+	renderMenu("settings");
+}
+function closeSettings() {
+	if (previous === "play") {
+		state = "play";
+		hideMenu();
+	} else {
+		state = "title";
+		renderMenu(previous === "settings" ? "title" : previous);
+		lastInput = performance.now();
+	}
+}
+function toTitle() {
+	if (hubInfo) return;
+	state = "title";
+	screen = "title";
+	attract = false;
+	isReplay = false;
+	audio.muted = false;
+	audio.level();
+	ship.visible = false;
+	hero.visible = true;
+	hero.position.set(20, 9, -18);
+	$("hud").style.display = "none";
+	$("attract").style.display = "none";
+	document.body.classList.remove("playing");
+	renderMenu("title");
+	lastInput = performance.now();
+}
+function startRun(demo = false, retry = false) {
+	if (demo) demoLap++;
+	const cp = retry ? checkpoint : null;
+	runSeed = hubInfo ? AIHub.seed : net.running ? net.seed : MISSION.seed;
+	createWorld(runSeed);
+	state = "play";
+	screen = "";
+	attract = demo;
+	isReplay = false;
+	hero.visible = false;
+	hp = 100;
+	ammo = 8;
+	weapon = 1;
+	energy = 100;
+	score = 0;
+	kills = 0;
+	shots = 0;
+	hits = 0;
+	secrets = 0;
+	combo = 0;
+	comboTime = 0;
+	yaw = 0;
+	pitch = 0;
+	bank = 0;
+	roll = 0;
+	throttle = 2;
+	camMode = 0;
+	stage = 0;
+	bossPhase = 0;
+	bossHP = 360;
+	relayKills = 0;
+	links = 0;
+	missionTime = 0;
+	simTime = 0;
+	escapeTime = 0;
+	shotCD = 0;
+	missileCD = 0;
+	invuln = 2;
+	rollCD = 0;
+	lockTime = 0;
+	lastTarget = null;
+	hubReported = false;
+	replayFrames = [];
+	replayRecordAt = 0;
+	checkpoint = cp;
+	audio.muted = demo;
+	audio.level();
+	if (cp) {
+		player.body.setTranslation({ x: cp.x, y: cp.y, z: cp.z }, true);
+		player.pos.set(cp.x, cp.y, cp.z);
+		score = cp.score;
+		kills = cp.kills;
+		secrets = cp.secrets;
+		weapon = cp.weapon;
+		stage = cp.stage;
+		ammo = 10;
+		missionTime = cp.time;
+		for (const e of entities) {
+			if (
+				e.mesh.position.z > cp.z + 60 &&
+				e.type !== "boss" &&
+				e.type !== "link"
+			) {
+				e.alive = false;
+				e.mesh.visible = false;
+				world.removeRigidBody(e.body);
+				bodies.delete(e.col.handle);
+			}
+		}
+		if (cp.stage >= 2) {
+			relayKills = 3;
+			const gate = level.getObjectByName("relay-door");
+			gate.visible = false;
+			world.removeCollider(gate.userData.collider, true);
+			bossPhase = 1;
+		}
+	}
+	hideMenu();
+	$("hud").style.display = "block";
+	$("attract").style.display = demo ? "block" : "none";
+	$("attract").querySelector("strong").textContent = "AUTOPILOT DEMONSTRATION";
+	$("attract").querySelector("p").textContent =
+		"ANY INPUT TO RETURN TO FLIGHT DECK";
+	document.body.classList.add("playing");
+	camera.position.copy(player.pos).add(new THREE.Vector3(0, 6, 19));
+	camera.lookAt(player.pos.clone().add(new THREE.Vector3(0, 0, -30)));
+	banner(
+		cp ? "CHECKPOINT RESTORED" : "OPERATION: QUIET HOURS",
+		cp
+			? "FIGHTER REPAIRED. MAKE IT COUNT."
+			: "ENTER THE FOUNDRY. SILENCE WARDEN.",
+		4,
+	);
+	toast("KITE-01, YOU ARE CLEAR. KEEP YOUR WINGS LEVEL.", 5);
+	updateHUD();
+}
+function setCheckpoint(s) {
+	if (attract) return;
+	const cp = MISSION.checkpoints.find((c) => c.stage === s);
+	checkpoint = {
+		stage: s,
+		x: cp.position[0],
+		y: cp.position[1],
+		z: cp.position[2],
+		score,
+		kills,
+		secrets,
+		weapon,
+		time: missionTime,
+	};
+	hp = Math.min(100, hp + 30);
+	ammo = Math.min(20, ammo + 4);
+	toast("CHECKPOINT STORED. SHIELDS AND SEEKERS REPLENISHED.", 4);
+}
+function finish(won = false) {
+	if (state === "over" || hubReported) return;
+	if (attract) {
+		startRun(true);
+		return;
+	}
+	state = "over";
+	if (hubInfo) missionTime = Math.max(0, AIHub.time() / 1000);
+	audio.tone(won ? 523 : 110, 0.8, "triangle", 0.3);
+	if (won) {
+		score += Math.round(2000 + hp * 15 + Math.max(0, 360 - missionTime) * 12);
+		escapeTime = Math.max(0.1, escapeTime);
+	}
+	if (score > best) {
+		best = score;
+		save();
+	}
+	if (hubInfo) {
+		hubReported = true;
+		AIHub.result({
+			score,
+			stats: { kills, secrets, flight: formatTime(missionTime) },
+			awards: won
+				? [
+						{
+							title: "Quiet hours",
+							detail: "Defense core destroyed. Fighter extracted.",
+						},
+					]
+				: [],
+		});
+	}
+	if (net.running) net.report(true);
+	$("attract").style.display = "none";
+	renderMenu("result");
+}
+function startReplay() {
+	if (!replayFrames.length) return;
+	replayOutcome = { hp, stage, escapeTime, score, kills, secrets, missionTime };
+	replaySource = replayFrames.slice();
+	createWorld(runSeed);
+	replayAt = 0;
+	state = "play";
+	isReplay = true;
+	attract = false;
+	hero.visible = false;
+	hideMenu();
+	$("attract").style.display = "block";
+	$("attract").querySelector("strong").textContent =
+		"FLIGHT RECORDER / PLAYBACK";
+	$("attract").querySelector("p").textContent = "△ / V CAMERA · ○ / ESC RETURN";
+}
+function formatTime(t) {
+	return Math.floor(t / 60) + ":" + String(Math.floor(t % 60)).padStart(2, "0");
+}
+const net = {
+	peer: null,
+	connections: [],
+	isHost: false,
+	open: false,
+	code: "",
+	me: 0,
+	roster: [],
+	status: "Opening frequency…",
+	detail: "Connecting to signaling service",
+	running: false,
+	seed: 2065,
+	startAt: 0,
+	scores: {},
+	offset: 0,
+	timer: 0,
+	async library() {
+		if (window.Peer) return;
+		await new Promise((resolve, reject) => {
+			const s = document.createElement("script");
+			s.src = "https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js";
+			s.onload = resolve;
+			s.onerror = () =>
+				reject(Error("Signaling library unavailable. Try again."));
+			document.head.append(s);
+		});
+	},
+	async hostRoom() {
+		this.close();
+		this.isHost = true;
+		this.me = 0;
+		this.roster = [{ id: 0 }];
+		this.code = String(
+			100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000),
+		);
+		this.status = "Opening frequency…";
+		this.detail = "Connecting to signaling service";
+		renderMenu("lobby");
+		try {
+			await this.library();
+			this.peer = new Peer("crimson-commotion-v1-" + this.code);
+			this.peer.on("open", () => {
+				this.open = true;
+				this.status = "Squadron standing by";
+				this.detail = "Room open · direct encrypted data";
+				renderMenu("lobby");
+			});
+			this.peer.on("connection", (c) => {
+				if (this.running || this.connections.length >= 3) {
+					c.on("open", () => {
+						c.send({ t: "reject" });
+						setTimeout(() => c.close(), 200);
+					});
+					return;
+				}
+				this.wire(c, true);
+			});
+			this.error();
+		} catch (e) {
+			this.problem(e.message);
+		}
+	},
+	async joinRoom(code) {
+		this.close();
+		this.isHost = false;
+		this.code = code;
+		this.status = "Tuning frequency…";
+		this.detail = "Finding commander";
+		renderMenu("lobby");
+		try {
+			await this.library();
+			this.peer = new Peer();
+			this.peer.on("open", () =>
+				this.wire(
+					this.peer.connect("crimson-commotion-v1-" + code, { reliable: true }),
+					false,
+				),
+			);
+			this.error();
+		} catch (e) {
+			this.problem(e.message);
+		}
+	},
+	error() {
+		this.peer.on("error", (e) =>
+			this.problem(
+				e.type === "peer-unavailable"
+					? "Room not found. Check the code and try again."
+					: e.type === "unavailable-id"
+						? "Frequency occupied. Create a new room."
+						: "Connection unavailable: " + e.type,
+			),
+		);
+		this.peer.on("disconnected", () => {
+			this.detail = "Signaling disconnected. Existing links can continue.";
+			if (screen === "lobby") renderMenu("lobby");
+		});
+	},
+	problem(s) {
+		this.status = "Frequency unavailable";
+		this.detail = s;
+		this.open = false;
+		if (screen === "lobby") renderMenu("lobby");
+	},
+	wire(c, host) {
+		c.on("open", () => {
+			c.lastSeen = Date.now();
+			this.connections.push(c);
+			if (host) {
+				c.seat = [1, 2, 3].find((i) => !this.roster.some((p) => p.id === i));
+				this.roster.push({ id: c.seat });
+				c.send({ t: "welcome", id: c.seat, roster: this.roster });
+				this.broadcast({ t: "roster", roster: this.roster });
+			} else {
+				this.open = true;
+				this.status = "Squadron linked";
+				this.detail = "Waiting for commander";
+				c.send({ t: "ping", time: Date.now() });
+			}
+			if (screen === "lobby") renderMenu("lobby");
+		});
+		c.on("data", (d) => {
+			c.lastSeen = Date.now();
+			if (!d || typeof d !== "object") return;
+			if (d.t === "welcome") {
+				this.me = d.id;
+				this.roster = d.roster;
+				this.status = "Squadron linked";
+				this.detail = "Ready for launch";
+			}
+			if (d.t === "roster") this.roster = d.roster;
+			if (d.t === "ping" && host)
+				c.send({ t: "pong", time: d.time, host: Date.now() });
+			if (d.t === "pong") this.offset = d.host - (d.time + Date.now()) / 2;
+			if (d.t === "start" && !host) {
+				this.seed = d.seed;
+				this.startAt = d.at;
+				this.running = true;
+				this.scores = {};
+				settings.difficulty = 1;
+				startRun();
+			}
+			if (d.t === "score" && host) {
+				this.scores[c.seat] = { score: Number(d.score) || 0, done: !!d.done };
+				this.broadcast({ t: "scores", scores: this.scores });
+			}
+			if (d.t === "scores") this.scores = d.scores;
+			if (d.t === "reject") this.problem("Squadron is full or already flying.");
+			if (screen === "lobby") renderMenu("lobby");
+		});
+		c.on("close", () => {
+			this.connections = this.connections.filter((x) => x !== c);
+			if (host) {
+				this.roster = this.roster.filter((p) => p.id !== c.seat);
+				this.broadcast({ t: "roster", roster: this.roster });
+			} else {
+				this.detail = "Commander disconnected. Your sortie can continue.";
+				if (this.running) toast("COMMAND LINK LOST. COMPLETE YOUR SORTIE.");
+				else this.problem(this.detail);
+			}
+			if (screen === "lobby") renderMenu("lobby");
+		});
+		c.on("error", () =>
+			this.problem("Peer link failed. Check network connectivity."),
+		);
+	},
+	heartbeat() {
+		if (!this.peer) return;
+		this.broadcast({ t: "heartbeat" });
+		for (const c of [...this.connections])
+			if (Date.now() - (c.lastSeen || Date.now()) > 10000) c.close();
+		if (this.running) this.report(state === "over");
+		if (screen === "result" && $("result-roster"))
+			$("result-roster").textContent = this.standings();
+	},
+	broadcast(d) {
+		for (const c of this.connections) if (c.open) c.send(d);
+	},
+	launch() {
+		this.seed = crypto.getRandomValues(new Uint32Array(1))[0];
+		this.startAt = Date.now() + 5000;
+		this.running = true;
+		this.scores = {};
+		settings.difficulty = 1;
+		this.broadcast({ t: "start", seed: this.seed, at: this.startAt });
+		startRun();
+	},
+	report(done = false) {
+		if (!this.running) return;
+		this.scores[this.me] = { score, done };
+		if (this.isHost) this.broadcast({ t: "scores", scores: this.scores });
+		else this.broadcast({ t: "score", score, done });
+	},
+	standings() {
+		if (!this.running) return "";
+		return this.roster
+			.slice()
+			.sort(
+				(a, b) =>
+					(this.scores[b.id]?.score || 0) - (this.scores[a.id]?.score || 0),
+			)
+			.map(
+				(p) =>
+					"KITE—0" +
+					(p.id + 1) +
+					"  " +
+					(this.scores[p.id]?.score || 0).toLocaleString() +
+					(this.scores[p.id]?.done ? " / BANKED" : " / FLYING"),
+			)
+			.join(" · ");
+	},
+	close() {
+		if (this.peer) this.peer.destroy();
+		this.peer = null;
+		this.connections = [];
+		this.running = false;
+		this.open = false;
+		this.roster = [];
+		this.code = "";
+		this.offset = 0;
+	},
+};
+function registerInput() {
+	const touchOnly =
+		matchMedia("(pointer:coarse)").matches &&
+		!matchMedia("(any-pointer:fine)").matches;
+	$("touchNotice").style.display = touchOnly ? "block" : "none";
+	$("touchSettings").onclick = () => openSettings();
+	const wake = () => {
+		lastInput = performance.now();
+		if (hubEnded) return true;
+		if (hubReadyPending) {
+			hubReadyPending = false;
+			AIHub.ready();
+		}
+		audio.start();
+		if (attract) {
+			toTitle();
+			return true;
+		}
+		return false;
+	};
+	window.addEventListener("keydown", (e) => {
+		if (
+			[
+				"Space",
+				"ArrowUp",
+				"ArrowDown",
+				"ArrowLeft",
+				"ArrowRight",
+				"Tab",
+			].includes(e.code)
+		)
+			e.preventDefault();
+		if (wake()) return;
+		held[e.code] = true;
+		if (e.repeat) return;
+		const menuVisible = $("menu").style.display !== "none";
+		if (e.code === "Escape") {
+			if (isReplay) {
+				stopReplay();
+				return;
+			}
+			if (menuVisible && screen !== "title" && screen !== "settings") {
+				if (screen === "lobby") net.close();
+				toTitle();
+				return;
+			}
+			openSettings();
+			return;
+		}
+		if (menuVisible) {
+			if (e.code === "PageDown" || e.code === "PageUp") {
+				const scrollArea =
+					$("menu").querySelector(".report") ||
+					$("menu").querySelector(".panel");
+				if (scrollArea)
+					scrollArea.scrollTop += e.code === "PageDown" ? 140 : -140;
+				return;
+			}
+			if (e.code === "ArrowDown" || e.code === "KeyS")
+				select(selected + (screen === "keypad" ? 3 : 1));
+			if (e.code === "ArrowUp" || e.code === "KeyW")
+				select(selected - (screen === "keypad" ? 3 : 1));
+			if (screen === "keypad" && e.code === "ArrowLeft") select(selected - 1);
+			if (screen === "keypad" && e.code === "ArrowRight") select(selected + 1);
+			if (e.code === "Enter" || e.code === "Space") activate();
+			if (
+				screen === "keypad" &&
+				/^Digit\d$/.test(e.code) &&
+				joinCode.length < 6
+			) {
+				joinCode += e.code.slice(-1);
+				renderMenu("keypad", true);
+			}
+			return;
+		}
+		if (e.code === "KeyQ") actions.roll = true;
+		if (e.code === "KeyV") actions.camera = true;
+		if (e.code === "KeyX") actions.uturn = true;
+		if (e.code === "Equal") throttle = Math.min(3, throttle + 1);
+		if (e.code === "Minus") throttle = Math.max(0, throttle - 1);
+	});
+	window.addEventListener("keyup", (e) => {
+		delete held[e.code];
+	});
+	window.addEventListener("blur", () => {
+		held = {};
+	});
+	window.addEventListener("pointerdown", (e) => {
+		if (wake()) return;
+		if (e.target === $("scene")) held.MouseFire = true;
+	});
+	window.addEventListener("pointerup", () => delete held.MouseFire);
+	window.addEventListener("pointermove", (e) => {
+		if (e.movementX || e.movementY) {
+			lastInput = performance.now();
+			if (attract) toTitle();
+		}
+	});
+	window.addEventListener("contextmenu", (e) => e.preventDefault());
+	window.addEventListener("gamepadconnected", () => {
+		lastInput = performance.now();
+	});
+}
+function readInput(dt) {
+	input = {
+		x:
+			(held.KeyD || held.ArrowRight ? 1 : 0) -
+			(held.KeyA || held.ArrowLeft ? 1 : 0),
+		y:
+			(held.KeyS || held.ArrowDown ? 1 : 0) -
+			(held.KeyW || held.ArrowUp ? 1 : 0),
+		sx: (held.KeyL ? 1 : 0) - (held.KeyJ ? 1 : 0),
+		sy: (held.KeyK ? 1 : 0) - (held.KeyI ? 1 : 0),
+		fire: !!(held.Space || held.MouseFire),
+		missile: !!held.KeyE,
+		boost: !!(held.ShiftLeft || held.ShiftRight),
+		brake: !!(held.ControlLeft || held.ControlRight),
+	};
+	const pad = Array.from(navigator.getGamepads?.() || []).find(
+		(p) => p && p.connected,
+	);
+	padPresent = !!pad;
+	menuRepeat -= dt;
+	if (!pad) {
+		prevButtons = [];
+		return;
+	}
+	const down = (i) => !!pad.buttons[i]?.pressed,
+		pressed = (i) => down(i) && !prevButtons[i],
+		axis = (i) => {
+			const a = pad.axes[i] || 0;
+			return Math.abs(a) < 0.16
+				? 0
+				: (Math.sign(a) * (Math.abs(a) - 0.16)) / 0.84;
+		};
+	const active =
+		pad.axes.some((a) => Math.abs(a) > 0.22) ||
+		pad.buttons.some((b) => b.pressed);
+	if (active) {
+		lastInput = performance.now();
+		if (attract) {
+			prevButtons = pad.buttons.map((b) => b.pressed);
+			toTitle();
+			return;
+		}
+		if (!hubEnded) audio.start();
+		if (hubReadyPending) {
+			hubReadyPending = false;
+			AIHub.ready();
+		}
+	}
+	if (hubEnded) {
+		prevButtons = pad.buttons.map((b) => b.pressed);
+		return;
+	}
+	if (pressed(9) && !down(8)) {
+		if (isReplay) {
+			stopReplay();
+		} else openSettings();
+	}
+	if ($("menu").style.display !== "none") {
+		const scrollArea =
+			$("menu").querySelector(".report") || $("menu").querySelector(".panel");
+		if (scrollArea && Math.abs(axis(3)) > 0.25)
+			scrollArea.scrollTop += axis(3) * 12;
+		if (menuRepeat <= 0) {
+			if (down(13) || axis(1) > 0.5) {
+				select(selected + (screen === "keypad" ? 3 : 1));
+				menuRepeat = 0.2;
+			} else if (down(12) || axis(1) < -0.5) {
+				select(selected - (screen === "keypad" ? 3 : 1));
+				menuRepeat = 0.2;
+			} else if (screen === "keypad" && (down(14) || axis(0) < -0.5)) {
+				select(selected - 1);
+				menuRepeat = 0.2;
+			} else if (screen === "keypad" && (down(15) || axis(0) > 0.5)) {
+				select(selected + 1);
+				menuRepeat = 0.2;
+			}
+		}
+		if (pressed(0)) activate();
+		if (pressed(1)) {
+			if (screen === "settings") closeSettings();
+			else if (screen === "lobby") {
+				net.close();
+				renderMenu("online");
+			} else if (screen !== "title" && !hubInfo) toTitle();
+		}
+	} else {
+		input.x += axis(0);
+		input.y += axis(1);
+		input.sx += axis(2);
+		input.sy += axis(3);
+		input.fire ||= down(7) || down(0);
+		input.missile ||= down(6);
+		input.boost ||= down(5);
+		input.brake ||= down(4);
+		if (pressed(2)) actions.roll = true;
+		if (pressed(3)) actions.camera = true;
+		if (pressed(11)) actions.uturn = true;
+		if (pressed(12)) throttle = Math.min(3, throttle + 1);
+		if (pressed(13)) throttle = Math.max(0, throttle - 1);
+		if (isReplay && pressed(1)) {
+			stopReplay();
+		}
+	}
+	input.x = clamp(input.x, -1, 1);
+	input.y = clamp(input.y, -1, 1);
+	prevButtons = pad.buttons.map((b) => b.pressed);
+}
+function autopilot(dt) {
+	const t = missionTime;
+	camMode = t < 12 ? 0 : t < 19 ? 3 : t < 25 ? 2 : t < 30 ? 1 : 0;
+	let p,
+		aim = null;
+	if (t < 32)
+		p = new THREE.Vector3(
+			Math.sin(t * 0.45) * 16,
+			Math.cos(t * 0.3) * 7,
+			80 - t * 19,
+		);
+	else if (t < 53)
+		p = new THREE.Vector3(
+			demoLap % 2 ? 44 : -44,
+			Math.sin(t * 0.4) * 8,
+			-528 - (t - 32) * 19,
+		);
+	else if (t < 77) {
+		p = new THREE.Vector3(Math.sin(t * 0.3) * 35, 8, -1000);
+		aim = entities.find((e) => e.type === "relay" && e.alive);
+		if (t > 59 + relayKills * 5 && aim) hurtEnemy(aim, 100);
+	} else if (t < 84) p = new THREE.Vector3(0, 8, -1000 - (t - 77) * 24);
+	else if (t < 119) {
+		p = new THREE.Vector3(
+			Math.sin(t * 0.22) * 42,
+			Math.sin(t * 0.35) * 18 + 10,
+			-1280,
+		);
+		aim =
+			entities.find((e) => e.type === "link" && e.alive) ||
+			entities.find((e) => e.type === "boss" && e.alive);
+		if (t > 87 + links * 5 && links < 3 && aim) hurtEnemy(aim, 80);
+		if (t > 105 && links === 3 && aim?.type === "boss") hurtEnemy(aim, dt * 30);
+	} else {
+		p = new THREE.Vector3(0, 0, -1280 - (t - 119) * 29);
+		const b = entities.find((e) => e.type === "boss" && e.alive);
+		if (b) hurtEnemy(b, 500);
+	}
+	if (!aim)
+		aim = entities.find(
+			(e) =>
+				e.alive &&
+				e.type !== "boss" &&
+				e.mesh.position.z < p.z &&
+				e.mesh.position.distanceTo(p) < 130,
+		);
+	const look = aim
+		? aim.mesh.position.clone().sub(p).normalize()
+		: new THREE.Vector3(-Math.cos(t * 0.45) * 0.1, 0, -1);
+	yaw = Math.atan2(-look.x, -look.z);
+	pitch = Math.asin(look.y);
+	player.body.setTranslation(p, true);
+	player.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+	player.pos.copy(p);
+	input.fire = true;
+	input.missile = t % 5 < 1;
+	input.boost = t > 119;
+	hp = 100;
+	ammo = 12;
+	energy = 100;
+	weapon = t > 35 ? 2 : 1;
+	if (t % 15 < 0.02) actions.roll = true;
+}
+function step(dt) {
+	simTime += dt;
+	missionTime += dt;
+	invuln -= dt;
+	shotCD -= dt;
+	missileCD -= dt;
+	rollCD -= dt;
+	comboTime -= dt;
+	if (comboTime <= 0) combo = 0;
+	damageFlash = Math.max(0, damageFlash - dt * 2);
+	if (attract) autopilot(dt);
+	if (actions.camera) {
+		camMode = (camMode + 1) % 4;
+		actions.camera = false;
+	}
+	if (actions.uturn) {
+		yaw += Math.PI;
+		actions.uturn = false;
+		toast("REVERSE VECTOR.", 1.5);
+	}
+	if (actions.roll && rollCD <= 0) {
+		roll = 6.28;
+		rollCD = 2.5;
+		invuln = 0.8;
+		audio.tone(350, 0.35, "triangle", 0.15, 90);
+	}
+	actions.roll = false;
+	roll = Math.max(0, roll - dt * 9);
+	if (!attract) {
+		const sens = settings.sensitivity / 100;
+		const ix = input.x * (settings.invertX ? -1 : 1),
+			iy = input.y * (settings.invertY ? -1 : 1);
+		yaw -= ix * dt * 1.55 * sens;
+		pitch = clamp(pitch - iy * dt * 1.05 * sens, -1.2, 1.2);
+		bank = lerp(bank, -ix * 0.55, 1 - Math.exp(-dt * 6));
+		const f = getForward(),
+			right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+		let speed = [-12, 0, 23, 38][throttle];
+		if (input.brake) speed = -10;
+		else if (input.boost && energy > 1) {
+			speed = 75;
+			energy = Math.max(0, energy - dt * 27);
+		} else energy = Math.min(100, energy + dt * 16);
+		const target = f
+			.multiplyScalar(speed)
+			.addScaledVector(right, input.sx * (settings.invertX ? -1 : 1) * 23);
+		target.y -= input.sy * (settings.invertY ? -1 : 1) * 23;
+		player.vel.lerp(target, 1 - Math.exp(-dt * 5));
+		player.body.setLinvel(player.vel, true);
+	}
+	// Kinematic enemies and dynamic fighter share the Rapier collision world.
+	for (const e of entities) {
+		if (!e.alive) continue;
+		if (e.type === "drone") {
+			e.mesh.position.x = e.base.x + Math.sin(simTime * 1.1 + e.phase) * 7;
+			e.mesh.position.y = e.base.y + Math.cos(simTime * 0.8 + e.phase) * 4;
+			e.mesh.rotation.z = Math.sin(simTime + e.phase) * 0.2;
+		}
+		if (e.type === "relay" || e.type === "link") e.mesh.rotation.y += dt * 0.7;
+		if (e.type === "link" && stage >= 2) {
+			const a = e.orbit + simTime * 0.25;
+			e.mesh.position.set(Math.cos(a) * 34, 7 + Math.sin(a) * 32, -1410);
+		}
+		e.body.setNextKinematicTranslation(e.mesh.position);
+		e.cd -= dt;
+		const distance = e.mesh.position.distanceTo(player.pos);
+		if (
+			distance < 220 &&
+			e.cd <= 0 &&
+			e.type !== "relay" &&
+			(e.type !== "link" || stage >= 2) &&
+			(e.type !== "boss" || stage >= 2)
+		) {
+			e.cd =
+				e.type === "boss"
+					? bossPhase === 3
+						? 1.0
+						: 1.7
+					: 2.4 + e.phase * 0.22;
+			const dir = player.pos.clone().sub(e.mesh.position).normalize();
+			spawnBolt(
+				e.mesh.position.clone().addScaledVector(dir, e.radius + 2),
+				dir,
+				true,
+			);
+			if (e.type === "boss") {
+				for (let j = 0; j < (bossPhase === 3 ? 16 : 9); j++) {
+					const a = (j / (bossPhase === 3 ? 16 : 9)) * Math.PI * 2 + simTime;
+					const d = new THREE.Vector3(
+						Math.cos(a) * 0.55,
+						Math.sin(a) * 0.55,
+						1,
+					).normalize();
+					spawnBolt(e.mesh.position.clone().addScaledVector(d, 20), d, true);
+				}
+			}
+		}
+	}
+	world.timestep = dt;
+	world.step(eventQueue);
+	if (!attract) player.pos.copy(player.body.translation());
+	eventQueue.drainCollisionEvents((a, b, started) => {
+		if (started && (a === player.col.handle || b === player.col.handle)) {
+			damage(14);
+			player.vel.multiplyScalar(0.25);
+		}
+	});
+	if (
+		Math.abs(player.pos.x) > 175 ||
+		Math.abs(player.pos.y) > 105 ||
+		player.pos.z > 170 ||
+		player.pos.z < -1750
+	) {
+		const p = {
+			x: clamp(player.pos.x, -170, 170),
+			y: clamp(player.pos.y, -100, 100),
+			z: clamp(player.pos.z, -1740, 160),
+		};
+		player.body.setTranslation(p, true);
+		player.pos.copy(p);
+		damage(8);
+		toast("FLIGHT ENVELOPE LIMIT. RETURN TO THE FOUNDRY.", 2);
+	}
+	ship.position.copy(player.pos);
+	ship.rotation.set(pitch, yaw, bank + roll, "YXZ");
+	ship.visible = camMode !== 2;
+	ship.traverse((o) => {
+		if (o.name === "flame")
+			o.scale.y = input.boost ? 3.6 : 1.5 + Math.sin(simTime * 40) * 0.3;
+	});
+	const target = nearestTarget(260, 0.91);
+	if (target === lastTarget) lockTime += dt;
+	else lockTime = 0;
+	lastTarget = target;
+	if (input.fire) fire();
+	if (input.missile) launchMissile();
+	for (let i = bullets.length - 1; i >= 0; i--) {
+		const b = bullets[i];
+		b.life -= dt;
+		if (b.missile && b.target?.alive) {
+			const desired = b.target.mesh.position
+				.clone()
+				.sub(b.mesh.position)
+				.normalize()
+				.multiplyScalar(100);
+			b.vel.lerp(desired, 1 - Math.exp(-dt * 8));
+			b.mesh.quaternion.setFromUnitVectors(
+				new THREE.Vector3(0, 0, -1),
+				b.vel.clone().normalize(),
+			);
+		}
+		const old = b.mesh.position.clone(),
+			travel = b.vel.length() * dt,
+			direction = b.vel.clone().normalize();
+		b.mesh.position.addScaledVector(b.vel, dt);
+		if (b.enemy) {
+			const ab = b.mesh.position.clone().sub(old),
+				ap = player.pos.clone().sub(old),
+				u = clamp(ap.dot(ab) / (ab.lengthSq() || 1), 0, 1);
+			if (old.addScaledVector(ab, u).distanceTo(player.pos) < 2.2) {
+				damage(9);
+				b.life = 0;
+			}
+		} else {
+			const ray = new RAPIER.Ray(old, direction);
+			const hit = world.castRay(
+				ray,
+				travel + 1,
+				true,
+				undefined,
+				undefined,
+				player.col,
+			);
+			if (hit) {
+				const e = bodies.get(hit.collider.handle);
+				if (e) hurtEnemy(e, b.damage);
+				b.life = 0;
+			}
+		}
+		if (b.life <= 0) {
+			level.remove(b.mesh);
+			bullets.splice(i, 1);
+		}
+	}
+	for (let i = particles.length - 1; i >= 0; i--) {
+		const p = particles[i];
+		p.life -= dt;
+		p.mesh.position.addScaledVector(p.vel, dt);
+		p.mesh.rotation.x += dt * 5;
+		if (p.blast) p.mesh.scale.multiplyScalar(1 + dt * 8);
+		else p.mesh.scale.multiplyScalar(1 - dt * 1.8);
+		if (p.life <= 0) {
+			level.remove(p.mesh);
+			particles.splice(i, 1);
+		}
+	}
+	for (const r of rings) {
+		if (!r.alive) continue;
+		r.mesh.rotation.z += dt * 0.16;
+		const d = r.mesh.position.clone().sub(player.pos);
+		if (Math.abs(d.z) < 4 && Math.hypot(d.x, d.y) < 8.6) {
+			r.alive = false;
+			r.mesh.visible = false;
+			hp = Math.min(100, hp + 8);
+			energy = 100;
+			addScore(r.secret ? 500 : 100);
+			if (r.secret) {
+				secrets++;
+				toast("HIDDEN FLIGHT LINE " + secrets + "/2. NICE FLYING.", 3);
+			}
+			audio.pick();
+		}
+	}
+	for (const p of pickups) {
+		if (!p.alive) continue;
+		p.mesh.rotation.y += dt;
+		p.mesh.position.y = p.baseY + Math.sin(simTime * 2) * 1.3;
+		if (p.mesh.position.distanceTo(player.pos) < 5.5) {
+			p.alive = false;
+			p.mesh.visible = false;
+			if (p.type === "shield") {
+				hp = Math.min(100, hp + 40);
+				toast("SHIELD REPAIR CONFIRMED.", 2);
+			}
+			if (p.type === "ammo") {
+				ammo = Math.min(24, ammo + 8);
+				toast("SEEKERS RELOADED.", 2);
+			}
+			if (p.type === "weapon") {
+				weapon = Math.min(3, weapon + 1);
+				toast("VULCAN UPGRADE. SPREAD ARRAY ONLINE.", 3);
+			}
+			addScore(250);
+			audio.pick();
+		}
+	}
+	moving.forEach((m) => (m.mesh.rotation[m.axis] += dt * m.speed));
+	if (core?.visible) core.getObjectByName("heart").rotation.y += dt * 0.25;
+	if (stage === 0 && player.pos.z < -525) {
+		stage = 1;
+		setCheckpoint(1);
+		banner("RELAY TRENCH", "LEFT: SALVAGE / RIGHT: REPAIR", 3);
+	}
+	if (stage === 1 && player.pos.z < -1110) {
+		stage = 2;
+		bossPhase = 1;
+		setCheckpoint(2);
+		banner("DANGER ZONE", "WARDEN / BREAK THREE ARMOR LINKS", 3);
+		toast("THREE LINKS FEED THE CORE. CUT THEM LOOSE.", 5);
+	}
+	if (stage === 3) {
+		escapeTime -= dt;
+		if (escapeTime <= 0) {
+			hp = 0;
+			finish(false);
+		} else if (
+			player.pos.z < -1635 &&
+			Math.hypot(player.pos.x, player.pos.y) < 26
+		) {
+			finish(true);
+			return;
+		}
+	}
+	if (!attract && state === "play" && missionTime - replayRecordAt > 0.1) {
+		replayRecordAt = missionTime;
+		replayFrames.push({
+			p: player.pos.toArray(),
+			y: yaw,
+			a: pitch,
+			b: bank,
+			sc: score,
+			h: hp,
+			st: stage,
+			bp: bossPhase,
+			bh: bossHP,
+			sk: secrets,
+			t: missionTime,
+			f: input.fire,
+			ammo,
+			weapon,
+			energy,
+			en: entities.map((e) => [
+				e.alive,
+				e.mesh.position.x,
+				e.mesh.position.y,
+				e.mesh.position.z,
+			]),
+		});
+		if (replayFrames.length > 7200) replayFrames.shift();
+	}
+	if (hubInfo && !hubReported)
+		AIHub.progress({
+			score,
+			label: ["Approach", "Relay trench", "Danger zone", "Extraction"][stage],
+		});
+}
+function replayStep(dt) {
+	simTime += dt;
+	replayAt += dt * 10;
+	const index = Math.min(replaySource.length - 1, Math.floor(replayAt));
+	const f = replaySource[index];
+	if (!f || replayAt >= replaySource.length) {
+		stopReplay();
+		return;
+	}
+	const n = replaySource[Math.min(index + 1, replaySource.length - 1)],
+		u = replayAt - index;
+	player.pos.fromArray(f.p).lerp(new THREE.Vector3().fromArray(n.p), u);
+	ship.position.copy(player.pos);
+	yaw = f.y;
+	pitch = f.a;
+	ship.rotation.set(f.a, f.y, f.b, "YXZ");
+	ship.visible = camMode !== 2;
+	score = f.sc;
+	hp = f.h;
+	stage = f.st;
+	bossPhase = f.bp;
+	bossHP = f.bh;
+	missionTime = f.t;
+	secrets = f.sk;
+	ammo = f.ammo;
+	weapon = f.weapon;
+	energy = f.energy;
+	shotCD -= dt;
+	if (f.f && shotCD <= 0) {
+		shotCD = 0.13;
+		spawnBolt(
+			player.pos.clone().addScaledVector(getForward(), 4),
+			getForward(),
+		);
+	}
+	for (let i = bullets.length - 1; i >= 0; i--) {
+		const b = bullets[i];
+		b.life -= dt;
+		b.mesh.position.addScaledVector(b.vel, dt);
+		if (b.life <= 0) {
+			level.remove(b.mesh);
+			bullets.splice(i, 1);
+		}
+	}
+	for (let i = particles.length - 1; i >= 0; i--) {
+		const p = particles[i];
+		p.life -= dt;
+		p.mesh.position.addScaledVector(p.vel, dt);
+		if (p.life <= 0) {
+			level.remove(p.mesh);
+			particles.splice(i, 1);
+		}
+	}
+	moving.forEach((m) => (m.mesh.rotation[m.axis] += dt * m.speed));
+	entities.forEach((e, i) => {
+		const s = f.en[i];
+		if (s) {
+			if (e.alive && !s[0]) explode(e.mesh.position, C.coral, 2);
+			e.mesh.visible = s[0];
+			e.alive = s[0];
+			e.mesh.position.set(s[1], s[2], s[3]);
+		}
+	});
+	const gate = level.getObjectByName("relay-door");
+	if (gate) gate.visible = stage < 2;
+	if (actions.camera) {
+		camMode = (camMode + 1) % 4;
+		actions.camera = false;
+	}
+}
+function updateCamera(dt) {
+	if (
+		state === "title" ||
+		(state === "menu" && previous !== "play" && screen !== "result" && !hubInfo)
+	) {
+		const t = time;
+		hero.visible = true;
+		hero.position.set(20, 12 + Math.sin(t * 0.7) * 1.5, -20);
+		hero.rotation.set(
+			-0.12 + Math.sin(t * 0.3) * 0.05,
+			2.3 + Math.sin(t * 0.18) * 0.15,
+			-0.18,
+		);
+		hero.scale.setScalar(3.1);
+		camera.position.set(2, 15, 43);
+		camera.lookAt(3, 6, -35);
+		camera.fov = 48;
+		camera.updateProjectionMatrix();
+		return;
+	}
+	const f = getForward(),
+		right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+	let desired, target;
+	if (camMode === 2) {
+		desired = player.pos
+			.clone()
+			.addScaledVector(f, 2)
+			.add(new THREE.Vector3(0, 0.65, 0));
+		target = desired.clone().addScaledVector(f, 80);
+	} else if (camMode === 3) {
+		desired = player.pos
+			.clone()
+			.addScaledVector(f, -30)
+			.addScaledVector(right, 17)
+			.add(new THREE.Vector3(0, 21, 0));
+		target = player.pos.clone().addScaledVector(f, 25);
+	} else {
+		desired = player.pos
+			.clone()
+			.addScaledVector(f, camMode === 1 ? -10 : -18)
+			.add(new THREE.Vector3(0, camMode === 1 ? 3 : 6, 0));
+		target = player.pos.clone().addScaledVector(f, 45);
+	}
+	camera.position.lerp(desired, 1 - Math.exp(-dt * (camMode === 2 ? 30 : 6)));
+	if (settings.shake && damageFlash > 0.1)
+		camera.position.add(
+			new THREE.Vector3(
+				(Math.random() - 0.5) * damageFlash,
+				(Math.random() - 0.5) * damageFlash,
+				0,
+			),
+		);
+	camera.lookAt(target);
+	camera.fov = lerp(camera.fov, input.boost ? 72 : 62, dt * 3);
+	camera.updateProjectionMatrix();
+}
+function updateHUD() {
+	const labels = MISSION.sectorLabels;
+	$("zone-label").textContent = labels[stage];
+	$("score").textContent = String(score).padStart(6, "0");
+	$("combo").textContent =
+		combo > 1
+			? "CHAIN " + combo + " / ×" + (1 + Math.min(combo, 20) * 0.05).toFixed(2)
+			: "";
+	$("shield").textContent = Math.ceil(hp);
+	$("shield-fill").style.width = hp + "%";
+	$("shield-fill").style.background = hp < 30 ? "var(--red)" : "var(--cyan)";
+	$("boost-fill").style.width = energy + "%";
+	$("missiles").textContent = String(ammo).padStart(2, "0") + " SEEKERS";
+	$("weapon-level").textContent = ["I", "II", "III"][weapon - 1];
+	$("camera-label").textContent = ["CHASE", "CLOSE", "COCKPIT", "TACTICAL"][
+		camMode
+	];
+	$("throttle").textContent = input.boost
+		? "AFTERBURN / 75"
+		: input.brake
+			? "REVERSE / −10"
+			: ["REVERSE / −12", "HOVER / 00", "CRUISE / 23", "FAST / 38"][throttle];
+	$("objective").textContent =
+		stage === 0
+			? "Follow the flight rings into the foundry"
+			: stage === 1
+				? "Silence the relay towers  " + relayKills + " / 3"
+				: stage === 2
+					? links < 3
+						? "Break WARDEN’s armor links  " + links + " / 3"
+						: "Destroy the exposed core"
+					: "Reach the cyan extraction gate  " + Math.ceil(escapeTime) + "s";
+	$("hint").innerHTML = padPresent
+		? "<kbd>R2</kbd> FIRE <kbd>L2</kbd> SEEKERS <kbd>R1</kbd> BOOST <kbd>□</kbd> ROLL"
+		: "<kbd>WASD</kbd> STEER <kbd>SPACE</kbd> FIRE <kbd>E</kbd> SEEKERS <kbd>SHIFT</kbd> BOOST";
+	$("boss").style.display = stage === 2 ? "block" : "none";
+	$("boss-name").textContent =
+		links < 3
+			? "WARDEN / ARMOR LINKS"
+			: bossPhase === 3
+				? "WARDEN / OVERDRIVE"
+				: "WARDEN / EXPOSED CORE";
+	$("boss-fill").style.width =
+		(links < 3 ? ((3 - links) / 3) * 100 : (bossHP / 360) * 100) + "%";
+	$("comms").style.opacity = simTime < commsUntil ? "1" : "0";
+	if (simTime > bannerUntil) $("banner").innerHTML = "";
+	$("damage").style.opacity = damageFlash;
+	const l = $("lock");
+	if (lastTarget?.alive && state === "play") {
+		const p = lastTarget.mesh.position.clone().project(camera);
+		if (Math.abs(p.x) < 1.1 && Math.abs(p.y) < 1.1 && p.z < 1) {
+			l.style.display = "block";
+			l.style.left = (p.x * 0.5 + 0.5) * innerWidth + "px";
+			l.style.top = (-p.y * 0.5 + 0.5) * innerHeight + "px";
+			l.style.borderColor = lockTime > 0.4 ? "var(--red)" : "var(--cyan)";
+			l.dataset.label = lockTime > 0.4 ? "LOCK / L2 · E" : "ACQUIRING";
+		} else l.style.display = "none";
+	} else l.style.display = "none";
+	const ctx = $("radar").getContext("2d");
+	ctx.clearRect(0, 0, 250, 250);
+	ctx.strokeStyle = "#9ce2d04a";
+	ctx.fillStyle = "#082a34aa";
+	ctx.lineWidth = 1;
+	ctx.beginPath();
+	ctx.arc(125, 125, 118, 0, Math.PI * 2);
+	ctx.fill();
+	ctx.stroke();
+	ctx.beginPath();
+	ctx.arc(125, 125, 60, 0, Math.PI * 2);
+	ctx.stroke();
+	ctx.beginPath();
+	ctx.moveTo(125, 8);
+	ctx.lineTo(125, 242);
+	ctx.moveTo(8, 125);
+	ctx.lineTo(242, 125);
+	ctx.stroke();
+	const f = getForward(),
+		r = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+	for (const e of entities) {
+		if (!e.alive) continue;
+		const d = e.mesh.position.clone().sub(player.pos),
+			x = d.dot(r) * 0.5,
+			z = -d.dot(f) * 0.5;
+		if (Math.hypot(x, z) > 110) continue;
+		ctx.fillStyle = e.type === "relay" ? "#ffbd5b" : "#ff624d";
+		ctx.fillRect(
+			122 + x,
+			122 + z,
+			e.type === "boss" ? 9 : 5,
+			e.type === "boss" ? 9 : 5,
+		);
+	}
+	ctx.fillStyle = "#fff1d6";
+	ctx.beginPath();
+	ctx.moveTo(125, 116);
+	ctx.lineTo(119, 132);
+	ctx.lineTo(131, 132);
+	ctx.closePath();
+	ctx.fill();
+	$("network-hud").textContent = net.running
+		? net.standings()
+		: hubInfo
+			? "HUB SQUADRON / " + hubInfo.players.length + " PILOTS"
+			: "";
+}
+let lastFrame = 0,
+	accumulator = 0;
+function frame(ms) {
+	if (state === "error") return;
+	const dt = Math.min(0.1, (ms - lastFrame) / 1000 || 0.016);
+	lastFrame = ms;
+	time += dt;
+	readInput(0);
+	audio.update();
+	if (
+		state === "title" &&
+		screen === "title" &&
+		ms - lastInput >= 10000 &&
+		!hubInfo
+	)
+		startRun(true);
+	let running = state === "play" && !hubEnded;
+	const clock = hubInfo
+		? AIHub.time() / 1000
+		: net.running
+			? (Date.now() + net.offset - net.startAt) / 1000
+			: 0;
+	if ((hubInfo || net.running) && clock < 0) {
+		running = false;
+		banner(
+			Number.isFinite(clock) ? String(Math.ceil(-clock)) : "SQUADRON READY",
+			"SYNCHRONIZING LAUNCH",
+			1,
+		);
+	}
+	if (net.running && clock >= 360 && state === "play") finish(false);
+	if (running) {
+		accumulator += dt;
+		let steps = 0;
+		while (accumulator >= 1 / 60 && steps < 6) {
+			if (isReplay) replayStep(1 / 60);
+			else step(1 / 60);
+			accumulator -= 1 / 60;
+			steps++;
+			if (state !== "play") break;
+		}
+	} else accumulator = 0;
+	updateCamera(dt);
+	if (ms - hudAt > 75) {
+		hudAt = ms;
+		if (state === "play" || previous === "play") updateHUD();
+		$("input-hint").innerHTML = padPresent
+			? "<kbd>↕</kbd> SELECT <kbd>✕</kbd> CONFIRM <kbd>○</kbd> BACK <kbd>RS</kbd> SCROLL"
+			: "<kbd>↑ ↓</kbd> SELECT <kbd>ENTER</kbd> CONFIRM";
+		if (screen === "title")
+			$("footer-note").textContent =
+				"AUTOPILOT IN " +
+				Math.max(0, Math.ceil((10000 - (ms - lastInput)) / 1000)) +
+				"s / BEST " +
+				best.toLocaleString();
+	}
+	renderer.render(scene, camera);
+}
+async function boot() {
+	try {
+		if (!navigator.gpu)
+			throw Error(
+				"WebGPU is required. Open this file in a WebGPU-enabled browser on HTTPS or localhost.",
+			);
+		$("boot-status").textContent = "Loading Three.js R180 and Rapier 0.19.3…";
+		[THREE, RAPIER] = await Promise.all([
+			import("three/webgpu"),
+			import(
+				"/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs"
+			).then((m) => m.default),
+		]);
+		await RAPIER.init();
+		renderer = new THREE.WebGPURenderer({
+			canvas: $("scene"),
+			antialias: true,
+			alpha: false,
+		});
+		renderer._getFallback = null;
+		await renderer.init();
+		if (!renderer.backend.isWebGPUBackend)
+			throw Error("A WebGPU device is required.");
+		renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+		renderer.setSize(innerWidth, innerHeight);
+		renderer.outputColorSpace = THREE.SRGBColorSpace;
+		renderer.toneMapping = THREE.ACESFilmicToneMapping;
+		renderer.toneMappingExposure = 1.25;
+		renderer.shadowMap.enabled = true;
+		renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+		scene = new THREE.Scene();
+		scene.background = new THREE.Color(0x123645);
+		scene.fog = new THREE.Fog(0x254d57, 160, 650);
+		camera = new THREE.PerspectiveCamera(
+			62,
+			innerWidth / innerHeight,
+			0.1,
+			3000,
+		);
+		const amb = new THREE.HemisphereLight(0xb6e9db, 0x52677b, 2.8);
+		scene.add(amb);
+		const sun = new THREE.DirectionalLight(0xffdbac, 4);
+		sun.position.set(-60, 110, 30);
+		sun.castShadow = true;
+		sun.shadow.mapSize.set(2048, 2048);
+		sun.shadow.camera.left = -100;
+		sun.shadow.camera.right = 100;
+		sun.shadow.camera.top = 100;
+		sun.shadow.camera.bottom = -100;
+		sun.shadow.camera.far = 350;
+		sun.shadow.bias = -0.001;
+		scene.add(sun);
+		scene.add(sun.target);
+		const rim = new THREE.DirectionalLight(C.cyan, 1.8);
+		rim.position.set(30, 10, -80);
+		scene.add(rim);
+		const data = new Uint8Array([
+			60, 60, 60, 255, 145, 145, 145, 255, 220, 220, 220, 255, 255, 255, 255,
+			255,
+		]);
+		materials.gradient = new THREE.DataTexture(data, 4, 1, THREE.RGBAFormat);
+		materials.gradient.minFilter = THREE.NearestFilter;
+		materials.gradient.magFilter = THREE.NearestFilter;
+		materials.gradient.needsUpdate = true;
+		materials.line = new THREE.LineBasicNodeMaterial({ color: 0x071f2a });
+		materials.flame = new THREE.MeshBasicNodeMaterial({ color: 0x74ffe3 });
+		materials.bright = new THREE.MeshBasicNodeMaterial({ color: C.cream });
+		materials.flash = new THREE.MeshBasicNodeMaterial({ color: 0xffde97 });
+		materials.bolt = new THREE.MeshBasicNodeMaterial({ color: 0xaaffdb });
+		materials.enemyBolt = new THREE.MeshBasicNodeMaterial({ color: 0xff8060 });
+		materials.missile = new THREE.MeshBasicNodeMaterial({ color: C.gold });
+		geo.box = new THREE.BoxGeometry(1, 1, 1);
+		geo.cone = new THREE.ConeGeometry(1, 1, 4);
+		geo.cylinder = new THREE.CylinderGeometry(1, 1, 1, 8);
+		geo.octa = new THREE.OctahedronGeometry(1);
+		geo.ico = new THREE.IcosahedronGeometry(1, 1);
+		geo.tetra = new THREE.TetrahedronGeometry(1);
+		geo.torus = new THREE.TorusGeometry(1, 0.065, 4, 12);
+		// A graphic orbital backdrop: faceted moon, ring, stars and distant spires.
+		const background = new THREE.Group();
+		scene.add(background);
+		const moon = mesh(
+			new THREE.IcosahedronGeometry(1, 3),
+			new THREE.MeshBasicNodeMaterial({ color: 0xd98065, fog: false }),
+			background,
+			[320, 230, -1100],
+			[180, 180, 180],
+			false,
+		);
+		const moonRing = mesh(
+			new THREE.TorusGeometry(260, 1.6, 4, 96),
+			new THREE.MeshBasicNodeMaterial({ color: 0xf7bd8e, fog: false }),
+			background,
+			[320, 230, -1100],
+			null,
+			false,
+		);
+		moonRing.rotation.set(0.5, 0.35, 0.4);
+		const srng = seeded(19);
+		const positions = [];
+		for (let i = 0; i < 800; i++)
+			positions.push(
+				(srng() - 0.5) * 3500,
+				(srng() - 0.15) * 1600,
+				-srng() * 2200 - 200,
+			);
+		const sgeo = new THREE.BufferGeometry();
+		sgeo.setAttribute(
+			"position",
+			new THREE.Float32BufferAttribute(positions, 3),
+		);
+		stars = new THREE.Points(
+			sgeo,
+			new THREE.PointsNodeMaterial({
+				color: 0xffe1b1,
+				size: 1.5,
+				sizeAttenuation: true,
+			}),
+		);
+		scene.add(stars);
+		createWorld();
+		hero = makeShip();
+		scene.add(hero);
+		registerInput();
+		setInterval(() => {
+			if (state !== "error" && state !== "loading") readInput(0.016);
+		}, 16);
+		setInterval(() => net.heartbeat(), 1000);
+		addEventListener("resize", () => {
+			camera.aspect = innerWidth / innerHeight;
+			camera.updateProjectionMatrix();
+			renderer.setSize(innerWidth, innerHeight);
+		});
+		renderer.onDeviceLost = (info) => {
+			console.error("WebGPU device loss", JSON.stringify(info));
+			fail(
+				"The WebGPU device disconnected. Reload to restore the flight deck.",
+			);
+		};
+		AIHub.probe(() => ({
+			scene:
+				hubEnded || state === "over"
+					? "over"
+					: state === "play"
+						? hubInfo && AIHub.time() < 0
+							? "ready"
+							: "play"
+						: state === "title" && screen === "title"
+							? "title"
+							: "menu",
+			menu: screen === "settings" && state === "menu",
+			world: simTime,
+			input: { x: input.x, y: input.y, fire: input.fire },
+		}));
+		if (AIHub.active) {
+			hubInfo = await AIHub.connect({ mode: "parallel", seats: [1, 4] });
+			if (hubInfo) {
+				settings.difficulty = 1;
+				startRun();
+				AIHub.on("start", () => audio.start());
+				AIHub.on("time-up", () => {
+					if (!hubReported) finish(false);
+				});
+				AIHub.on("end", () => {
+					hubEnded = true;
+					held = {};
+					input = { x: 0, y: 0, fire: false };
+					audio.muted = true;
+					audio.level();
+					state = "over";
+					hideMenu();
+					$("hud").style.display = "none";
+					$("banner").innerHTML =
+						"<strong>SORTIE LOGGED</strong><small>RETURNING TO HUB CONTROL</small>";
+					$("hud").style.display = "block";
+				});
+				if (hubInfo.splash) AIHub.ready();
+				else {
+					hubReadyPending = true;
+					banner("SQUADRON READY", "PRESS ANY KEY WHEN YOU ARE READY", 999);
+				}
+			} else toTitle();
+		} else toTitle();
+		$("boot").style.display = "none";
+		lastInput = performance.now();
+		lastFrame = lastInput;
+		renderer.setAnimationLoop(frame);
+		// Read-only diagnostics for browser checks and designer telemetry.
+		window.CrimsonTelemetry = {
+			get state() {
+				return {
+					state,
+					screen,
+					attract,
+					isReplay,
+					stage,
+					score,
+					hp,
+					ammo,
+					weapon,
+					simTime,
+					missionTime,
+					position: player.pos.toArray(),
+					relayKills,
+					links,
+					bossPhase,
+					bossHP,
+					backend: renderer.backend.constructor.name,
+					entities: entities.filter((e) => e.alive).length,
+				};
+			},
+			get settings() {
+				return { ...settings };
+			},
+			get net() {
+				return {
+					code: net.code,
+					open: net.open,
+					roster: net.roster,
+					running: net.running,
+					status: net.status,
+				};
+			},
+			get record() {
+				return replayFrames.length;
+			},
+		};
+	} catch (e) {
+		console.error(e);
+		fail(e.message);
+	}
+}
+function fail(message) {
+	state = "error";
+	if (window.AIHub?.active) AIHub.fail(message);
+	$("boot").style.display = "grid";
+	$("boot").innerHTML =
+		'<h2>Flight deck unavailable</h2><p></p><button onclick="location.reload()">Retry initialization</button>';
+	$("boot").querySelector("p").textContent = message;
+}
+boot();
+</script>
+</body></html>

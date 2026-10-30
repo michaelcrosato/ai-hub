@@ -1,0 +1,3801 @@
+<!--
+SOURCE INFORMATION
+Date: 2026-10-29 08:47 (America/Vancouver)
+Game title: Road Misbehavior. Selected with Python secrets.randbelow from 50 original candidates.
+Source: Road Rash II
+Tech: Three.js R180 (0.180.0), WebGPURenderer / WebGPU only, Rapier 0.19.3, JavaScript ES modules, HTML/CSS, Web Audio API, Gamepad API; built with esbuild 0.25.11. PeerJS 1.5.5; AI Hub Session Protocol v1, client 1.3.0.
+Art direction: original procedural low-poly cel-shaded coastal 3D with ink outlines and a peach, teal, charcoal, and lime palette.
+Animation: procedural hierarchical rider posing, punches, kicks, chain swings, wheel rotation, bike lean, camera springs, particles, and wreck motion.
+Audio: original code-written surf-rock music, synthesized sound effects, engine/wind/nitrous/siren layers, and seeded gibberish voices.
+Online: 1-4 rider shared races; AI Hub transport when embedded, PeerJS/WebRTC rooms standalone; synchronized starts, interpolated peers, directed combat, shared AI, host migration, progress and results.
+Testing: efficient lightweight browser and physics checks, screenshot inspection, official AI Hub harness. No FPS target/benchmark. 25/25 gameplay checks; 24/24 hub checks; three-peer transport test; real two-page WebRTC room and post-finish simulation test; audio smoke test.
+Environment: Codex CLI (headless); Linux; player browser unknown. Verified with Chrome 154 via Playwright; headed Xvfb used for visual captures.
+Model: OpenAI, gpt-6.1-sol, reasoning effort ultra.
+Usage: estimated API cost USD unknown; total tokens and breakdown unknown; measured session time approximately 27 minutes.
+
+TESTING FEEDBACK
+Issues caught: 18 during review and testing; 2 potentially game breaking (lost results navigation and frozen shared NPC simulation after the owner finishes). All fixed.
+Most helpful test: final-artifact gameplay regression using real Rapier stepping, combat, pickups, wreck recovery, economy, persistence, and attract looping.
+Least helpful test: headless WebGPU screenshots, whose compositor output was blank; headed Chrome under Xvfb supplied usable visual captures.
+Practical limits: physical controllers, four remote devices, restrictive NAT/firewalls, and browsers other than Chrome remain untested. Real two-page public PeerJS signaling and WebRTC were verified.
+
+ENGINE FEEDBACK
+Liked most: Three's scene graph, toon materials, and instancing made procedural visual direction straightforward; Rapier provided real contact events.
+Got stuck or guessed wrong: headless WebGPU capture initially appeared blank; headed Xvfb capture resolved it. WebGPURenderer's default WebGL fallback was explicitly disabled and the actual backend asserted.
+Most important custom system: path-local arcade motorcycle control, melee combat, rival AI, race flow, controller menus, and multiplayer authority.
+Hardest part: aligning curved-road visuals with local contact physics and peer interpolation.
+Would remove or overhaul: implicit renderer fallback behavior; require an explicit choice.
+Would change: add a first-class arcade vehicle controller for curved, hilly roads.
+
+PROMPT FEEDBACK
+Liked most: the complete vertical slice and arcade attract-mode requirements defined a useful finished product.
+Confusing: unlimited performance does not specify real browser/hardware limits; the online link required reading its separate integration protocol.
+Hardest: complete standalone and embedded multiplayer with controller-first menus in a single distributable HTML page.
+One extra test: four physical DualSense controllers across four remote machines, including a restrictive network.
+
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Crect width=%2764%27 height=%2764%27 rx=%2712%27 fill=%27%23172b2e%27/%3E%3Ctext x=%2732%27 y=%2745%27 font-family=%27sans-serif%27 font-weight=%27900%27 font-size=%2739%27 text-anchor=%27middle%27 fill=%27%23d8ff64%27%3ER%3C/text%3E%3C/svg%3E">
+<meta name="theme-color" content="#172b2c">
+<meta name="hub:session" content="1">
+<meta name="hub:session-mode" content="race">
+<meta name="hub:session-goal" content="Finish the outlaw road race first">
+<meta name="hub:session-howto" content="Steer stick/A D; Gas R2/W; Brake L2/S; Fight L1 R1/J L; Boost Cross/Space">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-minutes" content="4">
+<meta name="hub:webgpu" content="required">
+<title>Road Misbehavior • An outlaw motorcycle sprint</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--paper:#fff2d7;--ink:#152b2e;--lime:#d8ff64;--orange:#ff7649;--muted:#d0dbd0;--glass:rgba(16,38,40,.9);font-family:'Space Grotesk',sans-serif;color:var(--paper);font-synthesis:none;color-scheme:dark}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#172b2e}button,input{font:inherit}button{cursor:pointer}button:disabled{opacity:.42;cursor:default}button{border:0;color:inherit}button:focus-visible,input:focus-visible{outline:3px solid var(--lime);outline-offset:4px}#world{position:absolute;inset:0}#world canvas{display:block;width:100%;height:100%}.vignette{position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(13,34,38,.84),rgba(16,37,39,.18) 53%,transparent 76%),linear-gradient(0deg,rgba(14,34,37,.62),transparent 34%)}.topline{position:absolute;left:4.5vw;right:4.5vw;top:3.6vh;display:flex;justify-content:space-between;align-items:center;gap:15px;font-size:11px;font-weight:700;letter-spacing:3px;text-transform:uppercase;z-index:3}.brandmark{display:flex;align-items:center;gap:12px}.symbol{display:inline-grid;place-items:center;width:32px;height:32px;border:2px solid var(--lime);color:var(--lime);font:bold 23px 'Barlow Condensed';transform:skew(-10deg)}.pill{border:1px solid #fff4;padding:7px 12px;border-radius:99px;letter-spacing:1px;font-size:10px;display:inline-flex;align-items:center;gap:8px}.dot{width:6px;height:6px;background:var(--lime);border-radius:50%;box-shadow:0 0 10px #d8ff6455}.screen{position:absolute;inset:0;z-index:4}.hidden{display:none!important}#title{display:flex;align-items:center;padding:9vh 4.5vw 12vh}.title-content{width:55%;max-width:800px}.eyebrow{color:var(--lime);font-size:11px;letter-spacing:4px;font-weight:700;text-transform:uppercase;display:flex;align-items:center;gap:12px}.eyebrow:before{content:'';width:26px;height:2px;background:currentColor}h1{font-family:'Barlow Condensed',Impact,sans-serif;font-size:clamp(72px,8.9vw,150px);font-weight:900;line-height:.77;letter-spacing:-1.5px;margin:25px 0 24px;transform:skew(-7deg);text-shadow:5px 6px 0 #132d2b}h1 .road{color:var(--paper);font-size:1.05em}h1 .misbehavior{display:block;color:var(--lime);font-size:.73em;letter-spacing:-1px;margin-top:10px}.tagline{font-size:14px;color:#e0e9dc;max-width:390px;line-height:1.6;margin:0 0 27px}.menu-stack{display:flex;flex-direction:column;gap:9px;width:340px;max-width:90%}.menu-button{display:flex;align-items:center;justify-content:space-between;gap:20px;text-align:left;background:#172d2edb;border:1px solid #fff2;padding:15px 20px;font-size:13px;font-weight:700;letter-spacing:2px;min-height:53px;transition:.15s}.menu-button.primary{background:var(--lime);color:var(--ink);border-color:var(--lime);box-shadow:5px 5px 0 #0f272a80}.menu-button:hover,.menu-button.focused{transform:translateX(6px);border-color:var(--lime);background:#294b47}.menu-button.primary:hover,.menu-button.primary.focused{background:#e7ff9c}.menu-button .arrow{font-size:23px;line-height:1}.small-nav{display:flex;gap:21px;margin-top:20px}.text-button{font-size:11px;letter-spacing:1.4px;font-weight:700;background:transparent;padding:8px 0;border-bottom:1px solid #fff4}.text-button:hover,.text-button.focused{color:var(--lime);border-color:var(--lime)}.event-preview{position:absolute;right:4.5vw;bottom:16vh;width:300px;border-left:3px solid var(--lime);padding:16px 20px;background:#173233b8;backdrop-filter:blur(8px)}.event-preview .serial{font-size:10px;letter-spacing:3px;color:var(--lime)}.event-preview h3{font-family:'Barlow Condensed';font-size:34px;margin:7px 0 5px;line-height:1}.event-preview p{font-size:11px;letter-spacing:1px;margin:10px 0 0;color:#cbd8ce}.route-chooser{display:flex;gap:6px;margin-top:16px}.route-chooser button{height:5px;width:52px;background:#fff4;padding:0}.route-chooser button.active{background:var(--lime)}.footer{position:absolute;bottom:3.5vh;left:4.5vw;right:4.5vw;display:flex;justify-content:space-between;align-items:center;font-size:10px;letter-spacing:1.3px;gap:20px;z-index:5;color:#dce3d2}.key{display:inline-grid;place-items:center;min-width:23px;height:23px;padding:0 6px;border:1px solid #d9e5d666;border-radius:4px;font-weight:700;letter-spacing:0;margin-right:6px;color:var(--paper);font-size:10px}.ps{border-radius:50%;width:23px;padding:0;color:var(--lime);border-color:#d8ff6477}.footer-controls{display:flex;gap:18px;align-items:center}#idle-count{opacity:.7}.overlay{position:absolute;inset:0;background:rgba(10,29,31,.88);backdrop-filter:blur(14px);z-index:20;display:flex;align-items:center;justify-content:center;padding:5vh 6vw}.panel{width:100%;max-width:1080px;max-height:90vh;overflow:auto;scrollbar-width:thin;scrollbar-color:#7e9d88 #173334;outline:0}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:24px}.panel h2{font-family:'Barlow Condensed';font-size:clamp(34px,4.5vw,64px);line-height:.95;text-transform:uppercase;letter-spacing:1px;margin:8px 0}.panel p{line-height:1.6;color:#ceddd3;font-size:13px}.label{font-size:10px;letter-spacing:3px;color:var(--lime);font-weight:700;text-transform:uppercase}.close-button{background:transparent;border:1px solid #fff4;padding:12px 18px;letter-spacing:1px;font-size:11px}.close-button:hover,.close-button.focused{background:#355449;border-color:var(--lime)}.card-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{position:relative;padding:23px;background:#26474488;border:1px solid #fff2;text-align:left;transition:.15s}.card:hover,.card.focused,.card.selected{border-color:var(--lime);background:#36574e}.card.selected:after{content:'SELECTED';position:absolute;top:16px;right:16px;font-size:9px;letter-spacing:1px;color:var(--lime)}.card h3{font:700 30px 'Barlow Condensed';margin:12px 0 8px;text-transform:uppercase}.card .number{font:800 55px 'Barlow Condensed';opacity:.18;position:absolute;right:18px;bottom:8px}.card p{font-size:12px;min-height:40px}.card .meta{font-size:10px;letter-spacing:1px;color:var(--lime)}.bike-color{height:6px;width:48px;margin-top:12px}.stat{display:grid;grid-template-columns:78px 1fr 40px;gap:10px;align-items:center;font-size:10px;letter-spacing:1px;margin:10px 0}.bar{height:5px;background:#fff2;overflow:hidden}.bar span{height:100%;background:var(--lime);display:block;width:var(--value)}.split{display:flex;justify-content:space-between;align-items:center;gap:16px}.money{font:700 32px 'Barlow Condensed';color:var(--lime)}.upgrade-grid{margin-top:22px;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.upgrade{background:#ffffff0b;border:1px solid #fff2;padding:16px;text-align:left}.upgrade:hover,.upgrade.focused{border-color:var(--lime)}.upgrade strong{font-size:12px;letter-spacing:1px}.upgrade small{display:block;color:#b7ccbf;margin-top:8px;font-size:11px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 28px}.setting{display:flex;justify-content:space-between;align-items:center;gap:16px;min-height:66px;padding:13px 16px;border:1px solid #fff2;background:#fff1;font-size:12px;letter-spacing:1px;text-align:left}.setting:hover,.setting.focused{border-color:var(--lime)}.setting .value{color:var(--lime);white-space:nowrap}.controls-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#ffffff20;margin:20px 0}.control-line{background:#173233;padding:13px 16px;display:flex;align-items:center;justify-content:space-between;font-size:12px}.control-line span:last-child{color:var(--lime);font-size:11px}.muted{color:#a7beb1!important;font-size:11px!important}.about-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.about-section{border-top:1px solid #fff3;padding-top:10px}.about-section h3{font:700 25px 'Barlow Condensed';color:var(--lime);margin:10px 0}.about-section p{font-size:11px;line-height:1.7;margin:8px 0}.about-section a{color:var(--lime)}#hud{pointer-events:none;z-index:6;padding:0}.hud-top{position:absolute;top:4vh;left:4vw;right:4vw;display:flex;justify-content:space-between;align-items:flex-start}.position{display:flex;align-items:baseline;gap:8px}.position .big{font:800 67px/.9 'Barlow Condensed';color:var(--lime)}.position .total{font:600 26px 'Barlow Condensed';color:#fff9}.hud-label{font-size:10px;letter-spacing:2px;margin-top:9px;text-shadow:1px 1px 3px #000}.progress-wrap{width:33%;text-align:center}.progress-label{font-size:11px;letter-spacing:3px;font-weight:700;margin-bottom:10px}.progress-track{position:relative;height:5px;background:#123d3ac0;box-shadow:0 0 0 1px #fff2}.progress-fill{height:100%;background:var(--lime);width:0}.progress-meta{display:flex;justify-content:space-between;font-size:10px;color:#e1ead7;margin-top:8px}.heat-wrap{text-align:right}.heat{font:700 19px 'Barlow Condensed';letter-spacing:5px;color:var(--orange);margin-top:9px}.hud-bottom{position:absolute;left:4vw;right:4vw;bottom:5vh;display:flex;justify-content:space-between;align-items:flex-end}.vitals{width:235px}.vital-row{font-size:10px;letter-spacing:2px;display:flex;justify-content:space-between;margin:10px 0 6px;text-shadow:0 2px 3px #000}.vital-bar{height:9px;background:#102e32aa;border:1px solid #fff4;transform:skew(-13deg);padding:1px}.vital-bar span{display:block;height:100%;background:var(--lime);transition:width .1s}.vital-bar.boost span{background:#83e8e0}.weapon{font:600 17px 'Barlow Condensed';letter-spacing:2px;margin-top:17px;display:flex;gap:12px;align-items:center}.weapon .key{color:#fff;font-size:9px}.speed{text-align:right;position:relative}.speed .digits{font:800 112px/.85 'Barlow Condensed';letter-spacing:-3px;text-shadow:4px 4px 0 #14393990}.speed .unit{font-size:11px;letter-spacing:4px;margin:10px 0 8px}.speed-strip{display:flex;justify-content:flex-end;gap:3px}.speed-strip i{display:block;width:12px;height:5px;background:#fff3;transform:skew(-20deg)}.speed-strip i.on{background:var(--lime)}.hud-tip{position:absolute;left:50%;bottom:5vh;transform:translateX(-50%);text-align:center;font-size:11px;letter-spacing:1px;max-width:42%;text-shadow:0 2px 4px #000}.hud-tip strong{display:block;color:var(--lime);font:700 21px 'Barlow Condensed';letter-spacing:2px;margin-bottom:7px}.minimap{position:absolute;right:4.5vw;top:25vh;width:70px;height:180px;opacity:.9}.minimap canvas{width:100%;height:100%}#race-message{position:absolute;left:50%;top:31%;transform:translateX(-50%) rotate(-3deg);font:900 clamp(55px,8vw,115px)/.9 'Barlow Condensed';font-style:italic;color:var(--lime);text-shadow:5px 6px #143635;white-space:nowrap;text-align:center}#race-submessage{position:absolute;left:50%;top:47%;transform:translateX(-50%);font-size:13px;font-weight:700;letter-spacing:3px;text-shadow:0 1px 6px #000;text-align:center}#taunt{position:absolute;right:4vw;top:17vh;max-width:285px;padding:12px 17px;border-right:3px solid var(--orange);background:#173737d9;text-align:right;font-size:12px;line-height:1.6;transition:opacity .3s}#taunt b{color:var(--orange);font-size:10px;letter-spacing:2px;display:block;margin-bottom:4px}.toast{position:absolute;left:50%;top:17vh;transform:translateX(-50%);padding:11px 20px;background:var(--lime);color:var(--ink);font-size:12px;font-weight:700;letter-spacing:1px;z-index:30;box-shadow:4px 4px 0 #17333199;max-width:80vw;text-align:center}.attract-banner{position:absolute;left:50%;top:4vh;transform:translateX(-50%);background:var(--lime);color:var(--ink);padding:10px 23px;font-size:11px;letter-spacing:3px;font-weight:700;z-index:12}.attract-bottom{position:absolute;bottom:15vh;left:50%;transform:translateX(-50%);font:800 35px 'Barlow Condensed';letter-spacing:2px;z-index:12;text-shadow:3px 3px #173331;text-align:center}#flash{position:absolute;inset:0;pointer-events:none;z-index:9;box-shadow:inset 0 0 140px #ff432e;opacity:0;transition:opacity .1s}#loading{position:absolute;inset:0;z-index:99;background:#172e30;display:flex;align-items:center;justify-content:center;text-align:center}.loading-inner{max-width:600px;padding:35px}.loading-inner h2{font:900 64px/.85 'Barlow Condensed';transform:skew(-6deg);margin:20px;color:var(--lime)}.load-line{width:220px;height:3px;background:#ffffff20;margin:28px auto;overflow:hidden}.load-line:after{content:'';display:block;width:80px;height:100%;background:var(--lime);animation:loading 1.2s infinite ease-in-out}@keyframes loading{from{transform:translateX(-80px)}to{transform:translateX(230px)}}.load-status{font-size:11px;letter-spacing:2px;color:#c8d9ca;line-height:1.8}#error{color:#ffd3b4;font-size:13px;line-height:1.8;letter-spacing:0;white-space:pre-wrap}.results-layout{display:grid;grid-template-columns:1fr 1.1fr;gap:45px}.result-number{font:900 150px/.9 'Barlow Condensed';color:var(--lime);letter-spacing:-6px}.result-number small{font-size:40px;letter-spacing:0}.result-stat{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #ffffff20;font-size:12px}.result-stat span:last-child{color:var(--lime)}.leaderboard{width:100%;border-collapse:collapse;font-size:12px}.leaderboard td{padding:11px;border-bottom:1px solid #fff2}.leaderboard tr.you{background:#d8ff641a;color:var(--lime)}.actions{display:flex;gap:12px;margin-top:25px}.actions button{flex:1}.room-box{background:#fff1;border:1px solid #fff2;padding:22px;margin-top:18px}.room-code{font:800 58px 'Barlow Condensed';letter-spacing:10px;color:var(--lime)}input{background:#152c2f;border:1px solid #fff4;color:var(--lime);padding:13px;width:180px;font-size:20px;letter-spacing:5px;border-radius:0}.lobby-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}.connection{min-height:45px;display:flex;align-items:center;gap:10px;color:var(--lime);font-size:12px;line-height:1.5}.wide{width:100%}.touch-notice{position:absolute;top:15vh;left:50%;transform:translateX(-50%);background:var(--ink);border:1px solid var(--lime);padding:18px;z-index:25;text-align:center;font-size:13px}.touch-notice button{display:block;margin:15px auto 0}.damage-warn{color:#ff9873!important}.pause-info{max-width:440px;font-size:13px;line-height:1.7}.notice-line{padding:12px 0;border-top:1px solid #fff2;color:#b8cbbf;font-size:11px}.no-select{user-select:none;-webkit-user-select:none}#gpu-label{font-size:9px;color:#c0d0b9;letter-spacing:2px}.retry-error{display:none}.route-card-button{width:100%;margin-top:18px}.photo-credit{position:absolute;right:4.5vw;top:12vh;font-size:9px;letter-spacing:3px;color:#243e3b;text-align:right;font-weight:700;pointer-events:none}.photo-credit span{display:block;font:700 20px 'Barlow Condensed';letter-spacing:2px;margin-top:5px}.checkpoint-mark{position:absolute;left:2vw;top:40%;font-size:12px;color:var(--lime)}
+@media(min-width:1700px){.menu-stack{width:390px}.menu-button{padding:20px 24px}.tagline{font-size:17px}.event-preview{width:360px}.topline,.footer{font-size:12px}.event-preview h3{font-size:42px}}
+@media(max-height:700px){#title{padding-top:12vh}.title-content h1{font-size:clamp(70px,8vw,110px);margin:17px 0}.tagline{margin-bottom:15px;font-size:12px}.menu-button{padding:11px 17px;min-height:44px}.menu-stack{gap:6px}.small-nav{margin-top:10px}.event-preview{bottom:17vh}.panel-head{margin-bottom:14px}.panel h2{font-size:42px}.card{padding:17px}.control-line{padding:8px 13px}.vitals{width:195px}.speed .digits{font-size:95px}.footer{bottom:3vh}}
+@media(max-width:800px){.topline{left:5vw;right:5vw}.topline .pill{display:none}.title-content{width:80%}h1{font-size:15vw!important}.event-preview{right:5vw;bottom:15vh;width:220px;padding:13px}.event-preview h3{font-size:25px}.event-preview p{font-size:9px}.photo-credit{display:none}.footer #idle-count{display:none}.footer{font-size:9px;gap:8px}.footer-controls{gap:8px}.card-grid{gap:8px}.card{padding:14px}.card h3{font-size:23px}.settings-grid,.lobby-grid,.about-grid{grid-template-columns:1fr}.panel{max-height:88vh}.overlay{padding:5vh 5vw}.controls-grid{grid-template-columns:1fr}.upgrade-grid{gap:8px}.upgrade{padding:12px}.hud-tip{font-size:9px;bottom:3vh}.hud-tip strong{font-size:17px}.progress-wrap{width:40%}.progress-label{font-size:9px}.results-layout{gap:20px}.result-number{font-size:105px}.hud-top{top:3vh}.vitals{width:160px}.speed .digits{font-size:80px}.minimap{right:4vw;top:27vh;height:130px;width:50px}.position .big{font-size:50px}#taunt{max-width:220px;font-size:10px}.hud-bottom{bottom:4vh}.small-nav{gap:14px}.menu-stack{width:280px}.footer-controls .optional{display:none}}
+.menu-button{font-size:15px}.setting{font-size:14px}.control-line{font-size:14px}.control-line span:last-child{font-size:12px}.card p{font-size:14px}.hud-tip{font-size:13px}.hud-tip strong{font-size:23px}.vital-row{font-size:11px}.footer{font-size:11px}
+#hud:before{content:"";position:absolute;left:0;right:0;top:0;height:24vh;background:linear-gradient(180deg,rgba(13,34,37,.87),rgba(13,34,37,.48) 55%,transparent);pointer-events:none}.progress-label{font-size:13px}.progress-meta{font-size:12px}.hud-label{font-size:11px}.heat{font-size:22px}.panel-head .close-button{font-size:13px}.setting{min-height:72px}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+</head>
+<body class="no-select">
+<div id="world" aria-label="3D motorcycle racing game"></div>
+<div id="vignette" class="vignette"></div>
+<div id="topline" class="topline"><div class="brandmark"><span class="symbol">RM</span><span>NO GOOD DEED GOES UNPUNISHED.</span></div><span class="pill"><i class="dot"></i> WEBGPU / VOL. 01</span></div>
+<section id="title" class="screen">
+<div class="title-content"><div class="eyebrow">An outlaw motorcycle sprint</div><h1><span class="road">ROAD</span><span class="misbehavior">MISBEHAVIOR</span></h1><p class="tagline">Bad company. Beautiful roads.<br>Make a name. Leave a mark.</p>
+<nav class="menu-stack"><button class="menu-button primary" data-action="ride"><span>RIDE OUT</span><span class="arrow">↗</span></button><button class="menu-button" data-action="garage"><span>THE GARAGE</span><span class="arrow">→</span></button><button class="menu-button" data-action="online"><span>RIDE WITH A CREW</span><span class="arrow">+</span></button></nav>
+<div class="small-nav"><button class="text-button" data-action="settings">SETTINGS</button><button class="text-button" data-action="controls">HOW TO RIDE</button><button class="text-button" data-action="about">ABOUT</button></div></div>
+<aside class="event-preview"><div class="serial" id="preview-serial">01 / THE SUNSET CIRCUIT</div><h3 id="preview-name">COASTAL CHARGE</h3><p id="preview-meta">4.8 KM · 8 RIDERS · BAD INTENTIONS</p><div class="route-chooser"><button data-action="route0" class="active" aria-label="Coastal Charge"></button><button data-action="route1" aria-label="Redline Ridge"></button><button data-action="route2" aria-label="Afterglow Run"></button></div><button class="text-button route-card-button" data-action="events">CHOOSE YOUR TROUBLE →</button></aside>
+<div class="photo-credit">PACIFIC COUNTY, SOMEWHERE<span>THE LONG WAY HOME.</span></div>
+</section>
+<div id="footer" class="footer"><div class="footer-controls"><span><b class="key ps">×</b> SELECT</span><span><b class="key">↕</b> NAVIGATE</span><span class="optional"><b class="key">ESC</b> BACK</span></div><span id="idle-count">DEMO RIDE IN 10</span><span id="gpu-label">THREE.JS R180 · RAPIER 0.19.3</span></div>
+<section id="hud" class="screen hidden"><div class="hud-top"><div><div class="position"><span id="pos" class="big">8</span><span class="total" id="total">/ 8</span></div><div class="hud-label">POSITION</div></div><div class="progress-wrap"><div class="progress-label" id="race-route">COASTAL CHARGE</div><div class="progress-track"><div class="progress-fill" id="progress"></div></div><div class="progress-meta"><span id="distance">0.00 / 4.80 KM</span><span id="time">00:00.00</span></div></div><div class="heat-wrap"><div class="hud-label">COUNTY HEAT</div><div id="heat" class="heat">○ ○ ○ ○ ○</div><div class="hud-label" id="race-cash">$ 0 DIRTY MONEY</div></div></div>
+<div id="taunt" style="opacity:0"><b>NAILS</b><span>That helmet come with training wheels?</span></div><div class="minimap"><canvas id="map" width="140" height="360"></canvas></div>
+<div id="race-message"></div><div id="race-submessage"></div><div class="hud-bottom"><div class="vitals"><div class="vital-row"><span>BIKE INTEGRITY</span><span id="hp-num">100</span></div><div class="vital-bar"><span id="hp-bar" style="width:100%"></span></div><div class="vital-row"><span>NITROUS</span><span id="boost-num">100</span></div><div class="vital-bar boost"><span id="boost-bar" style="width:100%"></span></div><div class="weapon"><span id="weapon-label">BARE KNUCKLES</span><span class="key">△ / Q</span></div></div><div class="speed"><div class="digits" id="speed">000</div><div class="unit">KM / H</div><div class="speed-strip" id="rpm"></div></div></div><div class="hud-tip" id="hud-tip"><strong>R2 / W — GIVE IT HELL</strong>L1 / J · R1 / L to strike. Keep your friends close.</div></section>
+<div id="attract" class="hidden"><div class="attract-banner">DEMO RIDE · AI AT THE BARS</div><div class="attract-bottom">PRESS ANY BUTTON TO TAKE OVER</div></div>
+<div id="flash"></div><div id="toast" class="toast hidden"></div>
+<div id="modal" class="overlay hidden" role="dialog" aria-modal="true"><div id="panel" class="panel" tabindex="-1"></div></div>
+<div id="touch" class="touch-notice hidden">Controller or keyboard required<button class="close-button" data-action="settings">SETTINGS</button></div>
+<div id="loading"><div class="loading-inner"><div class="eyebrow" style="justify-content:center">Pacific County Racing Association</div><h2>ROAD<br>MISBEHAVIOR</h2><div class="load-line" id="load-line"></div><p class="load-status" id="load-status">WARMING THE ENGINE<br>WEBGPU REQUIRED</p><div id="error"></div><button id="retry-error" class="close-button retry-error" onclick="location.reload()">RETRY</button></div></div>
+<script type="module">
+// Road-Misbehavior-Road-Rash-II-gpt-6.1-sol-ultra-20261029-0819/game.js
+import RAPIER from "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs";
+
+// Road-Misbehavior-Road-Rash-II-gpt-6.1-sol-ultra-20261029-0819/world.js
+import * as THREE from "three/webgpu";
+var TAU = Math.PI * 2;
+var clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+function centerX(s) {
+  return 43 * Math.sin(s / 330) + 21 * Math.sin(s / 147) - 11 * Math.sin(s / 91);
+}
+function centerY(s) {
+  return 2 + 2.6 * Math.sin(s / 230) + 1.2 * Math.sin(s / 94);
+}
+function slope(s) {
+  return 43 / 330 * Math.cos(s / 330) + 21 / 147 * Math.cos(s / 147) - 11 / 91 * Math.cos(s / 91);
+}
+function pathAngle(s) {
+  return -Math.atan(slope(s));
+}
+function pathPoint(s, x = 0) {
+  const a = pathAngle(s);
+  return new THREE.Vector3(centerX(s) + x * Math.cos(a), centerY(s), -s - x * Math.sin(a));
+}
+var ROUTES = [
+  { name: "COASTAL CHARGE", length: 4800, subtitle: "Salt air. Bad decisions." },
+  { name: "REDLINE RIDGE", length: 5600, subtitle: "The scenery hits back." },
+  { name: "AFTERGLOW RUN", length: 5200, subtitle: "Last light. Long odds." }
+];
+function seeded(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a += 1831565813;
+    let t = a;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+var RoadWorld = class {
+  constructor() {
+    this.vehicles = /* @__PURE__ */ new Map();
+    this.pickups = /* @__PURE__ */ new Map();
+    this.effects = [];
+    this.finishGantries = [];
+    this.route = 0;
+    this.time = 0;
+    this.cameraReady = false;
+    this.lastMode = "";
+    this.temp = new THREE.Object3D();
+    this.camTarget = new THREE.Vector3();
+  }
+  async init(container) {
+    if (!navigator.gpu) throw new Error("WebGPU is required. Open this game in a WebGPU-enabled browser.");
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error("A WebGPU graphics adapter is required.");
+    this.renderer = new THREE.WebGPURenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
+    this.renderer._getFallback = null;
+    await this.renderer.init();
+    if (!this.renderer.backend.isWebGPUBackend) throw new Error("WebGPU is required; other graphics backends are disabled.");
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.17;
+    this.renderer.domElement.id = "game-canvas";
+    (container || document.body).appendChild(this.renderer.domElement);
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(16042920);
+    this.scene.fog = new THREE.Fog(16042920, 190, 1120);
+    this.camera = new THREE.PerspectiveCamera(54, window.innerWidth / window.innerHeight, 0.1, 1800);
+    this.makeMaterials();
+    this.makeLights();
+    this.makeLandscape();
+    this.makeRoad();
+    this.makeScenery();
+    this.setRoute(0);
+    this.hero = this.makeBike(13824606, true);
+    this.scene.add(this.hero.root);
+    this.hero.root.position.copy(pathPoint(5, 4.7));
+    this.hero.root.rotation.y = pathAngle(5) + 0.23;
+    this.hero.root.scale.setScalar(1.65);
+    this.windLines = [];
+    const lineMat = new THREE.MeshBasicMaterial({ color: 16777184, transparent: true, opacity: 0.35 });
+    for (let i = 0; i < 28; i++) {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.022, 7 + i % 5 * 2), lineMat);
+      m.visible = false;
+      this.scene.add(m);
+      this.windLines.push(m);
+    }
+    window.addEventListener("resize", () => {
+      this.camera.aspect = innerWidth / innerHeight;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(innerWidth, innerHeight);
+    });
+    return this;
+  }
+  makeMaterials() {
+    const data = new Uint8Array([67, 135, 206, 255]);
+    this.gradient = new THREE.DataTexture(data, 4, 1, THREE.RedFormat);
+    this.gradient.minFilter = THREE.NearestFilter;
+    this.gradient.magFilter = THREE.NearestFilter;
+    this.gradient.generateMipmaps = false;
+    this.gradient.needsUpdate = true;
+    this.mats = /* @__PURE__ */ new Map();
+    this.ink = new THREE.MeshBasicMaterial({ color: 1584435, side: THREE.BackSide });
+    this.geo = {
+      box: new THREE.BoxGeometry(1, 1, 1),
+      sphere: new THREE.SphereGeometry(1, 12, 8),
+      cylinder: new THREE.CylinderGeometry(1, 1, 1, 10),
+      cone: new THREE.ConeGeometry(1, 1, 6),
+      rock: new THREE.IcosahedronGeometry(1, 0),
+      ring: new THREE.TorusGeometry(1, 0.17, 6, 16),
+      tire: new THREE.CylinderGeometry(0.39, 0.39, 0.22, 16),
+      rim: new THREE.CylinderGeometry(0.245, 0.245, 0.235, 12)
+    };
+  }
+  mat(color, options = {}) {
+    const key = color + JSON.stringify(options);
+    if (!this.mats.has(key)) this.mats.set(key, new THREE.MeshToonMaterial({ color, gradientMap: this.gradient, ...options }));
+    return this.mats.get(key);
+  }
+  mesh(g, color, pos, scale, parent, outline = false, options = {}) {
+    const m = new THREE.Mesh(typeof g === "string" ? this.geo[g] : g, this.mat(color, options));
+    if (pos) m.position.set(...pos);
+    if (scale) m.scale.set(...scale);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    (parent || this.scene).add(m);
+    if (outline) {
+      const edge = new THREE.Mesh(m.geometry, this.ink);
+      edge.scale.setScalar(1.045);
+      m.add(edge);
+    }
+    return m;
+  }
+  rod(a, b, radius, color, parent, outline = false) {
+    const av = new THREE.Vector3(...a), bv = new THREE.Vector3(...b), d = bv.clone().sub(av);
+    const m = this.mesh("cylinder", color, av.clone().add(bv).multiplyScalar(0.5).toArray(), [radius, d.length(), radius], parent, outline);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d.normalize());
+    return m;
+  }
+  makeLights() {
+    this.scene.add(new THREE.HemisphereLight(16772308, 6395787, 2.6));
+    this.sunLight = new THREE.DirectionalLight(16769190, 3.2);
+    this.sunLight.position.set(-70, 110, 55);
+    this.sunLight.castShadow = true;
+    this.sunLight.shadow.mapSize.set(2048, 2048);
+    Object.assign(this.sunLight.shadow.camera, { left: -45, right: 45, top: 55, bottom: -45, near: 1, far: 280 });
+    this.sunLight.shadow.bias = -1e-3;
+    this.sunLight.shadow.normalBias = 0.08;
+    this.scene.add(this.sunLight);
+    this.scene.add(this.sunLight.target);
+    this.rimLight = new THREE.DirectionalLight(10743270, 1.1);
+    this.rimLight.position.set(70, 35, -100);
+    this.scene.add(this.rimLight);
+  }
+  ribbon(x1, x2, color, yOffset = 0, start = -350, end = 7100, step2 = 10) {
+    const pos = [], idx = [];
+    for (let s = start, i = 0; s <= end; s += step2, i++) {
+      for (const x of [x1, x2]) {
+        const p = pathPoint(s, x);
+        pos.push(p.x, p.y + yOffset, p.z);
+      }
+      if (i) {
+        const n = i * 2;
+        idx.push(n - 2, n, n - 1, n - 1, n, n + 1);
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    g.setIndex(idx);
+    g.computeVertexNormals();
+    const m = this.mesh(g, color, null, null, this.scene, false, { side: THREE.DoubleSide });
+    m.castShadow = false;
+    return m;
+  }
+  makeRoad() {
+    this.ribbon(-13, 13, 11111533, -0.035);
+    this.ribbon(-10, 10, 3423810, 5e-3);
+    this.ribbon(-9.55, -9.36, 16773569, 0.025);
+    this.ribbon(9.36, 9.55, 16773569, 0.025);
+    this.ribbon(-0.17, -0.05, 16172884, 0.032);
+    this.ribbon(0.05, 0.17, 16172884, 0.032);
+    const rand = seeded(7);
+    const dash = new THREE.InstancedMesh(this.geo.box, this.mat(15394763), 560);
+    let n = 0;
+    for (let s = -250; s < 7e3; s += 26) for (const x of [-4.65, 4.65]) {
+      const p = pathPoint(s, x);
+      this.temp.position.copy(p);
+      this.temp.position.y += 0.045;
+      this.temp.rotation.set(0, pathAngle(s), 0);
+      this.temp.scale.set(0.15, 0.035, 4.6);
+      this.temp.updateMatrix();
+      dash.setMatrixAt(n++, this.temp.matrix);
+    }
+    dash.count = n;
+    dash.receiveShadow = true;
+    this.scene.add(dash);
+    const marks = new THREE.InstancedMesh(this.geo.box, this.mat(1650228), 460);
+    n = 0;
+    for (let s = 12; s < 7e3; s += 16 + rand() * 28) {
+      const p = pathPoint(s, (rand() - 0.5) * 15);
+      this.temp.position.copy(p);
+      this.temp.position.y += 0.03;
+      this.temp.rotation.set(0, pathAngle(s) + (rand() - 0.5) * 0.2, 0);
+      this.temp.scale.set(0.08, 0.012, 1 + rand() * 5);
+      this.temp.updateMatrix();
+      marks.setMatrixAt(n++, this.temp.matrix);
+    }
+    marks.count = n;
+    this.scene.add(marks);
+    for (const s of [0, 4800, 5600, 5200]) this.gantry(s, s === 0 ? "BAD IDEAS \u2022 GOOD ROADS" : "FINISH / NO REFUNDS", s !== 0);
+  }
+  makeLandscape() {
+    const land = this.mesh(new THREE.PlaneGeometry(2200, 16e3), 13085567, [1030, -1, -3100], null);
+    land.rotation.x = -Math.PI / 2;
+    land.castShadow = false;
+    this.ribbon(-80, -13, 15124881, -0.15);
+    this.ribbon(13, 80, 13151354, -0.15);
+    this.sea = this.mesh(new THREE.PlaneGeometry(2600, 15e3), 5221544, [-1395, -2.8, -3100], null);
+    this.sea.rotation.x = -Math.PI / 2;
+    this.sea.castShadow = false;
+    const rand = seeded(192), shore = new THREE.InstancedMesh(this.geo.box, this.mat(9820097), 200);
+    for (let i = 0; i < 200; i++) {
+      this.temp.position.set(-130 - rand() * 950, -2.6, 400 - rand() * 7800);
+      this.temp.scale.set(6 + rand() * 22, 0.06, 0.18 + rand() * 0.5);
+      this.temp.rotation.set(0, (rand() - 0.5) * 0.08, 0);
+      this.temp.updateMatrix();
+      shore.setMatrixAt(i, this.temp.matrix);
+    }
+    this.scene.add(shore);
+    this.mountains = new THREE.Group();
+    this.scene.add(this.mountains);
+    for (let i = 0; i < 78; i++) {
+      const s = -500 + i * 105, h = 35 + rand() * 115;
+      const c = [12878437, 13997424, 12154722, 15117695][i % 4];
+      const p = pathPoint(s, 110 + rand() * 140);
+      p.y = h * 0.35 - 10;
+      const m = this.mesh("cone", c, p.toArray(), [45 + rand() * 70, h, 45 + rand() * 85], this.mountains);
+      m.rotation.y = rand() * TAU;
+      m.castShadow = false;
+    }
+    this.sky = new THREE.Group();
+    this.scene.add(this.sky);
+    this.sun = new THREE.Mesh(new THREE.SphereGeometry(58, 32, 20), new THREE.MeshBasicMaterial({ color: 16770210, fog: false }));
+    this.sun.position.set(-360, 135, -830);
+    this.sky.add(this.sun);
+    this.sunHalo = new THREE.Mesh(new THREE.SphereGeometry(74, 32, 20), new THREE.MeshBasicMaterial({ color: 16374695, fog: false, transparent: true, opacity: 0.18 }));
+    this.sunHalo.position.copy(this.sun.position);
+    this.sky.add(this.sunHalo);
+    this.clouds = [];
+    for (let i = 0; i < 18; i++) {
+      const g = new THREE.Group();
+      const x = -650 + rand() * 1300, y = 160 + rand() * 110, z = -150 - rand() * 1e3;
+      for (let j = 0; j < 3; j++) {
+        const m = new THREE.Mesh(this.geo.sphere, new THREE.MeshBasicMaterial({ color: 16310210, fog: false }));
+        m.position.set(j * 22, j % 2 * 8, 0);
+        m.scale.set(35 + rand() * 20, 8 + rand() * 7, 13);
+        g.add(m);
+      }
+      g.position.set(x, y, z);
+      this.sky.add(g);
+      this.clouds.push(g);
+    }
+    this.birds = [];
+    const bg = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-1, 0, 0), new THREE.Vector3(0, -0.3, 0), new THREE.Vector3(1, 0, 0)]);
+    const bm = new THREE.LineBasicMaterial({ color: 5799037, fog: false });
+    for (let i = 0; i < 11; i++) {
+      const b = new THREE.Line(bg, bm);
+      b.position.set(-110 + i * 7, 27 + i % 4 * 4, -170 - i * 16);
+      b.scale.setScalar(1.8);
+      this.sky.add(b);
+      this.birds.push(b);
+    }
+  }
+  textTexture(text, { bg = "#21353b", fg = "#fff0c4", width = 1024, height = 256, font = "bold 68px sans-serif" } = {}) {
+    const c = document.createElement("canvas");
+    c.width = width;
+    c.height = height;
+    const x = c.getContext("2d");
+    x.fillStyle = bg;
+    x.fillRect(0, 0, width, height);
+    x.strokeStyle = fg;
+    x.lineWidth = 12;
+    x.strokeRect(13, 13, width - 26, height - 26);
+    x.fillStyle = fg;
+    x.font = font;
+    x.textAlign = "center";
+    x.textBaseline = "middle";
+    x.fillText(text, width / 2, height / 2, width - 65);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = 4;
+    return t;
+  }
+  sign(s, x, text, width = 9, height = 2.3, bg = "#233a3c", fg = "#f5e5b3") {
+    const g = new THREE.Group();
+    g.position.copy(pathPoint(s, x));
+    g.rotation.y = pathAngle(s);
+    this.scene.add(g);
+    this.mesh("box", 4215631, [-width * 0.35, 2, 0], [0.14, 4, 0.14], g);
+    this.mesh("box", 4215631, [width * 0.35, 2, 0], [0.14, 4, 0.14], g);
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(width, height), new THREE.MeshBasicMaterial({ map: this.textTexture(text, { bg, fg }), side: THREE.DoubleSide }));
+    m.position.y = 4.5;
+    g.add(m);
+    return g;
+  }
+  gantry(s, text, finish) {
+    const g = new THREE.Group();
+    g.position.copy(pathPoint(s));
+    g.rotation.y = pathAngle(s);
+    this.scene.add(g);
+    if (s === 0) {
+      this.startGantry = g;
+      g.position.copy(pathPoint(38));
+      g.rotation.y = pathAngle(38);
+    } else {
+      g.userData.finishS = s;
+      this.finishGantries.push(g);
+    }
+    for (const x of [-11, 11]) {
+      this.mesh("box", 2308925, [x, 4, 0], [0.45, 8, 0.45], g);
+      this.mesh("box", 15782279, [x, 4, 0], [0.57, 0.35, 0.58], g);
+    }
+    this.mesh("box", 2308925, [0, 7.6, 0], [23, 0.5, 0.6], g);
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(19, 2.2), new THREE.MeshBasicMaterial({ map: this.textTexture(text, { bg: finish ? "#d6f16b" : "#263b3e", fg: finish ? "#1a3439" : "#efe5bf", font: "900 65px sans-serif" }), side: THREE.DoubleSide }));
+    m.position.set(0, 6.4, 0.35);
+    g.add(m);
+    if (finish) {
+      for (let i = 0; i < 40; i++) {
+        const x = -10 + i % 20 * 1.025;
+        const z = Math.floor(i / 20) * 1.1;
+        this.mesh("box", (i + Math.floor(i / 20)) % 2 ? 16115390 : 2505794, [x, 0.05, z], [1.02, 0.035, 1.1], g);
+      }
+    }
+  }
+  palm(s, x, scale = 1) {
+    const g = new THREE.Group();
+    g.position.copy(pathPoint(s, x));
+    g.scale.setScalar(scale);
+    g.rotation.y = s * 0.039 % TAU;
+    this.scene.add(g);
+    const trunk = this.mesh("cylinder", 9206112, [0.35, 3.7, 0], [0.24, 7.4, 0.24], g);
+    trunk.rotation.z = -0.1;
+    for (let i = 0; i < 7; i++) {
+      const a = i * TAU / 7;
+      const leaf = this.mesh("cone", i % 2 ? 5082216 : 3763032, [Math.cos(a) * 1.65, 7.25, Math.sin(a) * 1.65], [0.8, 4.6, 0.2], g);
+      leaf.rotation.set(Math.sin(a) * 1.4, 0, -Math.cos(a) * 1.4);
+    }
+    this.mesh("sphere", 5993554, [0.7, 7.5, 0], [0.46, 0.38, 0.46], g);
+    return g;
+  }
+  makeScenery() {
+    const rand = seeded(39), rockMat = [this.mat(10979685), this.mat(14130803), this.mat(9796192)];
+    const rocks = rockMat.map((m) => new THREE.InstancedMesh(this.geo.rock, m, 220));
+    const counts = [0, 0, 0];
+    const shrubs = new THREE.InstancedMesh(this.geo.rock, this.mat(8557419), 460);
+    let shrubCount = 0;
+    const posts = new THREE.InstancedMesh(this.geo.box, this.mat(15324331), 1e3);
+    let postCount = 0;
+    const reflectors = new THREE.InstancedMesh(this.geo.box, this.mat(14124375), 1e3);
+    let reflCount = 0;
+    for (let s = -180; s < 7100; s += 17) {
+      for (const side of [-1, 1]) {
+        const p = pathPoint(s, side * (14 + rand() * 53));
+        this.temp.position.copy(p);
+        this.temp.position.y -= 0.1;
+        this.temp.rotation.set(rand(), rand() * TAU, rand());
+        const r = 0.4 + rand() * 2.5;
+        this.temp.scale.set(r, r * 0.65, r * 0.85);
+        this.temp.updateMatrix();
+        const n = (s / 17 | 0) % 3 + 3;
+        const k = n % 3;
+        if (counts[k] < 220) rocks[k].setMatrixAt(counts[k]++, this.temp.matrix);
+        if (shrubCount < 460) {
+          const q = pathPoint(s + 8, side * (13 + rand() * 22));
+          this.temp.position.copy(q);
+          this.temp.position.y += 0.3;
+          this.temp.scale.set(0.6 + rand(), 0.5, 0.7 + rand());
+          this.temp.updateMatrix();
+          shrubs.setMatrixAt(shrubCount++, this.temp.matrix);
+        }
+        if (postCount < 1e3) {
+          const q = pathPoint(s, side * 10.8);
+          this.temp.position.copy(q);
+          this.temp.position.y += 0.55;
+          this.temp.rotation.set(0, pathAngle(s), 0);
+          this.temp.scale.set(0.16, 1.1, 0.16);
+          this.temp.updateMatrix();
+          posts.setMatrixAt(postCount++, this.temp.matrix);
+          this.temp.position.y += 0.3;
+          this.temp.scale.set(0.21, 0.18, 0.19);
+          this.temp.updateMatrix();
+          reflectors.setMatrixAt(reflCount++, this.temp.matrix);
+        }
+      }
+      if (s % 51 === -27 || Math.floor(s / 17) % 6 === 0) this.palm(s, -17 - rand() * 10, 0.75 + rand() * 0.5);
+      if (Math.floor(s / 17) % 13 === 0) this.palm(s, 20 + rand() * 8, 0.7 + rand() * 0.6);
+    }
+    rocks.forEach((m, i) => {
+      m.count = counts[i];
+      m.castShadow = true;
+      m.receiveShadow = true;
+      this.scene.add(m);
+    });
+    shrubs.count = shrubCount;
+    shrubs.castShadow = true;
+    this.scene.add(shrubs);
+    posts.count = postCount;
+    reflectors.count = reflCount;
+    posts.castShadow = true;
+    this.scene.add(posts, reflectors);
+    for (let s = -100; s < 7e3; s += 30) {
+      const p = pathPoint(s, -11.8);
+      const g = new THREE.Group();
+      g.position.copy(p);
+      g.rotation.y = pathAngle(s);
+      this.scene.add(g);
+      this.mesh("box", 10070689, [0, 0.85, 0], [0.18, 0.34, 25], g);
+      for (const z of [-10, 0, 10]) this.mesh("box", 7111038, [0, 0.5, z], [0.14, 1, 0.2], g);
+    }
+    this.sign(42, 19, "STAY WEIRD. RIDE HARD.", 12, 2.8, "#d7ef78", "#203a40");
+    this.sign(460, 17, "SALTY DOG / FUEL & FOOLS", 13, 2.5, "#c26349", "#fff1c5");
+    this.sign(1110, -20, "TIGHT BENDS / LOOSER MORALS", 11, 2.4, "#efc660", "#2a393c");
+    this.sign(2090, 20, "WELCOME TO BAD COMPANY", 13, 2.6, "#284f51", "#e6efb7");
+    this.sign(3260, -20, "POLICE / PLEASE ACT NORMAL", 13, 2.7, "#e9dfb6", "#273e40");
+    this.sign(4380, 20, "YOUR EXIT STRATEGY \u2192", 11, 2.5, "#d1ec7c", "#263d40");
+    this.building(290, 26, 15057034, 9, 5, 7, "LAST CHANCE");
+    this.building(480, 28, 14257003, 13, 4, 8, "SALTY DOG");
+    const station = new THREE.Group();
+    station.position.copy(pathPoint(300, 24));
+    station.rotation.y = pathAngle(300);
+    this.scene.add(station);
+    this.mesh("box", 16045477, [0, 4, -11], [20, 0.5, 9], station);
+    for (const x of [-8, 8]) this.mesh("box", 4547676, [x, 2, -11], [0.2, 4, 0.2], station);
+    for (const x of [-5, 0, 5]) {
+      this.mesh("box", 13197131, [x, 1, -10], [1, 2, 0.8], station);
+      this.mesh("box", 16245944, [x, 1.5, -9.56], [0.65, 0.5, 0.05], station);
+    }
+    for (let i = 0; i < 16; i++) {
+      const s = 1750 + i * 27;
+      this.building(s, 22 + i % 3 * 9, [15318414, 10008737, 13664356, 14732704][i % 4], 7 + i % 4, 4 + i % 3 * 2, 8, "");
+      if (i % 3 === 0) this.palm(s, 15, 1.2);
+    }
+    for (let i = 0; i < 9; i++) this.building(3700 + i * 37, -28, [14397052, 9416347, 12879720][i % 3], 8, 3, 7, "");
+    this.turbines = [];
+    for (let i = 0; i < 11; i++) {
+      const g = new THREE.Group();
+      g.position.copy(pathPoint(2450 + i * 98, 85 + i % 3 * 23));
+      this.scene.add(g);
+      this.mesh("cylinder", 14998970, [0, 15, 0], [0.55, 30, 0.55], g);
+      const blades = new THREE.Group();
+      blades.position.y = 29;
+      g.add(blades);
+      for (let j = 0; j < 3; j++) {
+        const b = this.mesh("box", 15656645, [0, 6.5, 0], [0.75, 13, 0.2], blades);
+        const pivot = new THREE.Group();
+        blades.remove(b);
+        pivot.rotation.z = j * TAU / 3;
+        pivot.add(b);
+        blades.add(pivot);
+      }
+      this.mesh("sphere", 5598828, [0, 29, 0.1], [1, 1, 0.7], g);
+      this.turbines.push(blades);
+    }
+  }
+  building(s, x, color, w, h, d, label) {
+    const g = new THREE.Group();
+    g.position.copy(pathPoint(s, x));
+    g.rotation.y = pathAngle(s);
+    this.scene.add(g);
+    this.mesh("box", color, [0, h / 2, 0], [w, h, d], g);
+    this.mesh("box", 7433304, [0, h + 0.2, 0], [w + 1, 0.4, d + 1], g);
+    this.mesh("box", 3165264, [-w * 0.25, h * 0.45, d * 0.505], [w * 0.28, h * 0.38, 0.07], g);
+    this.mesh("box", 3165264, [w * 0.25, h * 0.42, d * 0.505], [w * 0.21, h * 0.7, 0.07], g);
+    this.mesh("box", 15783840, [0, h * 0.8, d * 0.57], [w + 0.3, 0.4, 0.9], g);
+    if (label) {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(w * 0.9, 1.2), new THREE.MeshBasicMaterial({ map: this.textTexture(label, { bg: "#294449", fg: "#f4db9f" }), side: THREE.DoubleSide }));
+      m.position.set(0, h + 0.7, d * 0.51);
+      g.add(m);
+    }
+    return g;
+  }
+  makeBike(color, isPlayer = false, police = false) {
+    const root = new THREE.Group(), tilt = new THREE.Group();
+    root.add(tilt);
+    const wheels = [];
+    for (const z of [-0.91, 0.89]) {
+      const pivot = new THREE.Group();
+      pivot.position.set(0, 0.43, z);
+      tilt.add(pivot);
+      const tire = this.mesh("tire", 2109496, null, null, pivot, true);
+      tire.rotation.z = Math.PI / 2;
+      const rim = this.mesh("rim", 11977909, null, null, pivot);
+      rim.rotation.z = Math.PI / 2;
+      const hub = this.mesh("cylinder", 3755600, null, [0.095, 0.3, 0.095], pivot);
+      hub.rotation.z = Math.PI / 2;
+      for (let j = 0; j < 5; j++) {
+        const spoke = this.mesh("box", 6519928, [0.13, 0, 0], [0.025, 0.035, 0.45], pivot);
+        spoke.rotation.x = j * Math.PI / 5;
+      }
+      wheels.push(pivot);
+    }
+    this.rod([0, 0.58, 0.82], [0, 1.1, -0.55], 0.075, 2374208, tilt, true);
+    this.rod([0, 0.58, -0.9], [0, 1.1, -0.55], 0.07, 11124402, tilt);
+    this.rod([-0.17, 0.66, 0.7], [-0.17, 0.72, -0.3], 0.065, 2374721, tilt);
+    this.rod([0.17, 0.66, 0.7], [0.17, 0.72, -0.3], 0.065, 2374721, tilt);
+    this.mesh("box", 6387056, [0, 0.72, 0.1], [0.54, 0.47, 0.55], tilt, true);
+    for (const side of [-1, 1]) {
+      this.mesh("box", 10332058, [side * 0.32, 0.79, 0.07], [0.18, 0.28, 0.35], tilt);
+      for (let j = 0; j < 4; j++) this.mesh("box", 3427408, [side * 0.34, 0.69 + j * 0.06, 0.08], [0.2, 0.025, 0.38], tilt);
+      this.rod([side * 0.23, 0.56, -0.1], [side * 0.32, 0.47, 0.85], 0.07, 10269870, tilt);
+      this.mesh("cylinder", 13945511, [side * 0.32, 0.48, 0.79], [0.095, 0.48, 0.095], tilt).rotation.x = Math.PI / 2;
+      this.mesh("cylinder", 2703170, [side * 0.32, 0.48, 1.04], [0.067, 0.012, 0.067], tilt).rotation.x = Math.PI / 2;
+      this.rod([side * 0.13, 0.43, -0.9], [side * 0.13, 1.18, -0.67], 0.048, 14210483, tilt);
+    }
+    const tank = this.mesh("sphere", color, [0, 1.08, -0.24], [0.32, 0.24, 0.48], tilt, true);
+    tank.rotation.x = -0.16;
+    this.mesh("box", 2701371, [0, 1.1, 0.35], [0.49, 0.17, 0.64], tilt, true);
+    const tail = this.mesh("box", color, [0, 0.97, 0.79], [0.48, 0.25, 0.4], tilt, true);
+    tail.rotation.x = 0.12;
+    this.mesh("box", 16022360, [0, 1, 0.995], [0.29, 0.09, 0.025], tilt);
+    const front = this.mesh("box", color, [0, 1.15, -0.96], [0.48, 0.43, 0.28], tilt, true);
+    front.rotation.x = -0.19;
+    this.mesh("box", 16772538, [0, 1.2, -1.12], [0.32, 0.16, 0.025], tilt);
+    this.mesh("box", 4217952, [0, 1.43, -0.95], [0.4, 0.22, 0.035], tilt).rotation.x = -0.28;
+    this.rod([-0.4, 1.32, -0.6], [0.4, 1.32, -0.6], 0.035, 2374464, tilt);
+    for (const side of [-1, 1]) {
+      this.rod([side * 0.31, 1.3, -0.6], [side * 0.47, 1.48, -0.6], 0.022, 10336944, tilt);
+      this.mesh("box", 3296852, [side * 0.48, 1.49, -0.61], [0.17, 0.1, 0.06], tilt);
+    }
+    this.mesh("box", 16771515, [0, 0.79, 1.04], [0.2, 0.16, 0.02], tilt);
+    const rider = new THREE.Group();
+    rider.position.set(0, 1.12, 0.24);
+    tilt.add(rider);
+    const jacket = police ? 15062698 : isPlayer ? 2506051 : color;
+    const torso = this.mesh("box", jacket, [0, 0.34, -0.1], [0.55, 0.65, 0.34], rider, true);
+    torso.rotation.x = -0.27;
+    this.mesh("box", isPlayer ? color : 15784108, [0, 0.38, 0.095], [0.28, 0.25, 0.035], rider);
+    this.mesh("box", 2373178, [0, 0.01, 0.1], [0.5, 0.22, 0.38], rider);
+    this.mesh("sphere", 14594182, [0, 0.71, -0.21], [0.13, 0.13, 0.13], rider);
+    const helmet = this.mesh("sphere", police ? 15785914 : isPlayer ? color : 15325365, [0, 0.94, -0.25], [0.31, 0.32, 0.31], rider, true);
+    this.mesh("box", 2113095, [0, 0.96, -0.515], [0.47, 0.13, 0.07], rider);
+    this.mesh("box", 12645590, [-0.07, 0.985, -0.556], [0.15, 0.028, 8e-3], rider);
+    this.mesh("box", 2308929, [0, 1.22, -0.25], [0.08, 0.07, 0.3], rider);
+    const arms = [], legs = [];
+    for (const side of [-1, 1]) {
+      const arm = new THREE.Group();
+      arm.position.set(side * 0.29, 0.59, -0.15);
+      rider.add(arm);
+      this.rod([0, 0, 0], [side * 0.12, -0.26, -0.18], 0.105, jacket, arm, true);
+      this.rod([side * 0.12, -0.26, -0.18], [side * 0.09, -0.32, -0.49], 0.085, 14132345, arm);
+      this.mesh("sphere", 2637118, [side * 0.09, -0.32, -0.49], [0.105, 0.1, 0.13], arm);
+      arms.push(arm);
+      const leg = new THREE.Group();
+      leg.position.set(side * 0.23, 0.03, 0.1);
+      rider.add(leg);
+      this.rod([0, 0, 0], [side * 0.14, -0.34, -0.18], 0.115, 3493205, leg, true);
+      this.rod([side * 0.14, -0.34, -0.18], [side * 0.07, -0.56, 0.14], 0.1, 3493205, leg);
+      this.mesh("box", 2373692, [side * 0.08, -0.58, 0.06], [0.18, 0.15, 0.37], leg, true);
+      legs.push(leg);
+    }
+    const chain = new THREE.Group();
+    chain.visible = false;
+    rider.add(chain);
+    for (let i = 0; i < 9; i++) {
+      const link = this.mesh("ring", 10925216, [0.52 + i * 0.1, 0.19, -0.3], [0.085, 0.085, 0.085], chain);
+      link.rotation.x = i % 2 * Math.PI / 2;
+    }
+    const flame = new THREE.Mesh(new THREE.ConeGeometry(0.17, 0.8, 6), new THREE.MeshBasicMaterial({ color: 10414548 }));
+    flame.rotation.x = -Math.PI / 2;
+    flame.position.set(0.32, 0.48, 1.4);
+    tilt.add(flame);
+    flame.visible = false;
+    const glow = new THREE.Mesh(new THREE.CircleGeometry(0.9, 24), new THREE.MeshBasicMaterial({ color: isPlayer ? 13889399 : 6740169, transparent: true, opacity: 0.16, depthWrite: false }));
+    glow.rotation.x = -Math.PI / 2;
+    glow.position.y = 0.035;
+    root.add(glow);
+    glow.visible = isPlayer;
+    let beacon;
+    if (police) {
+      beacon = this.mesh("sphere", 15952722, [0, 1.05, 0.9], [0.14, 0.15, 0.14], tilt, false, { emissive: 15952722, emissiveIntensity: 0.8 });
+      this.mesh("box", 15591113, [-0.4, 0.9, 0.7], [0.22, 0.4, 0.5], tilt);
+      this.mesh("box", 15591113, [0.4, 0.9, 0.7], [0.22, 0.4, 0.5], tilt);
+    }
+    const shadow = new THREE.Mesh(new THREE.CircleGeometry(1, 20), new THREE.MeshBasicMaterial({ color: 1388340, transparent: true, opacity: 0.23, depthWrite: false }));
+    shadow.rotation.x = -Math.PI / 2;
+    shadow.position.y = 0.04;
+    shadow.scale.set(0.65, 1.35, 1);
+    root.add(shadow);
+    return { root, tilt, wheels, rider, arms, legs, chain, flame, helmet, beacon, color, colorParts: [tank, tail, front, ...isPlayer ? [helmet] : []], kind: "bike", attackAge: 0, prevAttack: 0 };
+  }
+  makeCar(color, kind = "car") {
+    const root = new THREE.Group(), body = new THREE.Group();
+    root.add(body);
+    const van = kind === "van" || kind === "truck";
+    this.mesh("box", 2572099, [0, 0.68, 0], [1.9, 0.3, 3.9], body, true);
+    this.mesh("box", color, [0, 1.04, 0], [1.95, 0.67, 3.85], body, true);
+    this.mesh("box", color, [0, van ? 1.84 : 1.56, van ? 0.35 : 0.25], [1.67, van ? 1.2 : 0.65, van ? 2.65 : 1.95], body, true);
+    this.mesh("box", 4156272, [0, van ? 1.88 : 1.65, van ? -0.985 : -0.75], [1.48, 0.43, 0.05], body);
+    this.mesh("box", 7115408, [0, van ? 1.87 : 1.65, van ? 1.69 : 1.25], [1.46, 0.4, 0.04], body);
+    for (const side of [-1, 1]) {
+      this.mesh("box", 4089964, [side * 0.85, van ? 1.91 : 1.65, 0.25], [0.035, 0.37, 1.7], body);
+      this.mesh("box", 12109492, [side * 0.85, 1.1, 0.1], [0.025, 0.06, 0.22], body);
+      this.mesh("box", 2571327, [side * 1.04, 1.39, -0.58], [0.23, 0.18, 0.23], body);
+      for (const z of [-1.2, 1.2]) {
+        const t = this.mesh("cylinder", 2307644, [side * 0.98, 0.48, z], [0.4, 0.21, 0.4], body, true);
+        t.rotation.z = Math.PI / 2;
+        const rim = this.mesh("cylinder", 10400941, [side * 1.095, 0.48, z], [0.23, 0.02, 0.23], body);
+        rim.rotation.z = Math.PI / 2;
+      }
+      this.mesh("box", 16770726, [side * 0.65, 1.05, -1.945], [0.42, 0.22, 0.035], body);
+      this.mesh("box", 15559504, [side * 0.69, 1.03, 1.945], [0.3, 0.21, 0.035], body);
+    }
+    this.mesh("box", 6847607, [0, 0.72, -2], [1.9, 0.16, 0.13], body);
+    this.mesh("box", 6847607, [0, 0.72, 2], [1.9, 0.16, 0.13], body);
+    this.mesh("box", 2637122, [0, 1, -1.955], [0.55, 0.16, 0.03], body);
+    const shadow = new THREE.Mesh(new THREE.PlaneGeometry(2.5, 4.6), new THREE.MeshBasicMaterial({ color: 1651256, transparent: true, opacity: 0.2, depthWrite: false }));
+    shadow.rotation.x = -Math.PI / 2;
+    shadow.position.y = 0.035;
+    root.add(shadow);
+    let beacons = [];
+    if (kind === "police") {
+      this.mesh("box", 2308157, [0, 1.4, -1.15], [1.8, 0.06, 1.27], body);
+      this.mesh("box", 2308157, [0, 1.94, 0.25], [1.45, 0.13, 0.4], body);
+      beacons.push(this.mesh("box", 15556428, [-0.43, 2.05, 0.25], [0.54, 0.18, 0.33], body, false, { emissive: 15556428, emissiveIntensity: 1 }));
+      beacons.push(this.mesh("box", 6932964, [0.43, 2.05, 0.25], [0.54, 0.18, 0.33], body, false, { emissive: 6932964, emissiveIntensity: 1 }));
+      for (const side of [-1, 1]) {
+        const label = new THREE.Mesh(new THREE.PlaneGeometry(1.75, 0.34), new THREE.MeshBasicMaterial({ map: this.textTexture("COUNTY PATROL", { bg: "#e3dfbd", fg: "#233a40", font: "bold 88px sans-serif" }), side: THREE.DoubleSide }));
+        label.position.set(side * 0.99, 1.15, 0.15);
+        label.rotation.y = side * Math.PI / 2;
+        body.add(label);
+      }
+    }
+    return { root, body, kind, beacons };
+  }
+  recolorBike(h, color) {
+    h.color = color;
+    for (const m of h.colorParts) m.material = this.mat(color);
+  }
+  createBike(id, color, isPlayer = false) {
+    const h = this.makeBike(color || 15775595, isPlayer);
+    this.scene.add(h.root);
+    this.vehicles.set(id, h);
+    return h;
+  }
+  createCar(id, color, kind) {
+    const h = this.makeCar(color || 14194285, kind);
+    this.scene.add(h.root);
+    this.vehicles.set(id, h);
+    return h;
+  }
+  removeVehicle(id) {
+    const h = this.vehicles.get(id);
+    if (h) {
+      this.scene.remove(h.root);
+      this.vehicles.delete(id);
+    }
+  }
+  makePickup(p) {
+    const root = new THREE.Group(), type = p.type;
+    const color = type === "repair" ? 7984567 : type === "chain" ? 15973736 : 8644832;
+    const ring = this.mesh("ring", color, [0, 1.1, 0], [0.72, 0.72, 0.72], root, true);
+    this.mesh("box", 2640460, [0, 1.1, 0], [0.62, 0.66, 0.2], root, true);
+    if (type === "repair") {
+      this.mesh("box", 14939068, [0, 1.1, 0.13], [0.15, 0.48, 0.05], root);
+      this.mesh("box", 14939068, [0, 1.1, 0.13], [0.45, 0.14, 0.05], root);
+    } else if (type === "chain") {
+      for (let i = 0; i < 3; i++) {
+        const a = this.mesh("ring", 16767383, [-0.16 + i * 0.15, 1.1, 0.17], [0.16, 0.16, 0.16], root);
+        a.rotation.z = 0.7;
+      }
+    } else {
+      const shape = new THREE.Shape();
+      shape.moveTo(0.08, 1.42);
+      shape.lineTo(-0.23, 1.07);
+      shape.lineTo(-0.03, 1.07);
+      shape.lineTo(-0.12, 0.8);
+      shape.lineTo(0.26, 1.17);
+      shape.lineTo(0.05, 1.17);
+      shape.closePath();
+      const bolt = new THREE.Mesh(new THREE.ShapeGeometry(shape), new THREE.MeshBasicMaterial({ color: 15203236, side: THREE.DoubleSide }));
+      bolt.position.z = 0.14;
+      root.add(bolt);
+    }
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.7, 0.04, 20), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.28 }));
+    beam.position.y = 0.08;
+    root.add(beam);
+    this.scene.add(root);
+    return { root, ring, type };
+  }
+  burst(s, x, color = 16762996, count = 12) {
+    const p = pathPoint(s, x);
+    p.y += 0.8;
+    const rand = Math.random;
+    for (let i = 0; i < count; i++) {
+      const m = new THREE.Mesh(this.geo.box, this.mat(color));
+      m.scale.setScalar(0.06 + rand() * 0.14);
+      m.position.copy(p);
+      this.scene.add(m);
+      this.effects.push({ mesh: m, v: new THREE.Vector3((rand() - 0.5) * 8, 2 + rand() * 5, (rand() - 0.5) * 8), life: 0.4 + rand() * 0.6, max: 1 });
+    }
+    while (this.effects.length > 240) {
+      const e = this.effects.shift();
+      this.scene.remove(e.mesh);
+    }
+  }
+  setRoute(index) {
+    this.route = index | 0;
+    for (const g of this.finishGantries) g.visible = g.userData.finishS === ROUTES[this.route % 3].length;
+    const c = [16042920, 15579536, 14986393][this.route % 3];
+    this.scene.background.setHex(c);
+    this.scene.fog.color.setHex(c);
+    this.sunLight.color.setHex([16769190, 16768160, 16761750][this.route % 3]);
+    this.sea.material.color.setHex([5221544, 5741974, 5083030][this.route % 3]);
+  }
+  render(dt, state = {}) {
+    if (!this.renderer) return;
+    dt = clamp(dt, 0, 0.1);
+    this.time = state.time ?? this.time + dt;
+    const mode2 = state.mode || "title", stage = ["title", "menu", "garage", "settings", "about", "controls", "online"].includes(mode2);
+    if (state.route !== void 0 && state.route !== this.route) this.setRoute(state.route);
+    const s = state.s || 0, x = state.x || 0, speed = state.speed || 0;
+    const playerView = (state.vehicles || []).find((v) => v.player || v.id === state.playerId);
+    if (playerView?.color !== void 0 && this.hero.color !== playerView.color) this.recolorBike(this.hero, playerView.color);
+    this.hero.root.visible = stage;
+    if (this.startGantry) this.startGantry.visible = !stage;
+    if (stage) {
+      this.hero.root.rotation.y = pathAngle(5) + 0.23 + Math.sin(this.time * 0.22) * 0.055;
+      this.hero.tilt.rotation.z = Math.sin(this.time * 0.7) * 0.012;
+      this.hero.arms[0].rotation.z = Math.sin(this.time) * 0.035;
+    }
+    const live = /* @__PURE__ */ new Set();
+    for (const v of state.vehicles || []) {
+      live.add(v.id);
+      let h = this.vehicles.get(v.id);
+      if (!h) {
+        if (v.type === "car" || v.type === "van" || v.type === "truck" || v.type === "police") h = this.createCar(v.id, v.color, v.type);
+        else {
+          h = this.makeBike(v.color || 15445625, !!v.player || v.id === state.playerId, v.type === "police");
+          this.scene.add(h.root);
+          this.vehicles.set(v.id, h);
+        }
+      }
+      if (v.name && !h.label && h.kind === "bike" && !v.player) {
+        const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.textTexture(String(v.name).slice(0, 18).toUpperCase(), { bg: v.remote ? "#34646a" : "#243d40", fg: v.remote ? "#a9f2ec" : "#efdfaf", width: 512, height: 96, font: "bold 51px sans-serif" }), transparent: false, depthWrite: false }));
+        label.position.set(0, 2.75, 0);
+        label.scale.set(1.9, 0.36, 1);
+        h.root.add(label);
+        h.label = label;
+      }
+      h.root.visible = !stage && Math.abs((v.s || 0) - s) < 1050;
+      if (!h.root.visible) continue;
+      if (h.label) h.label.visible = Math.abs((v.s || 0) - s) < 75;
+      if (h.kind === "bike" && v.color !== void 0 && h.color !== v.color) this.recolorBike(h, v.color);
+      const p = pathPoint(v.s || 0, v.x || 0);
+      h.root.position.copy(p);
+      h.root.rotation.set(0, pathAngle(v.s || 0) + (v.heading || 0), 0);
+      const crashed = Number(v.crashed) || 0;
+      if (h.kind === "bike") {
+        const lean = v.lean || v.steer || 0;
+        h.tilt.rotation.z = -clamp(lean, -1, 1) * 0.37;
+        h.tilt.rotation.x = Math.sin(this.time * 25 + (v.s || 0)) * 7e-3 * clamp(speed / 35, 0, 1);
+        h.tilt.position.y = Math.sin(this.time * 13 + (v.s || 0)) * 0.012;
+        for (const w of h.wheels) w.rotation.x = -(v.s || 0) * 2.4;
+        const atk = Number(v.attack) || 0, side = Math.sign(atk) || 1;
+        if (atk && (!h.prevAttack || h.prevAttack !== atk)) h.attackAge = 0;
+        else h.attackAge += dt;
+        h.prevAttack = atk;
+        const swing = atk ? Math.sin(clamp(h.attackAge / 0.36, 0, 1) * Math.PI) : 0, kick = Math.abs(atk) === 2;
+        for (let i = 0; i < 2; i++) {
+          const sign = i === 0 ? -1 : 1;
+          const striking = side === sign ? swing : 0;
+          h.arms[i].rotation.set(kick ? 0 : striking * 0.3, kick ? 0 : sign * striking * 1.35, kick ? 0 : sign * striking * 1.2);
+          h.legs[i].rotation.set(kick ? -striking * 0.4 : 0, kick ? sign * striking * 0.9 : 0, kick ? sign * striking * 1.25 : 0);
+        }
+        h.rider.rotation.y = -side * swing * 0.16;
+        h.chain.visible = !!v.chain && !!atk && !kick;
+        h.chain.rotation.y = -side * swing * 1.3;
+        h.flame.visible = !!v.boost;
+        h.flame.scale.setScalar(0.8 + Math.sin(this.time * 70) * 0.25);
+        if (crashed) {
+          h.tilt.rotation.z = crashed > 0 ? 1.35 : -1.35;
+          h.rider.rotation.set(Math.sin(this.time * 7) * 0.35, 0, Math.sin(this.time * 5) * 0.3);
+          h.tilt.position.y = 0.08;
+        } else {
+          h.rider.rotation.x = 0;
+          h.rider.rotation.z = 0;
+        }
+        if (h.beacon) h.beacon.material.emissiveIntensity = 0.3 + Math.max(0, Math.sin(this.time * 18)) * 2;
+      } else {
+        h.body.rotation.z = (v.lean || 0) * 0.04;
+        if (h.beacons) h.beacons.forEach((b, i) => b.material.emissiveIntensity = 0.35 + Math.max(0, Math.sin(this.time * 18 + i * Math.PI)) * 2.5);
+      }
+      h.root.position.y += v.y || 0;
+      if (v.remote && h.kind === "bike") h.root.position.y += 0.015;
+    }
+    for (const [id, h] of this.vehicles) {
+      if (!live.has(id)) {
+        h.root.visible = false;
+        if (id !== "player" && this.vehicles.size > 70) this.removeVehicle(id);
+      }
+    }
+    const pickupsLive = /* @__PURE__ */ new Set();
+    for (const p of state.pickups || []) {
+      pickupsLive.add(p.id);
+      let h = this.pickups.get(p.id);
+      if (!h) {
+        h = this.makePickup(p);
+        this.pickups.set(p.id, h);
+      }
+      h.root.visible = !stage && p.active !== false && Math.abs(p.s - s) < 800;
+      h.root.position.copy(pathPoint(p.s, p.x));
+      h.root.position.y += Math.sin(this.time * 3 + p.s) * 0.13;
+      h.root.rotation.y = Math.sin(this.time * 1.4 + p.s) * 0.18;
+      h.ring.rotation.z = this.time * 1.4;
+    }
+    for (const [id, h] of this.pickups) if (!pickupsLive.has(id)) h.root.visible = false;
+    for (let i = this.effects.length - 1; i >= 0; i--) {
+      const e = this.effects[i];
+      e.life -= dt;
+      e.v.y -= 12 * dt;
+      e.mesh.position.addScaledVector(e.v, dt);
+      e.mesh.rotation.x += dt * 8;
+      e.mesh.rotation.z += dt * 6;
+      e.mesh.scale.multiplyScalar(Math.pow(0.7, dt));
+      if (e.life <= 0) {
+        this.scene.remove(e.mesh);
+        this.effects.splice(i, 1);
+      }
+    }
+    for (let i = 0; i < this.turbines.length; i++) this.turbines[i].rotation.z = this.time * (0.25 + i * 0.014);
+    const base = pathPoint(stage ? 0 : s, 0);
+    this.sky.position.set(base.x * 0.2, 0, stage ? 0 : -s);
+    this.sunLight.position.set(base.x - 65, base.y + 105, base.z + 55);
+    this.sunLight.target.position.copy(base);
+    this.rimLight.position.set(base.x + 70, 50, base.z - 100);
+    this.rimLight.target.position.copy(base);
+    for (let i = 0; i < this.birds.length; i++) {
+      const b = this.birds[i];
+      b.rotation.z = Math.sin(this.time * 2 + i) * 0.12;
+      b.position.y = 27 + i % 4 * 4 + Math.sin(this.time * 0.5 + i) * 1.4;
+    }
+    let desired, look;
+    if (stage) {
+      desired = pathPoint(-3, -4);
+      desired.y += 3.2;
+      look = pathPoint(6, -0.4);
+      look.y += 1.15;
+    } else {
+      const close = state.camera === 1, dist = close ? 5.1 : 8.8, back2 = dist + clamp(speed / 55, 0, 1) * 1.5;
+      desired = pathPoint(s - back2, x * 0.75);
+      desired.y += (close ? 2.5 : 3.8) + Math.abs(state.lean || 0) * 0.1;
+      look = pathPoint(s + (close ? 8 : 12), x * 0.83);
+      look.y += 1.35;
+      const shake = state.shake || 0;
+      desired.x += Math.sin(this.time * 81) * shake * 0.22;
+      desired.y += Math.cos(this.time * 73) * shake * 0.14;
+    }
+    const changed = stage !== ["title", "menu", "garage", "settings", "about", "controls", "online"].includes(this.lastMode);
+    if (!this.cameraReady || changed || Math.abs(this.camera.position.z - desired.z) > 300) {
+      this.camera.position.copy(desired);
+      this.camTarget.copy(look);
+      this.cameraReady = true;
+    } else {
+      const t = 1 - Math.exp(-dt * (stage ? 2 : 8));
+      this.camera.position.lerp(desired, t);
+      this.camTarget.lerp(look, t);
+    }
+    this.camera.lookAt(this.camTarget);
+    this.camera.fov = 54 + (!stage && state.boost ? 5 : 0) + (!stage ? clamp(speed / 60, 0, 1) * 4 : 0);
+    this.camera.updateProjectionMatrix();
+    this.lastMode = mode2;
+    for (let i = 0; i < this.windLines.length; i++) {
+      const m = this.windLines[i];
+      m.visible = !stage && (state.boost || speed > 55);
+      if (m.visible) {
+        const side = i % 2 ? 1 : -1;
+        const p = pathPoint(s - 5 + (this.time * 65 + i * 11) % 45, x + side * (2.6 + i % 5 * 1.3));
+        p.y += 1.3 + i % 7 * 0.6;
+        m.position.copy(p);
+        m.rotation.y = pathAngle(s);
+      }
+    }
+    this.renderer.render(this.scene, this.camera);
+  }
+};
+
+// Road-Misbehavior-Road-Rash-II-gpt-6.1-sol-ultra-20261029-0819/audio.js
+var clamp2 = (v, a = 0, b = 1) => Math.max(a, Math.min(b, Number(v) || 0));
+var midi = (n) => 440 * 2 ** ((n - 69) / 12);
+var GameAudio = class {
+  constructor() {
+    this.ctx = null;
+    this.mode = "menu";
+    this.volumes = { master: 0.72, music: 0.44, fx: 0.8 };
+    this.step = 0;
+    this.nextStep = 0;
+    this.voiceUntil = 0;
+    this.paused = false;
+    this.disposed = false;
+    this.state = { speed: 0, rpm: 0, nitro: false, police: false, racing: false };
+    this.lastSfx = /* @__PURE__ */ Object.create(null);
+  }
+  async unlock() {
+    if (this.disposed) return false;
+    if (!this.ctx) {
+      const Context = globalThis.AudioContext || globalThis.webkitAudioContext;
+      if (!Context) return false;
+      this.ctx = new Context();
+      this._build();
+    }
+    if (this.ctx.state === "suspended") await this.ctx.resume();
+    this.nextStep = Math.max(this.nextStep, this.ctx.currentTime + 0.04);
+    return this.ctx.state === "running";
+  }
+  _build() {
+    const c = this.ctx;
+    this.master = c.createGain();
+    this.music = c.createGain();
+    this.fx = c.createGain();
+    this.ambient = c.createGain();
+    const limiter = c.createDynamicsCompressor();
+    limiter.threshold.value = -14;
+    limiter.knee.value = 8;
+    limiter.ratio.value = 5;
+    limiter.attack.value = 4e-3;
+    limiter.release.value = 0.18;
+    this.music.connect(this.master);
+    this.fx.connect(this.master);
+    this.ambient.connect(this.fx);
+    this.master.connect(limiter).connect(c.destination);
+    this.setVolumes(this.volumes.master, this.volumes.music, this.volumes.fx);
+    this.noiseBuffer = c.createBuffer(1, c.sampleRate * 2, c.sampleRate);
+    const noise = this.noiseBuffer.getChannelData(0);
+    let seed = 76467;
+    for (let i = 0; i < noise.length; i++) {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      noise[i] = (seed >>> 0) / 2147483648 - 1;
+    }
+    this.distortion = new Float32Array(1024);
+    for (let i = 0; i < this.distortion.length; i++) {
+      const x = i / (this.distortion.length - 1) * 2 - 1;
+      this.distortion[i] = Math.tanh(x * 3.5) / Math.tanh(3.5);
+    }
+    this.echoInput = c.createGain();
+    const echo = c.createDelay(1);
+    const feedback = c.createGain();
+    const echoFilter = c.createBiquadFilter();
+    echo.delayTime.value = 0.2113;
+    feedback.gain.value = 0.22;
+    this.echoInput.gain.value = 0.16;
+    echoFilter.type = "lowpass";
+    echoFilter.frequency.value = 2400;
+    this.echoInput.connect(echo);
+    echo.connect(echoFilter).connect(this.music);
+    echoFilter.connect(feedback).connect(echo);
+    this.engineGain = c.createGain();
+    this.engineGain.gain.value = 0;
+    this.engineFilter = c.createBiquadFilter();
+    this.engineFilter.type = "lowpass";
+    this.engineFilter.frequency.value = 700;
+    this.engineFilter.Q.value = 0.8;
+    this.engineFilter.connect(this.engineGain).connect(this.ambient);
+    this.engineA = c.createOscillator();
+    this.engineB = c.createOscillator();
+    this.engineA.type = "sawtooth";
+    this.engineB.type = "triangle";
+    this.engineA.frequency.value = 42;
+    this.engineB.frequency.value = 84;
+    const engineMix = c.createGain();
+    engineMix.gain.value = 0.45;
+    this.engineA.connect(engineMix);
+    this.engineB.connect(engineMix);
+    engineMix.connect(this.engineFilter);
+    this.engineA.start();
+    this.engineB.start();
+    this.wind = this._loopNoise("bandpass", 1e3, 0.5);
+    this.boost = this._loopNoise("highpass", 1600, 0.2);
+    this.siren = c.createOscillator();
+    this.siren.type = "triangle";
+    this.sirenGain = c.createGain();
+    this.sirenGain.gain.value = 0;
+    this.siren.connect(this.sirenGain).connect(this.ambient);
+    this.siren.start();
+    this.nextStep = c.currentTime + 0.04;
+  }
+  _loopNoise(type, frequency, q) {
+    const c = this.ctx, source = c.createBufferSource();
+    const filter = c.createBiquadFilter(), gain = c.createGain();
+    source.buffer = this.noiseBuffer;
+    source.loop = true;
+    filter.type = type;
+    filter.frequency.value = frequency;
+    filter.Q.value = q;
+    gain.gain.value = 0;
+    source.connect(filter).connect(gain).connect(this.ambient);
+    source.start();
+    return { source, filter, gain };
+  }
+  _cleanup(source, nodes) {
+    source.onended = () => {
+      try {
+        source.disconnect();
+      } catch {
+      }
+      for (const node of nodes) try {
+        node.disconnect();
+      } catch {
+      }
+    };
+  }
+  setVolumes(master = 0.72, music = 0.44, fx = 0.8) {
+    this.volumes = { master: clamp2(master), music: clamp2(music), fx: clamp2(fx) };
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    this.master.gain.setTargetAtTime(this.volumes.master, t, 0.03);
+    this.music.gain.setTargetAtTime(this.volumes.music * (this.paused ? 0.15 : 0.7), t, 0.04);
+    this.fx.gain.setTargetAtTime(this.volumes.fx, t, 0.03);
+  }
+  setMode(mode2) {
+    if (mode2 === this.mode) return;
+    this.mode = mode2;
+    this.paused = mode2 === "paused";
+    if (this.ctx) {
+      this.nextStep = this.ctx.currentTime + 0.035;
+      this.step = Math.floor(this.step / 16) * 16;
+      this.setVolumes(this.volumes.master, this.volumes.music, this.volumes.fx);
+    }
+  }
+  pause() {
+    this.resumeMode = this.mode;
+    this.setMode("paused");
+  }
+  resume() {
+    this.setMode(this.resumeMode || "race");
+    if (this.ctx?.state === "suspended") this.ctx.resume().catch(() => {
+    });
+  }
+  // speed is km/h; rpm is an optional normalized motor rev value.
+  update(dt, state = {}) {
+    Object.assign(this.state, state);
+    if (!this.ctx || this.ctx.state !== "running" || this.disposed) return;
+    const t = this.ctx.currentTime;
+    const racing = !this.paused && Boolean(this.state.racing);
+    const speed = clamp2(this.state.speed / 240);
+    const rpm = this.state.rpm > 0 ? clamp2(this.state.rpm) : 0.18 + speed * 4.2 % 0.8;
+    const motor = 33 + rpm * 102 + speed * 10;
+    this.engineA.frequency.setTargetAtTime(motor, t, 0.045);
+    this.engineB.frequency.setTargetAtTime(motor * 2.008, t, 0.045);
+    this.engineFilter.frequency.setTargetAtTime(420 + rpm * 1550, t, 0.08);
+    this.engineGain.gain.setTargetAtTime(racing ? 0.075 + speed * 0.065 : 0, t, 0.1);
+    this.wind.gain.gain.setTargetAtTime(racing ? speed ** 1.6 * 0.055 : 0, t, 0.12);
+    this.wind.filter.frequency.setTargetAtTime(420 + speed * 1500, t, 0.12);
+    this.boost.gain.gain.setTargetAtTime(racing && this.state.nitro ? 0.06 : 0, t, 0.07);
+    this.siren.frequency.setTargetAtTime(730 + Math.sin(t * 7.5) * 260, t, 0.025);
+    this.sirenGain.gain.setTargetAtTime(racing && this.state.police ? 0.032 : 0, t, 0.15);
+    if (this.paused) {
+      this.nextStep = t + 0.05;
+      return;
+    }
+    if (this.nextStep < t - 0.2) this.nextStep = t + 0.025;
+    const bpm = this.mode === "menu" ? 108 : this.mode === "results" ? 126 : 144;
+    const interval = 60 / bpm / 4;
+    let scheduled = 0;
+    while (this.nextStep < t + 0.16 && scheduled++ < 16) {
+      this._musicStep(this.step++, this.nextStep, interval);
+      this.nextStep += interval;
+    }
+  }
+  _tone(freq, t, duration, volume, type = "triangle", bus = this.fx, endFreq = null) {
+    const c = this.ctx, osc = c.createOscillator(), gain = c.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(Math.max(1, freq), t);
+    if (endFreq) osc.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), t + duration);
+    gain.gain.setValueAtTime(1e-4, t);
+    gain.gain.exponentialRampToValueAtTime(Math.max(2e-4, volume), t + Math.min(8e-3, duration / 4));
+    gain.gain.exponentialRampToValueAtTime(1e-4, t + duration);
+    osc.connect(gain).connect(bus);
+    osc.start(t);
+    osc.stop(t + duration + 0.02);
+    this._cleanup(osc, [gain]);
+  }
+  _noise(t, duration, volume, frequency, type = "highpass", bus = this.fx) {
+    const c = this.ctx, source = c.createBufferSource();
+    const filter = c.createBiquadFilter(), gain = c.createGain();
+    source.buffer = this.noiseBuffer;
+    filter.type = type;
+    filter.frequency.value = frequency;
+    filter.Q.value = 0.6;
+    gain.gain.setValueAtTime(Math.max(2e-4, volume), t);
+    gain.gain.exponentialRampToValueAtTime(1e-4, t + duration);
+    source.connect(filter).connect(gain).connect(bus);
+    source.start(t, t * 0.31 % 1.5);
+    source.stop(t + duration + 0.02);
+    this._cleanup(source, [filter, gain]);
+  }
+  _guitar(note, t, duration, volume, palm = false) {
+    const c = this.ctx;
+    const sum = c.createGain(), drive = c.createWaveShaper(), filter = c.createBiquadFilter();
+    const env = c.createGain(), a = c.createOscillator(), b = c.createOscillator();
+    a.type = "sawtooth";
+    b.type = "sawtooth";
+    a.frequency.value = midi(note);
+    b.frequency.value = midi(note) * 1.003;
+    sum.gain.value = 0.5;
+    drive.curve = this.distortion;
+    drive.oversample = "2x";
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(palm ? 2100 : 3300, t);
+    filter.frequency.exponentialRampToValueAtTime(palm ? 350 : 950, t + duration);
+    env.gain.setValueAtTime(1e-4, t);
+    env.gain.exponentialRampToValueAtTime(volume, t + 6e-3);
+    env.gain.exponentialRampToValueAtTime(1e-4, t + duration);
+    a.connect(sum);
+    b.connect(sum);
+    sum.connect(drive).connect(filter).connect(env).connect(this.music);
+    env.connect(this.echoInput);
+    a.start(t);
+    b.start(t);
+    a.stop(t + duration + 0.02);
+    b.stop(t + duration + 0.02);
+    this._cleanup(a, [sum, drive, filter, env]);
+    this._cleanup(b, []);
+  }
+  _musicStep(step2, t, sixteenth) {
+    const s = step2 % 16, bar = Math.floor(step2 / 16) % 8;
+    const menu = this.mode === "menu";
+    const root = [40, 40, 43, 45, 40, 43, 38, 45][bar];
+    if (s === 0 || s === 8 || s === 10 || !menu && s === 14) {
+      this._tone(132, t, 0.17, 0.24, "sine", this.music, 43);
+      this._noise(t, 0.028, 0.03, 2300, "highpass", this.music);
+    }
+    if (s === 4 || s === 12) {
+      this._noise(t, 0.145, 0.125, 1400, "highpass", this.music);
+      this._tone(180, t, 0.09, 0.08, "triangle", this.music, 98);
+    }
+    if (s % 2 === 0 || !menu && (s === 7 || s === 15)) {
+      this._noise(
+        t + (s % 4 === 2 ? 9e-3 : 0),
+        s === 14 ? 0.12 : 0.035,
+        s % 4 === 0 ? 0.034 : 0.019,
+        6200,
+        "highpass",
+        this.music
+      );
+    }
+    if (s === 0 && bar % 4 === 0) this._noise(t, 0.55, 0.045, 4300, "highpass", this.music);
+    const bass = [0, null, 0, 0, 7, null, 0, 10, 0, null, 0, 12, 7, null, 10, 7][s];
+    if (bass !== null) this._tone(
+      midi(root - 12 + bass),
+      t,
+      sixteenth * 1.65,
+      0.085,
+      "sawtooth",
+      this.music
+    );
+    if (s % 2 === 0) {
+      const open = s === 0 || s === 8;
+      this._guitar(root, t, sixteenth * (open ? 3.4 : 1.35), menu ? 0.021 : 0.035, !open);
+      this._guitar(root + 7, t + 7e-3, sixteenth * (open ? 3.3 : 1.3), menu ? 0.017 : 0.025, !open);
+    }
+    const phrases = [
+      [null, null, 76, null, 79, null, 81, 79, 76, null, 74, null, 76, null, null, null],
+      [null, null, 79, null, 81, 79, 76, null, 74, null, 72, null, 74, null, 76, null],
+      [76, null, null, null, 79, null, 81, null, 83, null, 81, 79, 76, null, 74, null],
+      [74, null, 76, null, 79, null, 76, 74, 72, null, 74, null, 76, null, null, null]
+    ];
+    const lead = phrases[Math.floor(bar / 2)][s];
+    if (lead !== null && (!menu || bar % 2)) {
+      this._guitar(lead, t, sixteenth * 2.2, menu ? 0.012 : 0.019, false);
+    }
+    if (!menu && bar === 7 && s >= 12) this._noise(t, 0.075, 0.06, 650 + (s - 12) * 250, "bandpass", this.music);
+  }
+  sfx(name, amount = 1) {
+    if (!this.ctx || this.ctx.state !== "running" || this.disposed) return;
+    const t = this.ctx.currentTime + 3e-3, a = clamp2(amount, 0.1, 2);
+    const cooldown = name === "hit" || name === "punch" ? 0.055 : name === "ui" ? 0.055 : 0.12;
+    if (t - (this.lastSfx[name] ?? -100) < cooldown) return;
+    this.lastSfx[name] = t;
+    switch (name) {
+      case "ui":
+      case "select":
+        this._tone(540, t, 0.045, 0.045, "square");
+        break;
+      case "confirm":
+        this._tone(440, t, 0.08, 0.065, "triangle");
+        this._tone(660, t + 0.065, 0.12, 0.065, "triangle");
+        break;
+      case "back":
+        this._tone(420, t, 0.1, 0.05, "triangle", this.fx, 210);
+        break;
+      case "countdown":
+        this._tone(550, t, 0.15, 0.12, "square");
+        this._tone(275, t, 0.15, 0.05, "sine");
+        break;
+      case "go":
+        this._tone(880, t, 0.5, 0.13, "square");
+        this._tone(1320, t + 0.1, 0.35, 0.055, "triangle");
+        break;
+      case "punch":
+      case "swing":
+        this._noise(t, 0.12, 0.14 * a, 1100, "bandpass");
+        this._tone(180, t, 0.085, 0.08 * a, "triangle", this.fx, 70);
+        break;
+      case "kick":
+        this._noise(t, 0.17, 0.16 * a, 680, "bandpass");
+        this._tone(160, t + 0.04, 0.11, 0.12 * a, "sine", this.fx, 48);
+        break;
+      case "hit":
+      case "impact":
+        this._noise(t, 0.13, 0.24 * a, 730, "bandpass");
+        this._tone(145, t, 0.14, 0.2 * a, "sine", this.fx, 38);
+        this._tone(290, t, 0.045, 0.06 * a, "square", this.fx, 65);
+        break;
+      case "crash":
+        this._noise(t, 0.65, 0.36 * a, 520, "lowpass");
+        this._noise(t + 0.04, 0.4, 0.2 * a, 2500, "highpass");
+        this._tone(110, t, 0.38, 0.25 * a, "sawtooth", this.fx, 22);
+        for (let i = 0; i < 5; i++) this._tone(
+          600 + i * 347,
+          t + i * 0.04,
+          0.18 + i * 0.03,
+          0.025,
+          "square",
+          this.fx,
+          120 + i * 90
+        );
+        break;
+      case "pickup":
+      case "repair":
+        [64, 67, 71, 76].forEach((n, i) => this._tone(midi(n), t + i * 0.055, 0.2, 0.075, "triangle"));
+        break;
+      case "weapon":
+        this._noise(t, 0.12, 0.14, 2200, "highpass");
+        [880, 1320, 1760].forEach((f, i) => this._tone(f, t + i * 0.025, 0.13, 0.045, "square"));
+        break;
+      case "nitro":
+      case "boost":
+        this._noise(t, 0.7, 0.18, 2e3, "highpass");
+        this._tone(90, t, 0.45, 0.1, "sawtooth", this.fx, 520);
+        break;
+      case "nearMiss":
+      case "near-miss":
+        this._noise(t, 0.18, 0.07, 1500, "bandpass");
+        this._tone(720, t, 0.13, 0.04, "sine", this.fx, 1320);
+        break;
+      case "finish":
+      case "win":
+        [64, 67, 71, 76, 79, 83, 88].forEach((n, i) => this._tone(
+          midi(n),
+          t + i * 0.105,
+          i === 6 ? 0.9 : 0.26,
+          0.09,
+          "triangle"
+        ));
+        this._noise(t, 0.7, 0.08, 4500, "highpass");
+        break;
+      case "busted":
+      case "lose":
+        [55, 54, 53, 40].forEach((n, i) => this._tone(midi(n), t + i * 0.19, 0.4, 0.1, "sawtooth"));
+        break;
+      case "police":
+        this._tone(660, t, 0.25, 0.08, "triangle");
+        this._tone(880, t + 0.24, 0.25, 0.08, "triangle");
+        break;
+      default:
+        this._tone(520, t, 0.08, 0.035, "triangle");
+    }
+  }
+  voice(seed = 1, mood = "taunt") {
+    if (!this.ctx || this.ctx.state !== "running" || this.disposed) return;
+    const c = this.ctx, now2 = c.currentTime;
+    if (now2 < this.voiceUntil) return;
+    let rng = (typeof seed === "string" ? [...seed].reduce((h, x) => Math.imul(h, 31) + x.charCodeAt(0) | 0, 7) : seed | 0) || 1;
+    const rand = () => {
+      rng ^= rng << 13;
+      rng ^= rng >>> 17;
+      rng ^= rng << 5;
+      return (rng >>> 0) / 4294967296;
+    };
+    const vowels = [[730, 1090, 2440], [530, 1840, 2480], [270, 2290, 3010], [570, 840, 2410], [300, 870, 2240]];
+    const count = mood === "hurt" ? 2 : mood === "win" ? 7 : 4 + Math.floor(rand() * 3);
+    const base = mood === "hurt" ? 140 : mood === "win" ? 255 : 165 + rand() * 90;
+    let t = now2 + 0.01;
+    for (let i = 0; i < count; i++) {
+      const duration = 0.065 + rand() * 0.065;
+      const vowel = vowels[Math.floor(rand() * vowels.length)];
+      const osc = c.createOscillator(), env = c.createGain();
+      osc.type = "sawtooth";
+      const pitch = base * (0.8 + rand() * 0.5) * (mood === "win" ? 1 + i * 0.05 : 1);
+      osc.frequency.setValueAtTime(pitch, t);
+      osc.frequency.linearRampToValueAtTime(pitch * (mood === "hurt" ? 0.6 : 0.9 + rand() * 0.3), t + duration);
+      env.gain.setValueAtTime(1e-4, t);
+      env.gain.linearRampToValueAtTime(0.095, t + 0.012);
+      env.gain.exponentialRampToValueAtTime(1e-4, t + duration);
+      env.connect(this.fx);
+      const nodes = [env];
+      for (let j = 0; j < 3; j++) {
+        const filter = c.createBiquadFilter(), gain = c.createGain();
+        filter.type = "bandpass";
+        filter.frequency.value = vowel[j];
+        filter.Q.value = j ? 7 : 5;
+        gain.gain.value = [1, 0.6, 0.3][j];
+        osc.connect(filter).connect(gain).connect(env);
+        nodes.push(filter, gain);
+      }
+      osc.start(t);
+      osc.stop(t + duration + 0.01);
+      this._cleanup(osc, nodes);
+      t += duration + 0.022 + rand() * 0.025;
+    }
+    this.voiceUntil = t + 0.4;
+  }
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const source of [this.engineA, this.engineB, this.siren, this.wind?.source, this.boost?.source]) {
+      try {
+        source?.stop();
+        source?.disconnect();
+      } catch {
+      }
+    }
+    this.ctx?.close().catch(() => {
+    });
+    this.ctx = null;
+  }
+};
+
+// Road-Misbehavior-Road-Rash-II-gpt-6.1-sol-ultra-20261029-0819/online.js
+var COLORS = ["#ed533d", "#41b8d4", "#8acd70", "#ffd162"];
+var MAX_PEERS = 4;
+var noop = () => {
+};
+var now = () => performance.now();
+var randomInt = () => crypto.getRandomValues(new Uint32Array(1))[0];
+var short = (v) => Math.round(v * 1e3) / 1e3;
+var snapshot = (v, depth = 0) => {
+  if (depth > 5 || v == null) return v == null ? null : void 0;
+  if (typeof v === "number") return Number.isFinite(v) ? short(v) : 0;
+  if (typeof v === "string") return v.slice(0, 80);
+  if (typeof v === "boolean") return v;
+  if (Array.isArray(v)) return v.slice(0, 96).map((x) => snapshot(x, depth + 1));
+  if (typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v).slice(0, 48)) out[k] = snapshot(v[k], depth + 1);
+    return out;
+  }
+};
+var member = (id, peer) => ({ id, name: `Rider ${id + 1}`, color: COLORS[id], peer });
+var peerLoad;
+async function loadPeer() {
+  if (globalThis.Peer) return globalThis.Peer;
+  if (!peerLoad) peerLoad = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js";
+    script.crossOrigin = "anonymous";
+    script.onload = () => globalThis.Peer ? resolve(globalThis.Peer) : reject(new Error("PeerJS did not load."));
+    script.onerror = () => {
+      peerLoad = null;
+      reject(new Error("Room service could not load. Check your connection."));
+    };
+    document.head.appendChild(script);
+  });
+  return peerLoad;
+}
+var OnlineSession = class {
+  constructor(options = {}) {
+    this.onStatus = options.onStatus || noop;
+    this.onPeers = options.onPeers || noop;
+    this.onEvent = options.onEvent || noop;
+    this.onStart = options.onStart || noop;
+    this.onTimeUp = options.onTimeUp || noop;
+    this.onEnd = options.onEnd || noop;
+    this.onWorld = options.onWorld || noop;
+    this.hubActive = !!globalThis.AIHub?.active;
+    this.active = false;
+    this.running = false;
+    this.ended = false;
+    this.me = 0;
+    this.host = 0;
+    this.isHost = true;
+    this.players = [member(0)];
+    this.seed = 681921;
+    this.roomCode = "";
+    this.status = this.hubActive ? "Joining AI Hub\u2026" : "Ride solo or open a crew room.";
+    this.round = 0;
+    this.limitMs = 36e4;
+    this.splash = false;
+    this.server = false;
+    this.peer = null;
+    this.connections = /* @__PURE__ */ new Map();
+    this._samples = /* @__PURE__ */ new Map();
+    this._seenPackets = /* @__PURE__ */ new Map();
+    this._sendElapsed = 0;
+    this._lastHeartbeat = 0;
+    this._sequence = 0;
+    this._goAt = null;
+    this._hostClockOffset = 0;
+    this._disposers = [];
+    this._closed = false;
+    this._result = null;
+  }
+  get simulationOwner() {
+    return Math.min(...this.players.map((p) => p.id));
+  }
+  async init() {
+    const hub = globalThis.AIHub;
+    if (!this.hubActive || !hub) {
+      this._status(this.status);
+      return null;
+    }
+    this._status("Joining AI Hub race\u2026");
+    const info = await hub.connect({ mode: "race", seats: [1, 4] });
+    if (!info) {
+      this.hubActive = false;
+      this._status("Solo ride. No AI Hub session found.");
+      return null;
+    }
+    this.active = true;
+    for (const key of ["me", "host", "isHost", "seed", "limitMs", "round", "splash", "server"]) this[key] = info[key];
+    this.players = info.players.slice();
+    this._disposers.push(
+      hub.on("message", (data, from) => this._receive(data, from)),
+      hub.on("start", () => {
+        this.running = true;
+        this.onStart({ seed: this.seed, hub: true });
+      }),
+      hub.on("leave", ({ id }) => this._removePlayer(id)),
+      hub.on("time-up", () => this.onTimeUp()),
+      hub.on("end", (details) => {
+        this.running = false;
+        this.ended = true;
+        this.onEnd(details);
+        this._status("AI Hub round complete.");
+      })
+    );
+    this._status(`AI Hub \xB7 ${this.players.length} rider${this.players.length === 1 ? "" : "s"}`);
+    return info;
+  }
+  ready() {
+    if (this.hubActive) globalThis.AIHub.ready();
+  }
+  probe(fn) {
+    globalThis.AIHub?.probe(fn);
+  }
+  time() {
+    if (this.hubActive) return globalThis.AIHub.time();
+    return this._goAt === null ? -Infinity : Date.now() + this._hostClockOffset - this._goAt;
+  }
+  tick(dt, state, world2) {
+    if (!this.active || this.ended) return;
+    this._sendElapsed += Math.min(dt, 0.25);
+    if (this._sendElapsed >= 1 / 12 && state) {
+      this._sendElapsed %= 1 / 12;
+      const data = { t: "p", at: this.time(), s: snapshot(state) };
+      if (!Number.isFinite(data.at)) data.at = -1e4;
+      if (world2 && this.me === this.simulationOwner) data.w = snapshot(world2);
+      this._send(data, { reliable: false });
+      if (this.hubActive && Number.isFinite(state.dist)) {
+        globalThis.AIHub.progress({ score: state.dist, label: `${Math.max(0, state.dist / 1e3).toFixed(2)} km` });
+      }
+    }
+    if (!this.hubActive && this.active && now() - this._lastHeartbeat > 2e3) {
+      this._lastHeartbeat = now();
+      if (!this.isHost) this._sendControl({ op: "ping", clientNow: Date.now() }, this.host);
+    }
+    this.onPeers(this.getPeers());
+  }
+  _send(data, options = {}) {
+    if (!this.active || this.ended) return false;
+    if (this.hubActive) return globalThis.AIHub.send(data, options);
+    const envelope = { op: "packet", v: 1, from: this.me, seq: ++this._sequence, to: options.to ?? null, data };
+    let sent = false;
+    for (const [id, connection] of this.connections) {
+      if (connection.open && (options.to == null || id === options.to || id === this.host)) {
+        try {
+          connection.send(envelope);
+          sent = true;
+        } catch {
+        }
+      }
+    }
+    return sent;
+  }
+  sendEvent(type, data = {}, to) {
+    return this._send({ t: "e", kind: String(type).slice(0, 24), d: snapshot(data), at: this.time() }, { reliable: true, to });
+  }
+  finish(result) {
+    if (this._result || this.ended) return;
+    this._result = result;
+    if (this.hubActive) globalThis.AIHub.result(result);
+    this.sendEvent("done", result);
+  }
+  _receive(data, from) {
+    if (!data || typeof data !== "object" || from === this.me || !this.players.some((p) => p.id === from)) return;
+    if (data.t === "p" && data.s && Number.isFinite(data.at)) {
+      let samples = this._samples.get(from);
+      if (!samples) this._samples.set(from, samples = []);
+      if (samples.length && data.at < samples[samples.length - 1].at) return;
+      samples.push({ at: data.at, state: data.s, received: now() });
+      if (samples.length > 12) samples.shift();
+      if (data.w && from === this.simulationOwner) this.onWorld(data.w, from);
+    } else if (data.t === "e" && typeof data.kind === "string") {
+      this.onEvent(data.kind, data.d, from);
+    }
+  }
+  getPeers() {
+    const at = this.time();
+    return this.players.filter((p) => p.id !== this.me).map((p) => {
+      const samples = this._samples.get(p.id);
+      if (!samples?.length) return { ...p, state: null, age: Infinity };
+      const last = samples[samples.length - 1];
+      let state = { ...last.state };
+      const target = at - 145;
+      for (let i = 1; i < samples.length; i++) {
+        const a = samples[i - 1], b = samples[i];
+        if (a.at <= target && b.at >= target) {
+          const t = Math.min(1, Math.max(0, (target - a.at) / Math.max(1, b.at - a.at)));
+          state = { ...b.state };
+          if (!b.state.teleport) for (const key of Object.keys(b.state)) {
+            if (typeof b.state[key] !== "number" || typeof a.state[key] !== "number") continue;
+            if (/yaw|angle|heading/.test(key)) {
+              let delta = (b.state[key] - a.state[key] + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+              state[key] = a.state[key] + delta * t;
+            } else state[key] = a.state[key] + (b.state[key] - a.state[key]) * t;
+          }
+          break;
+        }
+      }
+      return { ...p, state, age: Math.max(0, now() - last.received) };
+    });
+  }
+  collisionPeers() {
+    return this.players.filter((p) => p.id !== this.me).map((p) => {
+      const samples = this._samples.get(p.id);
+      if (!samples?.length) return { ...p, state: null, age: Infinity };
+      const last = samples[samples.length - 1];
+      const state = { ...last.state };
+      const elapsed = Math.max(0, Math.min(0.2, (this.time() - last.at) / 1e3));
+      for (const [position2, velocity] of [["x", "vx"], ["y", "vy"], ["z", "vz"], ["dist", "speed"]]) {
+        if (Number.isFinite(state[position2]) && Number.isFinite(state[velocity])) state[position2] += state[velocity] * elapsed;
+      }
+      return { ...p, state, age: Math.max(0, now() - last.received) };
+    });
+  }
+  _status(text) {
+    this.status = text;
+    this.onStatus(text);
+  }
+  async _openPeer(id) {
+    const Peer = await loadPeer();
+    const peer = new Peer(id, { debug: 0 });
+    this.peer = peer;
+    this._closed = false;
+    peer.on("connection", (connection) => this._acceptConnection(connection));
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const timer = setTimeout(() => {
+        if (!done) {
+          done = true;
+          peer.destroy();
+          reject(new Error("Room service timed out. Try again."));
+        }
+      }, 16e3);
+      peer.on("open", () => {
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          resolve(peer);
+        }
+      });
+      peer.on("error", (error) => {
+        const message = error.type === "peer-unavailable" ? "Room not found. Check the six digits." : error.type === "unavailable-id" ? "Room code is busy. Try hosting again." : "Connection failed. The room service or network is unavailable.";
+        this._status(message);
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          peer.destroy();
+          reject(new Error(message));
+        }
+      });
+      peer.on("disconnected", () => {
+        if (!this._closed && !peer.destroyed) {
+          this._status("Room signaling disconnected. Existing riders can keep racing.");
+        }
+      });
+    });
+  }
+  async createRoom() {
+    if (this.hubActive) throw new Error("AI Hub owns this race.");
+    this.disconnect();
+    this._status("Opening a crew room\u2026");
+    this.me = this.host = 0;
+    this.isHost = true;
+    this.seed = randomInt();
+    this.roomCode = String(1e5 + randomInt() % 9e5);
+    await this._openPeer(`road-misbehavior-${this.roomCode}`);
+    this.active = true;
+    this.ended = false;
+    this.running = false;
+    this.players = [member(0, this.peer.id)];
+    this._status(`Crew room ${this.roomCode} \xB7 1/4 riders`);
+    return this.roomCode;
+  }
+  async joinRoom(code) {
+    if (this.hubActive) throw new Error("AI Hub owns this race.");
+    code = String(code).replace(/\s/g, "");
+    if (!/^\d{6}$/.test(code)) throw new Error("Enter all six room digits.");
+    this.disconnect();
+    this._status(`Joining crew ${code}\u2026`);
+    this.roomCode = code;
+    this.isHost = false;
+    this.host = 0;
+    await this._openPeer(`rm-rider-${randomInt().toString(36)}-${randomInt().toString(36)}`);
+    return new Promise((resolve, reject) => {
+      const connection = this.peer.connect(`road-misbehavior-${code}`, { reliable: true, serialization: "json" });
+      const timer = setTimeout(() => {
+        if (this.active) return;
+        connection.close();
+        this._status("Room could not connect. Check the code and network.");
+        reject(new Error(this.status));
+      }, 2e4);
+      this._joinPending = { resolve: () => {
+        clearTimeout(timer);
+        resolve(code);
+      }, reject: (message) => {
+        clearTimeout(timer);
+        reject(new Error(message));
+      } };
+      this._bindConnection(connection, 0);
+      connection.on("open", () => connection.send({ op: "join", v: 1 }));
+      connection.on("error", () => {
+        clearTimeout(timer);
+        reject(new Error("The room could not connect."));
+      });
+    });
+  }
+  _acceptConnection(connection) {
+    if (this._closed) return connection.close();
+    const known = this.players.find((p) => p.peer === connection.peer);
+    this._bindConnection(connection, known?.id ?? null);
+    connection.on("open", () => {
+      if (known) connection.send({ op: "mesh", id: this.me });
+    });
+  }
+  _bindConnection(connection, initialId) {
+    let id = initialId;
+    if (id != null) this.connections.set(id, connection);
+    connection.on("data", (message) => {
+      if (!message || typeof message !== "object") return;
+      if (message.op === "join" && this.isHost && id == null) {
+        const available = Array.from({ length: MAX_PEERS }, (_, i) => i).find((i) => !this.players.some((p) => p.id === i));
+        if (available == null || this.running) {
+          connection.send({ op: "rejected", reason: this.running ? "This race already started." : "This crew has four riders." });
+          setTimeout(() => connection.close(), 200);
+          return;
+        }
+        id = available;
+        this.connections.set(id, connection);
+        this.players.push(member(id, connection.peer));
+        this.players.sort((a, b) => a.id - b.id);
+        connection.send({ op: "welcome", id, players: this.players, seed: this.seed, hostNow: Date.now(), host: this.me });
+        this._broadcastRoster();
+        return;
+      }
+      if (message.op === "welcome" && !this.active && initialId === 0) {
+        this.active = true;
+        this.ended = false;
+        this.me = message.id;
+        this.host = message.host;
+        this.seed = message.seed >>> 0;
+        this._hostClockOffset = message.hostNow - Date.now();
+        this._applyRoster(message.players);
+        this._joinPending?.resolve();
+        this._joinPending = null;
+        return;
+      }
+      if (message.op === "rejected") {
+        this._status(message.reason || "The room is unavailable.");
+        this._joinPending?.reject(this.status);
+        this._joinPending = null;
+        return;
+      }
+      if (message.op === "mesh") {
+        const valid = this.players.find((p) => p.id === message.id && p.peer === connection.peer);
+        if (valid) {
+          id = valid.id;
+          this.connections.set(id, connection);
+        }
+        return;
+      }
+      if (message.op === "roster" && id === this.host) return this._applyRoster(message.players);
+      if (message.op === "ping" && this.isHost && id != null) {
+        connection.send({ op: "pong", clientNow: message.clientNow, hostNow: Date.now() });
+        return;
+      }
+      if (message.op === "pong" && id === this.host) {
+        this._hostClockOffset = message.hostNow + (Date.now() - message.clientNow) / 2 - Date.now();
+        return;
+      }
+      if (message.op === "start" && id === this.host) {
+        this._applyStart(message);
+        return;
+      }
+      if (message.op === "packet" && id != null && Number.isInteger(message.from)) {
+        if (message.from !== id && id !== this.host) return;
+        if (!this.players.some((p) => p.id === message.from)) return;
+        if (message.from === this.me) return;
+        if (!Number.isInteger(message.seq) || message.seq < 0) return;
+        let seen = this._seenPackets.get(message.from);
+        if (!seen) this._seenPackets.set(message.from, seen = /* @__PURE__ */ new Set());
+        if (seen.has(message.seq)) return;
+        seen.add(message.seq);
+        if (seen.size > 512) seen.delete(seen.values().next().value);
+        if (this.isHost) {
+          for (const [otherId, other] of this.connections) if (otherId !== id && other.open && (message.to == null || message.to === otherId)) {
+            try {
+              other.send(message);
+            } catch {
+            }
+          }
+        }
+        if (message.to == null || message.to === this.me) this._receive(message.data, message.from);
+      }
+    });
+    connection.on("close", () => {
+      if (id == null || this.connections.get(id) !== connection || this._closed) return;
+      this.connections.delete(id);
+      this._removePlayer(id);
+      if (this.isHost) this._broadcastRoster();
+    });
+    connection.on("error", () => {
+      if (id != null && this.connections.get(id) === connection && !connection.open) this._status("A crew connection was interrupted.");
+    });
+  }
+  _sendControl(message, to) {
+    const connection = this.connections.get(to);
+    if (connection?.open) try {
+      connection.send(message);
+    } catch {
+      return false;
+    }
+  }
+  _broadcastRoster() {
+    this._status(`Crew room ${this.roomCode} \xB7 ${this.players.length}/4 riders`);
+    for (const connection of this.connections.values()) if (connection.open) connection.send({ op: "roster", players: this.players });
+    this.onPeers(this.getPeers());
+  }
+  _applyRoster(players) {
+    if (!Array.isArray(players)) return;
+    this.players = players.filter((p) => Number.isInteger(p.id) && p.id >= 0 && p.id < 4).map((p) => member(p.id, p.peer));
+    for (const player2 of this.players) {
+      if (player2.id >= this.me || this.connections.has(player2.id) || player2.id === this.host || !player2.peer) continue;
+      const connection = this.peer.connect(player2.peer, { reliable: true, serialization: "json" });
+      this._bindConnection(connection, player2.id);
+      connection.on("open", () => connection.send({ op: "mesh", id: this.me }));
+    }
+    for (const id of this._samples.keys()) if (!this.players.some((p) => p.id === id)) this._samples.delete(id);
+    this._status(`Crew room ${this.roomCode} \xB7 ${this.players.length}/4 riders`);
+    this.onPeers(this.getPeers());
+  }
+  _removePlayer(id) {
+    this.players = this.players.filter((p) => p.id !== id);
+    this._samples.delete(id);
+    if (!this.hubActive && id === this.host && this.players.length) {
+      this.host = this.simulationOwner;
+      this.isHost = this.me === this.host;
+      this._status(`Rider left \xB7 ${this.players.length} remaining`);
+    }
+    this.onEvent("leave", { id }, id);
+    this.onPeers(this.getPeers());
+  }
+  startRace(config = {}) {
+    if (this.hubActive || !this.active || !this.isHost) return false;
+    const message = { op: "start", at: Date.now() + this._hostClockOffset + 3200, seed: this.seed, config: snapshot(config), round: ++this.round };
+    for (const connection of this.connections.values()) if (connection.open) connection.send(message);
+    this._applyStart(message);
+    return true;
+  }
+  _applyStart(message) {
+    this._goAt = message.at;
+    this.seed = message.seed >>> 0;
+    this.round = message.round;
+    this.running = true;
+    this.ended = false;
+    this._result = null;
+    this._samples.clear();
+    this._seenPackets.clear();
+    this.onStart({ ...message.config || {}, seed: this.seed, hub: false });
+    this._status(`Crew race \xB7 ${this.players.length} riders`);
+  }
+  disconnect() {
+    if (this.hubActive) return;
+    this._closed = true;
+    this.active = false;
+    this.running = false;
+    this._goAt = null;
+    this._hostClockOffset = 0;
+    for (const connection of this.connections.values()) connection.close();
+    this.connections.clear();
+    this.peer?.destroy();
+    this.peer = null;
+    this.players = [member(0)];
+    this.me = this.host = 0;
+    this.isHost = true;
+    this._samples.clear();
+    this._seenPackets.clear();
+    this._result = null;
+    this._sequence = 0;
+  }
+  dispose() {
+    if (!this.hubActive) this.disconnect();
+    for (const dispose of this._disposers) dispose();
+    this._disposers.length = 0;
+  }
+};
+
+// Road-Misbehavior-Road-Rash-II-gpt-6.1-sol-ultra-20261029-0819/game.js
+var $ = (id) => document.getElementById(id);
+var clamp3 = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+var lerp = (a, b, t) => a + (b - a) * t;
+var fmt = (t) => {
+  const c = Math.floor(Math.max(0, t) * 100);
+  return `${String(Math.floor(c / 6e3)).padStart(2, "0")}:${String(Math.floor(c / 100) % 60).padStart(2, "0")}.${String(c % 100).padStart(2, "0")}`;
+};
+var esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+var ROUTES2 = [
+  { name: "Coastal Charge", length: 4800, tag: "THE SUNSET CIRCUIT", description: "A postcard coast. A pack of terrible influences. Your first bad decision starts here.", traffic: 1, prize: 1200, color: "#e5ae6a" },
+  { name: "Redline Ridge", length: 5600, tag: "THE HIGH COUNTRY", description: "Rock walls, heavy traffic, and rivals who confuse a handshake with a right hook.", traffic: 1.3, prize: 1600, color: "#d47753" },
+  { name: "Afterglow Run", length: 5200, tag: "THE LAST LIGHT", description: "One last run before the county wakes up. The cops did not get the memo.", traffic: 1.15, prize: 1500, color: "#a986aa" }
+];
+var BIKES = [
+  { name: "Mischief 600", desc: "Light on its feet. Heavy on bad ideas.", speed: 59, accel: 12.7, handling: 1.1, armor: 1, color: "#68d8bd", cost: 0 },
+  { name: "Bruiser 900", desc: "Built like a grudge. Hits like one, too.", speed: 62, accel: 10.8, handling: 0.92, armor: 1.3, color: "#ff7649", cost: 1800 },
+  { name: "Wasp 750", desc: "All sting. Absolutely no manners.", speed: 66, accel: 13.3, handling: 1.04, armor: 0.88, color: "#d8ff64", cost: 2600 }
+];
+var RIVALS = [
+  ["NAILS", "#df5a48", "That helmet come with training wheels?"],
+  ["MOTH", "#a991cd", "I brake for nobody. Especially you."],
+  ["CROW", "#6389aa", "Nice bike. Shame about the rider."],
+  ["AXLE", "#f3c44d", "My parole officer says hi."],
+  ["PEACH", "#dd86a1", "Aw. You brought fists to a chain fight."],
+  ["DEBT", "#9cbf72", "Keep up. I charge by the minute."],
+  ["RAT", "#ede4c7", "First prize is mine. Second prize is dental work."]
+];
+var TIPS = [
+  ["GIVE IT HELL", "R2 / W accelerates. L2 / S brakes. Left stick / A D steers."],
+  ["MAKE A TERRIBLE FIRST IMPRESSION", "L1 / J strikes left. R1 / L strikes right. Get alongside a rival."],
+  ["PERSONAL SPACE IS OVERRATED", "Square / K kicks the nearest rider. Kicks shove harder than punches."],
+  ["A LITTLE EXTRA BAD JUDGMENT", "Hold \xD7 / Space for nitrous. Blue pickups refill the bottle."],
+  ["FIND YOUR FAVORITE ARGUMENT", "Orange pickups give you a chain. \u25B3 / Q switches chain and fists."],
+  ["KEEP THE RUBBER SIDE DOWN", "Green pickups repair your bike. Wrecked? \u25B3 / R gets you back up."],
+  ["COUNTY HOSPITALITY", "Fighting and close calls build heat. Stay fast to shake the patrol."],
+  ["BAD DRIVING PAYS", "Near misses earn $25 and a little nitrous. Top three earns the contract."]
+];
+var save;
+try {
+  save = JSON.parse(localStorage.getItem("road-misbehavior-v1") || "null");
+} catch {
+}
+var profile = Object.assign({ cash: 600, bike: 0, owned: [0], engine: 0, armor: 0, tank: 0, races: 0, wins: 0, best: {} }, save?.profile);
+var settings = Object.assign({ master: 75, music: 50, fx: 85, invertX: false, invertY: false, camera: 0, shake: true, autoGas: false }, save?.settings);
+var persist = () => {
+  try {
+    localStorage.setItem("road-misbehavior-v1", JSON.stringify({ profile, settings }));
+  } catch {
+  }
+};
+var audio = new GameAudio();
+audio.setVolumes(settings.master / 100, settings.music / 100, settings.fx / 100);
+var world = new RoadWorld();
+var ready = false;
+var mode = "title";
+var modal = "";
+var route = 0;
+var lastInput = performance.now();
+var frameTime = performance.now();
+var globalTime = 0;
+var simTime = 0;
+var accumulator = 0;
+var physics;
+var eventQueue;
+var player;
+var actors = [];
+var pickups = [];
+var debris = [];
+var remoteBodies = /* @__PURE__ */ new Map();
+var colliders = /* @__PURE__ */ new Map();
+var remoteWorld = null;
+var raceTime = -3;
+var demo = false;
+var finished = false;
+var stopped = false;
+var countdownLast = 4;
+var goSound = false;
+var toastTime = 0;
+var tauntTime = 0;
+var impact = 0;
+var focusIndex = 0;
+var navNext = 0;
+var currentInput = { x: 0, y: 0, gas: 0, brake: 0, boost: false, fire: false };
+var lastButtons = [];
+var lastAxes = [0, 0];
+var joinDigits = [0, 0, 0, 0, 0, 0];
+var roomBusy = false;
+var roomStatus = "Ride together. Argue about it later.";
+var lastCheckpoint = 0;
+var lastTip = -1;
+var worldTick = 0;
+var lastUi = 0;
+var lastMap = 0;
+var resultData = null;
+var held = /* @__PURE__ */ new Set();
+var inputSerial = 0;
+var online = new OnlineSession({
+  onStatus: (text) => {
+    roomStatus = text;
+    if (modal === "online") updateRoomUI();
+  },
+  onPeers: () => {
+    if (modal === "online") updateRoomUI();
+  },
+  onStart: (config) => {
+    if (!ready) return;
+    if (config?.hub || online.hubActive) {
+      if (mode !== "race") startRace(false, config, true);
+    } else startRace(false, config, true);
+  },
+  onWorld: (snapshot2) => {
+    remoteWorld = snapshot2;
+  },
+  onEvent: (type, data, from) => {
+    if (!player || mode !== "race") return;
+    if (type === "hit" && !finished) {
+      damage(clamp3(Number(data.damage) || 20, 0, 40), "RIDER " + (from + 1));
+      player.body.applyImpulse({ x: (Number(data.side) || 1) * 12, y: 0, z: 3 }, true);
+    }
+    if (type === "ai-hit" && online.me === online.simulationOwner) {
+      const a = actors.find((a2) => a2.id === data.id);
+      if (a?.kind === "rival") hitRival(a, Number(data.damage) || 20, Number(data.side) || 1, false, false, from);
+    }
+    if (type === "ai-ko") {
+      player.knockouts++;
+      player.cash += 100;
+      player.heat = clamp3(player.heat + 0.7, 0, 5);
+      toast(`${String(data.name || "RIVAL")} DOWN \xB7 +$100`);
+      audio.voice(34, "cheer");
+    }
+    if (type === "done") toast(`RIDER ${from + 1} CROSSED THE LINE`);
+  },
+  onTimeUp: () => {
+    if (!finished) finishRace(true);
+  },
+  onEnd: () => {
+    stopped = true;
+    audio.pause();
+    held.clear();
+    if (!finished) finishRace(true);
+    if (modal === "results") showResults();
+  }
+});
+function userActivity() {
+  lastInput = performance.now();
+  inputSerial++;
+  if (!stopped) audio.unlock().catch(() => {
+  });
+  if (mode === "attract") {
+    showTitle();
+    return true;
+  }
+  return false;
+}
+function toast(text, seconds = 2.6) {
+  $("toast").textContent = text;
+  $("toast").classList.remove("hidden");
+  toastTime = seconds;
+}
+function taunt(name, text, seconds = 4) {
+  $("taunt").innerHTML = `<b>${esc(name)}</b><span>${esc(text)}</span>`;
+  $("taunt").style.opacity = 1;
+  tauntTime = seconds;
+}
+function visibleButtons() {
+  const root = modal ? $("panel") : $("title");
+  return Array.from(root.querySelectorAll("button:not(:disabled),input")).filter((el) => el.offsetParent !== null);
+}
+function focusButton(index) {
+  const all = visibleButtons();
+  if (!all.length) return;
+  all.forEach((el) => el.classList.remove("focused"));
+  focusIndex = (index + all.length) % all.length;
+  all[focusIndex].classList.add("focused");
+  all[focusIndex].focus({ preventScroll: true });
+  if (modal) all[focusIndex].scrollIntoView({ block: "nearest" });
+}
+function navigate(dx, dy) {
+  if (["about", "controls"].includes(modal) && dy) {
+    $("panel").scrollTop += dy * 135;
+    audio.sfx("ui");
+    return;
+  }
+  const all = visibleButtons();
+  if (!all.length) return;
+  const current = all[focusIndex] || all[0];
+  if (current.dataset.digit !== void 0 && dy) {
+    const i = Number(current.dataset.digit);
+    joinDigits[i] = (joinDigits[i] + (dy > 0 ? -1 : 1) + 10) % 10;
+    current.textContent = joinDigits[i];
+    audio.sfx("ui");
+    return;
+  }
+  if (current.dataset.setting && dx) {
+    changeSetting(current.dataset.setting, dx);
+    return;
+  }
+  const r = current.getBoundingClientRect(), cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+  let best = -1, score = Infinity;
+  all.forEach((el, i) => {
+    if (el === current) return;
+    const a = el.getBoundingClientRect(), x = a.x + a.width / 2 - cx, y = a.y + a.height / 2 - cy;
+    const along = dx ? x * dx : y * dy, across = dx ? Math.abs(y) : Math.abs(x);
+    if (along > 4) {
+      const s = along + across * 2.4;
+      if (s < score) {
+        score = s;
+        best = i;
+      }
+    }
+  });
+  if (best < 0) best = (focusIndex + (dx || dy) + all.length) % all.length;
+  focusButton(best);
+  audio.sfx("ui");
+}
+function back() {
+  audio.sfx("back");
+  if (modal) {
+    closeModal();
+    return;
+  }
+  if (mode === "race" && !finished) openModal("settings");
+}
+function dismissModal() {
+  modal = "";
+  $("modal").classList.add("hidden");
+  $("panel").innerHTML = "";
+}
+function closeModal() {
+  if (finished && mode === "race") {
+    if (modal === "results") {
+      if (!online.hubActive) showTitle();
+    } else showResults();
+    return;
+  }
+  const prev = modal;
+  dismissModal();
+  if (prev === "garage") world.setRoute(route);
+  if (mode === "title") {
+    audio.setMode("menu");
+    focusButton(0);
+  } else if (mode === "race") {
+    audio.setMode("race");
+  }
+  lastInput = performance.now();
+}
+function panelHeader(label, title) {
+  return `<div class="panel-head"><div><div class="label">${label}</div><h2>${title}</h2></div><button class="close-button" data-action="back">\u25CB / ESC &nbsp; BACK</button></div>`;
+}
+function openModal(which) {
+  if (!ready) return;
+  if (mode === "attract") showTitle();
+  modal = which;
+  focusIndex = 0;
+  $("modal").classList.remove("hidden");
+  const p = $("panel");
+  if (which === "events") {
+    p.innerHTML = panelHeader("Pick a fight. Pick a road.", "CHOOSE YOUR TROUBLE") + `<div class="card-grid">${ROUTES2.map((r, i) => `<button class="card ${i === route ? "selected" : ""}" data-action="select-route${i}"><div class="label">0${i + 1} / ${r.tag}</div><svg viewBox="0 0 260 90" style="width:100%;height:90px;margin-top:12px" aria-hidden="true"><path d="M-20 80 Q80 95 120 35 T280 10" fill="none" stroke="${r.color}" stroke-width="25"/><path d="M-20 80 Q80 95 120 35 T280 10" fill="none" stroke="#263c3b" stroke-width="19"/><path d="M-20 80 Q80 95 120 35 T280 10" fill="none" stroke="#d8ff64" stroke-width="1.5" stroke-dasharray="9 7"/></svg><h3>${r.name}</h3><p>${r.description}</p><div class="meta">${(r.length / 1e3).toFixed(1)} KM \xB7 $${r.prize} CONTRACT</div><div class="number">0${i + 1}</div></button>`).join("")}</div><div class="notice-line">Every event is a complete point-to-point race. Finish top three to collect the contract. Clean riding is optional.</div><button class="menu-button primary" data-action="start">LET'S MAKE THIS A PROBLEM <span>\u2197</span></button>`;
+  } else if (which === "garage") {
+    p.innerHTML = panelHeader("Nothing here is street legal.", "THE GARAGE") + `<div class="split"><p>Your bike. Your bad investment. Purchases save on this device.</p><div class="money">$${profile.cash.toLocaleString()}</div></div><div class="card-grid">${BIKES.map((b, i) => `<button class="card ${profile.bike === i ? "selected" : ""}" data-action="bike${i}"><div class="bike-color" style="background:${b.color}"></div><h3>${b.name}</h3><p>${b.desc}</p>${[["TOP END", Math.round(b.speed * 3.6), 250], ["PICKUP", Math.round(b.accel * 6), 100], ["ARMOR", Math.round(b.armor * 65), 100]].map(([label, v, max]) => `<div class="stat"><span>${label}</span><div class="bar"><span style="--value:${v / max * 100}%;background:${b.color}"></span></div><span>${v}</span></div>`).join("")}<div class="meta" style="margin-top:20px">${profile.owned.includes(i) ? "OWNED \xB7 SELECT" : `BUY FOR $${b.cost.toLocaleString()}`}</div></button>`).join("")}</div><div class="upgrade-grid">${[["engine", "HOT CAMS", "More acceleration. More top speed."], ["armor", "CRASH BARS", "Take a beating. Keep the bike."], ["tank", "BIG BOTTLE", "More nitrous. Quicker recharge."]].map(([id, name, desc]) => `<button class="upgrade" data-action="upgrade-${id}" ${profile[id] >= 3 ? "disabled" : ""}><div class="split"><strong>${name}</strong><span style="color:var(--lime)">${"\u25A0".repeat(profile[id])}${"\u25A1".repeat(3 - profile[id])}</span></div><small>${desc}</small><small style="color:var(--lime)">${profile[id] >= 3 ? "MAXED OUT" : `$${350 + profile[id] * 250} \xB7 FIT TO ALL BIKES`}</small></button>`).join("")}</div><div class="notice-line">${profile.races} EVENTS \xB7 ${profile.wins} WINS \xB7 No financing. No refunds. No witnesses.</div>`;
+  } else if (which === "settings") {
+    p.innerHTML = panelHeader(mode === "race" ? online.active ? "LIVE RACE \xB7 THE CREW KEEPS MOVING" : "RACE PAUSED" : "Make yourself uncomfortable.", "SETTINGS") + `<div class="settings-grid">${[["master", "MASTER VOLUME"], ["music", "MUSIC VOLUME"], ["fx", "EFFECTS & GIBBERISH"], ["invertX", "INVERT HORIZONTAL AXIS"], ["invertY", "INVERT VERTICAL AXIS"], ["camera", "CHASE CAMERA"], ["shake", "CAMERA SHAKE"], ["autoGas", "AUTO THROTTLE"]].map(([id, label]) => `<button class="setting" data-setting="${id}" data-action="setting-${id}"><span>${label}</span><span class="value" id="value-${id}">${settingValue(id)}</span></button>`).join("")}</div><p class="muted">D-pad / arrows to navigate. Left / right adjusts a setting; \xD7 / Enter cycles it. Axis toggles apply to the left stick and menus. R2 always overrides auto throttle.</p><div class="actions"><button class="menu-button primary" data-action="back">${mode === "race" ? "BACK TO THE ROAD" : "DONE"} <span>\u2192</span></button><button class="menu-button" data-action="controls">HOW TO RIDE</button>${mode === "race" && !online.hubActive ? '<button class="menu-button" data-action="quit">LEAVE RACE</button>' : ""}</div>`;
+  } else if (which === "controls") {
+    p.innerHTML = panelHeader("THE ROAD HAS RULES. THESE AREN\u2019T THEM.", "HOW TO MISBEHAVE") + `<div class="controls-grid">${[
+      ["Accelerate / brake", "R2 / L2", "W / S or \u2191 / \u2193"],
+      ["Steer", "LEFT STICK", "A / D or \u2190 / \u2192"],
+      ["Strike left / right", "L1 / R1", "J / L"],
+      ["Kick closest rider", "\u25A1 SQUARE", "K"],
+      ["Nitrous boost", "\xD7 CROSS", "SPACE"],
+      ["Switch fists / chain", "\u25B3 TRIANGLE", "Q"],
+      ["Recover after a wreck", "\u25B3 TRIANGLE", "R"],
+      ["Camera", "R3 STICK CLICK", "C"],
+      ["Settings / pause", "OPTIONS", "ESC"],
+      ["Menus: select / back", "\xD7 / \u25CB", "ENTER / ESC"]
+    ].map(([a, b, c]) => `<div class="control-line"><span>${a}</span><span>${b} &nbsp;\xB7&nbsp; ${c}</span></div>`).join("")}</div><div class="card-grid"><div class="card"><div class="label">01 / WIN</div><h3>GET THERE FIRST</h3><p>Eight riders. One finish line. Top three banks the contract. Spend winnings in the garage.</p></div><div class="card"><div class="label">02 / FIGHT</div><h3>GET ALONGSIDE</h3><p>Fists need close range. A chain reaches farther. A kick shoves riders toward trouble.</p></div><div class="card"><div class="label">03 / SURVIVE</div><h3>DON\u2019T GET PINCHED</h3><p>Repair at green pickups. Blue refills nitrous. Keep moving when the patrol gets close.</p></div></div>`;
+  } else if (which === "online") {
+    p.innerHTML = panelHeader("BAD INFLUENCES WELCOME \xB7 1\u20134 RIDERS", "RIDE WITH A CREW") + `<p>Race on the same road. Trade paint, punches, and excuses. One browser and controller per rider.</p><div class="connection" id="room-status">${esc(roomStatus)}</div>${online.hubActive ? '<div class="room-box"><div class="label">AI HUB SESSION</div><p>The hub handles the crew and synchronized race. Your settings never pause the shared road.</p></div>' : `<div class="lobby-grid"><div class="room-box"><div class="label">START SOMETHING</div><h3 style="font:700 30px 'Barlow Condensed';margin:12px 0">HOST A CREW</h3><p>Create a room and share its six digits. No account required.</p><button class="menu-button primary wide" data-action="host">CREATE ROOM <span>+</span></button><div class="room-code" id="room-code">${online.roomCode || "\u2014 \u2014 \u2014"}</div></div><div class="room-box"><div class="label">JOIN THE BAD COMPANY</div><p>Choose each digit with \u2191 / \u2193. Move with \u2190 / \u2192. \xD7 cycles a digit.</p><div style="display:flex;gap:5px;margin:18px 0">${joinDigits.map((d, i) => `<button class="close-button" data-action="digit${i}" data-digit="${i}" style="font:700 25px 'Barlow Condensed';padding:10px;flex:1">${d}</button>`).join("")}</div><button class="menu-button wide" data-action="join">JOIN ROOM <span>\u2192</span></button></div></div>`}<div id="room-players" class="notice-line"></div><div class="actions"><button id="room-start" class="menu-button primary" data-action="room-start" ${!online.active || !online.isHost ? "disabled" : ""}>START CREW RACE <span>\u2197</span></button>${!online.hubActive ? '<button class="menu-button" data-action="disconnect">LEAVE CREW</button>' : ""}</div><p class="muted">Standalone rooms use WebRTC / PeerJS public signaling; some restrictive networks block direct peer connections. AI Hub sessions use the hub transport. No chat or accounts.</p>`;
+    updateRoomUI();
+  } else if (which === "about") {
+    p.innerHTML = panelHeader("BUILT FROM BAD IDEAS, NOT BORROWED ASSETS.", "ABOUT / CREDITS") + aboutHTML();
+  } else if (which === "results") {
+    showResults();
+    return;
+  }
+  if (mode === "race" && !online.active) audio.setMode("paused");
+  focusButton(which === "settings" ? 1 : 0);
+}
+function settingValue(id) {
+  const v = settings[id];
+  if (["master", "music", "fx"].includes(id)) return `${v}%`;
+  if (id === "camera") return v ? "CLOSE & LOW" : "WIDE & STEADY";
+  return v ? "ON" : "OFF";
+}
+function changeSetting(id, dir = 1) {
+  if (["master", "music", "fx"].includes(id)) settings[id] = clamp3(settings[id] + dir * 10, 0, 100);
+  else if (id === "camera") settings.camera = 1 - settings.camera;
+  else settings[id] = !settings[id];
+  audio.setVolumes(settings.master / 100, settings.music / 100, settings.fx / 100);
+  const el = $("value-" + id);
+  if (el) el.textContent = settingValue(id);
+  persist();
+  audio.sfx("ui");
+}
+function updateRoomUI() {
+  if (modal !== "online") return;
+  const status = $("room-status");
+  if (status) status.textContent = roomStatus;
+  const code = $("room-code");
+  if (code) code.textContent = online.roomCode || "\u2014 \u2014 \u2014";
+  const players = $("room-players");
+  if (players) players.textContent = online.active ? online.players.map((p) => `${p.id === online.me ? "YOU \xB7 " : ""}${p.name}`).join("   /   ") : "No crew connected. Solo racing is always available.";
+  const start = $("room-start");
+  if (start) start.disabled = !online.active || !online.isHost || online.hubActive || roomBusy;
+}
+function aboutHTML() {
+  return `<p>Road Misbehavior is an original motorcycle combat sprint inspired by the road racing, rivalries, and delinquent attitude of Road Rash II. All riders, writing, music, models, scenery, and game code were created for this demo. No original game assets are used.</p><div class="about-grid"><div class="about-section"><h3>SOURCE INFORMATION</h3><p>Date: 2026-10-29 08:47 (America/Vancouver)<br>Source: Road Rash II<br>Tech: Three.js R180 / WebGPURenderer (WebGPU only); Rapier 0.19.3; JavaScript; Web Audio; Gamepad API; PeerJS 1.5.5; AI Hub Session Protocol v1, client 1.3.0.<br>Art direction: procedural cel-shaded coastal low-poly 3D.<br>Animation: procedural rider posing, bike lean and wheels, camera springs, particles and crash motion.<br>Audio: code-written surf-rock, synthesized effects, engine and siren, seeded gibberish voices.<br>Online: shared race, state interpolation, directed combat, shared AI; AI Hub and standalone WebRTC crew rooms.<br>Testing: efficient lightweight browser smoke tests and official AI Hub harness.<br>Environment: Codex CLI (headless); Linux; test browser Chrome, player browser unknown.<br>Model: OpenAI, gpt-6.1-sol, reasoning effort ultra.<br>Usage: API cost unknown; tokens unknown; approximate session time 27 minutes.</p></div><div class="about-section"><h3>TESTING FEEDBACK</h3><p id="test-feedback">Issues caught: 18 during review and testing; 2 potentially game breaking; all fixed.<br>Passed: 25/25 gameplay checks, 24/24 official AI Hub checks, real two-page WebRTC, three-peer transport, and audio smoke tests.<br>Most helpful: final-artifact gameplay regression with actual Rapier physics, combat, recovery, rewards, persistence, and attract looping.<br>Least helpful: blank headless WebGPU screenshots; headed Xvfb captures replaced them.<br>Physical pads, four remote devices, restrictive NAT, and other browsers: untested.</p><h3>ENGINE FEEDBACK</h3><p>Most useful: Three\u2019s scene graph and toon materials make procedural art easy to direct. Rapier gives real contact and collision events.<br>Got stuck / guessed wrong: blank headless WebGPU captures needed headed Chrome under Xvfb. The default WebGL fallback was explicitly disabled and the backend checked.<br>Built ourselves: path-local vehicle control, melee combat, rival AI, race flow, controller UI, and multiplayer state authority.<br>Hardest part: keeping curved-road visuals, contact physics, and peer interpolation in agreement.<br>Would overhaul: renderer fallback behavior should be opt-in.<br>Would change: a first-class arcade vehicle controller for roads with curves and hills.</p><h3>PROMPT FEEDBACK</h3><p>Best part: the complete vertical slice and attract-mode requirements gave the demo a clear finish line.<br>Confusing: \u201Cunlimited\u201D performance does not describe browser or hardware limits; the online link needed its protocol read before implementation.<br>Hardest: complete standalone and embedded multiplayer in a single distributable page.<br>Extra test: four physical DualSense controllers across four real machines and restrictive networks.</p></div></div><div class="notice-line">Fonts: Barlow Condensed & Space Grotesk via Google Fonts. Engine dependencies via jsDelivr. Multiplayer protocol: <a style="color:var(--lime)" href="https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub" target="_blank" rel="noopener">AI Hub</a>. This is an unofficial original tribute, with no affiliation to the source\u2019s owners.</div>`;
+}
+async function action(name, el) {
+  if (stopped && name !== "settings" && name !== "back") return;
+  audio.sfx("confirm");
+  if (name === "ride" || name === "events") {
+    openModal("events");
+    return;
+  }
+  if (name === "start") {
+    if (online.active && !online.hubActive) {
+      if (online.isHost) online.startRace({ route, bike: 0 });
+      else toast("THE CREW HOST STARTS THE RACE");
+    } else startRace();
+    return;
+  }
+  if (["garage", "settings", "controls", "online", "about"].includes(name)) {
+    openModal(name);
+    return;
+  }
+  if (name === "back") {
+    closeModal();
+    return;
+  }
+  if (name === "quit") {
+    if (online.active) online.disconnect();
+    showTitle();
+    return;
+  }
+  if (name === "next") {
+    route = (route + 1) % ROUTES2.length;
+    showTitle();
+    openModal("events");
+    return;
+  }
+  if (name === "retry") {
+    if (online.active) {
+      if (online.isHost) online.startRace({ route });
+      else toast("THE CREW HOST STARTS THE NEXT RACE");
+    } else startRace();
+    return;
+  }
+  if (name.startsWith("route")) {
+    setRoute(Number(name.slice(5)));
+    return;
+  }
+  if (name.startsWith("select-route")) {
+    setRoute(Number(name.slice(12)));
+    openModal("events");
+    focusButton(visibleButtons().findIndex((b) => b.dataset.action === "start"));
+    return;
+  }
+  if (name.startsWith("setting-")) {
+    changeSetting(name.slice(8));
+    return;
+  }
+  if (name.startsWith("bike")) {
+    const i = Number(name.slice(4)), b = BIKES[i];
+    if (!profile.owned.includes(i)) {
+      if (profile.cash < b.cost) {
+        toast("YOUR WALLET DISAGREES. WIN A FEW RACES.");
+        return;
+      }
+      profile.cash -= b.cost;
+      profile.owned.push(i);
+      audio.sfx("repair");
+    }
+    profile.bike = i;
+    persist();
+    openModal("garage");
+    focusButton(visibleButtons().findIndex((b2) => b2.dataset.action === "bike" + i));
+    toast(`${b.name.toUpperCase()} \xB7 READY TO MISBEHAVE`);
+    return;
+  }
+  if (name.startsWith("upgrade-")) {
+    const key = name.slice(8), cost = 350 + profile[key] * 250;
+    if (profile[key] >= 3) return;
+    if (profile.cash < cost) {
+      toast("CASH TALKS. YOURS IS A LITTLE QUIET.");
+      return;
+    }
+    profile.cash -= cost;
+    profile[key]++;
+    persist();
+    audio.sfx("repair");
+    openModal("garage");
+    const next = visibleButtons().findIndex((b) => b.dataset.action === "upgrade-" + key);
+    if (next >= 0) focusButton(next);
+    return;
+  }
+  if (name.startsWith("digit")) {
+    const i = Number(name.slice(5));
+    joinDigits[i] = (joinDigits[i] + 1) % 10;
+    if (el) el.textContent = joinDigits[i];
+    return;
+  }
+  if (name === "host" || name === "join") {
+    if (roomBusy) return;
+    roomBusy = true;
+    updateRoomUI();
+    try {
+      if (name === "host") await online.createRoom();
+      else await online.joinRoom(joinDigits.join(""));
+      toast(name === "host" ? "ROOM OPEN. INVITE YOUR BAD INFLUENCES." : "YOU FOUND YOUR BAD INFLUENCES.");
+    } catch (e) {
+      toast(e.message, 5);
+    } finally {
+      roomBusy = false;
+      updateRoomUI();
+    }
+    return;
+  }
+  if (name === "room-start") {
+    if (online.active && online.isHost) online.startRace({ route });
+    return;
+  }
+  if (name === "disconnect") {
+    online.disconnect();
+    updateRoomUI();
+    return;
+  }
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-action]");
+  if (!b) return;
+  if (userActivity()) return;
+  action(b.dataset.action, b);
+});
+document.addEventListener("pointermove", () => {
+  if (mode === "title") lastInput = performance.now();
+}, { passive: true });
+document.addEventListener("pointerdown", () => {
+  if (mode === "attract") userActivity();
+  else if (!stopped) audio.unlock().catch(() => {
+  });
+});
+var keyName = (e) => e.code || ({ ArrowUp: "ArrowUp", ArrowDown: "ArrowDown", ArrowLeft: "ArrowLeft", ArrowRight: "ArrowRight", Escape: "Escape", Enter: "Enter", " ": "Space" }[e.key] || "Key" + String(e.key).toUpperCase());
+document.addEventListener("keydown", (e) => {
+  const key = keyName(e);
+  if (["Enter", "Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Tab"].includes(key)) e.preventDefault();
+  if (stopped) return;
+  if (userActivity()) return;
+  held.add(key);
+  if (e.repeat) return;
+  if (key === "Escape") {
+    if (modal) closeModal();
+    else openModal("settings");
+    return;
+  }
+  if (modal || mode === "title") {
+    if (["ArrowUp", "KeyW"].includes(key)) navigate(0, -1);
+    if (["ArrowDown", "KeyS", "Tab"].includes(key)) navigate(0, 1);
+    if (["ArrowLeft", "KeyA"].includes(key)) navigate(-1, 0);
+    if (["ArrowRight", "KeyD"].includes(key)) navigate(1, 0);
+    if (key === "Enter" || key === "Space") {
+      const b = visibleButtons()[focusIndex];
+      if (b?.dataset.action) action(b.dataset.action, b);
+    }
+    return;
+  }
+  if (mode === "race") {
+    if (key === "KeyJ") strike(-1, "punch");
+    if (key === "KeyL") strike(1, "punch");
+    if (key === "KeyK") strike(0, "kick");
+    if (key === "KeyQ") switchWeapon();
+    if (key === "KeyR") recover();
+    if (key === "KeyC") {
+      settings.camera = 1 - settings.camera;
+      persist();
+      toast(settings.camera ? "CLOSE CAMERA" : "WIDE CAMERA");
+    }
+  }
+});
+document.addEventListener("keyup", (e) => held.delete(keyName(e)));
+window.addEventListener("blur", () => {
+  held.clear();
+  if (mode === "race" && !online.active && !modal) openModal("settings");
+});
+window.addEventListener("gamepadconnected", () => {
+  if (mode !== "attract") toast("CONTROLLER CONNECTED \xB7 RIDE WITH BOTH HANDS");
+  $("touch").classList.add("hidden");
+});
+function readInput(dt) {
+  const pads = navigator.getGamepads?.() || [], pad = Array.from(pads).find((p) => p?.connected), buttons = pad ? pad.buttons.map((b) => b.pressed) : [], edge = (i) => buttons[i] && !lastButtons[i];
+  let x = pad?.axes[0] || 0, y = pad?.axes[1] || 0;
+  if (Math.abs(x) < 0.15) x = 0;
+  if (Math.abs(y) < 0.15) y = 0;
+  if (settings.invertX) x = -x;
+  if (settings.invertY) y = -y;
+  const dX = (buttons[15] ? 1 : 0) - (buttons[14] ? 1 : 0), dY = (buttons[13] ? 1 : 0) - (buttons[12] ? 1 : 0);
+  if (buttons.some(Boolean) || Math.abs(x) > 0.2 || Math.abs(y) > 0.2) {
+    if (mode === "title") lastInput = performance.now();
+  }
+  const anyEdge = buttons.some((b, i) => b && !lastButtons[i]), axisStart = Math.abs(x) > 0.5 && Math.abs(lastAxes[0]) <= 0.5 || Math.abs(y) > 0.5 && Math.abs(lastAxes[1]) <= 0.5;
+  const attracted = mode === "attract";
+  if (anyEdge || axisStart) {
+    if (userActivity()) {
+      lastButtons = buttons;
+      lastAxes = [x, y];
+      return;
+    }
+  }
+  if (stopped) {
+    lastButtons = buttons;
+    return;
+  }
+  if (edge(9) && !buttons[8]) {
+    if (modal) closeModal();
+    else openModal("settings");
+  }
+  if (modal || mode === "title") {
+    if (edge(1)) back();
+    if (edge(0)) {
+      const b = visibleButtons()[focusIndex];
+      if (b?.dataset.action) action(b.dataset.action, b);
+    }
+    const dx = Math.abs(x) > 0.55 ? Math.sign(x) : dX, dy = Math.abs(y) > 0.55 ? Math.sign(y) : dY;
+    if ((dx || dy) && globalTime >= navNext) {
+      navigate(Math.abs(dx) ? dx : 0, dx ? 0 : dy);
+      navNext = globalTime + 0.2;
+    }
+    if (!dx && !dy) navNext = 0;
+  }
+  let kx = (held.has("KeyD") || held.has("ArrowRight") ? 1 : 0) - (held.has("KeyA") || held.has("ArrowLeft") ? 1 : 0);
+  const gas = held.has("KeyW") || held.has("ArrowUp") ? 1 : 0, brake = held.has("KeyS") || held.has("ArrowDown") ? 1 : 0;
+  currentInput = { x: clamp3(x + kx, -1, 1), y: y || -gas || brake, gas: Math.max(gas, pad?.buttons[7]?.value || 0), brake: Math.max(brake, pad?.buttons[6]?.value || 0), boost: !!(buttons[0] || held.has("Space")), fire: !!(buttons[4] || buttons[5] || held.has("KeyJ") || held.has("KeyL")) };
+  if (mode === "race" && !modal && !attracted) {
+    if (edge(4)) strike(-1, "punch");
+    if (edge(5)) strike(1, "punch");
+    if (edge(2)) strike(0, "kick");
+    if (edge(3)) {
+      if (player?.wreck > 0) recover();
+      else switchWeapon();
+    }
+    if (edge(11)) {
+      settings.camera = 1 - settings.camera;
+      persist();
+    }
+  }
+  if (modal || finished) currentInput = { x: 0, y: 0, gas: 0, brake: 0, boost: false, fire: false };
+  lastButtons = buttons;
+  lastAxes = [x, y];
+}
+function setRoute(i) {
+  route = clamp3(i, 0, 2);
+  world.setRoute(route);
+  const r = ROUTES2[route];
+  $("preview-serial").textContent = `0${route + 1} / ${r.tag}`;
+  $("preview-name").textContent = r.name.toUpperCase();
+  $("preview-meta").textContent = `${(r.length / 1e3).toFixed(1)} KM \xB7 8 RIDERS \xB7 BAD INTENTIONS`;
+  document.querySelectorAll(".route-chooser button").forEach((b, j) => b.classList.toggle("active", j === route));
+}
+function destroyPhysics() {
+  if (physics) physics.free();
+  if (eventQueue) eventQueue.free();
+  actors = [];
+  pickups = [];
+  debris = [];
+  colliders.clear();
+  remoteBodies.clear();
+}
+function addBody(id, x, s, kind = "rival", wide = 0.47, long = 1.04) {
+  const desc = kind === "player" || kind === "rival" ? RAPIER.RigidBodyDesc.dynamic() : RAPIER.RigidBodyDesc.kinematicPositionBased();
+  desc.setTranslation(x, 1, -s).lockRotations();
+  if (kind === "player" || kind === "rival") desc.enabledTranslations(true, false, true).setLinearDamping(0.1);
+  const body = physics.createRigidBody(desc);
+  const c = physics.createCollider(RAPIER.ColliderDesc.cuboid(wide, 0.7, long).setFriction(0.08).setRestitution(0.12).setDensity(kind === "player" ? 8 : 6).setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS), body);
+  colliders.set(c.handle, { id, kind });
+  return body;
+}
+function seeded2(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a += 1831565813;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t ^= t + Math.imul(t ^ t >>> 7, 61 | t);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function startRace(isDemo = false, config = {}, fromNetwork = false) {
+  if (!ready) return;
+  if (config.route !== void 0) setRoute(config.route);
+  if (modal) dismissModal();
+  mode = isDemo ? "attract" : "race";
+  demo = isDemo;
+  finished = false;
+  stopped = false;
+  raceTime = online.active && !isDemo ? online.time() / 1e3 : -3;
+  countdownLast = 4;
+  goSound = false;
+  simTime = 0;
+  accumulator = 0;
+  lastCheckpoint = 0;
+  lastTip = -1;
+  remoteWorld = null;
+  resultData = null;
+  destroyPhysics();
+  physics = new RAPIER.World({ x: 0, y: 0, z: 0 });
+  eventQueue = new RAPIER.EventQueue(true);
+  physics.timestep = 1 / 60;
+  const bike = BIKES[online.hubActive ? 0 : profile.bike], me = online.active ? online.me : 0;
+  player = { id: "player", s: 0, x: online.active ? [-4.5, -1.5, 1.5, 4.5][me] : 2.5, speed: 0, lean: 0, hp: 100, boost: 100 + (online.hubActive ? 0 : profile.tank) * 20, heat: route === 2 ? 2 : 0, cash: 0, chain: false, weapon: "fists", cooldown: 0, attack: 0, attackTime: 0, invincible: 0, wreck: 0, wrecks: 0, knockouts: 0, hits: 0, near: 0, top: 0, boostUsed: 0, busted: 0, policeTime: 0, demoStage: 0, finishTime: null, bike };
+  player.body = addBody("player", player.x, 0, "player");
+  if (isDemo) player.body.collider(0).setSensor(true);
+  const rnd = seeded2(online.active ? online.seed : 48112 + route * 859);
+  const aiCount = 8 - (online.active ? online.players.length : 1);
+  for (let i = 0; i < aiCount; i++) {
+    const [name, color, line] = RIVALS[i];
+    const s = 7 + Math.floor(i / 2) * 6.5, x = (i % 2 ? 1 : -1) * (2.3 + rnd());
+    const a = { id: "rival-" + i, kind: "rival", name, color, line, s, x, speed: 0, goalX: x, hp: 100, cooldown: 2 + i * 0.6, wreck: 0, attack: 0, attackTime: 0, seed: rnd() * 10, finishTime: null, near: false };
+    a.body = addBody(a.id, x, s);
+    actors.push(a);
+  }
+  for (let i = 0; i < Math.round(16 * ROUTES2[route].traffic); i++) {
+    const opposite = i % 3 === 0, x = opposite ? -4 : 3.8;
+    const s = 150 + i * 75 / ROUTES2[route].traffic + rnd() * 30;
+    const a = { id: "traffic-" + i, kind: "traffic", carType: i % 5 === 0 ? "van" : "car", color: ["#f1cf82", "#a6c5bb", "#da755c", "#78919b", "#e4dcc9"][i % 5], x, s, speed: opposite ? -19 - rnd() * 6 : 17 + rnd() * 8, near: false };
+    a.body = addBody(a.id, x, s, "traffic", 0.93, i % 5 === 0 ? 2.4 : 1.95);
+    actors.push(a);
+  }
+  const patrol = { id: "patrol", kind: "police", color: "#e2ebde", s: -100, x: -3, speed: 0, active: route === 2, cooldown: 0, near: false };
+  patrol.body = addBody(patrol.id, -3, -100, "police", 0.92, 1.95);
+  actors.push(patrol);
+  for (let i = 0; i < Math.ceil(ROUTES2[route].length / 135); i++) pickups.push({ id: "pickup-" + i, s: 110 + i * 135, x: [2.2, -2.2, 0, 4.8, -4.8][i % 5], type: i % 7 === 2 ? "chain" : i % 3 === 0 ? "repair" : "boost", active: true });
+  $("title").classList.add("hidden");
+  $("topline").classList.add("hidden");
+  $("footer").classList.add("hidden");
+  $("vignette").classList.add("hidden");
+  $("hud").classList.remove("hidden");
+  $("attract").classList.toggle("hidden", !isDemo);
+  $("touch").classList.add("hidden");
+  $("taunt").style.opacity = 0;
+  $("race-route").textContent = ROUTES2[route].name.toUpperCase();
+  $("total").textContent = "/ " + (aiCount + 1 + (online.active ? online.players.length - 1 : 0));
+  $("race-message").textContent = "";
+  $("race-submessage").textContent = "";
+  audio.setMode(isDemo ? "attract" : "race");
+  if (!isDemo) audio.voice(19, "taunt");
+  if (isDemo) {
+    player.chain = true;
+    player.weapon = "chain";
+    player.hp = 100;
+  }
+  if (!isDemo && !online.active) taunt("THE DISPATCHER", "Top three gets paid. Everyone else gets a story.", 5);
+  updateHUD();
+}
+function showTitle() {
+  if (online.hubActive) return;
+  if (modal) dismissModal();
+  mode = "title";
+  demo = false;
+  finished = false;
+  stopped = false;
+  lastInput = performance.now();
+  held.clear();
+  audio.setMode("menu");
+  $("title").classList.remove("hidden");
+  $("topline").classList.remove("hidden");
+  $("footer").classList.remove("hidden");
+  $("vignette").classList.remove("hidden");
+  $("hud").classList.add("hidden");
+  $("attract").classList.add("hidden");
+  $("flash").style.opacity = 0;
+  $("toast").classList.add("hidden");
+  focusButton(0);
+}
+function switchWeapon() {
+  if (!player || player.wreck > 0) return;
+  if (!player.chain) {
+    toast("FIND AN ORANGE CHAIN PICKUP FIRST");
+    return;
+  }
+  player.weapon = player.weapon === "chain" ? "fists" : "chain";
+  audio.sfx("weapon");
+  toast(player.weapon === "chain" ? "CHAIN EQUIPPED \xB7 REACH OUT AND RUIN SOMEONE" : "BARE KNUCKLES \xB7 THE PERSONAL TOUCH");
+}
+function strike(side, type) {
+  if (!player || finished || player.wreck > 0 || raceTime < 0 || player.cooldown > 0 || modal && !demo) return;
+  const chain = player.weapon === "chain" && type !== "kick", reach = chain ? 3.9 : 2.8, long = chain ? 6 : 4.5;
+  if (!side) {
+    const near = actors.filter((a) => a.kind === "rival" && !a.wreck).sort((a, b) => Math.hypot(a.s - player.s, (a.x - player.x) * 2) - Math.hypot(b.s - player.s, (b.x - player.x) * 2))[0];
+    side = near && near.x < player.x ? -1 : 1;
+  }
+  player.attack = side * (type === "kick" ? 2 : 1);
+  player.attackTime = 0.36;
+  player.cooldown = chain ? 0.75 : type === "kick" ? 0.8 : 0.48;
+  audio.sfx(type === "kick" ? "kick" : "punch");
+  let connected = false;
+  for (const a of actors) {
+    if (a.kind !== "rival" || a.wreck > 0) continue;
+    const dx = a.x - player.x, ds = Math.abs(a.s - player.s);
+    if (Math.sign(dx) === side && Math.abs(dx) < reach && ds < long) {
+      const dmg = chain ? 37 : type === "kick" ? 29 : 22;
+      hitRival(a, dmg, side, true, type === "kick");
+      connected = true;
+    }
+  }
+  if (online.active) for (const p of online.getPeers()) {
+    if (!p.state || p.age > 1500) continue;
+    const dx = p.state.x - player.x, ds = Math.abs(p.state.dist - player.s);
+    if (Math.sign(dx) === side && Math.abs(dx) < reach && ds < long) {
+      online.sendEvent("hit", { damage: chain ? 37 : type === "kick" ? 29 : 22, side }, p.id);
+      connected = true;
+    }
+  }
+  if (connected) {
+    player.hits++;
+    player.heat = clamp3(player.heat + 0.33, 0, 5);
+    audio.sfx("hit");
+    impact = 0.18;
+    world.burst(player.s + 1, player.x + side, chain ? "#f6df7c" : "#fff1d5", 12);
+  } else if (!demo && player.hits === 0) toast("GET ALONGSIDE \xB7 FISTS NEED A RIDER WITHIN REACH", 1.5);
+}
+function hitRival(a, damageAmount, side, local, kick = false, attacker = null) {
+  if (a.wreck > 0 || a.hp <= 0) return;
+  if (online.active && online.me !== online.simulationOwner && local) {
+    online.sendEvent("ai-hit", { id: a.id, damage: damageAmount, side }, online.simulationOwner);
+    return;
+  }
+  a.hp -= damageAmount;
+  a.body.applyImpulse({ x: side * (kick ? 15 : 8), y: 0, z: 2 }, true);
+  a.goalX = clamp3(a.x + side * 1.5, -6.1, 6.1);
+  if (a.hp <= 0) {
+    a.wreck = 4.5;
+    a.speed = 0;
+    if (attacker !== null) online.sendEvent("ai-ko", { name: a.name }, attacker);
+    a.body.setLinvel({ x: side * 3, y: 0, z: 0 }, true);
+    world.burst(a.s, a.x, "#ffb75e", 25);
+    if (local) {
+      player.knockouts++;
+      player.cash += 100;
+      player.heat = clamp3(player.heat + 0.7, 0, 5);
+      toast(`${a.name} DOWN \xB7 +$100`);
+      audio.voice(a.seed * 10, "hurt");
+    }
+  } else if (local && Math.random() < 0.32) {
+    taunt(a.name, a.line);
+    audio.voice(a.seed * 10, "taunt");
+  }
+}
+function damage(amount, from = "THE ROAD") {
+  if (!player || finished || player.invincible > 0 || player.wreck > 0) return;
+  if (demo) {
+    player.hp = Math.max(35, player.hp - amount * 0.15);
+    return;
+  }
+  player.hp -= amount / (player.bike.armor * (1 + (online.hubActive ? 0 : profile.armor) * 0.13));
+  player.invincible = 0.7;
+  impact = 0.65;
+  audio.sfx("hit", 1.2);
+  world.burst(player.s, player.x, "#ffbe67", 15);
+  $("flash").style.opacity = 0.55;
+  if (player.hp <= 0) wreck(from);
+  else if (amount > 15) taunt(from, from === "COUNTY PATROL" ? "Pull over. Let\u2019s make some paperwork." : "Your motorcycle would like a word.", 2.3);
+}
+function wreck(from) {
+  player.hp = 0;
+  player.wreck = 6;
+  player.wrecks++;
+  player.speed = 0;
+  player.busted = 0;
+  player.body.setLinvel({ x: Math.sin(simTime) * 2, y: 0, z: 0 }, true);
+  audio.sfx("crash");
+  audio.voice(53, "hurt");
+  world.burst(player.s, player.x, "#ff9252", 45);
+  taunt(from, "The road wins that round. Get up. Get even.", 4);
+  for (let i = 0; i < 7; i++) {
+    const body = physics.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(player.x, 1, -player.s).setLinvel((Math.random() - 0.5) * 12, 0, (Math.random() - 0.5) * 12));
+    body.setEnabledTranslations(true, false, true, true);
+    physics.createCollider(RAPIER.ColliderDesc.ball(0.12).setRestitution(0.7), body);
+    debris.push({ body, life: 2 });
+  }
+}
+function recover() {
+  if (!player || player.wreck <= 0) return;
+  if (player.wreck > 4.5) {
+    toast("LET THE ROAD STOP SPINNING FIRST", 1);
+    return;
+  }
+  player.wreck = 0;
+  player.hp = 65;
+  player.invincible = 2;
+  player.speed = 16;
+  player.x = clamp3(player.x, -5.7, 5.7);
+  player.body.setTranslation({ x: player.x, y: 1, z: -player.s }, true);
+  player.body.setLinvel({ x: 0, y: 0, z: -16 }, true);
+  audio.sfx("repair");
+  toast("BACK IN THE SADDLE \xB7 2 SECONDS OF GRACE");
+}
+function demoInput() {
+  const t = simTime;
+  let target = 2.4 + Math.sin(t * 0.65) * 2.9;
+  const nearby = actors.filter((a) => a.kind === "rival" && !a.wreck && Math.abs(a.s - player.s) < 20).sort((a, b) => Math.abs(a.s - player.s) - Math.abs(b.s - player.s))[0];
+  if (nearby) {
+    target = nearby.x + (nearby.x > 0 ? -1.9 : 1.9);
+    if (Math.abs(nearby.s - player.s) < 5) strike(Math.sign(nearby.x - player.x), t % 9 < 5 ? "punch" : "kick");
+  }
+  const traffic = actors.find((a) => a.kind === "traffic" && a.s > player.s && a.s - player.s < 33 && Math.abs(a.x - player.x) < 1.8);
+  if (traffic) target = traffic.x > 0 ? -0.7 : 2.5;
+  if (!nearby) {
+    const p = pickups.find((p2) => p2.active && p2.s > player.s && p2.s - player.s < 42);
+    if (p) target = p.x;
+  }
+  if (t > 30 && player.demoStage === 0) {
+    player.hp = 55;
+    player.demoStage = 1;
+  }
+  if (t > 45 && player.demoStage === 1) {
+    player.demoStage = 2;
+    wreck("BAD JUDGMENT");
+  }
+  if (player.wreck <= 0) player.hp = Math.max(35, player.hp);
+  player.boost = Math.max(70, player.boost);
+  player.heat = Math.min(5, 2.5 + t * 0.045);
+  if (t > 15) {
+    player.chain = true;
+    player.weapon = "chain";
+  }
+  return { x: clamp3((target - player.x) * 0.65, -1, 1), gas: nearby && nearby.s < player.s - 2 ? 0.35 : 1, brake: 0, boost: !nearby && t % 12 > 8, fire: false };
+}
+function raceRiders() {
+  const riders = [];
+  if (!finished) riders.push({ s: player.s, x: player.x, speed: player.speed, heat: player.heat, wreck: player.wreck, id: online.me });
+  if (online.active) for (const p of online.getPeers()) {
+    if (p.state && !p.state.finished && p.age < 5e3) riders.push({ s: p.state.dist, x: p.state.x, speed: p.state.speed, heat: p.state.heat || 0, wreck: p.state.wreck || 0, id: p.id });
+  }
+  return riders;
+}
+function updateActors(dt) {
+  const riders = raceRiders();
+  const anchor = riders.reduce((a, b) => b.s > a.s ? b : a, riders[0] || player);
+  const owner = !online.active || online.me === online.simulationOwner;
+  if (!owner && remoteWorld?.actors) {
+    for (const a of actors) {
+      const r = remoteWorld.actors.find((r2) => r2.id === a.id);
+      if (!r) continue;
+      a.s = lerp(a.s, r.s, Math.min(1, dt * 13));
+      a.x = lerp(a.x, r.x, Math.min(1, dt * 13));
+      a.speed = r.speed;
+      a.hp = r.hp ?? a.hp;
+      a.wreck = r.wreck || 0;
+      a.attack = r.attack || 0;
+      a.active = r.active ?? true;
+      a.finishTime = r.finishTime ?? null;
+      if (a.kind === "rival") {
+        a.body.setTranslation({ x: a.x, y: 1, z: -a.s }, true);
+        a.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      } else a.body.setNextKinematicTranslation({ x: a.x, y: 1, z: -a.s });
+    }
+    return;
+  }
+  for (const a of actors) {
+    if (a.kind === "rival") {
+      a.cooldown -= dt;
+      a.attackTime = Math.max(0, (a.attackTime || 0) - dt);
+      if (a.attackTime === 0) a.attack = 0;
+      if (a.wreck > 0) {
+        a.wreck -= dt;
+        a.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        if (a.wreck <= 0) {
+          a.hp = 75;
+          a.speed = 22;
+          a.goalX = clamp3(a.x, -5.5, 5.5);
+        }
+      } else {
+        const targetRider = riders.reduce((best, p) => Math.abs(p.s - a.s) < Math.abs(best.s - a.s) ? p : best, riders[0] || player);
+        const diff = anchor.s - a.s;
+        const base = 46.5 + route * 1.5 + Math.sin(simTime * 0.31 + a.seed) * 4.5;
+        const target = clamp3(base + diff * 0.038, 32, 60);
+        a.speed = lerp(a.speed, target, dt * 0.72);
+        const ds = targetRider.s - a.s;
+        if (Math.abs(ds) < 11 && a.cooldown < 1.2) a.goalX = clamp3(targetRider.x + (a.x > targetRider.x ? 1.8 : -1.8), -6, 6);
+        else if (Math.sin(simTime * 0.6 + a.seed) > 0.995) a.goalX = Math.sin(a.seed + simTime * 0.17) * 5.3;
+        for (const c of actors) {
+          if (c.kind === "traffic" && c.s > a.s && c.s - a.s < 27 && Math.abs(c.x - a.x) < 1.6) {
+            a.goalX = c.x > 0 ? -1 : 2.1;
+          }
+        }
+        const velocity = a.body.linvel();
+        a.body.setLinvel({ x: lerp(velocity.x, clamp3((a.goalX - a.x) * 1.9, -4.3, 4.3), dt * 5), y: 0, z: -a.speed }, true);
+        if (a.cooldown <= 0 && Math.abs(ds) < 4.2 && Math.abs(targetRider.x - a.x) < 2.65 && targetRider.wreck <= 0) {
+          a.attack = Math.sign(targetRider.x - a.x);
+          a.attackTime = 0.4;
+          a.cooldown = 2.4 + Math.sin(a.seed) * 0.8;
+          if (!demo) {
+            if (targetRider.id === online.me) {
+              damage(11 + route * 2, a.name);
+              player.body.applyImpulse({ x: Math.sign(player.x - a.x) * 6, y: 0, z: 0 }, true);
+            } else online.sendEvent("hit", { damage: 11 + route * 2, side: Math.sign(targetRider.x - a.x) }, targetRider.id);
+          }
+          audio.sfx("punch", 0.5);
+          if (Math.random() < 0.35) taunt(a.name, a.line);
+        }
+      }
+      if (a.s >= ROUTES2[route].length && !a.finishTime) a.finishTime = Math.max(0, raceTime);
+    } else if (a.kind === "traffic") {
+      a.s += a.speed * dt;
+      if (a.s < anchor.s - 95) {
+        a.s = anchor.s + 420 + Number(a.id.split("-")[1]) * 97 % 680;
+        a.near = false;
+      }
+      if (a.s > anchor.s + 1400) {
+        a.s = anchor.s + 160 + Number(a.id.split("-")[1]) * 73 % 650;
+        a.near = false;
+      }
+      a.body.setNextKinematicTranslation({ x: a.x, y: 1, z: -a.s });
+    } else if (a.kind === "police") {
+      if (anchor.heat >= 2.5 && !a.active) {
+        a.active = true;
+        a.s = anchor.s - 85;
+        a.speed = 55;
+        taunt("COUNTY PATROL", "You, the organ donor on two wheels. Pull over.", 4);
+        audio.voice(81, "taunt");
+      }
+      if (a.active) {
+        const chase = clamp3(anchor.speed + (anchor.s - 9 - a.s) * 0.85, 25, 67);
+        a.speed = lerp(a.speed, chase, dt * 0.9);
+        a.s += a.speed * dt;
+        a.x = lerp(a.x, clamp3(anchor.x, -5.3, 5.3), dt * 0.4);
+        if (anchor.s - a.s > 190) {
+          a.active = false;
+          player.heat = Math.max(0, player.heat - 1.8);
+          toast("PATROL LOST \xB7 FOR NOW");
+        }
+        a.body.setNextKinematicTranslation({ x: a.x, y: 1, z: -a.s });
+      } else {
+        a.s = anchor.s - 200;
+        a.body.setNextKinematicTranslation({ x: 0, y: 1, z: -a.s });
+      }
+    }
+  }
+}
+function updatePeers() {
+  if (!online.active) return;
+  const existing = /* @__PURE__ */ new Set();
+  for (const p of online.collisionPeers()) {
+    if (!p.state || p.age > 1800) continue;
+    const id = "peer-" + p.id;
+    existing.add(id);
+    let body = remoteBodies.get(id);
+    if (!body) {
+      body = addBody(id, p.state.x, p.state.dist, "peer");
+      remoteBodies.set(id, body);
+    }
+    body.setNextKinematicTranslation({ x: p.state.x, y: 1, z: -p.state.dist });
+  }
+  for (const [id, b] of remoteBodies) {
+    if (!existing.has(id)) {
+      physics.removeRigidBody(b);
+      remoteBodies.delete(id);
+    }
+  }
+}
+function step(dt) {
+  if (!player || finished || stopped) return;
+  const shared = online.active && !demo;
+  if (shared) raceTime = online.time() / 1e3;
+  else raceTime += dt;
+  if (!Number.isFinite(raceTime)) {
+    raceTime = -3;
+    return;
+  }
+  if (raceTime < 0) {
+    const n = Math.ceil(-raceTime);
+    if (n !== countdownLast) {
+      countdownLast = n;
+      audio.sfx("countdown");
+    }
+    return;
+  }
+  if (!goSound) {
+    goSound = true;
+    audio.sfx("go");
+    if (demo) player.speed = 30;
+  }
+  simTime += dt;
+  worldTick += dt;
+  player.cooldown = Math.max(0, player.cooldown - dt);
+  player.invincible = Math.max(0, player.invincible - dt);
+  player.attackTime = Math.max(0, player.attackTime - dt);
+  if (!player.attackTime) player.attack = 0;
+  let input = demo ? demoInput() : currentInput;
+  if (player.wreck > 0) {
+    player.wreck -= dt;
+    input = { x: 0, gas: 0, brake: 1, boost: false };
+    if (player.wreck <= 0.02) {
+      player.wreck = 0.03;
+      recover();
+    }
+  }
+  const bike = player.bike, eng = online.hubActive ? 0 : profile.engine, tank = online.hubActive ? 0 : profile.tank;
+  const maxBoost = 100 + tank * 20;
+  const boosting = input.boost && player.boost > 0 && player.speed > 8 && input.brake < 0.2 && player.wreck <= 0;
+  if (boosting) {
+    if (!player.wasBoosting) audio.sfx("nitro");
+    player.boost = Math.max(0, player.boost - dt * 24);
+    player.boostUsed += dt;
+  } else player.boost = Math.min(maxBoost, player.boost + dt * (3.5 + tank * 0.6));
+  player.wasBoosting = boosting;
+  const gas = settings.autoGas ? Math.max(0.9, input.gas) : input.gas;
+  const limit = (bike.speed + eng * 2.2) * (boosting ? 1.24 : 1);
+  const offroad = Math.abs(player.x) > 9.55;
+  const drag = 0.8 + player.speed * 0.015 + (offroad ? 10 : 0);
+  const accel = gas * (bike.accel + eng * 1.1) * (1 - Math.pow(clamp3(player.speed / (limit + 2), 0, 1), 2.5));
+  player.speed = clamp3(player.speed + (accel - drag - input.brake * 25 + (boosting ? 10 : 0)) * dt, 0, limit + 3);
+  if (player.wreck > 0) player.speed = 0;
+  if (Math.abs(player.x) > 10.8) {
+    player.x = clamp3(player.x, -10.8, 10.8);
+    player.body.setTranslation({ x: player.x, y: 1, z: -player.s }, true);
+    player.speed *= 0.85;
+    damage(12, "THE SHOULDER");
+  }
+  const velocity = player.body.linvel();
+  const curve = (pathAngle(player.s + 8) - pathAngle(player.s - 8)) / 16;
+  const turn = input.x * (2.7 + player.speed * 0.057) * bike.handling * (offroad ? 0.7 : 1) + curve * player.speed * player.speed * 0.24;
+  player.body.setLinvel({ x: lerp(velocity.x, turn, Math.min(1, dt * 8)), y: 0, z: -player.speed }, true);
+  player.lean = lerp(player.lean, -input.x * 0.44, dt * 7);
+  updateActors(dt);
+  updatePeers();
+  physics.step(eventQueue);
+  const pos = player.body.translation();
+  player.x = pos.x;
+  player.s = Math.max(0, -pos.z);
+  player.speed = clamp3(-player.body.linvel().z, 0, 100);
+  for (const a of actors) {
+    if (a.kind === "rival") {
+      const p = a.body.translation();
+      a.x = p.x;
+      a.s = -p.z;
+      if (Math.abs(a.x) > 8) {
+        a.goalX = clamp3(a.x, -5, 5);
+        a.speed *= 0.98;
+      }
+    }
+  }
+  eventQueue.drainCollisionEvents((h1, h2, started) => {
+    if (!started || demo) return;
+    const a = colliders.get(h1), b = colliders.get(h2);
+    if (!a || !b) return;
+    const other = a.kind === "player" ? b : b.kind === "player" ? a : null;
+    if (!other) return;
+    if (other.kind === "traffic" || other.kind === "police") {
+      const obj = actors.find((a2) => a2.id === other.id), rel = Math.abs(player.speed - (obj?.speed || 0));
+      damage(clamp3(rel * 0.7, 12, 48), other.kind === "police" ? "COUNTY PATROL" : "TRAFFIC");
+      player.speed *= 0.52;
+      player.body.applyImpulse({ x: player.x > (obj?.x || 0) ? 12 : -12, y: 0, z: 10 }, true);
+      audio.sfx("crash", 0.7);
+      player.heat = clamp3(player.heat + 0.25, 0, 5);
+    } else if (other.kind === "rival" || other.kind === "peer") {
+      damage(4, "ELBOW ROOM");
+      audio.sfx("hit", 0.25);
+    }
+  });
+  for (const p of pickups) {
+    if (!p.active) continue;
+    if (Math.abs(p.s - player.s) < 3.4 && Math.abs(p.x - player.x) < 1.35) {
+      p.active = false;
+      audio.sfx("pickup");
+      world.burst(p.s, p.x, p.type === "boost" ? "#7be8ee" : p.type === "repair" ? "#ccff72" : "#ff9d55", 16);
+      if (p.type === "boost") {
+        player.boost = Math.min(maxBoost, player.boost + 55);
+        toast("NITROUS +55 \xB7 AN EXCELLENT BAD IDEA", 1.5);
+      } else if (p.type === "repair") {
+        player.hp = Math.min(100, player.hp + 32);
+        toast("BIKE REPAIRED +32 \xB7 GOOD AS QUESTIONABLE", 1.5);
+      } else {
+        player.chain = true;
+        player.weapon = "chain";
+        audio.sfx("weapon");
+        toast("CHAIN ACQUIRED \xB7 LONGER REACH, WORSE MANNERS");
+      }
+    }
+  }
+  for (const a of actors) {
+    if (a.kind !== "traffic" || a.near) continue;
+    if (a.s < player.s - 3 && a.s > player.s - 8) {
+      a.near = true;
+      if (Math.abs(a.x - player.x) < 2.6 && Math.abs(a.x - player.x) > 1.15 && player.speed > 28) {
+        player.near++;
+        player.cash += 25;
+        player.boost = Math.min(maxBoost, player.boost + 7);
+        player.heat = clamp3(player.heat + 0.08, 0, 5);
+        audio.sfx("nearMiss");
+        if (!demo) toast("CLOSE CALL \xB7 +$25 / +7 NITROUS", 1.4);
+      }
+    }
+  }
+  const patrol = actors.find((a) => a.kind === "police");
+  if (patrol?.active && Math.abs(patrol.s - player.s) < 14 && player.speed < 13 && player.wreck <= 0) {
+    player.busted += dt;
+    if (player.busted > 4) {
+      player.cash = Math.max(0, player.cash - 150);
+      player.heat = 0;
+      patrol.active = false;
+      patrol.s = player.s - 180;
+      player.busted = 0;
+      player.speed = 10;
+      player.s = Math.max(0, player.s - 35);
+      player.body.setTranslation({ x: 3, y: 1, z: -player.s }, true);
+      audio.sfx("busted");
+      taunt("COUNTY PATROL", "A $150 donation to the county. How generous.", 4);
+    }
+  } else player.busted = Math.max(0, player.busted - dt * 2);
+  if (player.speed > 44) player.heat = Math.max(0, player.heat - dt * 0.018);
+  player.top = Math.max(player.top, player.speed * 3.6);
+  for (let i = debris.length - 1; i >= 0; i--) {
+    debris[i].life -= dt;
+    if (debris[i].life <= 0) {
+      physics.removeRigidBody(debris[i].body);
+      debris.splice(i, 1);
+    }
+  }
+  const cp = Math.floor(player.s / 1200);
+  if (cp > lastCheckpoint && player.s < ROUTES2[route].length - 100) {
+    lastCheckpoint = cp;
+    audio.sfx("pickup");
+    toast(`CHECKPOINT ${cp} \xB7 ${(Math.max(0, ROUTES2[route].length - player.s) / 1e3).toFixed(1)} KM TO GO`);
+  }
+  if (player.s >= ROUTES2[route].length) {
+    if (demo) {
+      startRace(true);
+    } else finishRace();
+  }
+  if (demo && simTime > 115) startRace(true);
+  if (!demo && Math.floor(simTime / 10) !== lastTip) {
+    lastTip = Math.floor(simTime / 10);
+    const tip = TIPS[lastTip % TIPS.length];
+    $("hud-tip").innerHTML = `<strong>${tip[0]}</strong>${tip[1]}`;
+  }
+}
+function position() {
+  return 1 + actors.filter((a) => a.kind === "rival" && (a.finishTime || a.s > player.s)).length + (online.active ? online.getPeers().filter((p) => p.state?.dist > player.s).length : 0);
+}
+function finishRace(timedOut = false) {
+  if (finished || !player) return;
+  finished = true;
+  player.finishTime = raceTime;
+  player.speed = 0;
+  player.body?.setLinvel({ x: 0, y: 0, z: 0 }, true);
+  const pos = position(), contract = !timedOut && pos <= 3 ? Math.round(ROUTES2[route].prize * (pos === 1 ? 1 : pos === 2 ? 0.7 : 0.5)) : 150;
+  const earned = contract + player.cash;
+  resultData = { pos, timedOut, earned, contract, time: Math.max(0, raceTime) };
+  if (!demo) {
+    profile.cash += earned;
+    profile.races++;
+    if (pos === 1 && !timedOut) profile.wins++;
+    if (!timedOut) {
+      const old = profile.best[route];
+      profile.best[route] = old ? Math.min(old, raceTime) : raceTime;
+    }
+    persist();
+  }
+  if (online.active) {
+    online.finish({ ...timedOut ? { score: Math.round(player.s) } : { time: Math.round(online.time()) }, stats: { knockouts: player.knockouts, nearMisses: player.near, topSpeed: Math.round(player.top) }, awards: player.knockouts >= 3 ? ["Trouble magnet"] : [] });
+  }
+  audio.sfx("finish");
+  audio.setMode("results");
+  if (!stopped) audio.voice(32, "cheer");
+  openModal("results");
+}
+function showResults() {
+  const r = resultData;
+  if (!r) return;
+  modal = "results";
+  $("modal").classList.remove("hidden");
+  const rivals = actors.filter((a) => a.kind === "rival").map((a) => ({ name: a.name, dist: a.s, time: a.finishTime, you: false }));
+  rivals.push({ name: "YOU", dist: player.s, time: r.timedOut ? null : r.time, you: true });
+  if (online.active) for (const p of online.getPeers()) rivals.push({ name: p.name, dist: p.state?.dist || 0, time: p.state?.finished ? p.state.time : null });
+  rivals.sort((a, b) => a.time && b.time ? a.time - b.time : a.time ? -1 : b.time ? 1 : b.dist - a.dist);
+  $("panel").innerHTML = `<div class="panel-head"><div><div class="label">${ROUTES2[route].name.toUpperCase()} / ${r.timedOut ? "THE COUNTY CALLED TIME" : "CONTRACT COMPLETE"}</div><h2>${r.pos === 1 && !r.timedOut ? "BAD NEWS TRAVELS FAST." : r.pos <= 3 && !r.timedOut ? "UGLY RIDING. PRETTY PAYDAY." : "THE ROAD KEEPS THE RECEIPT."}</h2></div></div><div class="results-layout"><div><div class="result-number">${r.pos}<small> / ${rivals.length}</small></div><p>${r.timedOut ? "Time\u2019s up. You made " + (player.s / 1e3).toFixed(2) + " km of questionable choices." : r.pos <= 3 ? "You got the job done. The county would like a quiet word." : "No contract bonus. But the hospital appreciates your business."}</p><div class="result-stat"><span>FINISH TIME</span><span>${r.timedOut ? "DNF" : fmt(r.time)}</span></div><div class="result-stat"><span>CONTRACT / RACE PAY</span><span>$${r.contract}</span></div><div class="result-stat"><span>DIRTY MONEY</span><span>$${player.cash}</span></div><div class="result-stat"><span>TOTAL BANKED</span><span>$${r.earned}</span></div><div class="result-stat"><span>KNOCKOUTS / CLOSE CALLS</span><span>${player.knockouts} / ${player.near}</span></div><div class="result-stat"><span>TOP SPEED / WRECKS</span><span>${Math.round(player.top)} KM/H / ${player.wrecks}</span></div></div><div><div class="label" style="margin-bottom:15px">THE USUAL SUSPECTS</div><table class="leaderboard">${rivals.map((a, i) => `<tr class="${a.you ? "you" : ""}"><td>${String(i + 1).padStart(2, "0")}</td><td>${esc(a.name)}</td><td style="text-align:right">${a.time ? fmt(a.time) : a.you ? "DNF" : (a.dist / 1e3).toFixed(2) + " KM"}</td></tr>`).join("")}</table><p class="muted">${online.hubActive ? "Your result has been sent to AI Hub. The hub will deal the next round." : `WALLET: $${profile.cash.toLocaleString()} \xB7 BEST: ${profile.best[route] ? fmt(profile.best[route]) : "SET ONE"}`}</p></div></div>${online.hubActive ? '<div class="notice-line">CREW ROUND COMPLETE \xB7 WAITING FOR THE HUB</div>' : `<div class="actions"><button class="menu-button primary" data-action="next">NEXT EVENT <span>\u2197</span></button><button class="menu-button" data-action="garage">THE GARAGE</button><button class="menu-button" data-action="retry">RUN IT BACK</button><button class="menu-button" data-action="quit">MAIN MENU</button></div>`}`;
+  focusButton(0);
+}
+function updateHUD() {
+  if (!player) return;
+  $("pos").textContent = position();
+  $("speed").textContent = String(Math.round(player.speed * 3.6)).padStart(3, "0");
+  $("time").textContent = fmt(raceTime);
+  $("distance").textContent = `${(player.s / 1e3).toFixed(2)} / ${(ROUTES2[route].length / 1e3).toFixed(2)} KM`;
+  $("progress").style.width = clamp3(player.s / ROUTES2[route].length * 100, 0, 100) + "%";
+  $("hp-num").textContent = Math.ceil(player.hp);
+  $("hp-bar").style.width = clamp3(player.hp, 0, 100) + "%";
+  $("hp-bar").style.background = player.hp < 30 ? "#ff7649" : "#d8ff64";
+  $("boost-num").textContent = Math.ceil(player.boost);
+  $("boost-bar").style.width = player.boost / (100 + (online.hubActive ? 0 : profile.tank) * 20) * 100 + "%";
+  $("weapon-label").textContent = player.weapon === "chain" ? "STEEL CHAIN" : "BARE KNUCKLES";
+  $("race-cash").textContent = `$ ${player.cash} DIRTY MONEY`;
+  $("heat").textContent = Array.from({ length: 5 }, (_, i) => i < Math.ceil(player.heat) ? "\u25CF" : "\u25CB").join(" ");
+  const rev = player.speed / ((player.bike?.speed || 60) + profile.engine * 2);
+  $("rpm").querySelectorAll("i").forEach((el, i) => el.classList.toggle("on", i < rev * 12));
+  let msg = "", sub = "";
+  if (raceTime < 0) {
+    msg = Number.isFinite(raceTime) ? Math.ceil(-raceTime) : "GET READY";
+    sub = "R2 / W \u2014 ACCELERATE";
+  } else if (raceTime < 1) {
+    msg = "MISBEHAVE.";
+    sub = "MAKE IT COUNT.";
+  }
+  if (player.wreck > 0) {
+    msg = "THAT\u2019LL LEAVE A MARK.";
+    sub = player.wreck > 4.5 ? "GET YOUR BEARINGS\u2026" : "\u25B3 / R \u2014 GET BACK ON THE BIKE";
+  } else if (player.busted > 0) {
+    msg = "SHAKE THE PATROL";
+    sub = `R2 / W \u2014 MOVE IT!  ${Math.max(0, 4 - player.busted).toFixed(1)}s`;
+  }
+  $("race-message").textContent = msg;
+  $("race-submessage").textContent = sub;
+}
+function drawMap() {
+  if (!player) return;
+  const c = $("map").getContext("2d");
+  c.clearRect(0, 0, 140, 360);
+  const path = (s) => 70 + Math.sin(s / 190) * 17 + Math.sin(s / 510) * 14;
+  const lo = player.s - 90, scale = 1.5;
+  c.strokeStyle = "#123a39cc";
+  c.lineWidth = 28;
+  c.lineCap = "round";
+  c.beginPath();
+  for (let i = 0; i <= 330; i += 5) {
+    const s = lo + (330 - i) * scale;
+    c.lineTo(path(s), i + 15);
+  }
+  c.stroke();
+  c.strokeStyle = "#fff5";
+  c.lineWidth = 1.3;
+  c.setLineDash([5, 9]);
+  c.stroke();
+  c.setLineDash([]);
+  for (const a of actors.filter((a2) => a2.kind === "rival" || a2.kind === "police" && a2.active)) {
+    const y2 = 345 - (a.s - lo) / scale;
+    if (y2 < 10 || y2 > 350) continue;
+    c.fillStyle = a.color;
+    c.beginPath();
+    c.arc(path(a.s) + a.x * 2, y2, 4, 0, Math.PI * 2);
+    c.fill();
+  }
+  if (online.active) for (const p of online.getPeers()) {
+    if (!p.state) continue;
+    const y2 = 345 - (p.state.dist - lo) / scale;
+    if (y2 < 10 || y2 > 350) continue;
+    c.fillStyle = p.color;
+    c.fillRect(path(p.state.dist) + p.state.x * 2 - 4, y2 - 4, 8, 8);
+  }
+  const y = 345 - (player.s - lo) / scale;
+  c.fillStyle = "#d8ff64";
+  c.beginPath();
+  c.moveTo(path(player.s) + player.x * 2, y - 8);
+  c.lineTo(path(player.s) + player.x * 2 + 6, y + 5);
+  c.lineTo(path(player.s) + player.x * 2 - 6, y + 5);
+  c.fill();
+}
+function visualState() {
+  if (mode === "title") return { mode: modal === "garage" ? "garage" : "title", s: 120, x: 2.6, speed: 0, time: globalTime, camera: settings.camera, playerId: "player", vehicles: [{ id: "player", type: "bike", player: true, s: 120, x: 2.6, color: BIKES[profile.bike].color, lean: 0, chain: profile.owned.includes(2) }], pickups: [], route };
+  const vehicles = [{ id: "player", type: "bike", player: true, s: player.s, x: player.x, color: player.bike.color, lean: player.lean, speed: player.speed, attack: player.attack, crashed: player.wreck > 0, boost: player.wasBoosting, chain: player.weapon === "chain", invincible: player.invincible }];
+  for (const a of actors) {
+    if (a.kind === "police" && !a.active) continue;
+    vehicles.push({ id: a.id, type: a.kind === "rival" ? "bike" : a.kind === "police" ? "police" : a.carType, s: a.s, x: a.x, color: a.color, speed: a.speed, lean: a.kind === "rival" ? clamp3((a.goalX - a.x) * -0.12, -0.4, 0.4) : 0, attack: a.attack, crashed: a.wreck > 0, chain: a.name === "PEACH", name: a.name });
+  }
+  if (online.active) for (const p of online.getPeers()) {
+    if (!p.state || p.age > 4e3) continue;
+    vehicles.push({ id: "peer-" + p.id, type: "bike", s: p.state.dist, x: p.state.x, color: p.color, lean: p.state.lean, attack: p.state.attack, crashed: p.state.wreck > 0, boost: p.state.boost, chain: p.state.chain, name: p.name, remote: true, speed: p.state.speed });
+  }
+  return { mode, s: player.s, x: player.x, speed: player.speed, lean: player.lean, boost: player.wasBoosting, time: globalTime, camera: settings.camera, shake: settings.shake ? impact : 0, vehicles, pickups, playerId: "player", route };
+}
+function advanceFinishedWorld(dt) {
+  if (!online.active || stopped || !physics) return;
+  raceTime = online.time() / 1e3;
+  simTime += dt;
+  worldTick += dt;
+  updateActors(dt);
+  updatePeers();
+  physics.step();
+  for (const a of actors) {
+    if (a.kind === "rival") {
+      const p = a.body.translation();
+      a.x = p.x;
+      a.s = -p.z;
+    }
+  }
+}
+function frame(now2) {
+  const dt = Math.min((now2 - frameTime) / 1e3, 0.1);
+  frameTime = now2;
+  globalTime += dt;
+  readInput(dt);
+  if (mode === "title" && !modal && !online.active) {
+    const idle = (now2 - lastInput) / 1e3;
+    $("idle-count").textContent = `DEMO RIDE IN ${Math.max(0, Math.ceil(10 - idle))}`;
+    if (idle >= 10) startRace(true);
+  }
+  const running = (mode === "race" || mode === "attract") && (!modal || online.active || demo) && !finished && !stopped;
+  if (running) {
+    accumulator += dt;
+    let steps = 0;
+    while (accumulator >= 1 / 60 && steps < 6) {
+      step(1 / 60);
+      accumulator -= 1 / 60;
+      steps++;
+    }
+    if (steps === 6) accumulator = 0;
+  }
+  if (finished && online.active && !stopped) advanceFinishedWorld(dt);
+  if (online.active && player && mode === "race" && !stopped) {
+    const own = online.me === online.simulationOwner;
+    online.tick(dt, { x: player.x, y: 1, z: -player.s, vx: player.body.linvel().x, vz: -player.speed, dist: player.s, speed: player.speed, lean: player.lean, attack: player.attack, wreck: player.wreck, boost: player.wasBoosting, chain: player.weapon === "chain", heat: player.heat, finished, time: player.finishTime }, own ? { actors: actors.map((a) => ({ id: a.id, s: a.s, x: a.x, speed: a.speed, hp: a.hp, wreck: a.wreck, attack: a.attack, active: a.active, finishTime: a.finishTime })) } : void 0);
+  }
+  if (player && (mode === "race" || mode === "attract")) {
+    if (globalTime - lastUi > 0.05) {
+      updateHUD();
+      lastUi = globalTime;
+    }
+    if (globalTime - lastMap > 0.1) {
+      drawMap();
+      lastMap = globalTime;
+    }
+  }
+  if (toastTime > 0) {
+    toastTime -= dt;
+    if (toastTime <= 0) $("toast").classList.add("hidden");
+  }
+  if (tauntTime > 0) {
+    tauntTime -= dt;
+    if (tauntTime <= 0) $("taunt").style.opacity = 0;
+  }
+  impact = Math.max(0, impact - dt * 1.8);
+  $("flash").style.opacity = impact * 0.5;
+  const patrol = actors.find((a) => a.kind === "police");
+  audio.update(dt, { speed: player && mode !== "title" ? player.speed * 3.6 : 0, nitro: running && player?.wasBoosting, police: running && patrol?.active && Math.abs(patrol.s - player.s) < 90, racing: running && raceTime >= 0 });
+  world.render(dt, visualState());
+  requestAnimationFrame(frame);
+}
+async function boot() {
+  try {
+    if (!navigator.gpu) throw new Error("WebGPU is required. Open this file in a WebGPU-capable browser on HTTPS or localhost.");
+    $("load-status").textContent = "BUILDING THE COAST \xB7 WEBGPU ONLY";
+    await Promise.all([world.init($("world")), RAPIER.init()]);
+    $("load-status").textContent = "CHECKING THE CREW";
+    await online.init();
+    ready = true;
+    setRoute(0);
+    $("rpm").innerHTML = "<i></i>".repeat(12);
+    $("attract").querySelector(".attract-bottom").textContent = "ANY INPUT RETURNS TO THE MENU";
+    online.probe(() => ({ scene: finished ? "over" : mode === "title" ? modal ? "menu" : "title" : raceTime < 0 ? "ready" : "play", menu: !!modal, world: worldTick, input: { x: currentInput.x, y: currentInput.y || currentInput.gas - currentInput.brake, fire: currentInput.fire || currentInput.boost } }));
+    window.__roadMisbehavior = { get state() {
+      return { ready, mode, modal, raceTime, simTime, route, finished, player: player ? { s: player.s, x: player.x, hp: player.hp, boost: player.boost, speed: player.speed, chain: player.chain, knockouts: player.knockouts } : null, renderer: world.renderer?.backend?.constructor?.name, online: online.active };
+    }, startRace, openModal, showTitle, world, online };
+    $("loading").classList.add("hidden");
+    if (online.hubActive) {
+      startRace(false, {}, true);
+      online.ready();
+    } else {
+      showTitle();
+      if (matchMedia("(pointer:coarse)").matches && !Array.from(navigator.getGamepads?.() || []).some(Boolean)) $("touch").classList.remove("hidden");
+    }
+    frameTime = performance.now();
+    requestAnimationFrame(frame);
+  } catch (error) {
+    console.error(error);
+    $("load-line").style.display = "none";
+    $("load-status").textContent = "THE ENGINE COULDN\u2019T TURN OVER";
+    $("error").textContent = error.message + "\n\nUse current Chrome or Edge with WebGPU enabled. This demo has no rendering fallback. Network access is needed for the engine dependencies.";
+    $("retry-error").style.display = "inline-block";
+    globalThis.AIHub?.fail(error.message);
+  }
+}
+boot();
+
+</script>
+</body>
+</html>

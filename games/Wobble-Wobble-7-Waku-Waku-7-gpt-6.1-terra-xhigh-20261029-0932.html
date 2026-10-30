@@ -1,0 +1,635 @@
+<!doctype html>
+<!--
+Source Information
+Date: 2026-10-29 09:32
+Source: Waku Waku 7
+Tech: Three.js r180 WebGPU; Rapier 0.19.3; Web Audio; Gamepad API; PeerJS 1.5.5; AI Hub Session Protocol v1.
+Art Direction: original, colorful cel-shaded toy-box arcade fighters.
+Animation: procedural articulated meshes and action poses.
+Audio: original synthesized music, effects and gibberish voices via Web Audio.
+Online: AI Hub parallel score sessions; standalone PeerJS room connection; local versus.
+Testing: lightweight browser smoke test; WebGPU required. Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort xhigh. Usage: unknown.
+Testing Feedback: 3 issues caught, 1 game-breaking (Rapier method); most useful: headless match smoke test; least useful: static inspection. WebGPU visual output, remote multiplayer and the hub harness remain unverified on supported hardware.
+Engine Feedback: Three.js makes procedural 3D approachable. I guessed a Rapier descriptor method wrong and corrected it. Combat, animation and UI needed custom implementation. WebGPU initialization and browser support were hardest. I would overhaul diagnostics for WebGPU initialization; clearer adapter and device failure messages would help.
+Prompt Feedback: The expressive arcade direction is welcome; exact desired online topology was open to interpretation. The hardest part was fitting an arcade fighting slice and networking into a single file. A real two-controller, two-device playtest would be the most valuable additional test.
+-->
+<html lang="en"><head><meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="4"><meta name="hub:session-goal" content="Earn the highest arcade score"><meta name="hub:session-howto" content="Move stick; Cross punch, Square kick, Triangle special, R1 guard"><meta name="hub:webgpu" content="required">
+<title>Wobble Wobble 7</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "rapier": "/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@700;800;900&family=Titan+One&display=swap');
+:root{--ink:#291a48;--cream:#fff5d5;--pink:#ff4f85;--yellow:#ffd346;--cyan:#73e9ea}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#281852;color:var(--cream);font-family:Nunito,system-ui,sans-serif}canvas{display:block;width:100%;height:100%}button{font:inherit;color:inherit;cursor:pointer}#ui{position:absolute;inset:0;pointer-events:none;overflow:hidden}#ui button,#ui input{pointer-events:auto}.screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(90deg,rgba(34,16,66,.9),rgba(47,24,76,.55) 60%,rgba(26,13,50,.25));padding:3vh 5vw}.hidden{display:none!important}.eyebrow{font-size:clamp(12px,1.3vw,20px);font-weight:900;letter-spacing:.26em;text-transform:uppercase;color:var(--cyan)}h1,h2,h3,p{margin:0}h1,h2,.big{font-family:'Titan One',Nunito,sans-serif;font-weight:400}h1{font-size:clamp(56px,8.8vw,140px);line-height:.83;letter-spacing:-.035em;color:var(--yellow);text-shadow:5px 6px 0 #df3f80,9px 10px 0 #39205d;transform:rotate(-3deg);margin:2vh 0 3vh;text-align:center}h1 span{color:#fff1d0}.tagline{font-size:clamp(16px,1.7vw,26px);font-weight:900;color:#fff4d0;margin:0 0 3vh;text-align:center}.menu{display:flex;flex-direction:column;gap:1vh;width:min(380px,80vw)}.menu button,.pill{border:3px solid #fff3d3;background:#593583;border-radius:999px;padding:.65em 1.3em;font-size:clamp(16px,1.55vw,24px);font-weight:900;box-shadow:0 5px 0 #251444;transition:.12s}.menu button:hover,.menu button.focus,.pill:hover{background:var(--yellow);color:var(--ink);transform:translateX(7px)}.hint{position:absolute;bottom:3vh;text-align:center;font-size:clamp(12px,1.1vw,17px);font-weight:800;opacity:.8}.corner{position:absolute;top:3vh;right:3vw;pointer-events:auto;border:2px solid #fff7;background:#2a1b49bb;border-radius:999px;padding:.5em 1em;font-weight:900;font-size:clamp(13px,1vw,18px)}.card{width:min(900px,90vw);max-height:82vh;overflow:auto;border:4px solid #ffe8a9;border-radius:30px;background:#38205aeF;box-shadow:0 12px 0 #1b1036;padding:clamp(20px,3vw,45px)}.card h2{font-size:clamp(32px,4vw,62px);color:var(--yellow);margin-bottom:.3em}.card p{font-size:clamp(14px,1.3vw,20px);line-height:1.45;margin:.5em 0}.row{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:.55em 0;border-bottom:1px solid #ffffff25;font-size:clamp(16px,1.4vw,23px)}.row button{background:#6b438f;border:2px solid #ffe7ba;border-radius:100px;padding:.3em 1em;min-width:110px}.row button.focus,.row button:hover{background:var(--yellow);color:var(--ink)}.small{font-size:clamp(12px,1vw,16px)!important;opacity:.8}.grid{display:grid;grid-template-columns:1fr 1fr;gap:1vw}.choose{display:flex;gap:1vw;margin:2vh 0;flex-wrap:wrap;justify-content:center}.fighterPick{width:clamp(130px,17vw,235px);background:#583780;border:4px solid #fff5d5;border-radius:24px;padding:1em;text-align:center;box-shadow:0 6px #241341}.fighterPick.focus,.fighterPick:hover{background:#f85c8e;transform:translateY(-4px)}.fighterPick b{display:block;font-family:'Titan One';font-size:clamp(20px,2vw,30px)}.fighterPick small{display:block;margin-top:.4em}.badge{font-size:clamp(35px,5vw,70px);display:block}.hud{position:absolute;top:3vh;left:3vw;right:3vw;display:grid;grid-template-columns:1fr auto 1fr;gap:2vw;align-items:start}.hudSide.right{text-align:right}.name{font-family:'Titan One';font-size:clamp(18px,2.1vw,34px);text-shadow:2px 3px #3a2057}.bar{height:clamp(15px,2.1vw,28px);border:4px solid #fff3d4;background:#5a285c;border-radius:50px;overflow:hidden;box-shadow:0 4px #30183f}.fill{height:100%;background:linear-gradient(90deg,#ffdd49,#ff6b83);width:100%;transition:width .12s}.right .fill{margin-left:auto;background:linear-gradient(90deg,#62d7ec,#b4fc96)}.meter{margin-top:6px;height:8px;background:#291849;border-radius:9px;overflow:hidden}.meter i{display:block;height:100%;width:0;background:#7cf3ff}.timer{font-family:'Titan One';font-size:clamp(26px,4vw,60px);color:#ffe45b;text-shadow:3px 4px #54295b}.rounds{font-weight:900;color:#ffe56e;letter-spacing:.2em}.centerCall{position:absolute;top:34%;left:0;right:0;text-align:center;font-family:'Titan One';font-size:clamp(44px,7vw,100px);color:#ffdf4c;text-shadow:5px 6px #d5467c;transform:rotate(-4deg)}.combatHint{position:absolute;bottom:3vh;left:0;right:0;text-align:center;font-size:clamp(12px,1.2vw,18px);font-weight:900;text-shadow:1px 2px #26113e}.score{position:absolute;top:16vh;left:3vw;font-weight:900;color:#fff2c4;font-size:clamp(13px,1.3vw,20px)}#toast{position:absolute;bottom:9vh;left:50%;transform:translateX(-50%);background:#342056dd;border:2px solid #ffeca5;border-radius:50px;padding:.5em 1.2em;font-weight:900;white-space:nowrap}.input{background:#251638;color:white;border:2px solid #ffedc0;border-radius:10px;font-size:20px;padding:.5em;width:100%;text-transform:uppercase}.loading{position:absolute;inset:0;background:#261641;display:grid;place-items:center;font-size:24px;font-weight:900;text-align:center;padding:20px}
+@media(max-height:650px){h1{font-size:clamp(48px,13vh,100px);margin:1vh 0 1.5vh}.tagline{margin-bottom:1vh}.menu{gap:.5vh}.menu button{padding:.42em 1.2em;font-size:clamp(14px,3.8vh,20px)}.hint{bottom:1vh;font-size:11px}.eyebrow{font-size:11px}}
+</style></head><body><div id="world"></div><div id="ui"><div id="loading" class="loading">WARMING UP THE WOBBLE MACHINE…</div><div id="title" class="screen hidden"><div class="eyebrow">A VERY UNREASONABLE FIGHTING FESTIVAL</div><h1>WOBBLE<br><span>WOBBLE</span> 7</h1><p class="tagline">Seven wishes. One shiny prize. Absolutely no dignity.</p><div class="menu" id="titleMenu"><button data-action="arcade">ARCADE STORY</button><button data-action="local">LOCAL VERSUS</button><button data-action="online">ONLINE ROOM</button><button data-action="how">HOW TO PLAY</button><button data-action="about">ABOUT / CREDITS</button></div><div class="hint">↑ ↓ CHOOSE &nbsp; • &nbsp; ✕ / ENTER SELECT &nbsp; • &nbsp; OPTIONS / ESC SETTINGS</div></div><button id="settingsButton" class="corner hidden" data-action="settings">⚙ SETTINGS</button><div id="select" class="screen hidden"><div class="eyebrow" id="selectTop">PICK YOUR TROUBLEMAKER</div><h2 class="big" style="font-size:clamp(36px,5vw,76px);color:#ffdf4b">WHO'S GOT THE WOBBLE?</h2><div class="choose" id="fighters"></div><p class="tagline" id="selectDesc"></p><div class="hint">← → CHOOSE &nbsp; • &nbsp; ✕ / ENTER CONFIRM &nbsp; • &nbsp; ○ / BACKSPACE BACK</div></div><div id="hud" class="hidden"><div class="hud"><div class="hudSide"><div class="name" id="n0"></div><div class="bar"><div class="fill" id="h0"></div></div><div class="meter"><i id="m0"></i></div><div class="rounds" id="r0"></div></div><div class="timer" id="timer">75</div><div class="hudSide right"><div class="name" id="n1"></div><div class="bar"><div class="fill" id="h1"></div></div><div class="meter"><i id="m1"></i></div><div class="rounds" id="r1"></div></div></div><div class="score" id="score"></div><div class="centerCall" id="call"></div><div class="combatHint" id="combatHint">✕ PUNCH &nbsp; □ KICK &nbsp; △ SPARK &nbsp; R1 GUARD &nbsp; ↑ JUMP</div></div><div id="overlay" class="screen hidden"><div class="card" id="card"></div></div><div id="toast" class="hidden"></div></div>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import RAPIER from 'rapier';
+const $=id=>document.getElementById(id), show=(id,v=true)=>$(id).classList.toggle('hidden',!v);
+const chars=[{name:'MOMO',emoji:'🐰',color:0xff729e,light:0xffd8cb,desc:'A starry-eyed courier who delivers punches express.',speed:5.2,power:1},{name:'BOLT',emoji:'⚡',color:0x58cbd0,light:0xffe1aa,desc:'A tiny storm with a very large opinion.',speed:6,power:.88},{name:'GUMBO',emoji:'🍡',color:0xf9bc50,light:0xffedc2,desc:'A snack champion seeking the legendary last dumpling.',speed:4.5,power:1.18}];
+let renderer,scene,camera,world,ground,clock=new THREE.Clock(), fighters=[], particles=[], projectiles=[], stageBits=[];
+let state='loading', mode='arcade', overlay='', previousState='', menuIndex=0, selectIndex=0, chosen=[0,1], selectSide=0, score=0, stage=0, matchWins=[0,0], timer=75, intro=0, resultSent=false, worldTime=0, idle=0, attract=false, toastTimer=0, stopped=false, lastInput={x:0,y:0,fire:false};
+let settings={volume:.45,invertX:false,invertY:false}; try{Object.assign(settings,JSON.parse(localStorage.getItem('ww7settings')||'{}'))}catch{}
+let peer=null,conn=null,onlineRole='',remoteInput={},netTimer=0,lastSnapshot=0,sessionReady=false;
+const keys={}, pressed={}, padPrev=[[],[]], padNow=[[],[]]; let axisPrev=[0,0], audioCtx,master,musicClock=0,musicStep=0;
+const held=(...k)=>k.some(x=>keys[x]); const tap=(...k)=>k.some(x=>pressed[x]);
+function sound(freq=440,dur=.1,type='square',vol=.12,slide=1){if(!audioCtx||settings.volume===0)return;let t=audioCtx.currentTime,o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type=type;o.frequency.setValueAtTime(freq,t);o.frequency.exponentialRampToValueAtTime(Math.max(30,freq*slide),t+dur);g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(.0001,t+dur);o.connect(g).connect(master);o.start(t);o.stop(t+dur)}
+function audioStart(){if(!audioCtx){audioCtx=new AudioContext();master=audioCtx.createGain();master.gain.value=settings.volume*.35;master.connect(audioCtx.destination)}if(audioCtx.state==='suspended')audioCtx.resume()}
+function voice(){for(let i=0;i<3;i++)setTimeout(()=>sound(330+Math.random()*300,.075,'sawtooth',.08,.7+Math.random()),i*65)}
+function music(dt){if(!audioCtx||stopped||settings.volume===0)return;musicClock-=dt;if(musicClock<=0){musicClock+=.18;let notes=[220,277,330,440,330,277,247,294,349,494,349,294,220,262,330,392];let n=notes[musicStep%notes.length];sound(n,.12,'triangle',.055);if(musicStep%4===0)sound(n/2,.16,'square',.035);if(musicStep%2===0)sound(95,.045,'sine',.09,.5);musicStep++}}
+function toast(s){$('toast').textContent=s;show('toast');toastTimer=2.8}
+function markInput(){idle=0;audioStart();if(attract){attract=false;toTitle();return true}return false}
+window.addEventListener('keydown',e=>{if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Enter','Escape','Backspace'].includes(e.key))e.preventDefault();if(!keys[e.code])pressed[e.code]=true;keys[e.code]=true;if(!e.repeat)markInput()});window.addEventListener('keyup',e=>keys[e.code]=false);
+window.addEventListener('blur',()=>{for(const k in keys)keys[k]=false});
+function saveSettings(){try{localStorage.setItem('ww7settings',JSON.stringify(settings))}catch{}if(master)master.gain.value=settings.volume*.35}
+function setState(s){state=s;for(const id of ['title','select','hud'])show(id,id===s||(id==='hud'&&['fight','result'].includes(s)));show('settingsButton',!AIHub.active&&(s==='title'||s==='select'));}
+function toTitle(){if(conn){conn.close();conn=null}if(peer){peer.destroy();peer=null}overlay='';show('overlay',false);mode='arcade';setState('title');idle=0;menuIndex=0;focusMenu();resetDisplay()}
+function resetDisplay(){fighters.forEach(f=>{if(f.body)world.removeRigidBody(f.body);scene.remove(f.group);scene.remove(f.shadow)});fighters=[];projectiles.forEach(p=>scene.remove(p.mesh));projectiles=[]}
+function focusMenu(){document.querySelectorAll('#titleMenu button').forEach((b,i)=>b.classList.toggle('focus',i===menuIndex))}
+function chooseScreen(m){mode=m;selectSide=0;selectIndex=0;chosen=[0,1];setState('select');renderSelect()}
+function renderSelect(){$('selectTop').textContent=(mode==='local'||mode==='online')&&selectSide===1?'PLAYER 2: PICK YOUR TROUBLEMAKER':'PICK YOUR TROUBLEMAKER';$('fighters').innerHTML=chars.map((c,i)=>`<button class="fighterPick ${i===selectIndex?'focus':''}" data-pick="${i}"><span class="badge">${c.emoji}</span><b>${c.name}</b><small>${i===selectIndex?'★ READY TO RUMBLE ★':'SELECT'}</small></button>`).join('');$('selectDesc').textContent=chars[selectIndex].desc}
+function confirmPick(){chosen[selectSide]=selectIndex;if((mode==='local'||mode==='online')&&selectSide===0){selectSide=1;selectIndex=1;renderSelect();voice()}else{if(mode==='arcade')chosen[1]=(chosen[0]+1)%3;stage=0;score=0;startMatch()}}
+function closeOverlay(){overlay='';show('overlay',false);if(previousState==='title')focusMenu()}
+function modal(kind){previousState=state;overlay=kind;show('overlay');let c=$('card');if(kind==='settings')c.innerHTML=`<h2>SETTINGS</h2><p>Make the festival feel just right.</p><div class="row"><span>Music &amp; effects</span><button data-setting="volume">${Math.round(settings.volume*100)}%</button></div><div class="row"><span>Invert horizontal axis</span><button data-setting="invertX">${settings.invertX?'ON':'OFF'}</button></div><div class="row"><span>Invert vertical axis</span><button data-setting="invertY">${settings.invertY?'ON':'OFF'}</button></div><p class="small">Use ↑ ↓ to choose, ← → or ✕ to change. Options / Esc or ○ goes back.</p><button class="pill" data-action="close">BACK</button>`;
+else if(kind==='how')c.innerHTML=`<h2>HOW TO WOBBLE</h2><div class="grid"><div><p><b>MOVE</b> &nbsp; Left stick / D-pad or arrow keys. Up jumps; down crouches. Tap toward twice to dash!</p><p><b>ATTACK</b> &nbsp; ✕ / J punches; □ / K kicks. Link a punch into a kick for a two-hit combo.</p><p><b>SPARK</b> &nbsp; △ / L spends half your blue meter on a flying wish. Fill meter by attacking and landing hits.</p></div><div><p><b>GUARD</b> &nbsp; Hold R1 / I to block. A guarded hit chips a little health. Jump over sparks and punish recovery!</p><p><b>WIN</b> &nbsp; Best of three rounds. In Arcade, beat all three challengers to earn the Wobble Star. Fast wins and hits earn points.</p><p><b>LOCAL P2</b> &nbsp; Second controller, or A/D move, W jump, S crouch, F punch, G kick, H spark, T guard.</p></div></div><button class="pill" data-action="close">GOT IT!</button>`;
+else if(kind==='about')c.innerHTML=`<h2>ABOUT / CREDITS</h2><p><b>Wobble Wobble 7</b> is an original arcade toy-box brawler inspired by <b>Waku Waku 7</b>. Its fighters, story, models, music and sounds were created for this demo.</p><p><b>Source information</b> · 2026-10-29 09:32 · Three.js r180 WebGPU, Rapier 0.19.3, PeerJS 1.5.5, Web Audio and Gamepad API. Cel-shaded procedural 3D; articulated procedural animation; synthesized music, effects and gibberish voices. Online: AI Hub parallel score sessions and standalone PeerJS rooms; local versus. Testing: lightweight headless Chrome 154 smoke test; real controller and remote device testing unknown. Environment: Codex CLI (headless), Linux, browser unknown. Model: OpenAI gpt-6.1-terra, xhigh. Usage: unknown.</p><p><b>Testing feedback</b> · Three issues caught, including one game-breaking Rapier method mismatch. Most useful: browser startup and gameplay smoke test. Least useful: static inspection alone. WebGPU visuals, remote multiplayer and the AI Hub harness remain unverified on supported hardware.</p><p><b>Engine feedback</b> · Three.js makes procedural 3D approachable. A Rapier descriptor method was guessed wrong and corrected. Combat, animation and interface were built here. WebGPU setup and browser support were the trickiest parts. I would overhaul WebGPU initialization diagnostics to make adapter and device failures clearer.</p><p><b>Prompt feedback</b> · The expressive arcade direction was the best part. Standalone online topology was open to interpretation. The hardest part was combining fighting, networking and a single-file delivery. A real two-controller, two-device playtest would be valuable.</p><button class="pill" data-action="close">BACK</button>`;
+else if(kind==='online')c.innerHTML=`<h2>ONLINE ROOM</h2><p>Host a room and share its code with a friend. The host picks both fighters and runs the match. Room codes are temporary.</p><div class="row"><button data-action="host">HOST ROOM</button><button data-action="join">JOIN ROOM</button></div><p>Friend's room code</p><input id="roomCode" class="input" maxlength="24" placeholder="WW7-0000" aria-label="Room code"><p class="small">Controller: choose each digit, then select JOIN ROOM.</p><div class="row" id="digits"><button data-digit="0">0</button><button data-digit="1">0</button><button data-digit="2">0</button><button data-digit="3">0</button></div><p id="netStatus" class="small">A network connection is required. No accounts or chat.</p><button class="pill" data-action="close">BACK</button>`;
+else if(kind==='ending')c.innerHTML=`<h2>${score>=0?'THE STAR IS YOURS!':'FESTIVAL COMPLETE!'}</h2><p>${chars[chosen[0]].name} catches the Wobble Star! It grants one magnificent wish… for another round of snacks. The crowd goes absolutely bananas.</p><p class="big" style="font-size:32px;color:#ffdf4b">FINAL SCORE ${score}</p><button class="pill" data-action="title">BACK TO TITLE</button>`;
+else if(kind==='error')c.innerHTML=`<h2>NO WEBGPU FOUND</h2><p>This game requires a browser and device with WebGPU enabled. Try a recent Chrome or Edge on a supported device.</p><p class="small" id="errorDetail"></p><button class="pill" data-action="settings">SETTINGS</button>`;
+menuIndex=0;focusOverlay()}
+function focusOverlay(){let b=[...$('card').querySelectorAll('button')];b.forEach((x,i)=>x.classList.toggle('focus',i===menuIndex));}
+function changeSetting(name,dir=1){if(name==='volume')settings.volume=(Math.round(settings.volume*100)+dir*10+110)%110/100;else settings[name]=!settings[name];saveSettings();modal('settings');}
+function perform(action){sound(600,.06,'square',.08,1.3);if(action==='settings'){if(overlay==='settings')closeOverlay();else modal('settings')}else if(action==='close')closeOverlay();else if(action==='title')toTitle();else if(action==='arcade'||action==='local')chooseScreen(action);else if(action==='how'||action==='about'||action==='online')modal(action);else if(action==='host')hostRoom();else if(action==='join')joinRoom()}
+document.addEventListener('click',e=>{if(markInput())return;const a=e.target.closest('[data-action]');if(a){perform(a.dataset.action);return}const p=e.target.closest('[data-pick]');if(p){selectIndex=+p.dataset.pick;confirmPick();return}const s=e.target.closest('[data-setting]');if(s)changeSetting(s.dataset.setting);const digit=e.target.closest('[data-digit]');if(digit)digit.textContent=(+digit.textContent+1)%10});
+function hostRoom(){if(!window.Peer){$('netStatus').textContent='Connection service unavailable.';return}let code='ww7-'+String(Math.floor(Math.random()*10000)).padStart(4,'0');peer=new Peer(code);onlineRole='host';$('netStatus').textContent='Opening room…';peer.on('open',()=>{$('netStatus').textContent='ROOM CODE: '+code.toUpperCase()+' — waiting for a friend.'});peer.on('connection',c=>{conn=c;setupConnection();});peer.on('error',e=>{$('netStatus').textContent='Connection error: '+e.type})}
+function joinRoom(){if(!window.Peer){$('netStatus').textContent='Connection service unavailable.';return}let code=$('roomCode').value.trim().toLowerCase()||'ww7-'+[...document.querySelectorAll('[data-digit]')].map(x=>x.textContent).join('');if(!code){$('netStatus').textContent='Enter your friend’s room code first.';return}peer=new Peer();onlineRole='guest';$('netStatus').textContent='Connecting…';peer.on('open',()=>{conn=peer.connect(code,{reliable:true});setupConnection()});peer.on('error',e=>{$('netStatus').textContent='Connection error: '+e.type})}
+function setupConnection(){conn.on('open',()=>{if(onlineRole==='host'){closeOverlay();chooseScreen('online');toast('Friend connected! Choose your fighter.')}else{$('netStatus').textContent='Connected! Waiting for host to choose fighters.'}});conn.on('data',d=>{if(d.t==='start'&&onlineRole==='guest'){chosen=d.chosen;mode='online';closeOverlay();startMatch(false)}else if(d.t==='input'&&onlineRole==='host')remoteInput=d.input;else if(d.t==='snap'&&onlineRole==='guest'&&fighters.length){if(state==='result'&&!d.result&&!overlay&&d.wins.every(n=>n<2))setState('fight');lastSnapshot=performance.now();timer=d.timer;score=d.score;matchWins=d.wins;d.f.forEach((a,i)=>{let f=fighters[i];f.body.setTranslation({x:a[0],y:a[1],z:0},true);f.hp=a[2];f.meter=a[3];f.action=a[4];f.actionTime=a[5];f.face=a[6]});intro=d.intro;while(projectiles.length>(d.p||[]).length)scene.remove(projectiles.pop().mesh);(d.p||[]).forEach((v,i)=>{if(!projectiles[i]){let m=shape(scene,sphere,v[1]?0x69e7e7:0xffd451,[v[0],1.35,.15],[.3,.3,.3]);shape(m,new THREE.TorusGeometry(1.35,.12,8,20),0xfff5d3,[0,0,0],[1,1,1]);projectiles[i]={mesh:m}}projectiles[i].mesh.position.x=v[0]});updateHUD();if(d.result&&state==='fight')finishRound(d.result-2,true)} });conn.on('close',()=>{if(state==='fight'){toast('Friend disconnected');setTimeout(toTitle,2000)}else if(overlay==='online')$('netStatus').textContent='Room closed.'});conn.on('error',()=>toast('Connection lost'))}
+function mat(color){return new THREE.MeshToonMaterial({color})}
+function mesh(geo,color,x=0,y=0,z=0,parent=scene){let m=new THREE.Mesh(geo,mat(color));m.position.set(x,y,z);m.castShadow=true;m.receiveShadow=true;parent.add(m);return m}
+const sphere=new THREE.SphereGeometry(1,16,12),box=new THREE.BoxGeometry(1,1,1),cyl=new THREE.CylinderGeometry(1,1,1,12);
+function shape(parent,geo,color,pos,scale){let m=mesh(geo,color,...pos,parent);m.scale.set(...scale);return m}
+function makeStage(){scene=new THREE.Scene();scene.background=new THREE.Color(0x7e70b4);scene.fog=new THREE.Fog(0x8d80bd,18,42);camera=new THREE.PerspectiveCamera(36,innerWidth/innerHeight,.1,100);camera.position.set(0,5.5,18.5);camera.lookAt(0,2,0);
+scene.add(new THREE.HemisphereLight(0xfff1c9,0x675187,2));let sun=new THREE.DirectionalLight(0xffffff,3);sun.position.set(-5,10,8);sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);sun.shadow.camera.left=-12;sun.shadow.camera.right=12;sun.shadow.camera.top=10;sun.shadow.camera.bottom=-10;scene.add(sun);
+shape(scene,box,0x4e3581,[0,-.65,0],[24,1,12]);shape(scene,box,0xefaab3,[0,-.1,0],[22,.16,9]);for(let i=-10;i<=10;i++){shape(scene,box,i%2?0xffe7a7:0xff79a4,[i,-.005,0],[.95,.05,9]);}
+// confectionery festival skyline
+for(let i=0;i<11;i++){let x=(i-5)*2.6,h=2.7+(i%3)*.7;shape(scene,box,[0x7351a1,0x5c75aa,0xc76f9c][i%3],[x,h/2-.1,-5.6],[2,h,1.7]);shape(scene,new THREE.ConeGeometry(1.5,1.25,4),[0xffd06c,0xe990af,0x89d9d6][i%3],[x,h+.45,-5.6],[1,1,1]);for(let j=0;j<2;j++)shape(scene,box,0xffedb4,[x-.5+j,1.3,-4.72],[.45,.65,.08]);}
+// arch framing the arena
+for(let x of [-8,8]){shape(scene,cyl,0xffd45c,[x,2.4,-2.8],[.35,5,.35]);shape(scene,sphere,0xff6a9a,[x,5,-2.8],[.65,.65,.65]);}
+let arch=shape(scene,new THREE.TorusGeometry(8,.2,8,40,Math.PI),0xffe08a,[0,5,-2.8],[1,.42,1]);
+for(let i=0;i<15;i++){let x=-7+i;let flag=shape(scene,new THREE.ConeGeometry(.25,.6,3),i%2?0x87eddb:0xffd759,[x,5.4+Math.sin(i/14*Math.PI)*1.9,-2.7],[1,1,1]);flag.rotation.z=Math.PI;}
+// stars and spectators
+for(let i=0;i<24;i++){let x=-9+i*.78,y=.6+Math.sin(i*8)*.15;let g=new THREE.Group();scene.add(g);g.position.set(x,y,-3.6-(i%2)*.6);shape(g,sphere,[0xffa98b,0x96dfcd,0xe5a3db,0xf5db8c][i%4],[0,.35,0],[.35,.4,.3]);shape(g,sphere,0x35214f,[-.11,.43,.27],[.035,.05,.035]);shape(g,sphere,0x35214f,[.11,.43,.27],[.035,.05,.035]);stageBits.push({g,phase:i});}
+world=new RAPIER.World({x:0,y:-18,z:0});ground=world.createCollider(RAPIER.ColliderDesc.cuboid(12,.2,4).setTranslation(0,-.25,0));}
+function fighter(idx,side){let c=chars[idx],g=new THREE.Group();scene.add(g);let shadow=shape(scene,new THREE.CircleGeometry(.65,24),0x493b69,[0,.035,0],[1,1,1]);shadow.rotation.x=-Math.PI/2;shadow.material.transparent=true;shadow.material.opacity=.3;
+let torso=shape(g,sphere,c.color,[0,1.2,0],[.55,.68,.34]);let belly=shape(g,sphere,0xffe8b4,[0,1.13,.32],[.32,.36,.07]);let head=shape(g,sphere,c.light,[0,2.05,0],[.57,.53,.4]);let hair=shape(g,sphere,c.color,[0,2.39,-.04],[.57,.24,.4]);
+for(let x of [-.2,.2]){shape(g,sphere,0xffffff,[x,2.1,.35],[.14,.18,.09]);shape(g,sphere,0x241d3e,[x+.025,2.1,.43],[.065,.09,.04]);shape(g,sphere,0xff92a8,[x*1.6,1.91,.37],[.1,.055,.025]);}
+let mouth=shape(g,sphere,0x592548,[0,1.87,.4],[.09,.045,.025]);
+if(idx===0){for(let x of [-.31,.31]){let ear=shape(g,sphere,c.color,[x,2.88,0],[.16,.55,.15]);ear.rotation.z=x*.5;shape(g,sphere,0xffd8da,[x,2.9,.13],[.075,.35,.04]);}}else if(idx===1){for(let x of [-.35,.35]){let ear=shape(g,new THREE.ConeGeometry(.25,.6,4),0xffdb50,[x,2.7,0],[1,1,1]);ear.rotation.z=x*1.5;}}else{shape(g,sphere,0xf8f1c7,[0,2.68,0],[.48,.18,.3]);shape(g,sphere,0xe96183,[0,2.85,0],[.17,.17,.17]);}
+let arms=[],legs=[];for(let x of [-1,1]){let a=new THREE.Group();a.position.set(x*.55,1.6,0);g.add(a);shape(a,sphere,c.color,[0,-.28,0],[.19,.39,.2]);shape(a,sphere,c.light,[0,-.58,.05],[.22,.2,.2]);arms.push(a);let l=new THREE.Group();l.position.set(x*.27,.78,0);g.add(l);shape(l,sphere,c.color,[0,-.27,0],[.22,.36,.22]);shape(l,sphere,0x433259,[0,-.6,.15],[.25,.15,.32]);legs.push(l);}
+let body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(side===0?-3:3,1.1,0).lockRotations().enabledTranslations(true,true,false).setLinearDamping(0));world.createCollider(RAPIER.ColliderDesc.capsule(.55,.45).setFriction(0).setRestitution(0),body);
+return {idx,side,group:g,shadow,body,torso,head,arms,legs,hp:100,meter:35,face:side===0?1:-1,action:'idle',actionTime:0,actionTotal:0,hitDone:false,stun:0,guard:false,grounded:true,combo:0,comboClock:0,aiClock:0,lastDir:0,lastDirTime:0};}
+function startMatch(send=true){resetDisplay();fighters=[fighter(chosen[0],0),fighter(chosen[1],1)];matchWins=[0,0];timer=75;intro=2.3;resultSent=false;setState('fight');updateHUD();if(mode==='online'&&onlineRole==='host'&&conn&&send){conn.send({t:'start',chosen})}voice();}
+function resetRound(){fighters.forEach((f,i)=>{f.hp=100;f.meter=Math.max(25,f.meter);f.action='idle';f.stun=0;f.body.setTranslation({x:i?-3:3,y:1.1,z:0},true);f.body.setLinvel({x:0,y:0,z:0},true)}); // restore left and right
+fighters[0].body.setTranslation({x:-3,y:1.1,z:0},true);fighters[1].body.setTranslation({x:3,y:1.1,z:0},true);projectiles.forEach(p=>scene.remove(p.mesh));projectiles=[];timer=75;intro=2.2;setState('fight');updateHUD()}
+function updateHUD(){fighters.forEach((f,i)=>{$('n'+i).textContent=chars[f.idx].name+(i===0?'  ✦':' ✦');$('h'+i).style.width=Math.max(0,f.hp)+'%';$('m'+i).style.width=Math.min(100,f.meter)+'%';$('r'+i).textContent='●'.repeat(matchWins[i])+'○'.repeat(2-matchWins[i])});$('timer').textContent=Math.max(0,Math.ceil(timer));$('score').textContent=mode==='arcade'||mode==='hub'?`SCORE ${score}   •   CHALLENGER ${stage+1}/3`:mode==='online'?'ONLINE ROOM':'LOCAL VERSUS'}
+function burst(x,y,color,count=10){for(let i=0;i<count;i++){let m=shape(scene,sphere,color,[x,y,0],[.08,.08,.08]);particles.push({m,vx:(Math.random()-.5)*6,vy:Math.random()*5,vz:(Math.random()-.5)*2,life:.35+Math.random()*.3})}}
+function strike(a,b,damage,knock,projectile=false){if(b.stun>0.03&&!projectile)return;let block=b.guard&&b.grounded&&b.action==='idle';let dmg=block?damage*.13:damage;a.side===0&&(score+=block?10:100+Math.round(damage*10));b.hp=Math.max(0,b.hp-dmg);a.meter=Math.min(100,a.meter+(block?3:9));b.meter=Math.min(100,b.meter+4);b.stun=block?.12:.28;b.body.setLinvel({x:a.face*(block?2:knock),y:block?0:2,z:0},true);burst(b.body.translation().x,1.6,block?0x94efff:0xffe159,block?6:14);sound(block?240:120,.12,'sawtooth',.16,block?1.8:.45);if(!block)voice();if(a.comboClock>0&&!block){a.combo++;if(a.combo>1){$('call').textContent=a.combo+' HIT WOBBLE!';setTimeout(()=>{if(state==='fight'&&intro<=0)$('call').textContent=''},650)}}else a.combo=1;a.comboClock=.8;updateHUD();if(AIHub.active)AIHub.progress({score,label:`Challenger ${stage+1}`})}
+function attack(f,kind){if(f.stun>0||f.action!=='idle')return;if(kind==='spark'&&f.meter<50){toast('Need 50% spark meter!');return}f.action=kind;f.actionTime=0;f.actionTotal=kind==='punch'?.33:kind==='kick'?.48:.68;f.hitDone=false;f.guard=false;if(kind==='spark')f.meter-=50;sound(kind==='spark'?540:280,.09,'square',.09,kind==='spark'?1.8:.65)}
+function spawnProjectile(f){let x=f.body.translation().x+f.face*.85;let m=shape(scene,sphere,f.side?0x69e7e7:0xffd451,[x,1.35,.15],[.3,.3,.3]);let ring=shape(m,new THREE.TorusGeometry(1.35,.12,8,20),0xfff5d3,[0,0,0],[1,1,1]);projectiles.push({mesh:m,x,y:1.35,v:f.face*8,owner:f,life:2});burst(x,1.35,0xffd851,8);sound(660,.2,'sine',.1,1.7)}
+function finishRound(winner,remote=false){if(state!=='fight')return;setState('result');if(winner>=0&&!remote)matchWins[winner]++;if(winner===0&&!remote)score+=Math.ceil(timer)*15+1000;$('call').textContent=winner<0?'DOUBLE WOBBLE!':`${chars[fighters[winner].idx].name} WINS!`;sound(440,.25,'triangle',.16,1.5);voice();updateHUD();if(mode==='online'&&onlineRole==='host'&&conn&&!remote)conn.send({t:'snap',timer,score,wins:matchWins,f:fighters.map(f=>{let p=f.body.translation();return[p.x,p.y,f.hp,f.meter,f.action,f.actionTime,f.face]}),intro:0,result:winner+2});
+setTimeout(()=>{if(state!=='result')return;if(mode==='online'&&onlineRole==='guest'){if(matchWins.some(n=>n>=2)){modal('ending');$('card').querySelector('h2').textContent=chars[fighters[matchWins[0]>=2?0:1].idx].name+' TAKES THE STAR!';$('card').querySelector('p').textContent='A dazzling festival of questionable decisions. Thanks for playing!'}return}if(matchWins.some(n=>n>=2)){if(mode==='arcade'||mode==='hub'){if(matchWins[0]>=2&&stage<2){stage++;chosen[1]=(chosen[0]+stage+1)%3;startMatch();toast('NEXT CHALLENGER!')}else if(mode==='hub'){finishHub()}else if(matchWins[0]>=2){modal('ending')}else{modal('ending');$('card').querySelector('h2').textContent='THE WISH CAN WAIT!';$('card').querySelector('p').textContent='A fine wobble! The festival will be waiting when you are ready for a rematch.'}}else{modal('ending');$('card').querySelector('h2').textContent=chars[fighters[matchWins[0]>=2?0:1].idx].name+' TAKES THE STAR!';$('card').querySelector('p').textContent='A dazzling festival of questionable decisions. Thanks for playing!'}}else resetRound()},2200)}
+function finishHub(){if(resultSent)return;resultSent=true;AIHub.result({score,stats:{challengers:stage+1}});setState('result');$('call').textContent='FESTIVAL COMPLETE!'}
+function control(side,pad){let x=side===0?(held('ArrowRight')?1:0)-(held('ArrowLeft')?1:0):(held('KeyD')?1:0)-(held('KeyA')?1:0);let y=side===0?(held('ArrowDown')?1:0)-(held('ArrowUp')?1:0):(held('KeyS')?1:0)-(held('KeyW')?1:0);if(pad){let px=(pad.buttons[15]?.pressed?1:0)-(pad.buttons[14]?.pressed?1:0),py=(pad.buttons[13]?.pressed?1:0)-(pad.buttons[12]?.pressed?1:0);if(!px&&Math.abs(pad.axes[0])>.28)px=Math.sign(pad.axes[0]);if(!py&&Math.abs(pad.axes[1])>.28)py=Math.sign(pad.axes[1]);x=px||x;y=py||y}if(settings.invertX)x=-x;if(settings.invertY)y=-y;let down=i=>!!pad?.buttons[i]?.pressed,edge=i=>down(i)&&!padPrev[side][i];return{x,y,jump:y<0,punch:side===0?(tap('KeyJ')||edge(0)):(tap('KeyF')||edge(0)),kick:side===0?(tap('KeyK')||edge(2)):(tap('KeyG')||edge(2)),spark:side===0?(tap('KeyL')||edge(3)):(tap('KeyH')||edge(3)),guard:side===0?(held('KeyI')||down(5)):(held('KeyT')||down(5))}}
+function ai(f,other,dt){f.aiClock-=dt;let dist=other.body.translation().x-f.body.translation().x;let c={x:Math.abs(dist)>1.5?Math.sign(dist):0,y:0,jump:false,punch:false,kick:false,spark:false,guard:false};if(f.aiClock<=0){f.aiClock=.3+Math.random()*.45;if(Math.abs(dist)<2.1){let r=Math.random();c.punch=r<.42;c.kick=r>=.42&&r<.8;c.guard=r>.8}else if(f.meter>=50&&Math.random()<.45)c.spark=true;else if(Math.random()<.15)c.jump=true}return c}
+function stepFighter(f,c,dt){let p=f.body.translation(),vel=f.body.linvel();f.grounded=p.y<1.06;f.stun=Math.max(0,f.stun-dt);f.comboClock-=dt;f.guard=!!c.guard&&f.stun<=0&&f.action==='idle';if(f.action==='idle'&&f.stun<=0){if(c.punch)attack(f,'punch');else if(c.kick)attack(f,'kick');else if(c.spark)attack(f,'spark');if(c.jump&&f.grounded){vel.y=8;sound(330,.1,'triangle',.08,1.6)}let speed=chars[f.idx].speed*(f.guard?.35:1);if(c.x&&c.x!==f.lastDir&&f.lastDirTime>0){speed*=1.65;f.lastDirTime=0}else if(c.x&&c.x!==f.lastDir){f.lastDirTime=.25}f.lastDir=c.x;f.lastDirTime-=dt;vel.x=c.x*speed;if(c.y>0&&f.grounded)vel.x*=.35;}else if(f.stun<=0)vel.x*=.8;f.body.setLinvel({x:vel.x,y:vel.y,z:0},true);if(p.x<-9||p.x>9)f.body.setTranslation({x:THREE.MathUtils.clamp(p.x,-9,9),y:p.y,z:0},true);
+if(f.action!=='idle'){f.actionTime+=dt;let target=fighters[1-f.side],distance=Math.abs(target.body.translation().x-p.x);if(!f.hitDone&&f.actionTime>(f.action==='punch'?.12:f.action==='kick'?.19:.34)){f.hitDone=true;if(f.action==='spark')spawnProjectile(f);else if(distance<(f.action==='punch'?1.5:2.05)&&Math.abs(target.body.translation().y-p.y)<1.3)strike(f,target,(f.action==='punch'?8:13)*chars[f.idx].power,f.action==='kick'?5:3)}if(f.actionTime>=f.actionTotal){f.action='idle';f.actionTime=0}}
+}
+function animateFighter(f,t){let p=f.body.translation(),v=f.body.linvel();f.group.position.set(p.x,p.y-1.03,0);f.shadow.position.x=p.x;f.shadow.scale.setScalar(Math.max(.35,1-(p.y-1)*.18));f.group.rotation.y=f.face===1?.2:-.2;let walk=Math.sin(t*13)*Math.min(1,Math.abs(v.x)/4);f.torso.rotation.z=walk*.08;f.head.rotation.z=Math.sin(t*3+f.side)*.07;f.arms[0].rotation.z=-.25+walk*.5;f.arms[1].rotation.z=.25-walk*.5;f.legs[0].rotation.z=walk*.45;f.legs[1].rotation.z=-walk*.45;if(f.action!=='idle'){let phase=Math.sin(Math.PI*Math.min(1,f.actionTime/f.actionTotal));if(f.action==='punch'){f.arms[f.face===1?1:0].rotation.z=-f.face*phase*1.7;f.torso.rotation.z=-f.face*phase*.25}else if(f.action==='kick'){f.legs[f.face===1?1:0].rotation.z=-f.face*phase*1.5;f.torso.rotation.z=f.face*phase*.25}else{f.arms[0].rotation.z=-1.2*phase;f.arms[1].rotation.z=1.2*phase}}if(f.guard){f.arms[0].rotation.z=-1;f.arms[1].rotation.z=1}if(f.stun>0)f.group.rotation.z=-f.face*.17;else f.group.rotation.z=0;}
+function menuControls(pad){let ax=pad?.axes?.[0]||0,ay=pad?.axes?.[1]||0;if(settings.invertX)ax=-ax;if(settings.invertY)ay=-ay;let buttons=pad?.buttons||[],edge=i=>buttons[i]?.pressed&&!padPrev[0][i];let up=tap('ArrowUp')||edge(12)||(ay<-.6&&axisPrev[1]>=-.6),down=tap('ArrowDown')||edge(13)||(ay>.6&&axisPrev[1]<=.6),left=tap('ArrowLeft')||edge(14)||(ax<-.6&&axisPrev[0]>=-.6),right=tap('ArrowRight')||edge(15)||(ax>.6&&axisPrev[0]<=.6),ok=tap('Enter','Space')||edge(0),back=tap('Backspace')||edge(1),options=tap('Escape')||(edge(9)&&!buttons[8]?.pressed);axisPrev=[ax,ay];if(up||down||left||right||ok||back||options){if(markInput())return;}
+if(options){if(overlay==='settings')closeOverlay();else modal('settings');return}if(overlay){if(back){closeOverlay();return}let b=[...$('card').querySelectorAll('button')];if(up||down){menuIndex=(menuIndex+(down?1:-1)+b.length)%b.length;focusOverlay()}if((left||right||ok)&&b[menuIndex]){let selected=b[menuIndex];if(selected.dataset.setting)changeSetting(selected.dataset.setting,left?-1:1);else if(selected.dataset.digit!==undefined){selected.textContent=(+selected.textContent+(left?9:1))%10}else if(ok)selected.click()}return}
+if(state==='title'){if(up||down){menuIndex=(menuIndex+(down?1:-1)+5)%5;focusMenu();sound(400,.04)}if(ok)document.querySelectorAll('#titleMenu button')[menuIndex].click()}
+else if(state==='select'){if(left||right){selectIndex=(selectIndex+(right?1:-1)+chars.length)%chars.length;renderSelect();sound(400,.04)}if(ok)confirmPick();if(back){if(selectSide===1){selectSide=0;renderSelect()}else toTitle()}}}
+function frame(){requestAnimationFrame(frame);let dt=Math.min(clock.getDelta(),.05),pads=[...navigator.getGamepads()].filter(Boolean),pad=pads[0];if(toastTimer>0&&(toastTimer-=dt)<=0)show('toast',false);if(state==='title'&&!overlay&&!AIHub.active){idle+=dt;if(idle>=10){attract=true;mode='attract';chosen=[0,1];score=0;stage=0;startMatch();toast('ATTRACT MODE • PRESS ANY BUTTON TO PLAY')}}
+if(attract&&pads.some((p,i)=>p.buttons.some((b,j)=>b.pressed&&!padPrev[i]?.[j])||p.axes.some(a=>Math.abs(a)>.55))){markInput()}menuControls(pad);let c0=control(0,pads[0]),c1=control(1,pads[1]);lastInput={x:c0.x,y:c0.y,fire:held('KeyJ','KeyK','KeyL')||!!pad?.buttons?.[0]?.pressed||!!pad?.buttons?.[2]?.pressed||!!pad?.buttons?.[3]?.pressed};if(state==='fight'&&!stopped&&(!overlay||mode==='online')&&(!AIHub.active||sessionReady&&AIHub.time()>=0)){worldTime+=dt;music(dt);if(intro>0){intro-=dt;$('call').textContent=intro>1.4?'READY?':intro>0?'WOBBLE!':''}else{timer-=dt;$('call').textContent=$('call').textContent==='WOBBLE!'?'':$('call').textContent;let f0=fighters[0],f1=fighters[1];f0.face=f0.body.translation().x<=f1.body.translation().x?1:-1;f1.face=-f0.face;
+if(mode==='attract'){c0=ai(f0,f1,dt);c1=ai(f1,f0,dt)}else if(mode==='arcade'||mode==='hub')c1=ai(f1,f0,dt);else if(mode==='online'){if(onlineRole==='host')c1=remoteInput;else{netTimer+=dt;if(conn&&netTimer>.065){netTimer=0;conn.send({t:'input',input:c0})}}}if(overlay){if(mode==='online'){if(onlineRole==='host')c0={};else c0={}}}
+if(!(mode==='online'&&onlineRole==='guest')){stepFighter(f0,c0,dt);stepFighter(f1,c1||{},dt);world.timestep=dt;world.step();for(let i=projectiles.length-1;i>=0;i--){let p=projectiles[i];p.x+=p.v*dt;p.life-=dt;p.mesh.position.x=p.x;p.mesh.rotation.z+=dt*6;let target=fighters[1-p.owner.side];if(Math.abs(target.body.translation().x-p.x)<.7&&Math.abs(target.body.translation().y-1.1)<1.4){strike(p.owner,target,16*chars[p.owner.idx].power,6,true);p.life=0}if(p.life<=0){scene.remove(p.mesh);projectiles.splice(i,1)}}if(f0.hp<=0||f1.hp<=0||timer<=0){let winner=f0.hp===f1.hp?-1:f0.hp>f1.hp?0:1;if(attract){resetRound()}else finishRound(winner)}}
+if(mode==='online'&&onlineRole==='host'&&conn){netTimer+=dt;if(netTimer>.07){netTimer=0;conn.send({t:'snap',timer,score,wins:matchWins,intro,p:projectiles.map(p=>[p.x,p.owner.side]),f:fighters.map(f=>{let p=f.body.translation();return[p.x,p.y,f.hp,f.meter,f.action,f.actionTime,f.face]})})}}updateHUD();}}
+if(state==='fight'||state==='result'){fighters.forEach(f=>animateFighter(f,worldTime));}else{stageBits.forEach(({g,phase})=>g.rotation.z=Math.sin(performance.now()*.002+phase)*.1)}
+for(let i=particles.length-1;i>=0;i--){let p=particles[i];p.life-=dt;p.vy-=9*dt;p.m.position.x+=p.vx*dt;p.m.position.y+=p.vy*dt;p.m.position.z+=p.vz*dt;p.m.scale.multiplyScalar(.97);if(p.life<=0){scene.remove(p.m);particles.splice(i,1)}}if(renderer&&scene)renderer.render(scene,camera);for(let s=0;s<2;s++)padPrev[s]=(pads[s]?.buttons||[]).map(b=>b.pressed);for(let k in pressed)delete pressed[k];}
+function resize(){if(!renderer)return;camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)}window.addEventListener('resize',resize);
+async function init(){try{if(!navigator.gpu)throw Error('WebGPU is unavailable in this browser.');await RAPIER.init();renderer=new THREE.WebGPURenderer({antialias:true,forceWebGL:false});await renderer.init();if(!renderer.backend?.isWebGPUBackend)throw Error('A WebGPU adapter could not be initialized.');renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setSize(innerWidth,innerHeight);renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;$('world').appendChild(renderer.domElement);makeStage();show('loading',false);AIHub.probe(()=>({scene:state==='fight'?'play':state==='result'?'over':state==='select'?'menu':state==='loading'?'ready':'title',menu:!!overlay,world:worldTime,input:lastInput}));
+if(AIHub.active){mode='hub';setState('loading');let info=await AIHub.connect({mode:'parallel',seats:[1,4]});if(info){chosen=[0,1];stage=0;score=0;startMatch();sessionReady=true;AIHub.on('time-up',finishHub);AIHub.on('end',()=>{stopped=true;if(audioCtx)audioCtx.suspend()});AIHub.ready()}else toTitle()}else if(matchMedia('(pointer: coarse)').matches&&!matchMedia('(pointer: fine)').matches){setState('title');$('title').innerHTML='<div class="eyebrow">WOBBLE WOBBLE 7</div><h2 class="big" style="font-size:clamp(30px,6vw,70px);text-align:center">CONTROLLER OR<br>KEYBOARD REQUIRED</h2><p class="tagline">Connect a controller or keyboard to join the festival.</p>';show('settingsButton')}else toTitle();frame();}catch(e){show('loading',false);setState('title');modal('error');$('errorDetail').textContent=e.message;AIHub.fail('WebGPU initialization failed: '+e.message);console.error(e)}}init();
+</script></body></html>

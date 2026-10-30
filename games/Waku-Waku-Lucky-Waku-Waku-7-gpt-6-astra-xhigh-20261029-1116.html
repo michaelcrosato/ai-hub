@@ -1,0 +1,5949 @@
+<!--
+SOURCE INFORMATION, ENGINE FEEDBACK, TESTING FEEDBACK, PROMPT FEEDBACK
+SOURCE
+Date: 2026-10-29 11:58 America/Vancouver.
+Source: Waku Waku 7.
+Tech: Three.js 0.180.0 (R180), WebGPU only; Rapier 3D 0.19.3; Gamepad API; Web Audio API; PeerJS 1.5.5; AI Hub session client 1.3.0; vanilla JavaScript/CSS/HTML.
+Art Direction: original cel-shaded 3D, stepped toon lighting, ink outlines, pastel carnival scenery.
+Animation: procedural hierarchical character rigs, pose blending, squash/stretch and animated scenery.
+Audio: code-composed sequencer music, synthesized effects and synthesized gibberish voices.
+Online: 2–4 player private PeerJS rooms; AI Hub Protocol v1 versus sessions for 1–4 players; host-authoritative combat, predicted local movement, snapshots and disconnect handling. Local two-player versus also included.
+Testing: efficient, lightweight browser and gameplay checks; no performance targets.
+Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6-astra, reasoning effort xhigh.
+Usage: estimated session time about 42 minutes; API cost unknown; token total and breakdown unknown.
+ENGINE
+Most liked: Three.js toon node materials, shadows and scene graphs made a coherent stylized cast practical.
+Stuck or guessed wrong: initial headless WebGPU flags produced blank captures; explicit SwiftShader Vulkan flags and bundled Chromium resolved the test setup. WebGPURenderer also needed its default fallback disabled.
+Most important custom system: the fighting-game state machine, hit timing, cancel rules, input buffers and multiplayer combat synchronization.
+Hardest part: coordinating fixed-step physics, combat authority and animation while keeping gameplay independent of rendering.
+Remove or overhaul: implicit renderer fallback behavior.
+One change: expose a documented strict-WebGPU initialization option.
+TESTING
+Issues found and fixed during lightweight tests and targeted verification: 13; 3 affected core controls or combo/lesson completion.
+Most helpful test: fixed-step combat assertions combined with the AI Hub conformance harness.
+Least helpful test: the first screenshot under an incompatible headless WebGPU presentation setup; it showed a blank canvas despite successful initialization.
+Passed: 12 combat/attract assertions; controller-only title-to-fight flow; axis inversion; EX, low guard, throw, held recovery, three-hit combo, arcade ending, and title safe areas at 1440×900, 1280×720 and 960×600.
+AI Hub passed at 2, 3 and 4 players with 150 ms latency, 50 ms jitter, 5% loss, departures, host departure and a dedicated server. Network checks suppressed drawing after initialization; full WebGPU visuals were inspected separately.
+Standalone PeerJS: two browser copies connected, guest movement reached the host, and departure ended the round; no runtime errors.
+Test browser: Playwright Chromium 141.0.7390.37; software WebGPU/Vulkan, with Xvfb for visual captures. A physical-controller test across independent networks was not run.
+PROMPT
+Most liked: the specific source-game identity, controller-first UX and required attract mode give the game a clear design target.
+Confusing: “all features” has no fixed size; this demo interprets it as a complete seven-fighter engine with a full arcade route, three stages and a guided mechanics dojo.
+Hardest: combining polished fighting mechanics, accessible controls and two multiplayer transports in one portable HTML file.
+One additional test: a real four-player session using DualSense controllers on separate networks at 250 ms latency.
+-->
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<script>/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#ffda63">
+<meta name="description" content="Seven charms. One wish. Absolutely no sensible people. An original cel-shaded arcade fighter.">
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="versus"><meta name="hub:session-minutes" content="3"><meta name="hub:session-goal" content="Most knockouts in 150 seconds; points break ties"><meta name="hub:session-howto" content="Move WASD; J/K/U/I attack; Q guard; L special; H super. Pad: stick + face buttons."><meta name="hub:webgpu" content="required"><meta name="hub:players" content="1-4">
+<title>Waku Waku Lucky — Seven charms. One wish.</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23ffda63'/%3E%3Ctext x='32' y='46' text-anchor='middle' font-size='46' fill='%23342b48'%3E★%3C/text%3E%3C/svg%3E">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<style>@import url("https://fonts.googleapis.com/css2?family=Bungee&family=Nunito+Sans:wght@500;600;700;800;900;1000&display=swap");
+:root {
+	--ink: #342b48;
+	--cream: #fff5d8;
+	--yellow: #ffda63;
+	--coral: #f97766;
+	--mint: #89d9c3;
+	--purple: #786194;
+	--line: 3px solid var(--ink);
+	font-family: "Nunito Sans", sans-serif;
+	color: var(--ink);
+	font-synthesis: none;
+}
+* {
+	box-sizing: border-box;
+}
+body {
+	margin: 0;
+	overflow: hidden;
+	background: #f8c9ac;
+}
+button,
+input {
+	font: inherit;
+}
+button {
+	cursor: pointer;
+	color: inherit;
+}
+button:focus-visible,
+input:focus-visible {
+	outline: 4px solid #fff;
+	outline-offset: 4px;
+}
+#world,
+#panel,
+#hud,
+#fx-ui,
+#touch-notice {
+	position: absolute;
+	inset: 0;
+}
+#world canvas {
+	width: 100%;
+	height: 100%;
+	display: block;
+}
+#panel,
+#hud,
+#fx-ui {
+	pointer-events: none;
+}
+#panel button,
+#panel input,
+#modal button {
+	pointer-events: auto;
+}
+#panel {
+	z-index: 5;
+}
+#hud {
+	z-index: 3;
+}
+#fx-ui {
+	z-index: 4;
+}
+#modal {
+	position: absolute;
+	inset: 0;
+	z-index: 20;
+	pointer-events: none;
+}
+#modal:not(:empty) {
+	pointer-events: auto;
+	background: #312b4877;
+	backdrop-filter: blur(5px);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+#loading {
+	position: absolute;
+	inset: 0;
+	z-index: 40;
+	background: var(--cream);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	text-align: center;
+}
+.load-star {
+	font-size: 80px;
+	color: var(--coral);
+	animation: spin 3s linear infinite;
+}
+.loading-title {
+	font-family: Bungee, sans-serif;
+	font-size: 34px;
+	margin: 15px 0;
+}
+.load-sub {
+	font-size: 18px;
+}
+.fatal {
+	max-width: 680px;
+	padding: 50px;
+}
+.fatal p {
+	font-size: 22px;
+	line-height: 1.5;
+}
+h1,
+h2,
+h3,
+p {
+	margin: 0;
+}
+h1,
+h2,
+h3,
+.arcade {
+	font-family: Bungee, "Arial Black", sans-serif;
+	font-weight: 400;
+}
+button {
+	border: 0;
+	background: none;
+}
+#chrome {
+	position: absolute;
+	z-index: 8;
+	left: 3.5%;
+	right: 3.5%;
+	top: 3%;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	pointer-events: none;
+}
+.brand {
+	font-weight: 1000;
+	letter-spacing: 2px;
+	font-size: 15px;
+}
+.brand b {
+	display: inline-flex;
+	background: var(--ink);
+	color: var(--cream);
+	width: 35px;
+	height: 35px;
+	border-radius: 50%;
+	align-items: center;
+	justify-content: center;
+	font-family: Bungee;
+	font-size: 22px;
+	margin-right: 10px;
+}
+.chrome-right {
+	display: flex;
+	gap: 15px;
+	align-items: center;
+}
+.chip {
+	font-size: 12px;
+	letter-spacing: 2px;
+	font-weight: 900;
+	background: var(--cream);
+	border: 2px solid var(--ink);
+	border-radius: 30px;
+	padding: 8px 15px;
+}
+.gear {
+	pointer-events: auto;
+	background: var(--cream);
+	border: 2px solid var(--ink);
+	width: 42px;
+	height: 42px;
+	border-radius: 50%;
+	display: grid;
+	place-items: center;
+	box-shadow: 2px 3px 0 var(--ink);
+}
+.gear svg {
+	width: 24px;
+	height: 24px;
+}
+.title-wash {
+	position: absolute;
+	inset: 0;
+	background: linear-gradient(
+		90deg,
+		#fff0d8 0%,
+		#fff0d8ee 28%,
+		#fff0d899 43%,
+		#fff0d800 65%
+	);
+}
+.title-content {
+	position: absolute;
+	left: 6%;
+	top: 13%;
+	width: 43%;
+	max-width: 650px;
+}
+.eyebrow {
+	display: flex;
+	gap: 10px;
+	align-items: center;
+	font-size: 13px;
+	letter-spacing: 3px;
+	font-weight: 1000;
+	text-transform: uppercase;
+	margin-bottom: 19px;
+}
+.eyebrow:before {
+	content: "";
+	height: 3px;
+	width: 28px;
+	background: var(--coral);
+}
+.wordmark {
+	position: relative;
+	display: inline-flex;
+	flex-direction: column;
+	transform: rotate(-3deg);
+	font-family: Bungee, "Arial Black", sans-serif;
+	font-size: clamp(50px, 6.8vw, 104px);
+	line-height: 0.99;
+	letter-spacing: -4px;
+	text-shadow:
+		3px 4px 0 var(--cream),
+		6px 7px 0 var(--ink);
+	-webkit-text-stroke: 2px var(--ink);
+	color: var(--coral);
+}
+.wordmark .waku2 {
+	color: var(--cream);
+}
+.wordmark .lucky {
+	font-size: 1.15em;
+	color: var(--yellow);
+	letter-spacing: -5px;
+}
+.title-copy {
+	font-size: clamp(17px, 1.45vw, 23px);
+	font-weight: 800;
+	line-height: 1.45;
+	margin-top: 25px;
+	max-width: 380px;
+}
+.title-menu {
+	margin-top: 25px;
+	display: flex;
+	flex-direction: column;
+	gap: 11px;
+	width: min(380px, 95%);
+}
+.menu-btn {
+	position: relative;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	text-align: left;
+	padding: 14px 21px;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 8px;
+	box-shadow: 4px 5px 0 var(--ink);
+	font-size: 18px;
+	font-weight: 1000;
+	transition:
+		transform 0.1s,
+		background 0.1s;
+}
+.menu-btn .arrow {
+	font-size: 24px;
+	line-height: 1;
+}
+.menu-btn.active,
+.menu-btn:hover {
+	background: var(--yellow);
+	transform: translate(2px, 2px);
+	box-shadow: 2px 3px 0 var(--ink);
+}
+.menu-btn small {
+	font-size: 11px;
+	letter-spacing: 1.3px;
+	font-weight: 900;
+}
+.menu-btn.primary {
+	background: var(--yellow);
+}
+.text-btn {
+	padding: 9px 0;
+	font-size: 13px;
+	letter-spacing: 1.4px;
+	font-weight: 1000;
+	text-align: left;
+	border-bottom: 2px solid transparent;
+	align-self: flex-start;
+}
+.text-btn.active,
+.text-btn:hover {
+	border-bottom-color: var(--ink);
+}
+.lucky-stamp {
+	position: absolute;
+	right: 5%;
+	top: 15%;
+	width: 130px;
+	height: 130px;
+	background: var(--yellow);
+	clip-path: polygon(
+		50% 0,
+		59% 9%,
+		72% 4%,
+		77% 17%,
+		91% 18%,
+		91% 32%,
+		100% 41%,
+		92% 52%,
+		98% 65%,
+		85% 71%,
+		84% 85%,
+		69% 85%,
+		61% 98%,
+		49% 91%,
+		36% 98%,
+		30% 85%,
+		16% 86%,
+		15% 72%,
+		2% 65%,
+		8% 52%,
+		0 39%,
+		10% 30%,
+		10% 16%,
+		25% 16%,
+		30% 3%,
+		43% 9%
+	);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	text-align: center;
+	transform: rotate(12deg);
+	font-weight: 1000;
+	font-size: 17px;
+	line-height: 1.2;
+}
+.hero-caption {
+	position: absolute;
+	right: 7%;
+	bottom: 15%;
+	text-align: right;
+}
+.hero-caption .hand {
+	font-family: Bungee;
+	font-size: 21px;
+	transform: rotate(-4deg);
+	background: var(--cream);
+	padding: 8px 18px;
+	box-shadow: 4px 4px 0 var(--ink);
+	border: 2px solid var(--ink);
+	display: inline-block;
+}
+.hero-caption p {
+	margin-top: 12px;
+	font-size: 13px;
+	font-weight: 900;
+	letter-spacing: 1px;
+}
+.footer {
+	position: absolute;
+	left: 3.5%;
+	right: 3.5%;
+	bottom: 3%;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 20px;
+	font-weight: 900;
+	font-size: 13px;
+	letter-spacing: 0.6px;
+}
+.footer .hint {
+	display: flex;
+	gap: 20px;
+	align-items: center;
+}
+.key {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	background: var(--cream);
+	border: 2px solid currentColor;
+	border-radius: 6px;
+	min-width: 26px;
+	height: 25px;
+	padding: 0 5px;
+	font-size: 12px;
+	margin-right: 5px;
+	font-weight: 1000;
+}
+.pad {
+	border-radius: 50%;
+	padding: 0;
+	min-width: 25px;
+}
+.screen {
+	position: absolute;
+	inset: 0;
+	padding: 10vh 6% 8vh;
+	background: linear-gradient(
+		90deg,
+		#fff1d9fa 0%,
+		#fff1d9dd 35%,
+		#fff1d955 65%,
+		transparent 100%
+	);
+}
+.screen-title {
+	font-size: clamp(28px, 4.5vw, 58px);
+	letter-spacing: -1px;
+	line-height: 1.1;
+}
+.screen-sub {
+	font-size: 20px;
+	font-weight: 700;
+	margin-top: 12px;
+	max-width: 600px;
+}
+.select-info {
+	position: absolute;
+	top: 26%;
+	left: 6%;
+	max-width: 40%;
+}
+.select-info h2 {
+	font-size: clamp(48px, 6vw, 90px);
+	line-height: 1.1;
+}
+.select-tag {
+	font-size: 18px;
+	font-weight: 900;
+	color: #99705e;
+	margin-top: 7px;
+}
+.select-story {
+	font-size: 20px;
+	max-width: 420px;
+	line-height: 1.5;
+	margin-top: 20px;
+}
+.stat-row {
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	margin-top: 9px;
+	font-size: 12px;
+	letter-spacing: 2px;
+	font-weight: 1000;
+}
+.stat-row span {
+	width: 62px;
+}
+.pips {
+	display: flex;
+	gap: 4px;
+}
+.pips i {
+	width: 25px;
+	height: 8px;
+	border-radius: 2px;
+	background: #dfd0bb;
+}
+.pips i.on {
+	background: var(--coral);
+}
+.special-tag {
+	font-size: 13px;
+	font-weight: 1000;
+	letter-spacing: 1px;
+	border-left: 4px solid var(--coral);
+	padding: 6px 12px;
+	margin-top: 22px;
+}
+.roster {
+	position: absolute;
+	left: 6%;
+	right: 6%;
+	bottom: 10%;
+	display: grid;
+	grid-template-columns: repeat(7, 1fr);
+	gap: 12px;
+}
+.fighter-card {
+	border: var(--line);
+	border-radius: 10px;
+	background: var(--cream);
+	box-shadow: 4px 5px 0 var(--ink);
+	position: relative;
+	overflow: hidden;
+	padding: 4px 6px 10px;
+	transition: transform 0.12s;
+}
+.fighter-card.active {
+	background: var(--yellow);
+	transform: translateY(-12px);
+	box-shadow: 5px 8px 0 var(--ink);
+}
+.fighter-card svg {
+	height: 100px;
+	max-width: 100%;
+	display: block;
+	margin: auto;
+}
+.fighter-card span {
+	display: block;
+	font-family: Bungee;
+	font-size: 16px;
+}
+.fighter-card small {
+	position: absolute;
+	left: 9px;
+	top: 8px;
+	font-size: 10px;
+	font-weight: 1000;
+	opacity: 0.6;
+}
+.sheet {
+	pointer-events: auto;
+	max-width: 780px;
+	width: 80vw;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 15px;
+	padding: 32px 40px;
+	box-shadow: 9px 10px 0 var(--ink);
+	max-height: 88vh;
+	overflow: auto;
+}
+.sheet h2 {
+	font-size: 35px;
+	margin-bottom: 9px;
+}
+.sheet .sub {
+	font-size: 17px;
+	font-weight: 700;
+	line-height: 1.4;
+	margin-bottom: 20px;
+}
+.settings-row {
+	display: flex;
+	width: 100%;
+	justify-content: space-between;
+	align-items: center;
+	padding: 12px 14px;
+	margin: 4px 0;
+	border-radius: 8px;
+	font-weight: 900;
+	font-size: 18px;
+	border: 2px solid transparent;
+}
+.settings-row.active,
+.settings-row:hover {
+	background: var(--yellow);
+	border-color: var(--ink);
+}
+.settings-row b {
+	font-size: 15px;
+}
+.settings-row .range {
+	display: flex;
+	gap: 3px;
+}
+.settings-row .range i {
+	width: 13px;
+	height: 10px;
+	background: #dcc9b0;
+}
+.settings-row .range i.on {
+	background: var(--ink);
+}
+.settings-foot {
+	border-top: 2px solid #d9c6ad;
+	padding-top: 15px;
+	margin-top: 16px;
+	font-size: 13px;
+	display: flex;
+	gap: 18px;
+	align-items: center;
+}
+.menu-stack {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+	margin-top: 25px;
+	max-width: 500px;
+}
+.wide-screen {
+	background: #fff1d9eb;
+	backdrop-filter: blur(4px);
+}
+.mode-grid {
+	display: grid;
+	grid-template-columns: repeat(3, 1fr);
+	gap: 24px;
+	margin-top: 45px;
+}
+.mode-card {
+	border: var(--line);
+	border-radius: 12px;
+	background: var(--cream);
+	box-shadow: 6px 7px 0 var(--ink);
+	padding: 30px;
+	text-align: left;
+	min-height: 240px;
+	display: flex;
+	flex-direction: column;
+	justify-content: space-between;
+}
+.mode-card.active,
+.mode-card:hover {
+	background: var(--yellow);
+	transform: translateY(-5px);
+}
+.mode-card .big-icon {
+	font-size: 48px;
+}
+.mode-card h3 {
+	font-size: 25px;
+	margin-top: 18px;
+}
+.mode-card p {
+	font-size: 17px;
+	line-height: 1.4;
+	margin-top: 10px;
+	font-weight: 700;
+}
+.stage-swatch {
+	height: 120px;
+	width: 100%;
+	border-radius: 8px;
+	border: 2px solid var(--ink);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-size: 60px;
+}
+.dialogue {
+	position: absolute;
+	left: 10%;
+	right: 10%;
+	bottom: 12%;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 12px;
+	box-shadow: 8px 8px 0 var(--ink);
+	padding: 24px 32px;
+}
+.dialogue h3 {
+	font-size: 25px;
+}
+.dialogue p {
+	font-size: 24px;
+	margin: 12px 0;
+	font-weight: 800;
+	max-width: 90%;
+}
+.dialogue small {
+	font-size: 12px;
+	font-weight: 1000;
+	letter-spacing: 2px;
+}
+.dialogue .menu-btn {
+	position: absolute;
+	right: 24px;
+	bottom: 24px;
+	font-size: 15px;
+	min-width: 125px;
+}
+.dialogue p {
+	padding-right: 130px;
+}
+.hud-top {
+	position: absolute;
+	left: 4%;
+	right: 4%;
+	top: 3%;
+	display: flex;
+	align-items: flex-start;
+	gap: 26px;
+	justify-content: space-between;
+}
+.health-side {
+	width: 41%;
+	filter: drop-shadow(2px 3px 0 var(--ink));
+}
+.fighter-name {
+	font-family: Bungee;
+	font-size: 24px;
+	margin-bottom: 6px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	text-shadow: 1px 1px var(--cream);
+}
+.fighter-name small {
+	font: 1000 11px "Nunito Sans";
+	letter-spacing: 1px;
+	background: var(--ink);
+	color: var(--cream);
+	padding: 4px 8px;
+	border-radius: 4px;
+}
+.health-track {
+	height: 28px;
+	background: var(--ink);
+	border: 3px solid var(--ink);
+	border-radius: 6px;
+	overflow: hidden;
+}
+.health-fill {
+	height: 100%;
+	background: var(--mint);
+	width: 100%;
+	transition: width 0.1s linear;
+	border-top: 4px solid #ffffff77;
+}
+.health-side.right {
+	text-align: right;
+}
+.health-side.right .health-fill {
+	margin-left: auto;
+	background: var(--coral);
+}
+.round-dots {
+	font-size: 19px;
+	letter-spacing: 8px;
+	margin-top: 4px;
+	color: var(--cream);
+	text-shadow: 1px 1px var(--ink);
+}
+.round-dots .won {
+	color: var(--yellow);
+}
+.timer {
+	min-width: 70px;
+	font-family: Bungee;
+	font-size: 42px;
+	line-height: 1;
+	color: var(--ink);
+	text-align: center;
+	margin-top: 23px;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 10px;
+	padding: 4px 9px;
+	box-shadow: 3px 3px 0 var(--ink);
+}
+.timer small {
+	display: block;
+	font: 900 9px "Nunito Sans";
+	letter-spacing: 1px;
+	margin: 4px;
+}
+.hud-bottom {
+	position: absolute;
+	left: 4%;
+	right: 4%;
+	bottom: 4%;
+	display: flex;
+	justify-content: space-between;
+	align-items: flex-end;
+}
+.meter {
+	display: flex;
+	gap: 5px;
+}
+.meter i {
+	width: 31px;
+	height: 19px;
+	background: #fff0d999;
+	border: 2px solid var(--ink);
+	transform: skewX(-13deg);
+	box-shadow: 2px 2px var(--ink);
+}
+.meter i.full {
+	background: var(--yellow);
+}
+.meter-label {
+	font-size: 11px;
+	font-weight: 1000;
+	letter-spacing: 2px;
+	margin: 10px 0;
+}
+.stage-caption {
+	position: absolute;
+	bottom: 3.5%;
+	left: 34%;
+	right: 34%;
+	text-align: center;
+	font-size: 12px;
+	font-weight: 1000;
+	letter-spacing: 2px;
+}
+.fight-help {
+	position: absolute;
+	left: 20%;
+	right: 20%;
+	bottom: 10%;
+	text-align: center;
+	font-size: 12px;
+	font-weight: 1000;
+	color: var(--ink);
+	background: #fff1d9cf;
+	display: inline-block;
+	padding: 6px;
+	border-radius: 30px;
+}
+.notice {
+	position: absolute;
+	top: 21%;
+	left: 12%;
+	right: 12%;
+	text-align: center;
+	opacity: 0;
+	transform: scale(0.85);
+	transition:
+		opacity 0.1s,
+		transform 0.15s;
+	pointer-events: none;
+}
+.notice.show {
+	opacity: 1;
+	transform: scale(1);
+}
+.notice b {
+	display: inline-block;
+	font-family: Bungee;
+	font-size: clamp(24px, 3vw, 43px);
+	color: var(--yellow);
+	-webkit-text-stroke: 1.5px var(--ink);
+	text-shadow: 3px 4px var(--ink);
+	line-height: 1.2;
+	transform: rotate(-2deg);
+}
+.notice small {
+	display: block;
+	font-size: 13px;
+	letter-spacing: 2px;
+	font-weight: 1000;
+	margin-top: 6px;
+	color: var(--ink);
+	text-shadow: 1px 1px var(--cream);
+}
+#countdown {
+	top: 35%;
+}
+#countdown b {
+	font-size: 100px;
+}
+.combo {
+	position: absolute;
+	top: 40%;
+	left: 6%;
+	font-family: Bungee;
+	color: var(--cream);
+	text-shadow: 3px 3px var(--ink);
+	-webkit-text-stroke: 1px var(--ink);
+	font-size: 40px;
+	opacity: 0;
+	transition: opacity 0.15s;
+}
+.combo.show {
+	opacity: 1;
+}
+.combo.right {
+	left: auto;
+	right: 6%;
+}
+.combo small {
+	display: block;
+	font-size: 18px;
+	color: var(--yellow);
+}
+.attract-ribbon {
+	position: absolute;
+	top: 15%;
+	left: 0;
+	right: 0;
+	text-align: center;
+	font-family: Bungee;
+	font-size: 17px;
+	letter-spacing: 2px;
+	color: var(--cream);
+	text-shadow: 2px 2px var(--ink);
+}
+.attract-footer {
+	position: absolute;
+	bottom: 12%;
+	left: 30%;
+	right: 30%;
+	text-align: center;
+	background: var(--yellow);
+	border: var(--line);
+	padding: 12px;
+	border-radius: 8px;
+	font-size: 16px;
+	font-weight: 1000;
+	box-shadow: 4px 4px var(--ink);
+}
+.lesson {
+	position: absolute;
+	bottom: 14%;
+	left: 25%;
+	right: 25%;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 10px;
+	padding: 15px 24px;
+	text-align: center;
+	box-shadow: 4px 5px var(--ink);
+}
+.lesson .number {
+	font-size: 10px;
+	letter-spacing: 2px;
+	font-weight: 1000;
+	color: #917267;
+}
+.lesson h3 {
+	font-size: 19px;
+	margin: 4px 0;
+}
+.lesson p {
+	font-size: 15px;
+	font-weight: 800;
+	line-height: 1.35;
+}
+.lesson .progress {
+	height: 5px;
+	background: #deccb5;
+	border-radius: 4px;
+	margin-top: 10px;
+	overflow: hidden;
+}
+.lesson .progress i {
+	height: 100%;
+	display: block;
+	background: var(--coral);
+}
+.dojo-tools {
+	position: absolute;
+	right: 4%;
+	top: 15%;
+	display: flex;
+	gap: 7px;
+}
+.mini-btn {
+	background: var(--cream);
+	border: 2px solid var(--ink);
+	border-radius: 6px;
+	padding: 7px 11px;
+	font-size: 12px;
+	font-weight: 1000;
+	pointer-events: auto;
+}
+.mini-btn:hover {
+	background: var(--yellow);
+}
+.result-card {
+	position: absolute;
+	inset: 14% 24%;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 15px;
+	box-shadow: 9px 10px var(--ink);
+	padding: 35px;
+	text-align: center;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	gap: 18px;
+}
+.result-card h2 {
+	font-size: 45px;
+	line-height: 1.1;
+}
+.result-card p {
+	font-size: 21px;
+	line-height: 1.4;
+	font-weight: 800;
+}
+.charms {
+	font-size: 31px;
+	letter-spacing: 8px;
+	color: #cebaa6;
+}
+.charms .collected {
+	color: var(--coral);
+}
+.score-line {
+	font-size: 15px;
+	font-weight: 1000;
+	letter-spacing: 2px;
+}
+.result-card .menu-btn {
+	min-width: 260px;
+}
+.manual-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 10px 25px;
+	margin-top: 20px;
+}
+.manual-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 10px 0;
+	border-bottom: 1px solid #d6c4ad;
+}
+.manual-row strong {
+	font-size: 15px;
+	min-width: 110px;
+}
+.manual-row span {
+	font-size: 15px;
+	font-weight: 700;
+}
+.credits-content {
+	font-size: 17px;
+	line-height: 1.6;
+	max-width: 1000px;
+	margin-top: 28px;
+	max-height: 54vh;
+	overflow: auto;
+	padding-right: 15px;
+}
+.credits-content h3 {
+	font-size: 20px;
+	margin: 18px 0 8px;
+}
+.credits-content p {
+	margin: 8px 0;
+}
+.credits-nav {
+	display: flex;
+	gap: 12px;
+	margin-top: 22px;
+}
+.credits-nav .menu-btn {
+	font-size: 14px;
+}
+.network-code {
+	font-family: Bungee;
+	font-size: 60px;
+	letter-spacing: 12px;
+	border: 3px dashed var(--ink);
+	border-radius: 12px;
+	padding: 12px 25px;
+	display: inline-block;
+	background: var(--yellow);
+	margin-top: 25px;
+}
+.lobby-players {
+	display: flex;
+	gap: 15px;
+	margin: 25px 0;
+}
+.lobby-player {
+	border: var(--line);
+	border-radius: 10px;
+	background: var(--cream);
+	padding: 16px 23px;
+	font-size: 20px;
+	font-weight: 1000;
+}
+.keypad {
+	display: grid;
+	grid-template-columns: repeat(3, 1fr);
+	gap: 8px;
+	width: 340px;
+	margin-top: 20px;
+}
+.keypad button {
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 7px;
+	padding: 10px;
+	font-size: 22px;
+	font-weight: 1000;
+}
+.keypad button.active {
+	background: var(--yellow);
+}
+.room-input {
+	display: block;
+	width: 340px;
+	padding: 15px;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 8px;
+	font-family: Bungee;
+	font-size: 30px;
+	letter-spacing: 10px;
+	pointer-events: auto;
+	margin-top: 20px;
+}
+.network-health {
+	position: absolute;
+	left: 4%;
+	right: 4%;
+	top: 3%;
+	display: grid;
+	gap: 16px;
+	grid-template-columns: repeat(4, 1fr);
+}
+.network-health .fighter-name {
+	font-size: 17px;
+}
+.network-health .health-track {
+	height: 18px;
+}
+.network-health .timer {
+	font-size: 28px;
+	margin: 0;
+}
+.net-score {
+	font-size: 14px;
+	font-weight: 1000;
+	margin-top: 5px;
+}
+.network-time {
+	position: absolute;
+	left: 45%;
+	right: 45%;
+	top: 15%;
+	text-align: center;
+	font-family: Bungee;
+	font-size: 25px;
+}
+#touch-notice {
+	z-index: 9;
+	display: none;
+	align-items: center;
+	justify-content: center;
+	background: #fff0d9b0;
+	pointer-events: none;
+}
+#touch-notice.show {
+	display: flex;
+}
+#touch-notice div {
+	padding: 25px 40px;
+	background: var(--cream);
+	border: var(--line);
+	border-radius: 12px;
+	font-size: 24px;
+	font-weight: 1000;
+}
+.error-line {
+	font-size: 18px;
+	color: #a8434a;
+	font-weight: 900;
+	max-width: 650px;
+	line-height: 1.5;
+	margin-top: 25px;
+}
+.page-marker {
+	position: absolute;
+	right: 6%;
+	bottom: 4%;
+	font-size: 13px;
+	font-weight: 1000;
+	letter-spacing: 2px;
+}
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+@media (max-height: 740px) {
+	.title-content {
+		top: 12%;
+	}
+	.wordmark {
+		font-size: min(6vw, 78px);
+	}
+	.title-copy {
+		margin-top: 16px;
+		font-size: 18px;
+	}
+	.title-menu {
+		gap: 8px;
+		margin-top: 18px;
+	}
+	.menu-btn {
+		padding: 10px 17px;
+	}
+	.fighter-card svg {
+		height: 70px;
+	}
+	.select-info {
+		top: 23%;
+	}
+	.select-story {
+		font-size: 17px;
+		margin-top: 12px;
+	}
+	.select-tag {
+		font-size: 15px;
+	}
+	.stat-row {
+		margin-top: 6px;
+	}
+	.sheet {
+		padding: 24px 32px;
+	}
+	.settings-row {
+		padding: 8px 12px;
+	}
+	.lesson {
+		bottom: 13%;
+		padding: 10px 18px;
+	}
+	.screen-sub {
+		font-size: 17px;
+	}
+	.mode-grid {
+		margin-top: 25px;
+	}
+	.mode-card {
+		min-height: 200px;
+		padding: 22px;
+	}
+	.select-info h2 {
+		font-size: 52px;
+	}
+}
+@media (max-width: 900px) {
+	.title-content {
+		left: 5%;
+		width: 52%;
+	}
+	.title-copy {
+		font-size: 16px;
+		max-width: 300px;
+	}
+	.title-menu {
+		width: 310px;
+	}
+	.lucky-stamp {
+		right: 3%;
+		width: 100px;
+		height: 100px;
+		font-size: 14px;
+	}
+	.hero-caption {
+		right: 4%;
+		bottom: 18%;
+	}
+	.hero-caption .hand {
+		font-size: 14px;
+	}
+	.chip {
+		display: none;
+	}
+	.roster {
+		gap: 6px;
+		left: 4%;
+		right: 4%;
+	}
+	.fighter-card span {
+		font-size: 11px;
+	}
+	.fighter-card svg {
+		height: 64px;
+	}
+	.select-story {
+		font-size: 16px;
+	}
+	.select-info {
+		max-width: 47%;
+		left: 4%;
+	}
+	.screen {
+		padding-left: 4%;
+		padding-right: 4%;
+	}
+	.screen-title {
+		font-size: 35px;
+	}
+	.sheet {
+		width: 88vw;
+	}
+	.result-card {
+		inset: 15% 15%;
+	}
+	.mode-grid {
+		gap: 12px;
+	}
+	.mode-card h3 {
+		font-size: 19px;
+	}
+	.mode-card p {
+		font-size: 14px;
+	}
+	.footer {
+		font-size: 10px;
+	}
+	.footer .hint {
+		gap: 10px;
+	}
+	.lesson {
+		left: 20%;
+		right: 20%;
+	}
+	.health-side {
+		width: 39%;
+	}
+	.fighter-name {
+		font-size: 18px;
+	}
+	.credits-content {
+		font-size: 15px;
+	}
+	.brand {
+		font-size: 11px;
+	}
+	.fight-help {
+		left: 10%;
+		right: 10%;
+		font-size: 10px;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	* {
+		animation: none !important;
+		transition: none !important;
+	}
+}
+
+/* Keep the title comfortably inside the safe area on a living-room display. */
+.title-content {
+	top: 12%;
+}
+.wordmark {
+	font-size: clamp(48px, 6.15vw, 88px);
+}
+.title-copy {
+	margin-top: 22px;
+}
+.title-menu {
+	margin-top: 21px;
+	gap: 10px;
+}
+.title-menu .menu-btn {
+	padding: 12px 20px;
+}
+.title-menu .text-btn {
+	font-size: 12px;
+	padding: 6px 0;
+}
+.title-content .eyebrow {
+	font-size: 11px;
+	letter-spacing: 2px;
+}
+.lucky-stamp {
+	top: 16%;
+}
+@media (max-height: 740px) {
+	.wordmark {
+		font-size: min(5.8vw, 66px);
+	}
+	.title-content {
+		top: 12%;
+	}
+	.title-copy {
+		margin-top: 15px;
+		font-size: 16px;
+	}
+	.title-menu {
+		margin-top: 16px;
+		gap: 8px;
+	}
+	.title-menu .menu-btn {
+		padding: 8px 16px;
+		font-size: 16px;
+	}
+	.title-menu .text-btn {
+		font-size: 10px;
+	}
+}
+
+#impact-flash {
+	position: absolute;
+	inset: 0;
+	background: #fff4c2;
+	opacity: 0;
+	pointer-events: none;
+}
+.settings-foot {
+	flex-wrap: wrap;
+}
+.fighter-name {
+	color: var(--ink);
+	-webkit-text-stroke: 0.3px var(--cream);
+}
+@media (max-height: 650px) {
+	.title-content {
+		top: 11%;
+	}
+	.title-content .eyebrow {
+		font-size: 9px;
+		margin-bottom: 10px;
+	}
+	.wordmark {
+		font-size: 48px;
+		line-height: 0.95;
+		letter-spacing: -2px;
+	}
+	.wordmark .lucky {
+		letter-spacing: -2px;
+	}
+	.title-copy {
+		font-size: 14px;
+		line-height: 1.3;
+		margin-top: 14px;
+	}
+	.title-menu {
+		margin-top: 14px;
+		gap: 7px;
+	}
+	.title-menu .menu-btn {
+		padding: 7px 14px;
+		font-size: 14px;
+	}
+	.title-menu .menu-btn small {
+		font-size: 9px;
+	}
+	.title-menu .text-btn {
+		font-size: 9px;
+	}
+	.hero-caption {
+		bottom: 17%;
+	}
+	.hero-caption p {
+		font-size: 10px;
+	}
+	.lucky-stamp {
+		width: 95px;
+		height: 95px;
+		font-size: 12px;
+	}
+	.footer {
+		font-size: 10px;
+	}
+	.sheet h2 {
+		font-size: 25px;
+	}
+	.settings-row {
+		font-size: 15px;
+		padding: 5px 10px;
+	}
+	.select-story {
+		font-size: 15px;
+		line-height: 1.3;
+	}
+	.select-info h2 {
+		font-size: 42px;
+	}
+	.select-tag {
+		font-size: 13px;
+	}
+	.special-tag {
+		font-size: 11px;
+		margin-top: 12px;
+	}
+	.stat-row {
+		font-size: 10px;
+	}
+	.fighter-card svg {
+		height: 56px;
+	}
+}
+</style></head>
+<body><div id="world"></div><div id="hud"></div><div id="fx-ui"><div id="impact-flash"></div><div id="notice" class="notice"></div><div id="countdown" class="notice"></div><div id="combo" class="combo"></div></div><main id="panel"></main><div id="chrome"><div class="brand"><b>✦</b> LUCKY LITTLE ARCADE</div><div class="chrome-right"><span class="chip">VOL. 07 / WISHFUL THINKING</span><button id="settings-button" class="gear" aria-label="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div><div id="modal"></div><div id="touch-notice"><div>Controller or keyboard required</div></div><div id="loading"><div><div class="load-star">✦</div><h1 class="loading-title">A little luck is loading.</h1><p class="load-sub">Warming up the Wish Department…</p><p style="font-size:13px;margin-top:18px">WEBGPU · HEADPHONES ENCOURAGED · COMMON SENSE OPTIONAL</p></div></div>
+<script>window.addEventListener('error',function(e){if(!window.__lucky&&document.querySelector('.load-sub'))document.querySelector('.load-sub').textContent='Loading problem: '+e.message;});setTimeout(function(){if(!window.__lucky&&document.querySelector('.load-sub'))document.querySelector('.load-sub').textContent='Still loading. Internet access is needed for Three.js and Rapier. WebGPU requires HTTPS or localhost.';},25000);</script>
+<script type="module">import * as THREE from 'three/webgpu';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+const REPORT={"source": "Date: 2026-10-29 11:58 America/Vancouver.\nSource: Waku Waku 7.\nTech: Three.js 0.180.0 (R180), WebGPU only; Rapier 3D 0.19.3; Gamepad API; Web Audio API; PeerJS 1.5.5; AI Hub session client 1.3.0; vanilla JavaScript/CSS/HTML.\nArt Direction: original cel-shaded 3D, stepped toon lighting, ink outlines, pastel carnival scenery.\nAnimation: procedural hierarchical character rigs, pose blending, squash/stretch and animated scenery.\nAudio: code-composed sequencer music, synthesized effects and synthesized gibberish voices.\nOnline: 2\u20134 player private PeerJS rooms; AI Hub Protocol v1 versus sessions for 1\u20134 players; host-authoritative combat, predicted local movement, snapshots and disconnect handling. Local two-player versus also included.\nTesting: efficient, lightweight browser and gameplay checks; no performance targets.\nEnvironment: Codex CLI (headless); Linux; browser unknown.\nModel: OpenAI, gpt-6-astra, reasoning effort xhigh.\nUsage: estimated session time about 42 minutes; API cost unknown; token total and breakdown unknown.", "engine": "Most liked: Three.js toon node materials, shadows and scene graphs made a coherent stylized cast practical.\nStuck or guessed wrong: initial headless WebGPU flags produced blank captures; explicit SwiftShader Vulkan flags and bundled Chromium resolved the test setup. WebGPURenderer also needed its default fallback disabled.\nMost important custom system: the fighting-game state machine, hit timing, cancel rules, input buffers and multiplayer combat synchronization.\nHardest part: coordinating fixed-step physics, combat authority and animation while keeping gameplay independent of rendering.\nRemove or overhaul: implicit renderer fallback behavior.\nOne change: expose a documented strict-WebGPU initialization option.", "testing": "Issues found and fixed during lightweight tests and targeted verification: 13; 3 affected core controls or combo/lesson completion.\nMost helpful test: fixed-step combat assertions combined with the AI Hub conformance harness.\nLeast helpful test: the first screenshot under an incompatible headless WebGPU presentation setup; it showed a blank canvas despite successful initialization.\nPassed: 12 combat/attract assertions; controller-only title-to-fight flow; axis inversion; EX, low guard, throw, held recovery, three-hit combo, arcade ending, and title safe areas at 1440\u00d7900, 1280\u00d7720 and 960\u00d7600.\nAI Hub passed at 2, 3 and 4 players with 150 ms latency, 50 ms jitter, 5% loss, departures, host departure and a dedicated server. Network checks suppressed drawing after initialization; full WebGPU visuals were inspected separately.\nStandalone PeerJS: two browser copies connected, guest movement reached the host, and departure ended the round; no runtime errors.\nTest browser: Playwright Chromium 141.0.7390.37; software WebGPU/Vulkan, with Xvfb for visual captures. A physical-controller test across independent networks was not run.", "prompt": "Most liked: the specific source-game identity, controller-first UX and required attract mode give the game a clear design target.\nConfusing: \u201call features\u201d has no fixed size; this demo interprets it as a complete seven-fighter engine with a full arcade route, three stages and a guided mechanics dojo.\nHardest: combining polished fighting mechanics, accessible controls and two multiplayer transports in one portable HTML file.\nOne additional test: a real four-player session using DualSense controllers on separate networks at 250 ms latency."};
+
+// data.js
+const TITLE = "Waku Waku Lucky";
+const CAST = [
+	{
+		name: "PIP",
+		title: "Express-delivery trouble",
+		kind: "rabbit",
+		color: 0x62dacd,
+		accent: 0xff6755,
+		dark: 0x2f4675,
+		speed: 5.8,
+		power: 1,
+		scale: 1,
+		special: "rush",
+		super: "EXPRESS DISTRESS",
+		wish: "A day off. Delivered before yesterday.",
+		quote: "Special delivery! The postage is your problem.",
+		story:
+			"Pip asked for a day off. The Wish Department sent seven forms and a boxing glove.",
+		stats: [5, 3, 3],
+	},
+	{
+		name: "MOCHI",
+		title: "Certified cuddle hazard",
+		kind: "bear",
+		color: 0xffd86b,
+		accent: 0x9a80d6,
+		dark: 0x694569,
+		speed: 3.8,
+		power: 1.22,
+		scale: 1.15,
+		special: "grab",
+		super: "BEARLY LEGAL",
+		wish: "A hug big enough to fit the whole town.",
+		quote: "You look like you need a hug. A medical hug.",
+		story:
+			"Mochi wants to hug the moon. The moon has requested a restraining orbit.",
+		stats: [2, 5, 4],
+	},
+	{
+		name: "RIVET",
+		title: "Warranty definitely void",
+		kind: "robot",
+		color: 0xff785b,
+		accent: 0xffe5a0,
+		dark: 0x3c536e,
+		speed: 4.4,
+		power: 1.12,
+		scale: 1.04,
+		special: "upper",
+		super: "TOTAL RECALL",
+		wish: "One nose. Preferably with a snooze button.",
+		quote: "My warranty does not cover your feelings.",
+		story:
+			"Built to make toast. Programmed to make friends. Somehow making uppercuts.",
+		stats: [3, 5, 3],
+	},
+	{
+		name: "KIKI",
+		title: "Part-time cosmic menace",
+		kind: "moth",
+		color: 0xb692ec,
+		accent: 0xff92b0,
+		dark: 0x574a92,
+		speed: 4.8,
+		power: 0.95,
+		scale: 0.98,
+		special: "shot",
+		super: "HOROSCOPE OF DOOM",
+		wish: "A constellation that spells her name correctly.",
+		quote: "Mercury is in retrograde. So are your knees.",
+		story:
+			"Kiki read your fortune. It says “duck.” She charges extra for context.",
+		stats: [4, 2, 5],
+	},
+	{
+		name: "BOBA",
+		title: "Soup of the end of days",
+		kind: "frog",
+		color: 0x91d978,
+		accent: 0xffad64,
+		dark: 0x477c67,
+		speed: 4.2,
+		power: 1.08,
+		scale: 1.05,
+		special: "wave",
+		super: "SOUPERNOVA",
+		wish: "A recipe that does not call for “one apocalypse”.",
+		quote: "Today’s special: a very personal space invasion.",
+		story:
+			"The secret ingredient is friendship. The second ingredient is unlicensed fireworks.",
+		stats: [3, 4, 4],
+	},
+	{
+		name: "NORI",
+		title: "Licensed to misplace things",
+		kind: "raccoon",
+		color: 0xf8ad65,
+		accent: 0x77bbdf,
+		dark: 0x514b70,
+		speed: 5.5,
+		power: 0.95,
+		scale: 0.95,
+		special: "spin",
+		super: "TRASH TO TREASURE",
+		wish: "The sock he lost in 2007. And absolute power.",
+		quote: "Finders keepers. Losers get a receipt.",
+		story:
+			"Nori found a magic charm in the recycling. Now everyone wants his garbage.",
+		stats: [5, 3, 3],
+	},
+	{
+		name: "LUMA",
+		title: "Five more light-years",
+		kind: "alien",
+		color: 0x8fafff,
+		accent: 0xffdb79,
+		dark: 0x58538c,
+		speed: 4.7,
+		power: 1.02,
+		scale: 1.02,
+		special: "orb",
+		super: "SNOOZE CRUISE",
+		wish: "To sleep through the end of the universe.",
+		quote: "Wake me when you have a better plan.",
+		story:
+			"Luma crashed a spaceship into a pillow shop. Honestly, best landing yet.",
+		stats: [3, 3, 5],
+	},
+	{
+		name: "THE FINE PRINT",
+		title: "Your wish. Terms apply.",
+		kind: "boss",
+		color: 0xb48cf2,
+		accent: 0xffd65f,
+		dark: 0x4c3a75,
+		speed: 3.6,
+		power: 1.25,
+		scale: 1.55,
+		special: "orb",
+		super: "TERMS & CONDITIONS",
+		wish: "Every wish comes with a handling fee.",
+		quote: "By losing, you agree to the following terms.",
+		stats: [2, 5, 5],
+	},
+];
+const STAGES = [
+	{
+		name: "WISH MARKET",
+		sub: "A little luck. A lot of property damage.",
+		sky: 0xffcbb0,
+		floor: 0xf2c294,
+		theme: 0xee846b,
+	},
+	{
+		name: "BUBBLE BATHHOUSE",
+		sub: "Please rinse before entering the brawl.",
+		sky: 0xbce3de,
+		floor: 0x98c6b7,
+		theme: 0x78a9c7,
+	},
+	{
+		name: "RADIO ROOFTOPS",
+		sub: "Broadcasting questionable decisions since 7:07.",
+		sky: 0xc9b3e5,
+		floor: 0xba9fce,
+		theme: 0x7c78b3,
+	},
+];
+const ATTACKS = {
+	jab: {
+		duration: 0.3,
+		start: 0.07,
+		end: 0.16,
+		reach: 1.65,
+		damage: 5,
+		stun: 0.21,
+		push: 1.2,
+		level: "mid",
+		chain: 1,
+	},
+	kick: {
+		duration: 0.42,
+		start: 0.13,
+		end: 0.25,
+		reach: 2,
+		damage: 8,
+		stun: 0.3,
+		push: 1.8,
+		level: "mid",
+		chain: 2,
+	},
+	heavy: {
+		duration: 0.62,
+		start: 0.23,
+		end: 0.36,
+		reach: 2.2,
+		damage: 13,
+		stun: 0.44,
+		push: 9,
+		launch: 4,
+		level: "high",
+		chain: 3,
+	},
+	sweep: {
+		duration: 0.65,
+		start: 0.21,
+		end: 0.36,
+		reach: 2.15,
+		damage: 11,
+		stun: 0.65,
+		push: 6,
+		launch: 2,
+		level: "low",
+		chain: 3,
+		down: true,
+	},
+	air: {
+		duration: 0.47,
+		start: 0.12,
+		end: 0.3,
+		reach: 1.85,
+		damage: 9,
+		stun: 0.35,
+		push: 5,
+		level: "high",
+		chain: 2,
+	},
+	special: {
+		duration: 0.8,
+		start: 0.23,
+		end: 0.49,
+		reach: 2.4,
+		damage: 16,
+		stun: 0.5,
+		push: 9,
+		launch: 4,
+		level: "mid",
+		chain: 4,
+	},
+	throw: {
+		duration: 0.65,
+		start: 0.14,
+		end: 0.22,
+		reach: 1.4,
+		damage: 18,
+		stun: 0.85,
+		push: 12,
+		launch: 5,
+		level: "throw",
+		chain: 4,
+		down: true,
+	},
+	super: {
+		duration: 2.35,
+		start: 1.52,
+		end: 1.9,
+		reach: 6.6,
+		damage: 36,
+		stun: 1.05,
+		push: 17,
+		launch: 7,
+		level: "unblockable",
+		chain: 5,
+		down: true,
+	},
+	burst: {
+		duration: 0.6,
+		start: 0.05,
+		end: 0.22,
+		reach: 2.5,
+		damage: 6,
+		stun: 0.38,
+		push: 12,
+		launch: 3,
+		level: "unblockable",
+		chain: 6,
+	},
+	wake: {
+		duration: 0.55,
+		start: 0.12,
+		end: 0.3,
+		reach: 2.1,
+		damage: 9,
+		stun: 0.4,
+		push: 7,
+		launch: 5,
+		level: "mid",
+		chain: 4,
+	},
+};
+const LESSONS = [
+	{
+		name: "Find your feet",
+		hint: "Move left and right. Stick / D-pad · A / D",
+		goal: "move",
+		need: 3,
+	},
+	{
+		name: "A little airtime",
+		hint: "Up to jump. Press Up again in the air to double jump.",
+		goal: "jump",
+		need: 2,
+	},
+	{
+		name: "Special delivery",
+		hint: "Tap R1 / E while moving to dash.",
+		goal: "dash",
+		need: 1,
+	},
+	{
+		name: "The one-two-three",
+		hint: "Land □ → × → △ quickly. Keyboard J → K → U.",
+		goal: "chain",
+		need: 3,
+	},
+	{
+		name: "Mind your ankles",
+		hint: "Land a low sweep with ○ / I.",
+		goal: "sweep",
+		need: 1,
+	},
+	{
+		name: "Keep your chin up",
+		hint: "Hold L1 / Q to guard. Block two incoming attacks.",
+		goal: "block",
+		need: 2,
+	},
+	{
+		name: "Perfect timing",
+		hint: "Tap L1 / Q just before a hit to parry it.",
+		goal: "parry",
+		need: 1,
+	},
+	{
+		name: "Everybody is special",
+		hint: "R2 / L uses your signature move. Down + R2 spends 1 star for EX.",
+		goal: "special",
+		need: 1,
+	},
+	{
+		name: "Hug responsibly",
+		hint: "Get close. Press □ + × together, or O, to throw.",
+		goal: "throw",
+		need: 1,
+	},
+	{
+		name: "Make a scene",
+		hint: "L2 / H spends 2 stars. The warning is real: charging can be interrupted!",
+		goal: "super",
+		need: 1,
+	},
+	{
+		name: "Personal space",
+		hint: "R3 / B spends 1 star to burst, even while being hit.",
+		goal: "burst",
+		need: 1,
+	},
+	{
+		name: "Wall, meet friend",
+		hint: "Land △ / U near the edge to wall-bounce your rival.",
+		goal: "wall",
+		need: 1,
+	},
+	{
+		name: "Rise and shine",
+		hint: "After a knockdown, hold Up for a wake-up attack, or sideways to roll.",
+		goal: "recover",
+		need: 1,
+	},
+];
+const $ = (s) => document.querySelector(s),
+	clamp = (v, a, b) => Math.max(a, Math.min(b, v)),
+	lerp = (a, b, t) => a + (b - a) * t;
+const defaults = {
+	volume: 0.7,
+	music: 0.65,
+	sfx: 0.85,
+	voice: 0.7,
+	invertX: false,
+	invertY: false,
+	shake: true,
+	flash: true,
+	difficulty: 1,
+};
+let settings = { ...defaults };
+try {
+	Object.assign(
+		settings,
+		JSON.parse(localStorage.getItem("wwl-settings") || "{}"),
+	);
+} catch {}
+let save = { best: 0, clears: 0, lessons: [] };
+try {
+	Object.assign(save, JSON.parse(localStorage.getItem("wwl-save") || "{}"));
+} catch {}
+function persist() {
+	try {
+		localStorage.setItem("wwl-settings", JSON.stringify(settings));
+		localStorage.setItem("wwl-save", JSON.stringify(save));
+	} catch {}
+}
+
+// audio.js
+class Sound {
+	constructor() {
+		this.ctx = null;
+		this.next = 0;
+		this.beat = 0;
+		this.enabled = true;
+		this.mood = 0;
+	}
+	unlock() {
+		if (!this.ctx) {
+			this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+			this.master = this.ctx.createGain();
+			this.master.gain.value = 0.4;
+			this.master.connect(this.ctx.destination);
+			this.noise = this.ctx.createBuffer(
+				1,
+				this.ctx.sampleRate * 0.3,
+				this.ctx.sampleRate,
+			);
+			let a = this.noise.getChannelData(0);
+			for (let i = 0; i < a.length; i++) a[i] = Math.random() * 2 - 1;
+		}
+		if (this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
+	}
+	tone(
+		freq,
+		dur,
+		type = "sine",
+		vol = 0.2,
+		when = 0,
+		slide = 0,
+		channel = "sfx",
+	) {
+		if (!this.ctx || !this.enabled) return;
+		const t = Math.max(this.ctx.currentTime, when || this.ctx.currentTime),
+			o = this.ctx.createOscillator(),
+			g = this.ctx.createGain();
+		o.type = type;
+		o.frequency.setValueAtTime(freq, t);
+		if (slide)
+			o.frequency.exponentialRampToValueAtTime(Math.max(20, slide), t + dur);
+		g.gain.setValueAtTime(0.001, t);
+		g.gain.linearRampToValueAtTime(vol * settings[channel], t + 0.008);
+		g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+		o.connect(g);
+		g.connect(this.master);
+		o.start(t);
+		o.stop(t + dur + 0.02);
+	}
+	hiss(dur = 0.13, vol = 0.18, when = 0, freq = 2500) {
+		if (!this.ctx || !this.enabled) return;
+		let s = this.ctx.createBufferSource(),
+			g = this.ctx.createGain(),
+			f = this.ctx.createBiquadFilter(),
+			t = when || this.ctx.currentTime;
+		s.buffer = this.noise;
+		f.type = "highpass";
+		f.frequency.value = freq;
+		g.gain.setValueAtTime(vol * settings.sfx, t);
+		g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+		s.connect(f);
+		f.connect(g);
+		g.connect(this.master);
+		s.start(t);
+		s.stop(t + dur);
+	}
+	fx(type) {
+		if (!this.ctx) return;
+		let t = this.ctx.currentTime;
+		if (type === "hit") {
+			this.tone(140, 0.14, "sawtooth", 0.3, 0, 45);
+			this.hiss(0.1, 0.25);
+		} else if (type === "heavy") {
+			this.tone(100, 0.26, "square", 0.35, 0, 30);
+			this.hiss(0.22, 0.4, 0, 700);
+		} else if (type === "block") {
+			this.tone(540, 0.09, "triangle", 0.4, 0, 180);
+			this.hiss(0.06, 0.15);
+		} else if (type === "parry") {
+			[880, 1320, 1760].forEach((f, i) =>
+				this.tone(f, 0.25, "sine", 0.25, t + i * 0.03),
+			);
+		} else if (type === "jump") {
+			this.tone(260, 0.13, "sine", 0.15, 0, 600);
+		} else if (type === "dash") {
+			this.hiss(0.16, 0.15, 0, 1100);
+		} else if (type === "super") {
+			[130, 165, 196, 260].forEach((f) => this.tone(f, 1.3, "sawtooth", 0.08));
+		} else if (type === "select") {
+			this.tone(640, 0.08, "square", 0.12, 0, 820);
+		} else if (type === "confirm") {
+			this.tone(640, 0.12, "triangle", 0.3);
+			this.tone(960, 0.2, "triangle", 0.3, t + 0.07);
+		} else if (type === "win") {
+			[60, 64, 67, 72, 76].forEach((n, i) =>
+				this.tone(
+					440 * 2 ** ((n - 69) / 12),
+					0.45,
+					"triangle",
+					0.3,
+					t + i * 0.11,
+				),
+			);
+		} else this.tone(220, 0.1, "triangle", 0.15);
+	}
+	voice(index = 0, excited = false) {
+		if (!this.ctx) return;
+		const t = this.ctx.currentTime;
+		for (let i = 0; i < 6; i++) {
+			let base = (175 + (index % 7) * 28) * (excited ? 1.3 : 1),
+				f = base * [1, 1.25, 0.8, 1.5, 1.1, 0.9][i];
+			this.tone(f, 0.085, "sawtooth", 0.075, t + i * 0.09, f * 1.12, "voice");
+			this.tone(f * 2.7, 0.08, "sine", 0.05, t + i * 0.09, 0, "voice");
+		}
+	}
+	tick() {
+		if (!this.ctx) return;
+		this.master.gain.setTargetAtTime(
+			this.enabled ? settings.volume * 0.48 : 0,
+			this.ctx.currentTime,
+			0.1,
+		);
+		if (!this.enabled) return;
+		if (this.next < this.ctx.currentTime - 0.2)
+			this.next = this.ctx.currentTime + 0.05;
+		while (this.next < this.ctx.currentTime + 0.12) {
+			this.musicStep(this.beat++, this.next);
+			this.next += 60 / (this.mood ? 142 : 118) / 4;
+		}
+	}
+	musicStep(b, t) {
+		const n = b % 64,
+			chord = [0, 5, 3, 7][Math.floor(n / 16)],
+			root = 48 + chord,
+			midi = (n) => 440 * 2 ** ((n - 69) / 12);
+		if (b % 4 === 0) {
+			this.tone(midi(root - 12), 0.19, "triangle", 0.25, t, 0, "music");
+			this.tone(100, 0.12, "sine", 0.32 * settings.music, t, 28, "music");
+		}
+		if (b % 8 === 4) this.tone(180, 0.06, "triangle", 0.2, t, 60, "music");
+		if (b % 2 === 0) this.tone(6500, 0.025, "square", 0.025, t, 2000, "music");
+		const melody = [
+			12, 16, 19, 16, 21, 19, 16, 14, 12, 7, 12, 16, 19, 24, 21, 19,
+		];
+		if (b % 2 === 0)
+			this.tone(
+				midi(root + melody[Math.floor(n / 2) % 16]),
+				0.16,
+				"triangle",
+				0.11,
+				t,
+				0,
+				"music",
+			);
+		if (b % 8 === 0)
+			[0, 4, 7].forEach((x) =>
+				this.tone(midi(root + x), 0.4, "sine", 0.08, t, 0, "music"),
+			);
+	}
+}
+const sound = new Sound();
+
+// visuals.js
+const INK = 0x302b49;
+const materialCache = new Map();
+const rampData = new Uint8Array([
+	90, 90, 90, 255, 173, 173, 173, 255, 255, 255, 255, 255,
+]);
+const ramp = new THREE.DataTexture(rampData, 3, 1);
+ramp.needsUpdate = true;
+ramp.minFilter = ramp.magFilter = THREE.NearestFilter;
+function toon(hex) {
+	if (!materialCache.has(hex))
+		materialCache.set(
+			hex,
+			new THREE.MeshToonNodeMaterial({ color: hex, gradientMap: ramp }),
+		);
+	return materialCache.get(hex);
+}
+const inkMat = new THREE.MeshBasicNodeMaterial({
+	color: INK,
+	side: THREE.BackSide,
+});
+function mesh(
+	geo,
+	color,
+	parent,
+	pos = [0, 0, 0],
+	scale = [1, 1, 1],
+	outline = true,
+) {
+	let m = new THREE.Mesh(geo, toon(color));
+	m.position.set(...pos);
+	m.scale.set(...scale);
+	m.castShadow = true;
+	m.receiveShadow = true;
+	if (outline) {
+		const o = new THREE.Mesh(geo, inkMat);
+		o.scale.setScalar(1.035);
+		m.add(o);
+	}
+	if (parent) parent.add(m);
+	return m;
+}
+const ballGeo = new THREE.SphereGeometry(1, 24, 16),
+	boxGeo = new THREE.BoxGeometry(1, 1, 1);
+function ball(p, c, pos, s = [1, 1, 1], line = true) {
+	return mesh(ballGeo, c, p, pos, s, line);
+}
+function box(p, c, pos, s, line = true) {
+	return mesh(boxGeo, c, p, pos, s, line);
+}
+function cyl(p, c, pos, rad, ht, segments = 20) {
+	return mesh(new THREE.CylinderGeometry(rad, rad, ht, segments), c, p, pos);
+}
+function cone(p, c, pos, rad, ht, n = 24) {
+	return mesh(new THREE.ConeGeometry(rad, ht, n), c, p, pos);
+}
+function tube(p, c, pts, r = 0.04) {
+	let curve = new THREE.CatmullRomCurve3(
+		pts.map((a) => new THREE.Vector3(...a)),
+	);
+	return mesh(
+		new THREE.TubeGeometry(curve, Math.max(8, pts.length * 4), r, 6, false),
+		c,
+		p,
+		[0, 0, 0],
+		[1, 1, 1],
+		false,
+	);
+}
+function star(p, c, pos, size = 0.3) {
+	let s = new THREE.Shape();
+	for (let i = 0; i < 10; i++) {
+		let a = (i * Math.PI) / 5 + Math.PI / 2,
+			r = i % 2 ? size * 0.46 : size;
+		let x = Math.cos(a) * r,
+			y = Math.sin(a) * r;
+		i ? s.lineTo(x, y) : s.moveTo(x, y);
+	}
+	s.closePath();
+	return mesh(
+		new THREE.ExtrudeGeometry(s, { depth: 0.1, bevelEnabled: false }),
+		c,
+		p,
+		pos,
+	);
+}
+function label(
+	text,
+	w = 512,
+	h = 128,
+	bg = "#fff4d5",
+	fg = "#40304c",
+	fontSize = 64,
+) {
+	let c = document.createElement("canvas");
+	c.width = w;
+	c.height = h;
+	let x = c.getContext("2d");
+	x.fillStyle = bg;
+	x.fillRect(0, 0, w, h);
+	x.strokeStyle = fg;
+	x.lineWidth = 8;
+	x.strokeRect(7, 7, w - 14, h - 14);
+	x.fillStyle = fg;
+	x.textAlign = "center";
+	x.textBaseline = "middle";
+	x.font = `900 ${fontSize}px sans-serif`;
+	x.fillText(text, w / 2, h / 2, w - 32);
+	let t = new THREE.CanvasTexture(c);
+	t.colorSpace = THREE.SRGBColorSpace;
+	return t;
+}
+function sign(p, text, pos, w, h, bg, fg) {
+	let m = new THREE.Mesh(
+		new THREE.PlaneGeometry(w, h),
+		new THREE.MeshBasicNodeMaterial({ map: label(text, 512, 128, bg, fg) }),
+	);
+	m.position.set(...pos);
+	p.add(m);
+	return m;
+}
+function makeFighter(id) {
+	const c = CAST[id],
+		g = new THREE.Group(),
+		root = new THREE.Group();
+	g.add(root);
+	const body = new THREE.Group();
+	body.position.y = 1;
+	root.add(body);
+	let torso = ball(body, c.color, [0, 0.15, 0], [0.63, 0.68, 0.46]);
+	ball(body, c.accent, [0, 0.1, 0.39], [0.42, 0.47, 0.15]);
+	let belt = cyl(body, c.dark, [0, -0.19, 0], 0.58, 0.16);
+	belt.scale.z = 0.77;
+	let emblem = star(body, 0xfff1ba, [0, 0.22, 0.55], 0.18);
+	const head = new THREE.Group();
+	head.position.set(0, 1.05, 0);
+	body.add(head);
+	const hd = ball(head, c.color, [0, 0, 0], [0.69, 0.62, 0.53]);
+	const eyes = [];
+	const legs = [],
+		arms = [];
+	for (let s of [-1, 1]) {
+		let leg = new THREE.Group();
+		leg.position.set(s * 0.34, -0.3, 0);
+		body.add(leg);
+		ball(leg, c.dark, [0, -0.23, 0], [0.21, 0.33, 0.22]);
+		ball(leg, c.accent, [s * 0.03, -0.59, 0.16], [0.29, 0.18, 0.43]);
+		box(leg, 0xfff3cf, [s * 0.03, -0.69, 0.17], [0.53, 0.1, 0.72]);
+		legs.push(leg);
+		let arm = new THREE.Group();
+		arm.position.set(s * 0.62, 0.5, 0);
+		body.add(arm);
+		ball(arm, c.color, [s * 0.12, -0.23, 0], [0.21, 0.37, 0.22]);
+		ball(arm, c.accent, [s * 0.16, -0.55, 0.1], [0.32, 0.33, 0.33]);
+		cyl(arm, c.dark, [s * 0.14, -0.39, 0.08], 0.235, 0.11);
+		arms.push(arm);
+		let eye = ball(
+			head,
+			0xfff8e9,
+			[s * 0.26, 0.07, 0.48],
+			[0.18, 0.24, 0.09],
+			false,
+		);
+		ball(eye, INK, [0.12, 0, 0.75], [0.37, 0.55, 0.35], false);
+		eyes.push(eye);
+		ball(head, 0xf78f83, [s * 0.46, -0.15, 0.46], [0.13, 0.055, 0.025], false);
+	}
+	ball(head, INK, [0, -0.11, 0.56], [0.095, 0.06, 0.04], false);
+	tube(
+		head,
+		INK,
+		[
+			[-0.16, -0.23, 0.51],
+			[0, -0.29, 0.55],
+			[0.17, -0.23, 0.51],
+		],
+		0.023,
+	);
+	if (c.kind === "rabbit") {
+		for (let s of [-1, 1]) {
+			let ear = ball(head, c.color, [s * 0.34, 0.86, -0.06], [0.21, 0.77, 0.2]);
+			ear.rotation.z = -s * 0.15;
+			ball(ear, c.accent, [0, 0, 0.75], [0.58, 0.79, 0.26], false);
+		}
+		let scarf = cyl(body, c.accent, [0, 0.68, 0], 0.48, 0.22);
+		scarf.scale.z = 0.9;
+		let tail = box(body, c.accent, [-0.67, 0.58, -0.24], [0.8, 0.23, 0.12]);
+		tail.rotation.z = 0.34;
+		ball(body, 0xfff3d0, [0, -0.05, -0.5], [0.28, 0.28, 0.28]);
+		box(head, 0xfff3d5, [0, -0.28, 0.57], [0.13, 0.12, 0.04]);
+	} else if (c.kind === "bear") {
+		for (let s of [-1, 1]) {
+			ball(head, c.color, [s * 0.56, 0.47, -0.04], [0.31, 0.31, 0.2]);
+			ball(head, c.accent, [s * 0.56, 0.47, 0.14], [0.18, 0.18, 0.04]);
+		}
+		ball(head, 0xffedba, [0, -0.21, 0.49], [0.37, 0.25, 0.15]);
+		ball(head, c.dark, [0, -0.12, 0.65], [0.13, 0.09, 0.08]);
+		tube(
+			head,
+			INK,
+			[
+				[-0.14, -0.3, 0.61],
+				[0, -0.34, 0.64],
+				[0.14, -0.3, 0.61],
+			],
+			0.02,
+		);
+		for (let s of [-1, 1])
+			box(body, c.accent, [s * 0.42, 0.36, 0.32], [0.19, 0.6, 0.29]);
+	} else if (c.kind === "robot") {
+		hd.scale.set(0.72, 0.62, 0.53);
+		box(head, c.dark, [0, 0.04, 0.45], [1.13, 0.53, 0.27]);
+		for (let s of [-1, 1])
+			box(head, 0xb4f8dc, [s * 0.28, 0.06, 0.61], [0.12, 0.31, 0.03]);
+		for (let s of [-1, 1])
+			cyl(head, c.accent, [s * 0.78, 0, 0], 0.18, 0.2).rotation.z = Math.PI / 2;
+		cyl(head, c.dark, [0, 0.78, 0], 0.045, 0.35);
+		ball(head, c.accent, [0, 0.97, 0], [0.13, 0.13, 0.13]);
+		box(head, 0xfff1c0, [0, -0.34, 0.54], [0.52, 0.11, 0.05]);
+		for (let i = -1; i <= 1; i++)
+			box(body, c.dark, [i * 0.17, 0.1, 0.56], [0.075, 0.28, 0.06]);
+	} else if (c.kind === "moth") {
+		for (let s of [-1, 1]) {
+			let wing = ball(body, c.dark, [s * 0.8, 0.4, -0.35], [0.62, 0.85, 0.12]);
+			wing.rotation.z = s * -0.3;
+			ball(wing, c.accent, [0, 0.1, 0.6], [0.75, 0.72, 0.3]);
+			ball(wing, c.color, [0, 0.15, 0.95], [0.4, 0.46, 0.15]);
+			tube(
+				head,
+				c.dark,
+				[
+					[s * 0.3, 0.4, 0],
+					[s * 0.4, 0.95, 0],
+					[s * 0.63, 1.1, 0.05],
+				],
+				0.035,
+			);
+			star(head, c.accent, [s * 0.63, 1.12, 0.05], 0.18);
+		}
+		cone(body, c.dark, [0, -0.05, 0], 0.75, 0.95).rotation.z = Math.PI;
+		ball(head, c.dark, [0, 0.34, -0.1], [0.73, 0.43, 0.52]);
+	} else if (c.kind === "frog") {
+		for (let s of [-1, 1]) {
+			ball(head, c.color, [s * 0.44, 0.44, 0], [0.3, 0.33, 0.35]);
+			ball(head, 0xfff2c2, [s * 0.44, 0.49, 0.31], [0.18, 0.2, 0.06]);
+			ball(head, INK, [s * 0.44, 0.5, 0.37], [0.065, 0.12, 0.035], false);
+			eyes.forEach((e) => (e.visible = false));
+		}
+		cyl(head, 0xfff4dc, [0, 0.67, -0.02], 0.38, 0.22);
+		for (let x of [-0.24, 0, 0.24])
+			ball(head, 0xfff4dc, [x, 0.88, -0.04], [0.25, 0.26, 0.26]);
+		box(body, 0xfff3d0, [0, 0.02, 0.48], [0.75, 0.65, 0.12]);
+		star(body, c.accent, [0, 0.13, 0.59], 0.19);
+		tube(
+			head,
+			INK,
+			[
+				[-0.38, -0.18, 0.48],
+				[0, -0.34, 0.55],
+				[0.38, -0.18, 0.48],
+			],
+			0.027,
+		);
+	} else if (c.kind === "raccoon") {
+		for (let s of [-1, 1]) {
+			cone(head, c.dark, [s * 0.48, 0.61, 0], 0.25, 0.49, 3);
+			ball(head, c.dark, [s * 0.28, 0.06, 0.49], [0.31, 0.25, 0.07]);
+			eyes.find((_, i) => i === (s < 0 ? 0 : 1)).position.z = 0.57;
+		}
+		let tail = new THREE.Group();
+		tail.position.set(-0.23, -0.13, -0.43);
+		tail.rotation.z = -0.6;
+		body.add(tail);
+		ball(tail, c.color, [0, 0.2, -0.3], [0.36, 0.4, 0.85]);
+		for (let i = 0; i < 3; i++) {
+			let t = cyl(tail, c.dark, [0, 0.2, -0.7 + i * 0.36], 0.35, 0.18);
+			t.rotation.x = Math.PI / 2;
+		}
+		cyl(head, c.accent, [0, 0.58, 0], 0.55, 0.13);
+		box(head, c.accent, [0, 0.54, 0.47], [0.78, 0.08, 0.65]);
+	} else if (c.kind === "alien") {
+		let halo = mesh(
+			new THREE.TorusGeometry(0.6, 0.045, 8, 40),
+			c.accent,
+			head,
+			[0, 0.82, 0],
+		);
+		halo.rotation.x = Math.PI / 2;
+		for (let s of [-1, 1]) {
+			ball(head, c.accent, [s * 0.71, 0, 0], [0.16, 0.34, 0.3]);
+			star(body, c.accent, [s * 0.36, 0.35, 0.41], 0.1);
+		}
+		cyl(body, 0xfff3d9, [0, 0.66, 0], 0.46, 0.2);
+		ball(body, c.dark, [0, 0.2, -0.47], [0.4, 0.5, 0.23]);
+	} else {
+		for (let s of [-1, 1])
+			cone(head, c.accent, [s * 0.47, 0.58, 0], 0.3, 0.65, 3);
+		box(head, c.dark, [0, 0.1, 0.46], [1.22, 0.24, 0.18]);
+		for (let s of [-1, 1])
+			ball(head, 0xfff4ab, [s * 0.29, 0.1, 0.58], [0.15, 0.065, 0.04]);
+		box(body, 0xfff0c1, [0, 0.1, 0.47], [0.86, 0.66, 0.15]);
+		sign(body, "7 7 7", [0, 0.12, 0.56], 0.78, 0.25, "#fff3cd", "#5c4777");
+		let crown = star(head, c.accent, [0, 0.87, 0], 0.29);
+	}
+	g.userData = { root, body, head, arms, legs, eyes, id };
+	g.scale.setScalar(c.scale);
+	return g;
+}
+function animateFighter(g, f, t) {
+	const d = g.userData,
+		c = CAST[d.id],
+		root = d.root,
+		body = d.body,
+		head = d.head;
+	let speed = f?.move || 0,
+		act = f?.attack || "",
+		at = f?.at || 0,
+		dir = f?.face || 1;
+	root.rotation.y = lerp(root.rotation.y, dir * 0.36, 0.2);
+	body.position.y = 1 + Math.sin(t * 4.5 + d.id) * 0.035;
+	body.rotation.z = 0;
+	body.scale.set(1, 1, 1);
+	head.rotation.z = Math.sin(t * 2.4) * 0.035;
+	root.rotation.z = 0;
+	let walk = Math.sin(t * 12) * Math.min(1, Math.abs(speed));
+	d.legs.forEach((l, i) => {
+		l.rotation.x = walk * (i ? 1 : -1) * 0.6;
+		l.rotation.z = 0;
+	});
+	d.arms.forEach((a, i) => {
+		a.rotation.z = (i ? 1 : -1) * 0.15;
+		a.rotation.x = -walk * (i ? 1 : -1) * 0.45;
+	});
+	if (f?.guard) {
+		d.arms[dir > 0 ? 1 : 0].rotation.z = dir * 1.9;
+		body.scale.y = 0.94;
+		head.rotation.z = -dir * 0.12;
+	}
+	if (f?.crouch) {
+		body.position.y = 0.65;
+		d.legs.forEach((l, i) => (l.rotation.z = (i ? 1 : -1) * 0.6));
+		body.scale.y = 0.87;
+	}
+	if (f?.air) {
+		d.legs[0].rotation.z = -0.6;
+		d.legs[1].rotation.z = 0.6;
+		d.arms[0].rotation.z = -0.7;
+		d.arms[1].rotation.z = 0.7;
+	}
+	if (f?.stun > 0) {
+		body.rotation.z = -dir * 0.23;
+		d.arms.forEach((a, i) => (a.rotation.z = (i ? 1 : -1) * 1.2));
+		head.rotation.z = -dir * 0.22;
+	}
+	if (f?.down > 0) {
+		root.rotation.z = dir * 1.3;
+		body.position.y = 0.55;
+	}
+	if (act) {
+		const a = ATTACKS[act],
+			p = Math.sin(clamp(at / a.duration, 0, 1) * Math.PI),
+			hand = d.arms[dir > 0 ? 1 : 0],
+			leg = d.legs[dir > 0 ? 1 : 0];
+		if (act === "super") {
+			body.position.y += Math.sin(at * 32) * 0.04;
+			d.arms[0].rotation.z = -2.6;
+			d.arms[1].rotation.z = 2.6;
+			body.scale.set(1 + Math.sin(at * 18) * 0.04, 1, 1);
+			if (at > 1.5) {
+				body.rotation.z = -dir * 0.35;
+				hand.rotation.z = dir * 1.7;
+			}
+		} else if (act === "kick" || act === "sweep" || act === "air") {
+			leg.rotation.z = dir * (act === "sweep" ? 1.8 : 1.45) * p;
+			body.rotation.z = -dir * 0.16 * p;
+		} else if (act === "burst" || act === "wake") {
+			d.arms[0].rotation.z = -1.6;
+			d.arms[1].rotation.z = 1.6;
+			root.rotation.y += at * 8;
+		} else {
+			hand.rotation.z = dir * 1.65 * p;
+			hand.scale.y = 1 + 0.48 * p;
+			body.rotation.z = -dir * 0.12 * p;
+		}
+	} else d.arms.forEach((a) => (a.scale.y = 1));
+	let blink = Math.sin(t * 0.7 + d.id) > 0.995;
+	d.eyes.forEach((e) => (e.scale.y = blink ? 0.04 : 0.24));
+}
+class View {
+	async init() {
+		if (!navigator.gpu)
+			throw new Error(
+				"WebGPU is required. Open this game in a WebGPU-enabled browser over HTTPS or localhost.",
+			);
+		this.renderer = new THREE.WebGPURenderer({ antialias: true, alpha: false });
+		this.renderer._getFallback = null;
+		this.renderer.onDeviceLost = (info) => {
+			game.ended = true;
+			sound.enabled = false;
+			AIHub.fail("WebGPU device lost: " + info.message);
+			$("#modal").innerHTML =
+				'<div class="sheet"><h2>The graphics device disconnected.</h2><p class="sub">Reload this page to reconnect WebGPU.</p></div>';
+		};
+		await this.renderer.init();
+		if (!this.renderer.backend.isWebGPUBackend)
+			throw new Error("WebGPU could not start. No WebGL fallback is used.");
+		this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+		this.renderer.setSize(innerWidth, innerHeight);
+		this.renderer.shadowMap.enabled = true;
+		this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+		this.renderer.toneMapping = THREE.NeutralToneMapping;
+		$("#world").append(this.renderer.domElement);
+		this.scene = new THREE.Scene();
+		this.scene.background = new THREE.Color(STAGES[0].sky);
+		this.scene.fog = new THREE.Fog(STAGES[0].sky, 27, 65);
+		this.camera = new THREE.PerspectiveCamera(
+			38,
+			innerWidth / innerHeight,
+			0.1,
+			100,
+		);
+		this.camera.position.set(0, 6.5, 19);
+		this.scene.add(new THREE.HemisphereLight(0xfff0d9, 0x7e6d96, 2.2));
+		let key = new THREE.DirectionalLight(0xfff2da, 3);
+		key.position.set(-7, 13, 9);
+		key.castShadow = true;
+		key.shadow.mapSize.set(2048, 2048);
+		Object.assign(key.shadow.camera, {
+			left: -19,
+			right: 19,
+			top: 15,
+			bottom: -12,
+			near: 0.1,
+			far: 55,
+		});
+		key.shadow.bias = -0.0008;
+		key.shadow.normalBias = 0.04;
+		this.scene.add(key);
+		this.stage = new THREE.Group();
+		this.scene.add(this.stage);
+		this.characters = new Map();
+		this.fx = [];
+		this.bobs = [];
+		this.amb = [];
+		this.stageIndex = -1;
+		this.makeStage(0);
+		this.hero = true;
+		this.shake = 0;
+		this.look = new THREE.Vector3(0, 1.8, 0);
+		addEventListener("resize", () => {
+			this.camera.aspect = innerWidth / innerHeight;
+			this.camera.updateProjectionMatrix();
+			this.renderer.setSize(innerWidth, innerHeight);
+		});
+	}
+	clearGroup(g) {
+		while (g.children.length) g.remove(g.children[0]);
+	}
+	makeStage(index) {
+		if (this.stageIndex === index) return;
+		this.stageIndex = index;
+		this.clearGroup(this.stage);
+		this.bobs = [];
+		let s = STAGES[index];
+		this.scene.background.setHex(s.sky);
+		this.scene.fog.color.setHex(s.sky);
+		const p = this.stage;
+		let base = cyl(p, s.floor, [0, -0.35, -2], 18, 0.6, 64);
+		base.receiveShadow = true;
+		const plaza = cyl(
+			p,
+			index === 0 ? 0xf9d4aa : index === 1 ? 0xc3e2c9 : 0xd4bbde,
+			[0, -0.025, 0],
+			10.5,
+			0.08,
+			64,
+		);
+		plaza.scale.z = 0.48;
+		let ring = mesh(
+			new THREE.TorusGeometry(8.4, 0.055, 8, 100),
+			0xf6e4c3,
+			p,
+			[0, 0.04, 0],
+		);
+		ring.rotation.x = Math.PI / 2;
+		ring.scale.y = 0.43;
+		for (let x = -10; x <= 10; x += 1.4)
+			box(p, 0xf9e1bc, [x, 0.029, 2.9], [0.66, 0.018, 0.11], false);
+		for (let x = -16; x < 17; x += 5.5) {
+			let z = -9.5 - Math.abs(x) * 0.13,
+				col = [0xf0a784, 0xd79b97, 0xeac88b, 0xc5b0ba, 0xeaa6a0][
+					Math.floor((x + 16) / 5.5) % 5
+				];
+			if (index === 1)
+				col = [0x84b7b0, 0xa7c9b7, 0x759cae][Math.abs(Math.floor(x)) % 3];
+			if (index === 2)
+				col = [0x8487b2, 0xa18bb6, 0xad8fb7][Math.abs(Math.floor(x)) % 3];
+			let ht = 4.8 + (Math.sin(x * 2) + 1) * 1.7;
+			box(p, col, [x, ht / 2 - 0.1, z], [4.8, ht, 3.4]);
+			let roof = cone(
+				p,
+				index === 0 ? 0xd06e66 : index === 1 ? 0x4d8b8c : 0x655a8d,
+				[x, ht + 0.65, z],
+				3.7,
+				1.5,
+				4,
+			);
+			roof.rotation.y = Math.PI / 4;
+			box(p, 0xffe1a5, [x, ht - 0.45, z + 1.73], [4.9, 0.25, 0.28]);
+			for (let wx of [-1.35, 0, 1.35])
+				for (let wy = 1; wy < ht - 1; wy += 1.5) {
+					box(p, 0x594e67, [x + wx, wy, z + 1.73], [0.77, 0.93, 0.07]);
+					box(p, 0xf8d487, [x + wx, wy, z + 1.79], [0.6, 0.75, 0.06]);
+					box(p, col, [x + wx, wy, z + 1.85], [0.065, 0.8, 0.04]);
+				}
+			sign(
+				p,
+				["LUCKY MART", "SOUP!", "WISH POST", "GOOD OMENS", "7th HEAVEN"][
+					Math.floor((x + 16) / 5.5) % 5
+				],
+				[x, 2.9, z + 1.84],
+				3.8,
+				0.85,
+				"#fff0c8",
+				"#664867",
+			);
+			for (let a = -2; a < 2; a += 0.5) {
+				let awn = box(
+					p,
+					Math.round(a * 2) % 2 ? 0xffeed1 : s.theme,
+					[x + a + 0.25, 2.3, z + 2.2],
+					[0.5, 0.13, 1.25],
+				);
+				awn.rotation.x = 0.15;
+			}
+			box(p, 0x72596b, [x, 1, z + 2.12], [3.8, 1.4, 0.25]);
+		}
+		// Monument: seven little wishes orbit a thoroughly unhelpful moon.
+		let shrine = new THREE.Group();
+		shrine.position.set(0, 0, -6.2);
+		p.add(shrine);
+		cyl(shrine, 0x9b7d94, [0, 0.25, 0], 2.1, 0.45);
+		cyl(shrine, 0xffe9ba, [0, 0.65, 0], 1.55, 0.35);
+		box(shrine, 0xf6d49a, [0, 1.5, 0], [1.7, 1.6, 1.2]);
+		sign(
+			shrine,
+			"MAKE A WISH",
+			[0, 1.65, 0.64],
+			1.5,
+			0.35,
+			"#fff0c6",
+			"#775476",
+		);
+		let lucky = ball(shrine, 0xffd466, [0, 3.4, 0], [1.15, 1.15, 0.65]);
+		for (let x of [-0.35, 0.35]) {
+			ball(lucky, INK, [x, 0.12, 0.88], [0.065, 0.14, 0.04], false);
+			ball(lucky, 0xf4927b, [x * 1.6, -0.1, 0.8], [0.11, 0.05, 0.02], false);
+		}
+		tube(
+			shrine,
+			INK,
+			[
+				[-0.26, 3.15, 0.65],
+				[0, 3.07, 0.69],
+				[0.26, 3.15, 0.65],
+			],
+			0.025,
+		);
+		for (let i = 0; i < 7; i++) {
+			let a = (i / 7) * Math.PI * 2;
+			let st = star(
+				shrine,
+				[0xff947a, 0xffd671, 0x94d4ba, 0x99c7e6, 0xc4a3e6, 0xffa6c7, 0xfff1a8][
+					i
+				],
+				[Math.cos(a) * 1.85, 3.4 + Math.sin(a) * 1.85, 0],
+				0.25,
+			);
+			this.bobs.push({ m: st, y: st.position.y, p: i });
+		}
+		for (let side of [-1, 1]) {
+			for (let k = 0; k < 3; k++) {
+				let x = side * (9 + k * 3),
+					z = -3 - k * 3;
+				let trunk = cyl(p, 0x9b705d, [x, 1.3, z], 0.24, 2.6);
+				for (let j = 0; j < 5; j++)
+					ball(
+						p,
+						index === 0 ? 0xb9cba0 : index === 1 ? 0x82bdb0 : 0xc39ed0,
+						[
+							x + Math.sin(j * 2.4) * 0.9,
+							3 + Math.cos(j * 3) * 0.5,
+							z + Math.cos(j) * 0.6,
+						],
+						[1.1, 1.1, 1.1],
+						false,
+					);
+			}
+			// chunky paper lanterns and arcade boundary markers
+			let x = side * 9.4;
+			box(p, 0x745a72, [x, 2.5, -1.7], [0.18, 5, 0.18]);
+			box(p, 0x745a72, [x - side * 0.7, 4.75, -1.7], [1.5, 0.14, 0.15]);
+			let lamp = ball(
+				p,
+				0xffb876,
+				[x - side * 1.3, 4.05, -1.7],
+				[0.4, 0.55, 0.4],
+			);
+			cyl(p, 0x71506a, [x - side * 1.3, 3.54, -1.7], 0.22, 0.1);
+			sign(p, "★", [x, 1, -1.5], 0.75, 0.75, "#f7dc95", "#7a6177");
+		}
+		const wire = [];
+		for (let i = 0; i < 15; i++) {
+			let x = -15 + i * 2.15,
+				y = 7.1 - Math.sin((i / 14) * Math.PI) * 1.2;
+			wire.push([x, y, -5]);
+			if (i % 1 === 0) {
+				let l = ball(
+					p,
+					[0xffc069, 0xffe7a8, 0xed998a][i % 3],
+					[x, y - 0.4, -5],
+					[0.24, 0.34, 0.24],
+				);
+				this.bobs.push({ m: l, y: y - 0.4, p: i });
+				cyl(p, 0x8b6473, [x, y - 0.08, -5], 0.04, 0.1);
+			}
+		}
+		tube(p, 0x765875, wire, 0.025);
+		// The very small, very invested audience.
+		for (let i = 0; i < 16; i++) {
+			let x = -11 + i * 1.5,
+				z = -4.4 + Math.cos(i) * 0.25;
+			let npc = new THREE.Group();
+			npc.position.set(x, 0, z);
+			p.add(npc);
+			let col = [0xc395b7, 0xf4bc88, 0x8ebfaa, 0x9cb6ce][i % 4];
+			ball(npc, col, [0, 0.65, 0], [0.38, 0.55, 0.29]);
+			ball(npc, 0xffdcb5, [0, 1.23, 0.06], [0.36, 0.34, 0.3]);
+			for (let side of [-1, 1])
+				ball(npc, INK, [side * 0.12, 1.26, 0.33], [0.025, 0.055, 0.02], false);
+			if (i % 3 === 0) cone(npc, col, [0, 1.7, 0], 0.34, 0.5);
+			else {
+				ball(npc, col, [-0.25, 1.48, 0.02], [0.13, 0.19, 0.13]);
+				ball(npc, col, [0.25, 1.48, 0.02], [0.13, 0.19, 0.13]);
+			}
+			this.bobs.push({ m: npc, y: 0, p: i });
+		}
+		if (index === 1) {
+			for (let x of [-6, 6]) {
+				cyl(p, 0x729b9d, [x, 0.18, -3], 1.3, 0.35);
+				cyl(p, 0xb5eee6, [x, 0.38, -3], 1.15, 0.08);
+				for (let j = 0; j < 5; j++) {
+					let b = ball(
+						p,
+						0xe0f6e3,
+						[x + Math.cos(j) * 0.7, 1 + j * 0.3, -3],
+						[0.17, 0.17, 0.17],
+						false,
+					);
+					this.bobs.push({ m: b, y: b.position.y, p: j });
+				}
+			}
+		}
+		if (index === 2) {
+			for (let x of [-7, 7]) {
+				box(p, 0x605a82, [x, 6, -9], [0.16, 5, 0.16]);
+				for (let k = 0; k < 3; k++)
+					box(p, 0x605a82, [x, 6 + k * 0.7, -9], [2 - k * 0.4, 0.08, 0.1]);
+			}
+			sign(p, "LUCKY FM 77.7", [5, 7.5, -9], 4, 1, "#ffe4b6", "#705a86");
+		}
+		for (let i = 0; i < 12; i++) {
+			let x = -28 + i * 5,
+				z = -20 - (i % 3) * 4;
+			cone(
+				p,
+				index === 0 ? 0xdcaeaa : index === 1 ? 0x91c5c3 : 0xab95c3,
+				[x, 2, z],
+				5,
+				7 + (i % 3) * 2,
+				6,
+			);
+		}
+		// Graphic cloud puffs, deliberately sculpted rather than photoreal.
+		for (let i = 0; i < 8; i++) {
+			let cl = new THREE.Group();
+			cl.position.set(-23 + i * 7, 10 + (i % 3) * 1.9, -18);
+			p.add(cl);
+			for (let j = 0; j < 4; j++)
+				ball(
+					cl,
+					0xffead6,
+					[j * 0.9, Math.sin(j) * 0.25, 0],
+					[1.2, 0.48, 0.45],
+					false,
+				);
+		}
+	}
+	setFighters(fs) {
+		for (let m of this.characters.values()) this.scene.remove(m);
+		this.characters.clear();
+		for (let f of fs) {
+			let m = makeFighter(f.char);
+			this.characters.set(f.id, m);
+			this.scene.add(m);
+		}
+	}
+	particles(x, y, color, count = 12, big = false) {
+		if (big) this.flash = 0.09;
+		for (let i = 0; i < count; i++) {
+			let m =
+				i % 3 === 0
+					? star(null, color, [0, 0, 0], 0.09 + (big ? 0.1 : 0))
+					: mesh(
+							new THREE.IcosahedronGeometry(0.07 + (big ? 0.08 : 0), 0),
+							color,
+							null,
+							[0, 0, 0],
+							[1, 1, 1],
+							false,
+						);
+			m.position.set(x, y, 0.6);
+			this.scene.add(m);
+			let a = Math.random() * Math.PI * 2,
+				v = 2 + Math.random() * (big ? 7 : 5);
+			this.fx.push({
+				m,
+				v: new THREE.Vector3(
+					Math.cos(a) * v,
+					Math.sin(a) * v,
+					Math.random() * 4,
+				),
+				life: 0.35 + Math.random() * 0.35,
+				full: 0.7,
+			});
+		}
+	}
+	ring(x, y, color, size = 1) {
+		let m = new THREE.Mesh(
+			new THREE.TorusGeometry(size, 0.035, 6, 40),
+			new THREE.MeshBasicNodeMaterial({ color, transparent: true }),
+		);
+		m.position.set(x, y, 0.8);
+		this.scene.add(m);
+		this.fx.push({
+			m,
+			v: new THREE.Vector3(),
+			life: 0.32,
+			full: 0.32,
+			ring: true,
+		});
+	}
+	update(game, t, dt) {
+		this.flash = Math.max(0, (this.flash || 0) - dt);
+		$("#impact-flash").style.opacity = settings.flash
+			? Math.min(0.16, this.flash * 2)
+			: 0;
+		for (let b of this.bobs)
+			b.m.position.y = b.y + Math.sin(t * 2 + b.p) * 0.06;
+		let title = game.mode === "title" || game.mode === "select";
+		for (let f of game.fighters) {
+			let m = this.characters.get(f.id);
+			if (!m) continue;
+			m.visible = !f.left && f.respawn <= 0;
+			const pos = f.body.translation();
+			let targetX = f.visualX ?? pos.x,
+				targetY = f.visualY ?? pos.y;
+			if (title) {
+				targetX = f.x;
+				targetY = 0.85;
+			}
+			m.position.set(targetX, targetY - 0.85, 0);
+			m.scale.setScalar(CAST[f.char].scale * (title ? 1.4 : 1));
+			animateFighter(m, f, t);
+			if (f.invuln > 0 && !title) m.visible = Math.floor(t * 18) % 2 === 0;
+		}
+		for (let i = this.fx.length - 1; i >= 0; i--) {
+			let p = this.fx[i];
+			p.life -= dt;
+			if (p.life <= 0) {
+				this.scene.remove(p.m);
+				if (p.ring) p.m.material.dispose();
+				this.fx.splice(i, 1);
+				continue;
+			}
+			p.m.position.addScaledVector(p.v, dt);
+			p.v.y -= dt * 12;
+			p.m.rotation.z += dt * 5;
+			if (p.ring) {
+				p.m.scale.addScalar(dt * 8);
+				p.m.material.opacity = p.life / p.full;
+			} else p.m.scale.setScalar(Math.min(1, p.life * 4));
+		}
+		const alive = game.fighters.filter((f) => !f.left),
+			positions = alive.map((f) => f.body.translation().x),
+			mid = positions.length
+				? (Math.min(...positions) + Math.max(...positions)) / 2
+				: 0,
+			spread = positions.length
+				? Math.max(...positions) - Math.min(...positions)
+				: 8;
+		let target = new THREE.Vector3(
+			title ? 1.5 : mid * 0.55,
+			title ? 5.8 : 5.8,
+			title ? 19 : Math.max(18, spread * 1.03 + 11),
+		);
+		let look = new THREE.Vector3(title ? 1.5 : mid * 0.6, title ? 2.4 : 2.1, 0);
+		if (game.mode === "select") {
+			target.set(4, 4.2, 12);
+			look.set(4, 1.9, 0);
+		}
+		this.camera.position.lerp(target, 1 - Math.exp(-dt * 5));
+		this.look.lerp(look, 1 - Math.exp(-dt * 6));
+		this.shake = Math.max(0, this.shake - dt * 3);
+		if (settings.shake) {
+			this.camera.position.x += (Math.random() - 0.5) * this.shake * 0.18;
+			this.camera.position.y += (Math.random() - 0.5) * this.shake * 0.12;
+		}
+		this.camera.lookAt(this.look);
+		this.renderer.render(this.scene, this.camera);
+	}
+}
+const view = new View();
+
+// input.js
+class Controls {
+	constructor() {
+		this.keys = new Set();
+		this.pressedKeys = new Set();
+		this.prev = new Set();
+		this.padPrev = [];
+		this.last = performance.now();
+		this.seen = false;
+		this.menuGate = 0;
+		this.lastAxis = 0;
+		this.lastAction = 0;
+		this.states = [];
+		this.menu = {};
+		addEventListener("keydown", (e) => {
+			if (
+				[
+					"ArrowUp",
+					"ArrowDown",
+					"ArrowLeft",
+					"ArrowRight",
+					"Space",
+					"Tab",
+					"Backspace",
+				].includes(e.code) &&
+				e.target.tagName !== "INPUT"
+			)
+				e.preventDefault();
+			if (e.repeat) return;
+			this.keys.add(e.code);
+			this.pressedKeys.add(e.code);
+			this.activity();
+			sound.unlock();
+			this.seen = true;
+		});
+		addEventListener("keyup", (e) => this.keys.delete(e.code));
+		addEventListener("blur", () => this.keys.clear());
+		addEventListener("pointerdown", () => {
+			this.activity();
+			sound.unlock();
+			if (!matchMedia("(pointer: coarse)").matches) this.seen = true;
+		});
+		addEventListener("pointermove", (e) => {
+			if (e.movementX || e.movementY) this.activity();
+		});
+	}
+	activity() {
+		this.last = performance.now();
+		if (typeof game !== "undefined" && game.mode === "attract") {
+			game.toTitle();
+			this.suppress = performance.now() + 250;
+		}
+	}
+	poll() {
+		let pads = Array.from(navigator.getGamepads?.() || []).filter(
+				(p) => p && p.connected,
+			),
+			k = (c) => this.keys.has(c),
+			kp = (c) => this.pressedKeys.has(c),
+			local = game?.mode === "local";
+		this.states = [];
+		for (let i = 0; i < Math.max(2, pads.length); i++) {
+			let p = pads[i],
+				old = this.padPrev[i] || [],
+				b = (n) => !!p?.buttons[n]?.pressed,
+				bp = (n) => b(n) && !old[n],
+				x = p ? (p.axes[0] || 0) * (settings.invertX ? -1 : 1) : 0,
+				y = p ? (p.axes[1] || 0) * (settings.invertY ? -1 : 1) : 0;
+			if (Math.abs(x) < 0.24) x = 0;
+			if (Math.abs(y) < 0.24) y = 0;
+			x = b(14) ? -1 : b(15) ? 1 : x;
+			y = b(12) ? -1 : b(13) ? 1 : y;
+			const second = i === 1,
+				hasKeyboard = i === 0 || (local && second);
+			let left = second ? "ArrowLeft" : "KeyA",
+				right = second ? "ArrowRight" : "KeyD",
+				up = second ? "ArrowUp" : "KeyW",
+				down = second ? "ArrowDown" : "KeyS";
+			if (hasKeyboard) {
+				x = k(left) ? -1 : k(right) ? 1 : x;
+				y = k(up) ? -1 : k(down) ? 1 : y;
+				if (!local && !second) {
+					x = k("ArrowLeft") ? -1 : k("ArrowRight") ? 1 : x;
+					y = k("ArrowUp") ? -1 : k("ArrowDown") ? 1 : y;
+				}
+			}
+			let map = second
+				? [
+						"Numpad1",
+						"Numpad2",
+						"Numpad4",
+						"Numpad5",
+						"Numpad6",
+						"Numpad7",
+						"NumpadDecimal",
+						"Numpad9",
+						"Numpad8",
+					]
+				: [
+						"KeyJ",
+						"KeyK",
+						"KeyU",
+						"KeyI",
+						"KeyL",
+						"KeyH",
+						"KeyE",
+						"KeyB",
+						"KeyO",
+					];
+			let acts = [
+					"jab",
+					"kick",
+					"heavy",
+					"sweep",
+					"special",
+					"super",
+					"dash",
+					"burst",
+					"throw",
+				],
+				idx = [2, 0, 3, 1, 7, 6, 5, 11, -1],
+				a = [];
+			for (let n = 0; n < acts.length; n++)
+				if ((hasKeyboard && kp(map[n])) || (idx[n] >= 0 && bp(idx[n])))
+					a.push(acts[n]);
+			if (
+				(b(2) && bp(0)) ||
+				(b(0) && bp(2)) ||
+				(i === 0 && k("KeyJ") && kp("KeyK"))
+			) {
+				a = a.filter((v) => v !== "jab" && v !== "kick");
+				a.push("throw");
+			}
+			let prevY = this.statesPrev?.[i]?.y || 0;
+			let jump =
+				(y < -0.5 && prevY >= -0.5) ||
+				(hasKeyboard && (kp(up) || (!second && kp("Space"))));
+			let guard = b(4) || (hasKeyboard && k(second ? "Numpad0" : "KeyQ"));
+			this.states.push({
+				x,
+				y,
+				jump,
+				guard,
+				actions: a,
+				fire:
+					a.length > 0 ||
+					[0, 1, 2, 3, 5, 6, 7, 11].some(b) ||
+					(hasKeyboard && map.some(k)),
+				pad: !!p,
+			});
+			if (p) {
+				let changed =
+					p.buttons.some((v, j) => v.pressed && !old[j]) ||
+					((Math.abs(x) > 0.3 || Math.abs(y) > 0.3) &&
+						Math.abs(x - (this.statesPrev?.[i]?.x || 0)) + Math.abs(y - prevY) >
+							0.2);
+				if (changed) {
+					this.activity();
+					sound.unlock();
+					this.seen = true;
+				}
+			}
+		}
+		let p = pads[0],
+			b = (n) => !!p?.buttons[n]?.pressed,
+			bp = (n) => b(n) && !(this.padPrev[0] || [])[n],
+			st = this.states[0],
+			now = performance.now();
+		let axis =
+			Math.abs(st.y) > 0.5
+				? st.y > 0
+					? 1
+					: -1
+				: Math.abs(st.x) > 0.5
+					? st.x > 0
+						? 2
+						: -2
+					: 0;
+		let dir = 0;
+		if (axis && (axis !== this.lastAxis || now > this.menuGate)) {
+			dir = axis;
+			this.menuGate = now + (axis !== this.lastAxis ? 330 : 145);
+		}
+		this.lastAxis = axis;
+		if (kp("ArrowDown") || kp("KeyS")) dir = 1;
+		if (kp("ArrowUp") || kp("KeyW")) dir = -1;
+		if (kp("ArrowRight") || kp("KeyD")) dir = 2;
+		if (kp("ArrowLeft") || kp("KeyA")) dir = -2;
+		this.menu = {
+			dir,
+			confirm: kp("Enter") || kp("Space") || bp(0),
+			back: kp("Backspace") || bp(1),
+			pause: kp("Escape") || (bp(9) && !b(8)),
+			tab: kp("Tab"),
+			reset: kp("KeyR"),
+			lessonNext: kp("BracketRight"),
+			lessonPrev: kp("BracketLeft"),
+		};
+		this.prev = new Set(this.keys);
+		this.pressedKeys.clear();
+		this.padPrev = pads.map((p) => p.buttons.map((b) => b.pressed));
+		this.statesPrev = this.states.map((s) => ({ ...s }));
+		if (this.suppress > now) {
+			this.menu = {};
+			this.states = this.states.map(() => emptyInput());
+		}
+		return this.states;
+	}
+}
+function emptyInput() {
+	return { x: 0, y: 0, jump: false, guard: false, actions: [], fire: false };
+}
+const controls = new Controls();
+
+// combat.js
+class Game {
+	constructor() {
+		this.fighters = [];
+		this.mode = "title";
+		this.time = 0;
+		this.sim = 0;
+		this.round = 1;
+		this.stage = 0;
+		this.countdown = 0;
+		this.over = false;
+		this.freeze = 0;
+		this.timer = 60;
+		this.score = 0;
+		this.selected = 0;
+		this.lesson = 0;
+		this.lessonCount = 0;
+		this.lessonDone = false;
+		this.practiceStyle = "lessons";
+		this.ended = false;
+		this.net = null;
+		this.projectiles = [];
+		this.route = [];
+		this.bout = 0;
+		this.wins = [0, 0];
+		this.acc = 0;
+		this.showTitlePending = false;
+		this.noticeT = 0;
+		this.events = [];
+		this.journal = {};
+		this.serial = 0;
+		this.aiRng = Math.random;
+	}
+	initWorld() {
+		if (this.world) this.world.free();
+		this.world = new RAPIER.World({ x: 0, y: -27, z: 0 });
+		this.world.timestep = 1 / 60;
+		let fixed = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+		this.world.createCollider(
+			RAPIER.ColliderDesc.cuboid(30, 0.2, 5)
+				.setTranslation(0, -0.2, 0)
+				.setCollisionGroups(0x00020001),
+			fixed,
+		);
+		for (let x of [-10.2, 10.2])
+			this.world.createCollider(
+				RAPIER.ColliderDesc.cuboid(0.3, 6, 5)
+					.setTranslation(x, 5, 0)
+					.setCollisionGroups(0x00020001),
+				fixed,
+			);
+		this.fighters = [];
+		for (let p of this.projectiles) view.scene.remove(p.mesh);
+		this.projectiles = [];
+	}
+	addFighter(char, id, x, ai = false, name = "") {
+		let body = this.world.createRigidBody(
+			RAPIER.RigidBodyDesc.dynamic()
+				.setTranslation(x, 0.88, 0)
+				.lockRotations()
+				.enabledTranslations(true, true, false)
+				.setLinearDamping(0.1)
+				.setCcdEnabled(true),
+		);
+		this.world.createCollider(
+			RAPIER.ColliderDesc.capsule(0.4, 0.43)
+				.setFriction(0)
+				.setRestitution(0)
+				.setDensity(1)
+				.setCollisionGroups(0x00010002),
+			body,
+		);
+		let f = {
+			id,
+			char,
+			body,
+			x,
+			ai,
+			name: name || CAST[char].name,
+			hp: 100,
+			maxHp: 100,
+			meter: 2,
+			stun: 0,
+			down: 0,
+			invuln: 0,
+			guard: false,
+			guardTime: 0,
+			face: x > 0 ? -1 : 1,
+			move: 0,
+			air: false,
+			jumps: 0,
+			crouch: false,
+			attack: "",
+			at: 0,
+			hitSet: new Set(),
+			hitConfirm: false,
+			combo: 0,
+			comboT: 0,
+			dash: 0,
+			roll: 0,
+			score: 0,
+			kos: 0,
+			damage: 0,
+			parries: 0,
+			respawn: 0,
+			left: false,
+			aiT: 0,
+			aiGuard: 0,
+			buffer: null,
+			seq: 0,
+			lastSeq: 0,
+			wall: 0,
+			superHit: false,
+			input: emptyInput(),
+		};
+		this.fighters.push(f);
+		return f;
+	}
+	setup(chars, mode, stage = 0) {
+		this.initWorld();
+		this.mode = mode;
+		this.stage = stage;
+		this.over = false;
+		this.ended = false;
+		this.freeze = 0;
+		this.roundEnd = 0;
+		this.timer = mode === "network" ? 150 : 60;
+		this.noticeT = 0;
+		$("#notice").classList.remove("show");
+		$("#countdown").classList.remove("show");
+		$("#combo").classList.remove("show");
+		this.countdown = ["title", "select", "attract", "practice"].includes(mode)
+			? 0
+			: 2.1;
+		this.time = 0;
+		this.winner = null;
+		chars.forEach((c, i) =>
+			this.addFighter(
+				c.char ?? c,
+				c.id ?? i,
+				c.x ?? (i % 2 ? -4 : 4) * (i < 2 ? -1 : 1) * (i < 2 ? 1 : 1.7),
+				c.ai ?? i > 0,
+				c.name,
+			),
+		);
+		view.makeStage(stage);
+		view.setFighters(this.fighters);
+		sound.mood = mode === "title" ? 0 : 1;
+		ui.hide();
+		this.updateHUD(true);
+	}
+	toTitle() {
+		if (this.net) {
+			this.net.close?.();
+			this.net = null;
+		}
+		this.setup(
+			[
+				{ char: 0, x: 3.3, ai: false },
+				{ char: 1, x: 6.5, ai: false },
+				{ char: 3, x: 0.6, ai: false },
+			],
+			"title",
+			0,
+		);
+		controls.last = performance.now();
+		ui.title();
+	}
+	preview(char) {
+		this.setup([{ char, x: 4, ai: false }], "select", 0);
+	}
+	startArcade(char) {
+		this.selected = char;
+		this.route = [...Array(7).keys()].filter((i) => i !== char);
+		this.route.push(7);
+		this.bout = 0;
+		this.score = 0;
+		this.wins = [0, 0];
+		this.startBout();
+	}
+	startBout() {
+		this.wins = [0, 0];
+		this.round = 1;
+		this.setup(
+			[
+				{ char: this.selected, ai: false },
+				{ char: this.route[this.bout], ai: true },
+			],
+			"arcade",
+			this.bout % 3,
+		);
+		if (this.route[this.bout] === 7) {
+			this.fighters[1].maxHp = this.fighters[1].hp = 135;
+		}
+		ui.dialogue(this.fighters[0].char, this.fighters[1].char, this.bout);
+	}
+	startLocal(a, b, stage) {
+		this.wins = [0, 0];
+		this.round = 1;
+		this.setup(
+			[
+				{ char: a, ai: false },
+				{ char: b, ai: false },
+			],
+			"local",
+			stage,
+		);
+	}
+	startPractice(char) {
+		this.selected = char;
+		this.lesson = 0;
+		this.lessonCount = 0;
+		this.lessonDone = false;
+		this.setup(
+			[
+				{ char, ai: false },
+				{ char: 2, ai: true },
+			],
+			"practice",
+			0,
+		);
+		this.timer = Infinity;
+		this.fighters[0].meter = 7;
+		ui.practiceHUD();
+		this.positionLesson();
+	}
+	positionLesson() {
+		let a = this.fighters[0],
+			b = this.fighters[1];
+		if (!a || !b) return;
+		let near = [
+			"chain",
+			"sweep",
+			"throw",
+			"block",
+			"parry",
+			"wall",
+			"recover",
+		].includes(LESSONS[this.lesson]?.goal);
+		let x = LESSONS[this.lesson]?.goal === "wall" ? 6 : near ? -1 : -3;
+		this.place(a, x);
+		this.place(b, LESSONS[this.lesson]?.goal === "wall" ? 8.6 : near ? 1 : 3);
+		this.lessonDone = false;
+		this.lessonCount = 0;
+		b.aiT = 1;
+		this.updateHUD(true);
+	}
+	place(f, x) {
+		f.body.setTranslation({ x, y: 0.86, z: 0 }, true);
+		f.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+		Object.assign(f, {
+			hp: f.maxHp,
+			meter: 7,
+			stun: 0,
+			down: 0,
+			invuln: 0.5,
+			attack: "",
+			at: 0,
+			guard: false,
+			combo: 0,
+			respawn: 0,
+			buffer: null,
+		});
+	}
+	lessonEvent(type, n = 1) {
+		this.journal[type] = (this.journal[type] || 0) + n;
+		if (
+			this.mode !== "practice" ||
+			this.practiceStyle !== "lessons" ||
+			this.lessonDone
+		)
+			return;
+		let l = LESSONS[this.lesson];
+		if (type === l.goal) {
+			this.lessonCount =
+				type === "chain" ? Math.max(this.lessonCount, n) : this.lessonCount + n;
+			if (this.lessonCount >= l.need) {
+				this.lessonDone = true;
+				sound.fx("win");
+				this.say(
+					"NICE! LESSON COMPLETE",
+					"Press Enter / × for the next lesson",
+					2.5,
+				);
+				if (!save.lessons.includes(this.lesson)) save.lessons.push(this.lesson);
+				persist();
+			}
+			ui.practiceHUD();
+		}
+	}
+	nearest(f) {
+		let p = f.body.translation();
+		return this.fighters
+			.filter((o) => o !== f && !o.left && o.respawn <= 0 && o.hp > 0)
+			.sort(
+				(a, b) =>
+					Math.abs(a.body.translation().x - p.x) -
+					Math.abs(b.body.translation().x - p.x),
+			)[0];
+	}
+	aiInput(f, dt) {
+		let o = this.nearest(f),
+			input = emptyInput();
+		if (!o) return input;
+		let p = f.body.translation(),
+			q = o.body.translation(),
+			d = q.x - p.x,
+			dist = Math.abs(d),
+			dir = Math.sign(d) || 1;
+		f.aiT -= dt;
+		f.aiGuard = Math.max(0, f.aiGuard - dt);
+		if (this.mode === "practice" && this.practiceStyle === "dummy")
+			return input;
+		if (this.mode === "practice" && this.practiceStyle === "guard") {
+			input.guard = true;
+			return input;
+		}
+		if (this.mode === "practice" && this.practiceStyle === "lessons") {
+			let goal = LESSONS[this.lesson].goal;
+			if (goal === "block" || goal === "parry") {
+				input.x = dist > 1.65 ? dir : 0;
+				if (f.aiT <= 0 && dist < 2) {
+					input.actions = ["heavy"];
+					f.aiT = 1.65;
+				}
+			} else if (goal === "recover") {
+				input.x = dist > 1.7 ? dir : 0;
+				if (f.aiT <= 0 && dist < 2) {
+					input.actions = ["sweep"];
+					f.aiT = 2.4;
+				}
+			}
+			return input;
+		}
+		let diff = this.mode === "attract" ? 2 : settings.difficulty,
+			aggression = [0.65, 0.85, 1][diff];
+		if (o.attack === "super" && o.at < 1.4) {
+			input.x = dir;
+			if (dist > 2.4 && f.aiT <= 0) {
+				input.actions = ["dash"];
+				f.aiT = 0.2;
+			} else if (dist < 2.5 && f.aiT <= 0) {
+				input.actions = ["heavy"];
+				f.aiT = 0.5;
+			}
+			return input;
+		}
+		input.x = dist > 2.1 ? dir : dist < 1 && this.aiRng() < 0.02 ? -dir : 0;
+		if (o.attack && dist < 2.6 && this.aiRng() < dt * [0.7, 2.5, 4][diff])
+			f.aiGuard = 0.4;
+		input.guard = f.aiGuard > 0;
+		if (f.down > 0) {
+			input.x = dir;
+			input.jump = this.aiRng() < 0.03;
+			return input;
+		}
+		if (f.aiT <= 0) {
+			f.aiT = 0.22 + this.aiRng() * (1.0 - aggression + 0.5);
+			let r = this.aiRng();
+			if (f.meter >= 2 && dist > 4 && r < 0.25) {
+				input.actions = ["super"];
+			} else if (dist < 2.3) {
+				input.actions = [
+					r < 0.28
+						? "jab"
+						: r < 0.46
+							? "kick"
+							: r < 0.65
+								? "heavy"
+								: r < 0.79
+									? "sweep"
+									: r < 0.9
+										? "special"
+										: "throw",
+				];
+			} else if (dist < 7 && r < 0.42) input.actions = ["special"];
+			else if (dist > 3 && r < 0.7) input.actions = ["dash"];
+			if (r > 0.88) input.jump = true;
+			if (f.stun > 0.2 && f.meter >= 1 && r < 0.17) input.actions = ["burst"];
+		}
+		return input;
+	}
+	begin(f, type, ex = false) {
+		if (!ATTACKS[type]) return false;
+		if ((type === "super" && f.meter < 2) || (type === "burst" && f.meter < 1))
+			return false;
+		if (type === "super") {
+			f.meter -= 2;
+			sound.fx("super");
+			sound.voice(f.char, true);
+			this.say(
+				"UH-OH! " + CAST[f.char].super,
+				"INTERRUPT THE CHARGE — OR GET OUT OF THE WAY",
+				1.5,
+			);
+		}
+		if (type === "burst") {
+			f.meter--;
+			f.stun = 0;
+			f.down = 0;
+			f.invuln = 0.4;
+			this.lessonEventFor(f, "burst");
+		}
+		if (type === "special" && ex && f.meter >= 1) {
+			f.meter--;
+			f.ex = true;
+		} else f.ex = false;
+		f.attack = type;
+		f.at = 0;
+		f.hitSet.clear();
+		f.hitConfirm = false;
+		f.spawned = false;
+		f.superHit = false;
+		f.seq++;
+		f.attackSerial = ++this.serial;
+		if (type === "wake") f.invuln = 0.3;
+		return true;
+	}
+	lessonEventFor(f, type, n = 1) {
+		if (f.id === 0) this.lessonEvent(type, n);
+	}
+	stepFighter(f, input, dt, predict = false) {
+		if (f.left) return;
+		f.input = input;
+		if (f.respawn > 0) {
+			f.respawn -= dt;
+			if (f.respawn <= 0) {
+				this.place(f, (f.id % 2 ? 1 : -1) * (3 + f.id));
+				f.invuln = 1.2;
+				f.hp = f.maxHp;
+				f.meter = 2;
+			}
+			return;
+		}
+		if (f.hp <= 0) return;
+		const pos = f.body.translation(),
+			v = f.body.linvel(),
+			o = this.nearest(f);
+		let ground = pos.y < 0.9 && v.y < 1;
+		f.air = !ground;
+		if (ground) f.jumps = 0;
+		f.stun = Math.max(0, f.stun - dt);
+		f.invuln = Math.max(0, f.invuln - dt);
+		f.wall = Math.max(0, f.wall - dt);
+		f.dash = Math.max(0, f.dash - dt);
+		f.roll = Math.max(0, f.roll - dt);
+		f.comboT = Math.max(0, f.comboT - dt);
+		if (!f.comboT) f.combo = 0;
+		if (o && !f.attack && !f.stun)
+			f.face = o.body.translation().x > pos.x ? 1 : -1;
+		if (f.down > 0) {
+			f.down -= dt;
+			f.guard = false;
+			if (
+				f.down < 0.35 &&
+				(Math.abs(input.x) > 0.4 || input.jump || input.y < -0.5)
+			) {
+				f.down = 0;
+				f.stun = 0;
+				if (input.jump || input.y < -0.5) this.begin(f, "wake");
+				else {
+					f.roll = 0.28;
+					f.invuln = 0.33;
+					f.body.setLinvel({ x: input.x * 10, y: 0, z: 0 }, true);
+				}
+				this.lessonEventFor(f, "recover");
+			}
+			if (f.down > 0) return;
+		}
+		if (input.actions.includes("burst") && f.meter >= 1) this.begin(f, "burst");
+		let guard = input.guard || input.x * f.face < -0.4;
+		f.guard = guard && !f.attack && !f.stun && ground;
+		f.guardTime = f.guard ? f.guardTime + dt : 0;
+		f.crouch = input.y > 0.5 && ground && !f.attack;
+		if (input.jump && f.stun <= 0 && !f.attack && f.jumps < 2) {
+			f.jumps++;
+			f.body.setLinvel({ x: v.x, y: f.jumps === 1 ? 10.6 : 9.2, z: 0 }, true);
+			sound.fx("jump");
+			view.ring(pos.x, pos.y - 0.5, 0xffedaa, 0.5);
+			this.lessonEventFor(f, "jump");
+		}
+		if (input.actions.includes("dash") && !f.attack && !f.stun) {
+			f.dash = 0.21;
+			f.dashDir = Math.abs(input.x) > 0.3 ? Math.sign(input.x) : f.face;
+			f.invuln = Math.max(f.invuln, 0.055);
+			sound.fx("dash");
+			this.lessonEventFor(f, "dash");
+		}
+		let act = input.actions.find((a) => a !== "dash" && a !== "burst");
+		if (act) {
+			if (f.air && ["jab", "kick", "heavy", "sweep"].includes(act)) act = "air";
+			f.buffer = { type: act, ex: input.y > 0.5, time: 0.14 };
+		}
+		if (f.buffer) {
+			f.buffer.time -= dt;
+			let a = ATTACKS[f.buffer.type],
+				cur = ATTACKS[f.attack];
+			if (
+				!f.stun &&
+				(!f.attack ||
+					(f.hitConfirm &&
+						cur &&
+						a.chain > cur.chain &&
+						f.at > cur.start + 0.02))
+			) {
+				this.begin(f, f.buffer.type, f.buffer.ex);
+				f.buffer = null;
+			} else if (f.buffer.time <= 0) f.buffer = null;
+		}
+		if (f.attack) {
+			let a = ATTACKS[f.attack];
+			f.at += dt;
+			if (f.at >= a.duration) {
+				f.attack = "";
+				f.at = 0;
+			} else if (!predict) {
+				this.processAttack(f, a, dt);
+			}
+		}
+		let vx = f.body.linvel().x,
+			vy = f.body.linvel().y;
+		if (!f.stun) {
+			let speed = CAST[f.char].speed;
+			f.move = input.x;
+			let desired = input.x * speed * (f.crouch ? 0.3 : f.guard ? 0.32 : 1);
+			if (f.attack) desired *= 0.15;
+			if (f.dash > 0) desired = f.dashDir * 12;
+			if (f.roll > 0) desired = vx;
+			if (
+				f.attack === "special" &&
+				["rush", "spin"].includes(CAST[f.char].special) &&
+				f.at > 0.15 &&
+				f.at < 0.45
+			)
+				desired = f.face * (f.ex ? 15 : 11);
+			if (f.attack === "super" && f.at > 1.5 && f.at < 1.85)
+				desired = f.face * 14;
+			vx = ground ? desired : lerp(vx, desired, dt * 7);
+			if (Math.abs(input.x) > 0.3) this.lessonEventFor(f, "move", dt);
+		} else {
+			f.move = 0;
+			vx *= Math.exp(-dt * 1.7);
+		}
+		f.body.setLinvel({ x: vx, y: vy, z: 0 }, true);
+		if (this.mode === "practice") f.meter = Math.min(7, f.meter + dt * 1.3);
+		else f.meter = Math.min(7, f.meter + dt * 0.035);
+		if (
+			Math.abs(pos.x) > 9.2 &&
+			f.stun > 0 &&
+			Math.abs(vx) > 5 &&
+			f.wall <= 0
+		) {
+			f.body.setLinvel({ x: -Math.sign(pos.x) * 8, y: 6, z: 0 }, true);
+			f.wall = 0.6;
+			f.stun = 0.5;
+			view.particles(pos.x, pos.y, 0xffe76d, 20, true);
+			this.say("SPECIAL WALL DELIVERY!", "Wall bounce", 0.75);
+			let attacker = this.fighters.find((o) => o.id === f.lastHit);
+			if (attacker) this.lessonEventFor(attacker, "wall");
+		}
+	}
+	processAttack(f, a, dt) {
+		if (f.at < a.start || f.at > a.end) return;
+		const kind = CAST[f.char].special,
+			pos = f.body.translation();
+		if (f.attack === "special" && !f.spawned) {
+			f.spawned = true;
+			sound.voice(f.char);
+			if (["shot", "wave", "orb"].includes(kind)) {
+				this.spawnProjectile(f, kind);
+				return;
+			}
+			if (kind === "upper")
+				f.body.setLinvel({ x: f.face * 3, y: 9, z: 0 }, true);
+		}
+		if (f.attack === "special" && ["shot", "wave", "orb"].includes(kind))
+			return;
+		if (f.attack === "super" && !f.spawned) {
+			f.spawned = true;
+			view.ring(pos.x, pos.y + 1, CAST[f.char].accent, 2);
+			view.particles(pos.x, pos.y + 1, CAST[f.char].accent, 28, true);
+			view.shake = 1.4;
+			sound.fx("heavy");
+		}
+		let reach = a.reach * (f.ex ? 1.3 : 1) * (f.char === 7 ? 1.15 : 1),
+			damage = a.damage * (f.ex ? 1.3 : 1),
+			level = a.level;
+		if (f.attack === "special" && kind === "grab") {
+			reach = 1.9;
+			damage = 23;
+			level = "throw";
+		}
+		for (let o of this.fighters) {
+			if (o === f || o.hp <= 0 || o.left || o.respawn > 0 || f.hitSet.has(o.id))
+				continue;
+			let q = o.body.translation(),
+				dx = q.x - pos.x,
+				dy = q.y - pos.y;
+			if (
+				Math.abs(dx) < reach &&
+				Math.abs(dy) < (f.attack === "super" ? 3.8 : 1.45) &&
+				(dx * f.face > -0.45 || f.attack === "burst" || f.attack === "wake")
+			) {
+				f.hitSet.add(o.id);
+				this.hit(f, o, { ...a, damage, level });
+			}
+		}
+	}
+	spawnProjectile(f, kind) {
+		let p = f.body.translation(),
+			col = CAST[f.char].accent,
+			m = ball(
+				null,
+				col,
+				[p.x + f.face * 0.9, kind === "wave" ? 0.45 : p.y + 0.7, 0],
+				[0.33, 0.33, 0.33],
+			);
+		view.scene.add(m);
+		let r = mesh(
+			new THREE.TorusGeometry(0.43, 0.055, 8, 24),
+			CAST[f.char].color,
+			m,
+			[0, 0, 0],
+		);
+		let body = this.world.createRigidBody(
+			RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(
+				m.position.x,
+				m.position.y,
+				0,
+			),
+		);
+		this.world.createCollider(
+			RAPIER.ColliderDesc.ball(0.3).setSensor(true).setCollisionGroups(0),
+			body,
+		);
+		this.projectiles.push({
+			mesh: m,
+			body,
+			owner: f.id,
+			x: m.position.x,
+			y: m.position.y,
+			dir: f.face,
+			speed: kind === "orb" ? 5 : 8,
+			life: 2.4,
+			ex: f.ex,
+			kind,
+		});
+		sound.fx("dash");
+	}
+	hit(f, o, a) {
+		if (o.invuln > 0) return;
+		let pos = o.body.translation();
+		if (
+			o.down > 0 &&
+			f.attack !== "sweep" &&
+			f.attack !== "super" &&
+			f.attack !== "air"
+		)
+			return;
+		const block =
+			o.guard &&
+			a.level !== "unblockable" &&
+			a.level !== "throw" &&
+			(a.level === "low" ? o.crouch : a.level === "high" ? !o.crouch : true) &&
+			o.face === -f.face;
+		if (block) {
+			let parry = o.guardTime < 0.13;
+			if (parry) {
+				o.meter = Math.min(7, o.meter + 0.45);
+				o.parries++;
+				f.stun = 0.32;
+				f.attack = "";
+				view.ring(pos.x, pos.y + 0.7, 0xb4f8e1, 0.8);
+				sound.fx("parry");
+				this.say("LUCKY PARRY!", "Your turn.", 0.65);
+				this.lessonEventFor(o, "parry");
+			} else {
+				o.hp = Math.max(1, o.hp - a.damage * 0.07);
+				o.meter = Math.min(7, o.meter + 0.13);
+				o.body.setLinvel({ x: f.face * 2, y: 0, z: 0 }, true);
+				sound.fx("block");
+			}
+			view.particles(pos.x, pos.y + 0.8, 0x9decdf, 8);
+			this.lessonEventFor(o, "block");
+			this.events.push({
+				kind: "block",
+				x: pos.x,
+				y: pos.y + 0.8,
+				c: 0x9decdf,
+			});
+			return;
+		}
+		let interrupted = o.attack === "super" && o.at < 1.52;
+		let damage =
+			a.damage * CAST[f.char].power * Math.max(0.45, 1 - f.combo * 0.1);
+		if (o.down > 0) damage *= 0.55;
+		o.hp = Math.max(0, o.hp - damage);
+		o.attack = "";
+		o.buffer = null;
+		o.stun = a.stun;
+		o.guard = false;
+		o.lastHit = f.id;
+		if (a.down) o.down = a.stun + 0.25;
+		o.body.setLinvel({ x: f.face * a.push, y: a.launch || 2, z: 0 }, true);
+		f.hitConfirm = true;
+		f.combo = f.comboT > 0 ? f.combo + 1 : 1;
+		f.comboT = 0.9;
+		f.damage += damage;
+		f.score += Math.round(damage * 10);
+		f.meter = Math.min(7, f.meter + 0.18);
+		o.meter = Math.min(7, o.meter + 0.12);
+		if (f.attack === "super") f.superHit = true;
+		this.freeze = Math.max(
+			this.freeze,
+			f.attack === "super" ? 0.1 : a.damage > 10 ? 0.055 : 0.025,
+		);
+		view.shake = a.damage > 10 ? 0.7 : 0.3;
+		view.particles(
+			pos.x,
+			pos.y + 0.7,
+			CAST[f.char].accent,
+			a.damage > 10 ? 17 : 9,
+			a.damage > 20,
+		);
+		view.ring(pos.x, pos.y + 0.7, 0xfff3c0, 0.35);
+		sound.fx(a.damage > 10 ? "heavy" : "hit");
+		this.events.push({
+			kind: "hit",
+			x: pos.x,
+			y: pos.y + 0.7,
+			c: CAST[f.char].accent,
+		});
+		if (interrupted) {
+			this.say("RETURN TO SENDER!", "Super interrupted", 1);
+			f.score += 150;
+		}
+		this.lessonEventFor(f, f.attack);
+		this.lessonEventFor(f, "chain", f.combo);
+		if (f.combo > 1) ui.combo(f.combo, o.id === 0 ? -1 : 1);
+		if (o.hp <= 0) {
+			f.kos++;
+			f.score += 1000;
+			sound.voice(f.char, true);
+			if (this.mode === "network") {
+				o.respawn = 2;
+				this.say(CAST[f.char].name + " SCORES!", "Back in two shakes.", 1.2);
+			} else if (this.mode === "practice") {
+				o.hp = o.maxHp;
+				f.hp = f.maxHp;
+			} else if (this.mode === "attract") {
+				o.hp = o.maxHp;
+				f.hp = f.maxHp;
+			} else this.finishRound(f.id);
+		}
+	}
+	say(big, small = "", duration = 1.5) {
+		this.noticeT = duration;
+		ui.notice(big, small);
+	}
+	finishRound(id) {
+		if (this.roundEnd || this.over) return;
+		this.winner = id;
+		this.roundEnd = 2.8;
+		this.wins[id]++;
+		sound.fx("win");
+		this.say(
+			id < 0
+				? "DRAW!"
+				: CAST[this.fighters.find((f) => f.id === id).char].name + " TAKES IT!",
+			this.wins[id] >= 2 ? "MATCH COMPLETE" : "ROUND COMPLETE",
+			2.8,
+		);
+	}
+	nextRound() {
+		if (Math.max(...this.wins) >= 2) {
+			this.over = true;
+			let winner = this.winner;
+			if (this.mode === "arcade" && winner === 0) {
+				this.score += this.fighters[0].score + Math.round(this.timer * 10);
+				save.best = Math.max(save.best, this.score);
+				persist();
+				ui.victory(this.bout === 6);
+			} else ui.result(winner);
+		} else {
+			this.round++;
+			this.fighters.forEach((f, i) => {
+				this.place(f, i ? -4 : 4);
+				f.meter = 2;
+			});
+			this.timer = 60;
+			this.countdown = 2;
+			this.roundEnd = 0;
+			this.winner = null;
+		}
+	}
+	update(dt, inputs) {
+		this.time += dt;
+		this.noticeT = Math.max(0, this.noticeT - dt);
+		if (!this.noticeT) $("#notice").classList.remove("show");
+		if (this.ended) return;
+		if (this.mode === "title" || this.mode === "select") {
+			if (
+				!(ui.room && !ui.room.closed) &&
+				performance.now() - controls.last >= 10000 &&
+				!ui.settingsOpen &&
+				!ui.modal
+			) {
+				this.startAttract();
+			}
+			return;
+		}
+		if ((ui.blocking || ui.settingsOpen) && !this.net) return;
+		if (this.mode === "attract" && this.time > 24) {
+			this.startAttract((this.attractIndex + 1) % 7);
+			return;
+		}
+		if (this.mode === "network" && this.net?.hub && AIHub.time() < 0) {
+			this.countdown = 2;
+			this.updateHUD();
+			return;
+		}
+		if (this.over) return;
+		if (this.countdown > 0) {
+			this.countdown -= dt;
+			ui.countdown(this.countdown);
+			this.updateHUD();
+			return;
+		} else $("#countdown").classList.remove("show");
+		this.sim += dt;
+		if (this.roundEnd > 0) {
+			this.roundEnd -= dt;
+			if (this.roundEnd <= 0) this.nextRound();
+			return;
+		}
+		if (this.freeze > 0) {
+			this.freeze -= dt;
+			return;
+		}
+		if (this.net && !this.net.isHost) {
+			this.clientStep(dt, inputs);
+			return;
+		}
+		this.timer -= dt;
+		if (this.mode === "network" && this.net?.hub)
+			this.timer = Math.max(
+				0,
+				(Math.min(150000, this.net.limitMs) - AIHub.time()) / 1000,
+			);
+		if (this.timer <= 0) {
+			if (this.mode === "network") this.finishNetwork();
+			else if (this.mode !== "practice" && this.mode !== "attract") {
+				let a = this.fighters[0],
+					b = this.fighters[1];
+				if (Math.abs(a.hp - b.hp) < 0.01) {
+					this.timer = 15;
+					this.say("SUDDEN LUCK!", "Fifteen more seconds.", 1);
+				} else this.finishRound(a.hp > b.hp ? a.id : b.id);
+			}
+			return;
+		}
+		for (let f of this.fighters) {
+			let input = f.ai
+				? this.aiInput(f, dt)
+				: this.net
+					? f.id === this.net.me
+						? ui.settingsOpen || ui.blocking
+							? emptyInput()
+							: inputs[0]
+						: this.remoteInput(f)
+					: inputs[f.id] || emptyInput();
+			if (this.mode === "attract" && f.meter < 3) f.meter = 5;
+			this.stepFighter(f, input, dt);
+		}
+		this.stepProjectiles(dt);
+		this.world.step();
+		this.separate();
+		if (this.mode === "practice") {
+			for (let f of this.fighters)
+				if (f.hp < 50 && !f.stun && !f.attack)
+					f.hp = Math.min(f.maxHp, f.hp + dt * 25);
+		}
+		if (this.net) this.networkTick(dt);
+		this.updateHUD();
+	}
+	separate() {
+		for (let i = 0; i < this.fighters.length; i++)
+			for (let j = i + 1; j < this.fighters.length; j++) {
+				let a = this.fighters[i],
+					b = this.fighters[j];
+				if (a.left || b.left || a.respawn > 0 || b.respawn > 0) continue;
+				let p = a.body.translation(),
+					q = b.body.translation(),
+					d = q.x - p.x;
+				if (Math.abs(d) < 0.86 && Math.abs(p.y - q.y) < 1.3) {
+					let push = (0.86 - Math.abs(d)) * 0.5,
+						sign = d >= 0 ? 1 : -1;
+					a.body.setTranslation(
+						{ x: clamp(p.x - push * sign, -9.45, 9.45), y: p.y, z: 0 },
+						true,
+					);
+					b.body.setTranslation(
+						{ x: clamp(q.x + push * sign, -9.45, 9.45), y: q.y, z: 0 },
+						true,
+					);
+				}
+			}
+	}
+	stepProjectiles(dt) {
+		for (let i = this.projectiles.length - 1; i >= 0; i--) {
+			let p = this.projectiles[i];
+			p.life -= dt;
+			p.x += p.dir * p.speed * dt;
+			p.mesh.position.x = p.x;
+			p.mesh.rotation.z += dt * 5;
+			p.body.setNextKinematicTranslation({ x: p.x, y: p.y, z: 0 });
+			let owner = this.fighters.find((f) => f.id === p.owner);
+			for (let o of this.fighters) {
+				if (!owner || o.id === p.owner || o.hp <= 0 || o.left || o.respawn > 0)
+					continue;
+				let q = o.body.translation();
+				if (Math.abs(q.x - p.x) < 0.7 && Math.abs(q.y + 0.2 - p.y) < 1) {
+					this.hit(owner, o, {
+						...ATTACKS.special,
+						damage: p.ex ? 21 : 14,
+						level: p.kind === "wave" ? "low" : "mid",
+					});
+					this.lessonEventFor(owner, "special");
+					p.life = 0;
+					break;
+				}
+			}
+			if (p.life <= 0 || Math.abs(p.x) > 11) {
+				view.scene.remove(p.mesh);
+				this.world.removeRigidBody(p.body);
+				this.projectiles.splice(i, 1);
+			}
+		}
+	}
+	startAttract(index = 0) {
+		this.attractIndex = index;
+		this.setup(
+			[
+				{ char: index, ai: true },
+				{ char: (index + 3) % 7, ai: true },
+			],
+			"attract",
+			index % 3,
+		);
+		this.fighters.forEach((f) => (f.meter = 7));
+		ui.attract();
+		this.say(
+			"A LITTLE LUCK. A LOT OF PUNCH.",
+			"Watch the warning. Interrupt the super.",
+			3,
+		);
+	}
+	updateHUD(force = false) {
+		ui.hud(this, force);
+	}
+}
+const game = new Game();
+
+// network.js
+// Both transports use the same authoritative combat and locally predicted movement.
+function hubTransport(info) {
+	return {
+		...info,
+		hub: true,
+		close() {},
+		send: (d, o) => AIHub.send(d, o),
+		onMessage: (fn) => AIHub.on("message", fn),
+		onLeave: (fn) => AIHub.on("leave", ({ id }) => fn(id)),
+	};
+}
+class Room {
+	constructor() {
+		this.me = 0;
+		this.host = 0;
+		this.isHost = true;
+		this.hub = false;
+		this.players = [];
+		this.links = new Map();
+		this.handlers = [];
+		this.leavers = [];
+		this.limitMs = 150000;
+		this.closed = false;
+		this.launched = false;
+	}
+	async library() {
+		if (window.Peer) return;
+		await new Promise((ok, no) => {
+			let s = document.createElement("script");
+			s.src = "https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js";
+			s.onload = ok;
+			s.onerror = () =>
+				no(
+					new Error("The room service could not load. Check your connection."),
+				);
+			document.head.append(s);
+		});
+	}
+	async hostRoom(char) {
+		await this.library();
+		this.players = [{ id: 0, name: "Player 1", char }];
+		this.code = String(
+			crypto.getRandomValues(new Uint32Array(1))[0] % 1000000,
+		).padStart(6, "0");
+		this.peer = new Peer("waku-lucky-v1-" + this.code, { debug: 0 });
+		this.errors();
+		this.peer.on("open", () => {
+			if (!this.closed) ui.roomLobby(this);
+		});
+		this.peer.on("connection", (conn) => {
+			if (this.links.size >= 3 || this.launched) {
+				conn.on("open", () => {
+					conn.send({
+						t: "reject",
+						reason: "This room is full or already playing.",
+					});
+					setTimeout(() => conn.close(), 300);
+				});
+				return;
+			}
+			let id = [1, 2, 3].find((i) => !this.links.has(i));
+			this.links.set(id, conn);
+			conn.on("data", (data) => {
+				if (data?.t === "join") {
+					this.players.push({
+						id,
+						name: "Player " + (id + 1),
+						char: clamp(Number(data.char) || 0, 0, 6),
+					});
+					conn.send({
+						t: "welcome",
+						me: id,
+						code: this.code,
+						players: this.players,
+					});
+					this.send({ t: "roster", players: this.players });
+					ui.roomLobby(this);
+				} else this.handlers.forEach((h) => h(data, id));
+			});
+			conn.on("close", () => this.depart(id));
+			conn.on("error", () => this.depart(id));
+		});
+	}
+	async joinRoom(code, char) {
+		await this.library();
+		this.isHost = false;
+		this.code = code;
+		this.peer = new Peer(undefined, { debug: 0 });
+		this.errors();
+		this.peer.on("open", () => {
+			let c = this.peer.connect("waku-lucky-v1-" + code, { reliable: true });
+			this.links.set(0, c);
+			c.on("open", () => c.send({ t: "join", char }));
+			c.on("data", (d) => {
+				if (d?.t === "welcome") {
+					this.me = d.me;
+					this.players = d.players;
+					ui.roomLobby(this);
+				} else if (d?.t === "roster") {
+					this.players = d.players;
+					if (!this.launched) ui.roomLobby(this);
+				} else if (d?.t === "reject") ui.networkError(d.reason);
+				else if (d?.t === "launch") {
+					this.launched = true;
+					game.startNetwork(this, d.stage);
+				} else this.handlers.forEach((h) => h(d, 0));
+			});
+			c.on("close", () => {
+				if (!this.closed) {
+					this.leavers.forEach((h) => h(0));
+					if (!this.launched)
+						ui.networkError("The room closed. Create or join another room.");
+				}
+			});
+			c.on("error", (e) =>
+				ui.networkError("Could not reach the room. Check the six-digit code."),
+			);
+		});
+	}
+	errors() {
+		this.peer.on("error", (e) => {
+			if (!this.closed)
+				ui.networkError(
+					e.type === "peer-unavailable"
+						? "Room not found. Check the code and try again."
+						: "Room connection failed: " +
+								(e.type || "unknown") +
+								". Try again.",
+				);
+		});
+	}
+	depart(id) {
+		if (!this.links.has(id)) return;
+		this.links.delete(id);
+		this.players = this.players.filter((p) => p.id !== id);
+		this.leavers.forEach((h) => h(id));
+		this.send({ t: "depart", id });
+		if (!this.launched && !this.closed) ui.roomLobby(this);
+	}
+	send(data, opts = {}) {
+		if (this.closed) return;
+		for (let [id, c] of this.links)
+			if (c.open && (opts.to === undefined || opts.to === id)) c.send(data);
+	}
+	onMessage(fn) {
+		this.handlers.push(fn);
+	}
+	onLeave(fn) {
+		this.leavers.push(fn);
+	}
+	launch(stage) {
+		if (this.players.length < 2) return;
+		this.launched = true;
+		this.send({ t: "launch", stage });
+		game.startNetwork(this, stage);
+	}
+	close() {
+		this.closed = true;
+		for (let c of this.links.values()) c.close();
+		this.peer?.destroy();
+	}
+}
+const attackKeys = [
+	"",
+	"jab",
+	"kick",
+	"heavy",
+	"sweep",
+	"air",
+	"special",
+	"throw",
+	"super",
+	"burst",
+	"wake",
+];
+Object.assign(Game.prototype, {
+	startNetwork(net, stage = 0) {
+		this.net = net;
+		this.setup(
+			net.players.map((p, i) => ({
+				id: p.id,
+				char: p.char ?? p.id % 7,
+				name: p.name,
+				ai: false,
+				x: -6 + (i * 12) / Math.max(1, net.players.length - 1),
+			})),
+			"network",
+			stage,
+		);
+		if (net.players.length === 1)
+			this.addFighter(2, 99, 4, true, "RIVET · CPU");
+		view.setFighters(this.fighters);
+		this.net = net;
+		this.netClock = 0;
+		this.netSeq = 0;
+		this.pendingCommands = [];
+		this.snapAt = -Infinity;
+		this.netAt = 0;
+		this.networkStopped = false;
+		net.onMessage((d, from) => this.receive(d, from));
+		net.onLeave((id) => this.leaveNetwork(id));
+		this.say("LUCKY RUMBLE", "Most knockouts wins. Everybody respawns.", 2);
+	},
+	remoteInput(f) {
+		let r = f.remote;
+		if (!r || performance.now() - r.received > 650) return emptyInput();
+		let input = { ...r.input, actions: [...(r.actions || [])], jump: !!r.jump };
+		r.actions = [];
+		r.jump = false;
+		return input;
+	},
+	receive(d, from) {
+		if (!d || typeof d !== "object" || this.mode !== "network" || this.ended)
+			return;
+		if (d.t === "me" && this.net.isHost) {
+			let f = this.fighters.find((f) => f.id === from);
+			if (!f || f.left || !Array.isArray(d.p) || d.at <= f.lastPacket) return;
+			f.lastPacket = d.at;
+			let [x, y, vx, vy] = d.p;
+			if (![x, y, vx, vy].every(Number.isFinite)) return;
+			f.remote ??= { actions: [] };
+			f.remote.received = performance.now();
+			f.remote.input = {
+				x: clamp(+d.x || 0, -1, 1),
+				y: clamp(+d.y || 0, -1, 1),
+				guard: !!d.g,
+				actions: [],
+				jump: false,
+			};
+			if (f.stun <= 0 && f.down <= 0 && f.respawn <= 0 && f.hp > 0) {
+				f.body.setTranslation(
+					{ x: clamp(x, -9.5, 9.5), y: clamp(y, 0.83, 10), z: 0 },
+					true,
+				);
+				f.body.setLinvel(
+					{ x: clamp(vx, -18, 18), y: clamp(vy, -20, 15), z: 0 },
+					true,
+				);
+			}
+			for (let c of (d.cmd || []).slice(-16)) {
+				if (!Array.isArray(c) || c[0] <= f.lastSeq) continue;
+				f.lastSeq = c[0];
+				f.remote.actions.push(
+					...(c[1] || []).filter((a) => attackKeys.includes(a) || a === "dash"),
+				);
+				if (c[2]) f.remote.jump = true;
+			}
+		} else if (d.t === "state" && !this.net.isHost && from === this.net.host) {
+			if (d.at <= this.snapAt) return;
+			this.snapAt = d.at;
+			this.timer = d.timer;
+			this.countdown = d.cd;
+			for (let a of d.f || []) {
+				let f = this.fighters.find((f) => f.id === a[0]);
+				if (!f) continue;
+				let [
+					id,
+					x,
+					y,
+					vx,
+					vy,
+					hp,
+					meter,
+					attack,
+					at,
+					stun,
+					face,
+					combo,
+					down,
+					score,
+					kos,
+					respawn,
+					ack,
+					invuln,
+					left,
+					guard,
+					crouch,
+				] = a;
+				f.hp = hp;
+				f.meter = meter;
+				f.score = score;
+				f.kos = kos;
+				f.combo = combo;
+				f.respawn = respawn;
+				f.left = !!left;
+				f.stun = stun;
+				f.down = down;
+				f.invuln = invuln;
+				if (id === this.net.me) {
+					this.pendingCommands = this.pendingCommands.filter((c) => c[0] > ack);
+					if (
+						stun > 0 ||
+						down > 0 ||
+						respawn > 0 ||
+						Math.abs(f.body.translation().x - x) > 3
+					) {
+						f.body.setTranslation({ x, y, z: 0 }, true);
+						f.body.setLinvel({ x: vx, y: vy, z: 0 }, true);
+						f.attack = attackKeys[attack] || "";
+						f.at = at;
+					}
+				} else {
+					f.target = { x, y, vx, vy };
+					f.body.setTranslation({ x, y, z: 0 }, true);
+					f.body.setLinvel({ x: vx, y: vy, z: 0 }, true);
+					f.attack = attackKeys[attack] || "";
+					f.at = at;
+					f.face = face;
+					f.air = y > 1;
+					f.move = vx / 5;
+					f.guard = !!guard;
+					f.crouch = !!crouch;
+				}
+			}
+			for (let e of d.e || []) {
+				view.particles(e.x, e.y, e.c, 9);
+				sound.fx(e.kind === "block" ? "block" : "hit");
+			}
+			this.remoteProjectiles = d.p || [];
+		} else if (d.t === "finish" && from === this.net.host) {
+			this.over = true;
+			this.finalStandings = d.standings;
+			ui.networkResults(d.standings);
+		} else if (d.t === "depart" && from === this.net.host)
+			this.leaveNetwork(d.id);
+	},
+	clientStep(dt, inputs) {
+		let f = this.fighters.find((f) => f.id === this.net.me);
+		const input = ui.settingsOpen ? emptyInput() : inputs[0] || emptyInput();
+		if (f) {
+			if (input.actions.length || input.jump)
+				this.pendingCommands.push([
+					++this.netSeq,
+					[...input.actions],
+					input.jump,
+				]);
+			this.stepFighter(f, input, dt, true);
+		}
+		for (let o of this.fighters) {
+			if (o === f) continue;
+			o.at += dt;
+			let a = ATTACKS[o.attack];
+			if (a && o.at > a.duration) o.attack = "";
+			if (o.target) {
+				let age = Math.min(
+					0.15,
+					Math.max(0, (this.netTime() - this.snapAt) / 1000),
+				);
+				o.visualX = lerp(
+					o.visualX ?? o.target.x,
+					o.target.x + o.target.vx * age,
+					1 - Math.exp(-dt * 20),
+				);
+				o.visualY = lerp(
+					o.visualY ?? o.target.y,
+					o.target.y,
+					1 - Math.exp(-dt * 20),
+				);
+			}
+		}
+		this.world.step();
+		this.syncProjectileVisuals();
+		this.networkTick(dt);
+		this.updateHUD();
+	},
+	syncProjectileVisuals() {
+		this.remoteMeshes ??= [];
+		const ps = this.remoteProjectiles || [];
+		while (this.remoteMeshes.length > ps.length)
+			view.scene.remove(this.remoteMeshes.pop());
+		ps.forEach((p, i) => {
+			let m = this.remoteMeshes[i];
+			if (!m) {
+				m = ball(null, p[2], [p[0], p[1], 0], [0.33, 0.33, 0.33]);
+				view.scene.add(m);
+				this.remoteMeshes.push(m);
+			}
+			m.position.set(p[0], p[1], 0);
+			m.rotation.z += 0.1;
+		});
+	},
+	netTime() {
+		return this.net.hub ? AIHub.time() : performance.now();
+	},
+	networkTick(dt) {
+		this.netClock += dt;
+		if (this.netClock < 1 / 15 || this.over || this.ended) return;
+		this.netClock = 0;
+		const round = (n) => Math.round(n * 100) / 100;
+		if (this.net.isHost) {
+			let fs = this.fighters.map((f) => {
+				let p = f.body.translation(),
+					v = f.body.linvel();
+				return [
+					f.id,
+					round(p.x),
+					round(p.y),
+					round(v.x),
+					round(v.y),
+					round(f.hp),
+					round(f.meter),
+					attackKeys.indexOf(f.attack),
+					round(f.at),
+					round(f.stun),
+					f.face,
+					f.combo,
+					round(f.down),
+					f.score,
+					f.kos,
+					round(f.respawn),
+					f.lastSeq,
+					round(f.invuln),
+					+f.left,
+					+f.guard,
+					+f.crouch,
+				];
+			});
+			this.net.send(
+				{
+					t: "state",
+					at: this.netTime(),
+					timer: round(this.timer),
+					cd: round(this.countdown),
+					f: fs,
+					e: this.events.splice(0, 6),
+					p: this.projectiles.map((p) => [
+						round(p.x),
+						round(p.y),
+						CAST[this.fighters.find((f) => f.id === p.owner)?.char || 0].accent,
+					]),
+				},
+				{ reliable: false },
+			);
+		} else {
+			let f = this.fighters.find((f) => f.id === this.net.me);
+			if (f) {
+				let p = f.body.translation(),
+					v = f.body.linvel(),
+					input = ui.settingsOpen ? emptyInput() : controls.states[0];
+				this.net.send(
+					{
+						t: "me",
+						at: ++this.netAt,
+						p: [round(p.x), round(p.y), round(v.x), round(v.y)],
+						x: input?.x || 0,
+						y: input?.y || 0,
+						g: !!input?.guard,
+						cmd: this.pendingCommands.slice(-16),
+					},
+					{ to: this.net.host, reliable: false },
+				);
+			}
+		}
+		if (this.net.hub) {
+			let f = this.fighters.find((f) => f.id === this.net.me);
+			if (f)
+				AIHub.progress({
+					score: f.kos * 10000 + f.score,
+					label: f.kos + " knockouts",
+				});
+		}
+	},
+	leaveNetwork(id) {
+		let f = this.fighters.find((f) => f.id === id);
+		if (f) {
+			f.left = true;
+			f.hp = 0;
+		}
+		if (id === this.net.host && !this.net.isHost) {
+			this.ended = true;
+			this.over = true;
+			sound.enabled = false;
+			ui.networkError("The host left. This round has ended.");
+			return;
+		}
+		if (
+			this.net.isHost &&
+			this.fighters.filter((f) => !f.left && f.id !== 99).length <= 1
+		)
+			this.finishNetwork();
+	},
+	finishNetwork() {
+		if (this.over || !this.net?.isHost) return;
+		this.over = true;
+		let list = this.fighters
+				.filter((f) => !f.left && f.id !== 99)
+				.sort((a, b) => b.kos - a.kos || b.score - a.score),
+			groups = [];
+		for (let f of list) {
+			let prev = groups.at(-1),
+				prior = prev && this.fighters.find((o) => o.id === prev[0]);
+			if (prior && prior.kos === f.kos && prior.score === f.score)
+				prev.push(f.id);
+			else groups.push([f.id]);
+		}
+		this.finalStandings = groups;
+		this.net.send({ t: "finish", standings: groups });
+		if (this.net.hub) {
+			let scores = {},
+				stats = {};
+			for (let f of list) {
+				scores[f.id] = f.kos * 10000 + f.score;
+				stats[f.id] = {
+					Knockouts: f.kos,
+					Damage: Math.round(f.damage),
+					Parries: f.parries,
+				};
+			}
+			AIHub.finish({ standings: groups, scores, stats });
+		}
+		ui.networkResults(groups);
+	},
+});
+
+// ui.js
+function esc(v) {
+	return String(v).replace(
+		/[&<>"']/g,
+		(c) =>
+			({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+				c
+			],
+	);
+}
+function portrait(i) {
+	let c = CAST[i],
+		hex = (n) => "#" + n.toString(16).padStart(6, "0"),
+		ears =
+			c.kind === "rabbit"
+				? '<ellipse cx="37" cy="24" rx="10" ry="24"/><ellipse cx="72" cy="24" rx="10" ry="24"/>'
+				: c.kind === "robot"
+					? '<path d="M55 25V8M49 8h12"/>'
+					: c.kind === "alien"
+						? '<ellipse cx="55" cy="14" rx="27" ry="7" fill="none"/>'
+						: c.kind === "frog"
+							? '<circle cx="35" cy="35" r="16"/><circle cx="75" cy="35" r="16"/>'
+							: '<circle cx="28" cy="32" r="15"/><circle cx="82" cy="32" r="15"/>';
+	return `<svg viewBox="0 0 110 110" aria-hidden="true"><g stroke="#342b48" stroke-width="3.5" fill="${hex(c.color)}" stroke-linejoin="round">${ears}<ellipse cx="55" cy="68" rx="38" ry="33"/><path d="M20 97 Q55 78 90 97 L96 110H14Z" fill="${hex(c.accent)}"/><ellipse cx="40" cy="63" rx="6" ry="9" fill="#fff5dc"/><ellipse cx="70" cy="63" rx="6" ry="9" fill="#fff5dc"/><path d="M40 63v4m30-4v4M47 80q8 9 16 0" fill="none" stroke-linecap="round"/><circle cx="27" cy="77" r="5" fill="#f89b94" stroke="none"/><circle cx="83" cy="77" r="5" fill="#f89b94" stroke="none"/></g></svg>`;
+}
+class UI {
+	constructor() {
+		this.kind = "loading";
+		this.index = 0;
+		this.cols = 1;
+		this.handlers = {};
+		this.blocking = false;
+		this.modal = false;
+		this.settingsOpen = false;
+		this.hudMode = "";
+		this.creditPage = 0;
+		this.lastHud = 0;
+		this.lastCount = -1;
+		this.selectChar = 0;
+		this.picks = [];
+		this.comboTimer = 0;
+		this.back = null;
+	}
+	screen(html, handlers = {}, opts = {}) {
+		$("#panel").innerHTML = html;
+		this.handlers = handlers;
+		this.index = opts.index ?? 0;
+		this.cols = opts.cols || 1;
+		this.blocking = opts.blocking ?? true;
+		this.kind = opts.kind || "menu";
+		this.back = opts.back || (() => game.toTitle());
+		this.bind($("#panel"), handlers);
+		this.focus();
+		$("#chrome").style.display = [
+			"title",
+			"select",
+			"menu",
+			"credits",
+		].includes(this.kind)
+			? "flex"
+			: "none";
+		$("#touch-notice").classList.toggle(
+			"show",
+			matchMedia("(pointer: coarse)").matches && !controls.seen,
+		);
+	}
+	bind(root, handlers) {
+		root.querySelectorAll("[data-action]").forEach((el) =>
+			el.addEventListener("click", () => {
+				sound.unlock();
+				sound.fx("confirm");
+				handlers[el.dataset.action]?.(el);
+			}),
+		);
+	}
+	buttons() {
+		return [
+			...(this.settingsOpen ? $("#modal") : $("#panel")).querySelectorAll(
+				"[data-nav]",
+			),
+		];
+	}
+	focus() {
+		let bs = this.buttons();
+		if (!bs.length) return;
+		this.index = (this.index + bs.length) % bs.length;
+		bs.forEach((b, i) => b.classList.toggle("active", i === this.index));
+	}
+	footer(left = "Navigate", right = "WISH RESPONSIBLY.") {
+		return `<div class="footer"><div class="hint"><span><span class="key">↕</span>${left}</span><span><span class="key pad">×</span><span class="key">ENTER</span> Confirm</span><span><span class="key">ESC</span> Settings</span></div><span>${right}</span></div>`;
+	}
+	btn(action, text, extra = "", cls = "") {
+		return `<button class="menu-btn ${cls}" data-nav data-action="${action}"><span>${text}${extra ? `<br><small>${extra}</small>` : ""}</span><span class="arrow">↗</span></button>`;
+	}
+	hide() {
+		$("#panel").innerHTML = "";
+		this.blocking = false;
+		this.modal = false;
+		this.kind = "play";
+		this.hudMode = "";
+		$("#chrome").style.display = "none";
+		$("#touch-notice").classList.remove("show");
+	}
+	title() {
+		this.modal = false;
+		$("#hud").innerHTML = "";
+		this.screen(
+			`<div class="title-wash"></div><div class="title-content"><div class="eyebrow">THE WISHES ARE REAL. THE RULES ARE OPTIONAL.</div><h1 class="wordmark"><span>WAKU</span><span class="waku2">WAKU</span><span class="lucky">LUCKY<span style="font-size:.42em;vertical-align:top">✦</span></span></h1><p class="title-copy">Seven charms. One wish.<br>Absolutely no sensible people.</p><div class="title-menu">${this.btn("arcade", "Arcade adventure", "A SEVEN-CHARM MISADVENTURE", "primary")}${this.btn("versus", "Versus party", "COUCH · ONLINE · 2–4 PLAYERS")}${this.btn("dojo", "Practice dojo", "LEARN A LITTLE. HIT A LOT.")}<button class="text-btn" data-nav data-action="about">ABOUT & CREDITS ↗</button></div></div><div class="lucky-stamp">7 FIGHTERS<br>1 VERY<br>BAD IDEA</div><div class="hero-caption"><div class="hand">Your wish is our problem.</div><p>WELCOME TO WISH MARKET · POPULATION: UNHINGED</p></div>${this.footer("Choose a mode", "BEST " + String(save.best).padStart(6, "0") + " · FREE PLAY")}`,
+			{
+				arcade: () => this.select("arcade"),
+				versus: () => this.versus(),
+				dojo: () => this.select("practice"),
+				about: () => this.credits(0),
+			},
+			{ kind: "title", blocking: false },
+		);
+	}
+	select(mode, phase = 0) {
+		this.pickMode = mode;
+		this.pickPhase = phase;
+		if (!phase) this.picks = [];
+		this.selectChar = phase ? (this.picks[0] + 1) % 7 : game.selected;
+		game.preview(this.selectChar);
+		this.renderSelect();
+	}
+	renderSelect() {
+		let c = CAST[this.selectChar],
+			label =
+				this.pickMode === "local"
+					? "PLAYER " + (this.pickPhase + 1)
+					: this.pickMode === "practice"
+						? "PRACTICE DOJO"
+						: this.pickMode === "online"
+							? "ONLINE PARTY"
+							: "ARCADE ADVENTURE";
+		let bars = c.stats
+			.map(
+				(n, i) =>
+					`<div class="stat-row"><span>${["SPEED", "POWER", "TRICKS"][i]}</span><div class="pips">${[1, 2, 3, 4, 5].map((v) => `<i class="${v <= n ? "on" : ""}"></i>`).join("")}</div></div>`,
+			)
+			.join("");
+		let cards = CAST.slice(0, 7)
+			.map(
+				(c, i) =>
+					`<button class="fighter-card ${i === this.selectChar ? "active" : ""}" data-action="pick${i}" aria-label="Choose ${c.name}"><small>0${i + 1}</small>${portrait(i)}<span>${c.name}</span></button>`,
+			)
+			.join("");
+		let handlers = {};
+		for (let i = 0; i < 7; i++)
+			handlers["pick" + i] = () => {
+				if (this.selectChar === i) this.confirmFighter();
+				else {
+					this.selectChar = i;
+					game.preview(i);
+					this.renderSelect();
+				}
+			};
+		this.screen(
+			`<div class="screen"><div class="eyebrow">${label} · SEVEN PERFECTLY QUESTIONABLE CHOICES</div><h1 class="screen-title">Pick your problem.</h1><div class="select-info"><h2>${c.name}</h2><p class="select-tag">${c.title}</p><p class="select-story">${c.story}</p><div style="margin-top:18px">${bars}</div><div class="special-tag">R2 SIGNATURE · ${c.special.toUpperCase()}<br>L2 SUPER · ${c.super}</div></div><div class="roster">${cards}</div></div>${this.footer("← → Choose a fighter", "○ / BACKSPACE · BACK")}`,
+			handlers,
+			{
+				kind: "select",
+				blocking: true,
+				back: () =>
+					this.pickMode === "local" || this.pickMode === "online"
+						? this.versus()
+						: game.toTitle(),
+			},
+		);
+	}
+	confirmFighter() {
+		sound.fx("confirm");
+		sound.voice(this.selectChar);
+		game.selected = this.selectChar;
+		if (this.pickMode === "arcade") game.startArcade(this.selectChar);
+		else if (this.pickMode === "practice") game.startPractice(this.selectChar);
+		else if (this.pickMode === "online") this.onlineMenu();
+		else {
+			this.picks[this.pickPhase] = this.selectChar;
+			if (this.pickPhase === 0) this.select("local", 1);
+			else this.chooseStage();
+		}
+	}
+	versus() {
+		game.mode = "select";
+		$("#hud").innerHTML = "";
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">THE MORE THE MESSIER</div><h1 class="screen-title">Bring a worthy nuisance.</h1><p class="screen-sub">One couch, or a few cities apart. Friendship sold separately.</p><div class="mode-grid"><button class="mode-card" data-nav data-action="local"><span class="big-icon">✌</span><div><h3>Couch versus</h3><p>Two fighters. First to two rounds.<br>Two pads or one shared keyboard.</p></div></button><button class="mode-card" data-nav data-action="online"><span class="big-icon">◎</span><div><h3>Online rumble</h3><p>2–4 players. A private room code.<br>Most knockouts in 150 seconds.</p></div></button><button class="mode-card" data-nav data-action="controls"><span class="big-icon">⌘</span><div><h3>Know your buttons</h3><p>A little knowledge is dangerous.<br>Here is quite a lot.</p></div></button></div></div>${this.footer("Choose", "○ / BACKSPACE · BACK")}`,
+			{
+				local: () => this.select("local"),
+				online: () => this.select("online"),
+				controls: () => this.manual(() => this.versus()),
+			},
+			{ cols: 3 },
+		);
+	}
+	chooseStage() {
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">PROPERTY DAMAGE IS A LOVE LANGUAGE</div><h1 class="screen-title">Take it outside.</h1><div class="mode-grid">${STAGES.map((s, i) => `<button class="mode-card" data-nav data-action="stage${i}"><div class="stage-swatch" style="background:#${s.sky.toString(16)}">${["☀", "♨", "✧"][i]}</div><div><h3>${s.name}</h3><p>${s.sub}</p></div></button>`).join("")}</div></div>${this.footer("Choose a stage", "○ / BACKSPACE · BACK")}`,
+			Object.fromEntries(
+				STAGES.map((_, i) => [
+					"stage" + i,
+					() => game.startLocal(this.picks[0], this.picks[1], i),
+				]),
+			),
+			{ cols: 3, back: () => this.select("local") },
+		);
+	}
+	dialogue(a, b, bout) {
+		this.screen(
+			`<div class="dialogue"><small>CHARM ${bout + 1} OF 7 · ${STAGES[game.stage].name}</small><h3>${CAST[b].name}</h3><p>“${CAST[b].quote}”</p>${this.btn("go", "LET’S GO!")}</div>`,
+			{
+				go: () => {
+					this.hide();
+					sound.voice(b);
+					game.say("WISH UPON A FIGHT!", "First to two rounds.", 1.7);
+				},
+			},
+			{ kind: "dialogue", back: () => this.openSettings() },
+		);
+	}
+	notice(big, small) {
+		$("#notice").innerHTML = `<b>${esc(big)}</b><small>${esc(small)}</small>`;
+		$("#notice").classList.add("show");
+	}
+	countdown(n) {
+		let v = n > 1.3 ? "ROUND " + game.round : n > 0.55 ? "READY?" : "GO!";
+		if (v !== this.lastCount) {
+			this.lastCount = v;
+			$("#countdown").innerHTML = `<b>${v}</b>`;
+			$("#countdown").classList.add("show");
+			if (v === "GO!") sound.fx("confirm");
+		}
+	}
+	combo(n, side) {
+		let el = $("#combo");
+		el.className = "combo show" + (side > 0 ? " right" : "");
+		el.innerHTML = n + "<small>LUCKY HITS!</small>";
+		clearTimeout(this.comboTimer);
+		this.comboTimer = setTimeout(() => el.classList.remove("show"), 900);
+	}
+	hud(g, force = false) {
+		if (["title", "select"].includes(g.mode)) {
+			$("#hud").innerHTML = "";
+			return;
+		}
+		let net = g.mode === "network";
+		let key = g.mode + g.fighters.length;
+		if (this.hudMode !== key || force) {
+			this.hudMode = key;
+			let bars = (f) =>
+				`<div class="fighter-name"><span id="name-${f.id}">${esc(f.name)}</span><small>${f.ai ? "CPU" : net ? "P" + (f.id + 1) : "P" + (f.id + 1)}</small></div><div class="health-track"><div class="health-fill" id="hp-${f.id}"></div></div>`;
+			if (net) {
+				$("#hud").innerHTML =
+					`<div class="network-health">${g.fighters.map((f) => `<div>${bars(f)}<div class="net-score" id="score-${f.id}"></div></div>`).join("")}</div><div class="network-time" id="time"></div><div class="hud-bottom"><div><div class="meter-label">YOUR LUCK · L2 SUPER COSTS 2</div><div class="meter" id="meter-local"></div></div></div>`;
+			} else {
+				$("#hud").innerHTML =
+					`<div class="hud-top"><div class="health-side">${bars(g.fighters[0])}<div class="round-dots" id="rounds-0"></div></div><div class="timer"><span id="time">60</span><small>${g.mode === "practice" ? "DOJO" : "ROUND " + g.round}</small></div><div class="health-side right">${bars(g.fighters[1])}<div class="round-dots" id="rounds-1"></div></div></div><div class="hud-bottom">${g.fighters.map((f, i) => `<div style="text-align:${i ? "right" : "left"}"><div class="meter-label">LUCK · ${i ? "" : "L2 SUPER = 2 STARS"}</div><div class="meter" id="meter-${f.id}"></div></div>`).join("")}</div><div class="stage-caption">${STAGES[g.stage].name}</div><div class="fight-help">□ JAB · × KICK · △ HEAVY · ○ SWEEP · R2 SPECIAL · L1 GUARD · OPTIONS PAUSE</div>`;
+			}
+		}
+		if (performance.now() - this.lastHud < 60 && !force) return;
+		this.lastHud = performance.now();
+		const meter = (v) =>
+			Array.from(
+				{ length: 7 },
+				(_, i) =>
+					`<i class="${i < Math.floor(v) ? "full" : ""}" style="${i === Math.floor(v) ? `background:linear-gradient(90deg,#ffda63 ${(v % 1) * 100}%,#fff0d9 ${(v % 1) * 100}%)` : ""}"></i>`,
+			).join("");
+		for (let f of g.fighters) {
+			let hp = $("#hp-" + f.id);
+			if (hp) hp.style.width = clamp((f.hp / f.maxHp) * 100, 0, 100) + "%";
+			let m = $("#meter-" + f.id);
+			if (m) m.innerHTML = meter(f.meter);
+			let r = $("#rounds-" + f.id);
+			if (r)
+				r.innerHTML = [0, 1]
+					.map(
+						(i) =>
+							`<span class="${i < (g.wins[f.id] || 0) ? "won" : ""}">●</span>`,
+					)
+					.join("");
+			let score = $("#score-" + f.id);
+			if (score)
+				score.textContent = f.left
+					? "LEFT"
+					: f.respawn > 0
+						? "BACK IN " + Math.ceil(f.respawn)
+						: f.kos + " KOs · " + f.score + " PTS";
+		}
+		let timer = $("#time");
+		if (timer)
+			timer.textContent = Number.isFinite(g.timer)
+				? Math.ceil(Math.max(0, g.timer))
+				: "∞";
+		if (net) {
+			let me = g.fighters.find((f) => f.id === g.net?.me);
+			let m = $("#meter-local");
+			if (m) m.innerHTML = me ? meter(me.meter) : "SERVER";
+		}
+	}
+	attract() {
+		this.screen(
+			`<div class="attract-ribbon">WAKU WAKU LUCKY · LIVE ARCADE DEMO</div><div class="attract-footer">ANY BUTTON TO JOIN THE TROUBLE</div>`,
+			{},
+			{ kind: "attract", blocking: false },
+		);
+	}
+	practiceHUD() {
+		let l = LESSONS[game.lesson];
+		let content =
+			game.practiceStyle === "lessons"
+				? `<div class="lesson"><div class="number">DOJO LESSON ${game.lesson + 1} / ${LESSONS.length}</div><h3>${game.lessonDone ? "★ NICE WORK!" : l.name}</h3><p>${game.lessonDone ? "× / Enter for next lesson · ] to skip" : l.hint}</p><div class="progress"><i style="width:${Math.min(100, (game.lessonCount / l.need) * 100)}%"></i></div></div>`
+				: `<div class="lesson"><div class="number">FREE PRACTICE</div><h3>${{ dummy: "Patient punching partner", guard: "Guarding partner", spar: "Live sparring partner" }[game.practiceStyle]}</h3><p>Health regenerates. Luck refills. R resets positions.</p></div>`;
+		this.screen(
+			content +
+				`<div class="dojo-tools"><button class="mini-btn" data-action="mode">MODE: ${game.practiceStyle.toUpperCase()} [TAB]</button><button class="mini-btn" data-action="reset">RESET [R]</button><button class="mini-btn" data-action="manual">MOVE LIST</button></div>`,
+			{
+				mode: () => this.cyclePractice(),
+				reset: () => game.positionLesson(),
+				manual: () => this.manual(() => this.practiceHUD()),
+			},
+			{ kind: "practice", blocking: false, back: () => this.openSettings() },
+		);
+	}
+	cyclePractice() {
+		let a = ["lessons", "dummy", "guard", "spar"];
+		game.practiceStyle = a[(a.indexOf(game.practiceStyle) + 1) % a.length];
+		game.positionLesson();
+		this.practiceHUD();
+	}
+	nextLesson(dir = 1) {
+		game.lesson = (game.lesson + dir + LESSONS.length) % LESSONS.length;
+		game.positionLesson();
+		this.practiceHUD();
+	}
+	victory(final) {
+		if (final) {
+			save.clears++;
+			persist();
+		}
+		let collected = game.bout + 1;
+		this.screen(
+			`<div class="result-card"><div class="eyebrow">${final ? "THE WISH DEPARTMENT IS CLOSED" : "A WISH CLOSER TO TROUBLE"}</div><h2>${final ? "WISH GRANTED!*" : "CHARM GET!"}</h2><div class="charms">${Array.from({ length: 7 }, (_, i) => `<span class="${i < collected ? "collected" : ""}">★</span>`).join("")}</div><p>${final ? esc(CAST[game.selected].wish) + "<br><small>*Delivery may take 7–700 business years.</small>" : esc(CAST[game.selected].quote)}</p><div class="score-line">SCORE ${game.score} · ${collected} / 7 CHARMS</div>${this.btn("next", final ? "TAKE A BOW" : "NEXT MISADVENTURE")}</div>`,
+			{
+				next: () => {
+					if (final) game.toTitle();
+					else {
+						game.bout++;
+						game.startBout();
+					}
+				},
+			},
+			{ kind: "result" },
+		);
+	}
+	result(winner) {
+		let won = game.mode === "local";
+		this.screen(
+			`<div class="result-card"><div class="eyebrow">${won ? "FRIENDSHIP: SLIGHTLY DENTED" : "YOUR WISH IS STILL OUT THERE"}</div><h2>${esc(CAST[game.fighters[winner]?.char || 0].name)} WINS!</h2><p>${won ? "Same friends. New bruises?" : "Every great hero has a very embarrassing first draft."}</p><div class="score-line">${game.wins[0]} — ${game.wins[1]} · BEST OF THREE</div>${this.btn("retry", won ? "REMATCH" : "TRY THIS RIVAL AGAIN")}${this.btn("exit", "BACK TO THE MARKET")}</div>`,
+			{
+				retry: () =>
+					won
+						? game.startLocal(
+								game.fighters[0].char,
+								game.fighters[1].char,
+								game.stage,
+							)
+						: game.startBout(),
+				exit: () => game.toTitle(),
+			},
+			{ kind: "result" },
+		);
+	}
+	manual(back) {
+		let rows = [
+			["Move / crouch", "Stick, D-pad · WASD"],
+			["Jump / double jump", "↑ twice · W or Space"],
+			["Jab / kick", "□ / × · J / K"],
+			["Heavy / low sweep", "△ / ○ · U / I"],
+			["Guard / parry", "L1 · Q (tap just before impact)"],
+			["Dash / air dash", "R1 · E"],
+			["Signature / EX", "R2 · L / hold Down + L"],
+			["Throw", "□ + × · O"],
+			["Warning super", "L2 · H · 2 luck stars"],
+			["Defensive burst", "R3 · B · 1 luck star"],
+			["Recover / wake attack", "Hold side / Up when knocked down"],
+			["P2 keyboard", "Arrows · Num 1/2/4/5 · 6 special"],
+		];
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">THE BUTTONS ARE YOUR FRIENDS</div><h1 class="screen-title">Small inputs. Big problems.</h1><div class="manual-grid">${rows.map((r) => `<div class="manual-row"><strong>${r[0]}</strong><span>${r[1]}</span></div>`).join("")}</div><p class="screen-sub">Chain a landed jab → kick → heavy → special. Block low sweeps crouching; block air attacks standing. Supers are unblockable, but interruptible during their warning.</p><p style="font-size:13px;margin-top:12px;font-weight:800">P2: Num 0 guard · Decimal dash · 7 super · 8 throw · 9 burst. A controller can navigate every menu.</p><div class="credits-nav">${this.btn("back", "GOT IT")}</div></div>`,
+			{ back },
+			{ kind: "menu", back },
+		);
+	}
+	openSettings() {
+		if (this.settingsOpen) {
+			this.closeSettings();
+			return;
+		}
+		this.settingsOpen = true;
+		this.savedIndex = this.index;
+		this.index = 0;
+		this.settingsPage = 0;
+		this.renderSettings();
+	}
+	renderSettings() {
+		let rows = [
+			["volume", "Master volume"],
+			["music", "Music"],
+			["sfx", "Sound effects"],
+			["voice", "Gibberish voices"],
+			["invertX", "Invert horizontal axis"],
+			["invertY", "Invert vertical axis"],
+			["shake", "Camera shake"],
+			["flash", "Impact flashes"],
+			["difficulty", "CPU difficulty"],
+		];
+		let html = rows
+			.map(([k, label]) => {
+				let val =
+					typeof settings[k] === "boolean"
+						? settings[k]
+							? "ON"
+							: "OFF"
+						: k === "difficulty"
+							? ["COZY", "ARCADE", "SPICY"][settings[k]]
+							: `${Math.round(settings[k] * 100)}%`;
+				return `<button class="settings-row" data-nav data-setting="${k}" data-action="${k}"><span>${label}</span><b>‹ ${val} ›</b></button>`;
+			})
+			.join("");
+		let hs = {};
+		rows.forEach(([k]) => (hs[k] = () => this.changeSetting(k, 1)));
+		hs.resume = () => this.closeSettings();
+		hs.training = () => {
+			this.closeSettings();
+			this.cyclePractice();
+		};
+		hs.lesson = () => {
+			this.closeSettings();
+			this.nextLesson();
+		};
+		hs.controls = () => {
+			this.closeSettings();
+			this.manual(() => {
+				if (game.mode === "practice") this.practiceHUD();
+				else if (game.mode === "title") this.title();
+				else this.hide();
+			});
+		};
+		hs.fullscreen = () => {
+			if (document.fullscreenElement) document.exitFullscreen?.();
+			else document.documentElement.requestFullscreen?.().catch(() => {});
+		};
+		hs.exit = () => {
+			this.closeSettings();
+			game.toTitle();
+		};
+		$("#modal").innerHTML =
+			`<div class="sheet"><div class="eyebrow">${game.net ? "THE FIGHT KEEPS GOING" : "TAKE A BREATHER"}</div><h2>Make yourself lucky.</h2>${html}<div class="settings-foot">${game.mode === "practice" ? '<button class="mini-btn" data-nav data-action="training">DOJO MODE</button><button class="mini-btn" data-nav data-action="lesson">NEXT LESSON</button>' : ""}<button class="mini-btn" data-nav data-action="resume">RESUME</button><button class="mini-btn" data-nav data-action="controls">CONTROLS</button><button class="mini-btn" data-nav data-action="fullscreen">FULLSCREEN</button>${!game.net?.hub ? '<button class="mini-btn" data-nav data-action="exit">TITLE</button>' : ""}</div></div>`;
+		this.settingHandlers = hs;
+		this.bind($("#modal"), hs);
+		this.focus();
+	}
+	changeSetting(k, dir) {
+		if (typeof settings[k] === "boolean") settings[k] = !settings[k];
+		else if (k === "difficulty") settings[k] = (settings[k] + dir + 3) % 3;
+		else
+			settings[k] = Math.round(clamp(settings[k] + dir * 0.1, 0, 1) * 10) / 10;
+		persist();
+		sound.fx("select");
+		this.renderSettings();
+	}
+	closeSettings() {
+		this.settingsOpen = false;
+		$("#modal").innerHTML = "";
+		this.index = this.savedIndex || 0;
+		controls.last = performance.now();
+		this.focus();
+	}
+	credits(page = 0) {
+		this.creditPage = page;
+		let pages = [
+			`<h3>Source Information</h3><p><strong>Waku Waku Lucky</strong> is an original spiritual successor to Waku Waku 7 (Sunsoft, 1996). Original characters, music, models, and writing; no source-game assets are included.</p><p>${esc(REPORT.source).replace(/\n/g, "<br>")}</p><p>Title chosen from 50 candidates using Python secrets.randbelow(50).</p><h3>Thank you, troublemakers.</h3><p>Three.js · Dimforge Rapier · PeerJS · AI Hub session client. Bungee by David Jonathan Ross; Nunito Sans by Vernon Adams and contributors. Libraries and fonts retain their respective open-source licenses.</p>`,
+			`<h3>Engine Feedback</h3><p>${esc(REPORT.engine).replace(/\n/g, "<br>")}</p><h3>Testing Feedback</h3><p>${esc(REPORT.testing).replace(/\n/g, "<br>")}</p>`,
+			`<h3>Prompt Feedback</h3><p>${esc(REPORT.prompt).replace(/\n/g, "<br>")}</p><h3>How the wish works</h3><p>Arcade: six rivals, then The Fine Print. Two rounds to win each match. Every character has a different signature, movement speed and power. Three arenas rotate through the route.</p><p>Dojo: 13 lessons, idle dummy, guarding dummy and live sparring. Local versus: two controllers or a shared keyboard. Online: private 2–4 player knockout rumble, host-authoritative combat and local movement prediction. AI Hub starts its round automatically.</p>`,
+		];
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">MADE WITH AN UNREASONABLE AMOUNT OF LUCK</div><h1 class="screen-title">The fine print, for real.</h1><div class="credits-content">${pages[page]}</div><div class="credits-nav">${this.btn("prev", "← PREVIOUS")}${this.btn("next", "NEXT →")}${this.btn("back", "BACK TO TITLE")}</div><div class="page-marker">${page + 1} / 3 · ↑↓ SCROLL · ←→ PAGE · ○ BACK</div></div>`,
+			{
+				prev: () => this.credits((page + 2) % 3),
+				next: () => this.credits((page + 1) % 3),
+				back: () => game.toTitle(),
+			},
+			{ kind: "credits", cols: 3 },
+		);
+	}
+	onlineMenu() {
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">PRIVATE ROOM · 2–4 PLAYERS</div><h1 class="screen-title">Long-distance nonsense.</h1><p class="screen-sub">Pick a host. Share the six-digit room code in your own chat.<br>All fighters respawn. Most knockouts wins; points break ties.</p><div class="menu-stack">${this.btn("host", "CREATE A ROOM")}${this.btn("join", "JOIN WITH A CODE")}${this.btn("back", "BACK")}</div><p class="screen-sub" style="font-size:15px">Room service needs an internet connection. AI Hub handles its own connections automatically.</p></div>`,
+			{
+				host: () => this.createRoom(),
+				join: () => this.joinCode(),
+				back: () => this.versus(),
+			},
+		);
+	}
+	async createRoom() {
+		this.room?.close();
+		this.room = new Room();
+		this.networkWait("Opening your room…");
+		try {
+			await this.room.hostRoom(game.selected);
+		} catch (e) {
+			this.networkError(e.message);
+		}
+	}
+	networkWait(text) {
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">CONNECTING THE NONSENSE</div><h1 class="screen-title">${esc(text)}</h1><div class="menu-stack">${this.btn("cancel", "CANCEL")}</div></div>`,
+			{
+				cancel: () => {
+					this.room?.close();
+					this.onlineMenu();
+				},
+			},
+			{
+				back: () => {
+					this.room?.close();
+					this.onlineMenu();
+				},
+			},
+		);
+	}
+	networkError(text) {
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">A SMALL DETOUR</div><h1 class="screen-title">Connection interrupted.</h1><p class="error-line">${esc(text)}</p>${!game.net?.hub ? `<div class="menu-stack">${this.btn("back", "BACK TO ONLINE MENU")}</div>` : ""}</div>`,
+			{
+				back: () => {
+					this.room?.close();
+					game.net = null;
+					this.onlineMenu();
+				},
+			},
+			{ kind: "menu", blocking: !game.net },
+		);
+	}
+	joinCode(code = "") {
+		this.code = code;
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">ASK YOUR HOST FOR SIX DIGITS</div><h1 class="screen-title">Got a lucky number?</h1><input id="room-code" class="room-input" inputmode="numeric" maxlength="6" aria-label="Six digit room code" value="${esc(code)}"><div class="keypad">${["1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫", "0", "GO"].map((n) => `<button data-nav data-action="key${n}">${n}</button>`).join("")}</div></div>${this.footer("Choose a digit", "○ / BACKSPACE · BACK")}`,
+			Object.fromEntries(
+				["1", "2", "3", "4", "5", "6", "7", "8", "9", "⌫", "0", "GO"].map(
+					(n) => [
+						"key" + n,
+						async () => {
+							let field = $("#room-code");
+							if (n === "GO") {
+								let v = field.value.replace(/\D/g, "");
+								if (v.length !== 6) {
+									sound.fx("block");
+									return;
+								}
+								this.room?.close();
+								this.room = new Room();
+								this.networkWait("Finding your people…");
+								try {
+									await this.room.joinRoom(v, game.selected);
+								} catch (e) {
+									this.networkError(e.message);
+								}
+								return;
+							}
+							field.value =
+								n === "⌫"
+									? field.value.slice(0, -1)
+									: (field.value + n).slice(0, 6);
+						},
+					],
+				),
+			),
+			{ cols: 3, back: () => this.onlineMenu() },
+		);
+		$("#room-code").addEventListener(
+			"input",
+			(e) => (e.target.value = e.target.value.replace(/\D/g, "").slice(0, 6)),
+		);
+	}
+	roomLobby(room) {
+		let players = room.players
+			.map(
+				(p) =>
+					`<div class="lobby-player">${portrait(p.char ?? p.id)}${esc(p.name)}<br><small>${CAST[p.char ?? p.id].name}</small></div>`,
+			)
+			.join("");
+		this.screen(
+			`<div class="screen wide-screen"><div class="eyebrow">PRIVATE ROOM · ${room.players.length} / 4 FIGHTERS</div><h1 class="screen-title">Invite a little trouble.</h1><div class="network-code">${room.code}</div><div class="lobby-players">${players}</div><p class="screen-sub">${room.isHost ? (room.players.length > 1 ? "Everybody here? Let the nonsense begin." : "Waiting for a second fighter. Share the code with a friend.") : "You are ready. Waiting for the host to start."}</p><div class="menu-stack">${room.isHost && room.players.length > 1 ? this.btn("start", "START RUMBLE") : ""}${this.btn("leave", "LEAVE ROOM")}</div></div>`,
+			{
+				start: () => room.launch(0),
+				leave: () => {
+					room.close();
+					this.onlineMenu();
+				},
+			},
+			{
+				back: () => {
+					room.close();
+					this.onlineMenu();
+				},
+			},
+		);
+	}
+	networkResults(groups) {
+		this.screen(
+			`<div class="result-card"><div class="eyebrow">LUCKY RUMBLE COMPLETE</div><h2>WHAT A MESS!</h2>${groups.map((g, i) => `<p><b>${i + 1}.</b> ${g.map((id) => esc(game.fighters.find((f) => f.id === id)?.name || "Player")).join(" + ")}</p>`).join("")}<p style="font-size:15px">Knockouts first. Points break ties.</p>${game.net?.hub ? '<div class="score-line">RESULTS SENT TO AI HUB</div>' : this.btn("back", "BACK TO THE MARKET")}</div>`,
+			{ back: () => game.toTitle() },
+			{ kind: "result", blocking: false },
+		);
+	}
+	handle(menu) {
+		if (menu.pause) {
+			this.openSettings();
+			return;
+		}
+		if (this.settingsOpen) {
+			if (menu.back) {
+				this.closeSettings();
+				return;
+			}
+			let bs = this.buttons();
+			if (menu.dir) {
+				if (Math.abs(menu.dir) === 2 && bs[this.index]?.dataset.setting)
+					this.changeSetting(
+						bs[this.index].dataset.setting,
+						Math.sign(menu.dir),
+					);
+				else {
+					this.index += Math.sign(menu.dir);
+					this.focus();
+					sound.fx("select");
+				}
+			}
+			if (menu.confirm) bs[this.index]?.click();
+			return;
+		}
+		if (this.kind === "play" || this.kind === "attract") {
+			if (menu.back) this.openSettings();
+			return;
+		}
+		if (this.kind === "credits") {
+			if (menu.back) {
+				game.toTitle();
+				return;
+			}
+			if (menu.dir) {
+				if (Math.abs(menu.dir) === 2)
+					this.credits((this.creditPage + Math.sign(menu.dir) + 3) % 3);
+				else
+					$(".credits-content")?.scrollBy({
+						top: Math.sign(menu.dir) * 140,
+						behavior: "smooth",
+					});
+			}
+			if (menu.confirm) this.credits((this.creditPage + 1) % 3);
+			return;
+		}
+		if (this.kind === "select") {
+			if (menu.back) {
+				this.back?.();
+				return;
+			}
+			if (menu.dir) {
+				this.selectChar = (this.selectChar + Math.sign(menu.dir) + 7) % 7;
+				game.preview(this.selectChar);
+				this.renderSelect();
+				sound.fx("select");
+			}
+			if (menu.confirm) this.confirmFighter();
+			return;
+		}
+		if (this.kind === "practice") {
+			if (menu.tab) this.cyclePractice();
+			if (menu.reset) game.positionLesson();
+			if (menu.lessonNext) this.nextLesson(1);
+			if (menu.lessonPrev) this.nextLesson(-1);
+			if (menu.confirm && game.lessonDone) this.nextLesson();
+			if (menu.back) this.openSettings();
+			return;
+		}
+		if (menu.back) {
+			if (this.kind === "play") this.openSettings();
+			else this.back?.();
+			return;
+		}
+		if (menu.dir) {
+			let delta =
+				Math.abs(menu.dir) === 2
+					? Math.sign(menu.dir)
+					: Math.sign(menu.dir) * this.cols;
+			this.index += delta;
+			this.focus();
+			sound.fx("select");
+		}
+		if (menu.confirm) this.buttons()[this.index]?.click();
+	}
+}
+const ui = new UI();
+
+// main.js
+let booted = false,
+	lastFrame = 0,
+	pendingInputs = [];
+$("#settings-button").addEventListener("click", () => {
+	sound.unlock();
+	ui.openSettings();
+});
+async function boot() {
+	try {
+		await Promise.all([view.init(), RAPIER.init()]);
+		AIHub.probe(() => ({
+			scene:
+				game.ended || game.over
+					? "over"
+					: game.net?.hub && AIHub.time() < 0
+						? "ready"
+						: game.mode === "title"
+							? "title"
+							: game.mode === "select"
+								? "menu"
+								: "play",
+			menu: ui.settingsOpen,
+			world: game.sim,
+			input: {
+				x: ui.settingsOpen ? 0 : controls.states[0]?.x || 0,
+				y: ui.settingsOpen ? 0 : controls.states[0]?.y || 0,
+				fire: ui.settingsOpen ? false : !!controls.states[0]?.fire,
+			},
+		}));
+		if (AIHub.active) {
+			let info = await AIHub.connect({ mode: "versus", seats: [1, 4] });
+			if (info) {
+				game.aiRng = AIHub.rng("computer");
+				game.startNetwork(hubTransport(info), info.seed % 3);
+				AIHub.on("time-up", () => game.finishNetwork());
+				AIHub.on("end", ({ reason }) => {
+					game.ended = true;
+					game.over = true;
+					sound.enabled = false;
+					controls.keys.clear();
+					if (reason !== "finished")
+						ui.notice("ROUND ENDED", reason.replaceAll("-", " "));
+				});
+				AIHub.ready();
+			} else game.toTitle();
+		} else game.toTitle();
+		await view.renderer.compileAsync(view.scene, view.camera);
+		view.update(game, performance.now() / 1000, 1 / 60);
+		controls.last = performance.now();
+		booted = true;
+		$("#loading").remove();
+		window.__lucky = {
+			game,
+			view,
+			ui,
+			controls,
+			sound,
+			settings,
+			CAST,
+			ATTACKS,
+			LESSONS,
+			version: "1.0.0",
+			backend: view.renderer.backend.isWebGPUBackend ? "WebGPU" : "unknown",
+		};
+		lastFrame = performance.now();
+		requestAnimationFrame(frame);
+	} catch (e) {
+		console.error(e);
+		AIHub.fail(e.message);
+		$("#loading").innerHTML =
+			`<div class="fatal"><div class="load-star">✦</div><h1 class="loading-title">A little more power, please.</h1><p>${esc(e.message)}</p><p>WebGPU is required. Use a compatible browser with hardware acceleration, and serve the file over HTTPS or localhost.</p></div>`;
+	}
+}
+function frame(now) {
+	let dt = Math.min(0.1, (now - lastFrame) / 1000);
+	lastFrame = now;
+	const read = controls.poll();
+	const input = read.map((s, i) => ({
+		...s,
+		actions: [...new Set([...(pendingInputs[i]?.actions || []), ...s.actions])],
+		jump: s.jump || pendingInputs[i]?.jump,
+	}));
+	pendingInputs = input;
+	if (!game.ended) {
+		ui.handle(controls.menu);
+		sound.tick();
+	}
+	game.acc += dt;
+	let n = 0;
+	while (game.acc >= 1 / 60 && n++ < 5) {
+		game.update(1 / 60, input);
+		input.forEach((s) => {
+			s.actions = [];
+			s.jump = false;
+		});
+		game.acc -= 1 / 60;
+	}
+	if (n >= 5) game.acc = 0;
+	view.update(game, now / 1000, dt);
+	if (matchMedia("(pointer: coarse)").matches)
+		$("#touch-notice").classList.toggle("show", !controls.seen);
+	requestAnimationFrame(frame);
+}
+addEventListener("visibilitychange", () => {
+	if (
+		document.hidden &&
+		!game.net &&
+		booted &&
+		!["title", "select", "attract"].includes(game.mode) &&
+		!ui.settingsOpen
+	)
+		ui.openSettings();
+});
+boot();
+</script></body></html>

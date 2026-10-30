@@ -1,0 +1,602 @@
+<!doctype html>
+<!--
+Source Information: 2026-10-29 09:17; SiN. Tech: Three.js r180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio API, PeerJS 1.5.5, AI Hub session v1. Art: procedural cel-shaded geometry. Animation: procedural transforms. Audio: synthesized music, effects, and gibberish voices. Online: AI Hub parallel score sessions and standalone PeerJS score race. Testing: lightweight browser and syntax checks. Environment: Codex CLI (headless); Linux; browser unknown. Model: OpenAI gpt-6.1-terra, reasoning effort ultra. Usage: unknown.
+Engine Feedback: Three.js makes scene composition straightforward; WebGPU initialization and compatibility required care. The most important custom work was the complete game loop and interaction systems. Hardest: combining WebGPU with physics and multiplayer. Overhaul/change: clearer WebGPU material compatibility and diagnostics.
+Prompt Feedback: The clear creative and accessibility constraints were useful. The source's full scope versus a vertical slice was open to interpretation; multiplayer integration was the hardest requirement. Desired additional test: a full controller playthrough on physical hardware.
+Testing Feedback: One issue was caught by testing (initial AI Hub progress reporting); zero confirmed game-breaking issues. Most helpful: two-player AI Hub harness. Least helpful: JavaScript syntax check alone. Chrome 154 headless Vulkan showed no WebGPU pixels even in a minimal native sample, so visual rendering remains unverified; physical controller and remote PeerJS tests were not run.
+-->
+<html lang="en"><head><meta charset="utf-8"><title>SiN Fuel</title>
+<meta name="hub:session" content="1"><meta name="hub:session-players" content="1-4"><meta name="hub:session-mode" content="parallel"><meta name="hub:session-minutes" content="6"><meta name="hub:session-goal" content="Score the most points in the refinery raid."><meta name="hub:session-howto" content="Move L, look R, fire R2, interact square, reload circle, swap triangle."><meta name="hub:webgpu" content="required">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+    "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+    "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+    "three/src/": "/lib/vendor/three/0.180.0/src/"
+  },
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;800;900&family=Space+Mono:wght@400;700&display=swap');
+:root{--ink:#e6eee7;--muted:#a4b5ac;--acid:#d6ff46;--orange:#ff7951;--glass:rgba(9,18,19,.90)}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#091010;color:var(--ink);font-family:'Barlow Condensed',sans-serif}canvas{display:block}button{font:inherit;color:inherit;cursor:pointer}#view{position:absolute;inset:0}#vignette{position:absolute;inset:0;pointer-events:none;background:radial-gradient(ellipse,transparent 40%,rgba(0,0,0,.42) 100%)}#hud{position:absolute;inset:0;pointer-events:none;display:none}.topline{position:absolute;top:4%;left:4%;display:flex;gap:18px;align-items:flex-start}.tag{background:var(--acid);color:#172017;padding:6px 10px;font-weight:900;letter-spacing:.12em;font-size:15px}.objective{border-left:2px solid var(--acid);padding:0 14px;text-shadow:0 2px 6px #000}.eyebrow{font:700 11px 'Space Mono',monospace;letter-spacing:.12em;color:var(--acid)}.objective strong{display:block;font-size:23px;line-height:1.05;text-transform:uppercase;max-width:400px}.objective small{font-size:15px;color:#cad7cf}.hudright{position:absolute;right:4%;top:4%;text-align:right;text-shadow:0 2px 5px #000}.score{font:700 18px 'Space Mono',monospace}.hudbottom{position:absolute;bottom:4%;left:4%;right:4%;display:flex;align-items:end;justify-content:space-between}.stat{display:flex;align-items:end;gap:12px;text-shadow:0 2px 8px #000}.stat b{font-size:60px;line-height:.8}.stat label{font:700 11px 'Space Mono',monospace;letter-spacing:.15em;color:var(--acid)}.ammo{text-align:right}.ammo b{font-size:48px}.ammo small{font:14px 'Space Mono';color:#c7d3cb}.cross{position:absolute;left:50%;top:50%;width:18px;height:18px;transform:translate(-50%,-50%)}.cross:before,.cross:after{content:'';position:absolute;background:#eaffd9;box-shadow:0 0 4px #000}.cross:before{width:2px;height:18px;left:8px}.cross:after{height:2px;width:18px;top:8px}.cross i{position:absolute;inset:6px;background:#ff805f;z-index:1;border:1px solid #fff}.prompt{position:absolute;top:58%;left:50%;transform:translateX(-50%);font-size:20px;text-transform:uppercase;font-weight:800;text-align:center;text-shadow:0 2px 6px #000;white-space:nowrap}.toast{position:absolute;top:18%;left:50%;transform:translateX(-50%);text-align:center;font-size:26px;font-weight:900;text-transform:uppercase;text-shadow:0 2px 8px #000}.hurt{position:absolute;inset:0;background:rgba(255,46,22,.28);opacity:0}.hitmarker{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:38px;color:#fff;opacity:0}.feed{position:absolute;right:4%;top:12%;font:12px 'Space Mono';color:#d7e7dc;text-align:right;line-height:1.6}#overlay{position:absolute;inset:0;background:linear-gradient(90deg,rgba(4,12,13,.98) 0%,rgba(5,15,16,.91) 43%,rgba(5,15,16,.18) 100%);display:flex;align-items:center;padding:5% 7%}#panel{width:min(660px,90vw);max-height:90vh;overflow:auto}.brand{font:700 12px 'Space Mono';letter-spacing:.27em;color:var(--acid);margin-bottom:10px}.title{font-size:clamp(72px,10vw,140px);font-weight:900;line-height:.75;letter-spacing:-.055em;margin:0;text-transform:uppercase}.title span{color:var(--acid)}.subtitle{font-size:21px;letter-spacing:.12em;text-transform:uppercase;margin:20px 0 30px;color:#c8d7cb}.intro{font-size:22px;line-height:1.2;color:#c4d2c7;max-width:520px}.menu{display:grid;gap:7px;margin-top:24px;max-width:420px}.menu button{border:1px solid #43524b;background:rgba(12,25,25,.8);text-align:left;padding:11px 16px;font-weight:800;font-size:23px;text-transform:uppercase;letter-spacing:.035em}.menu button:focus,.menu button:hover,.menu button.selected{outline:none;border-color:var(--acid);background:var(--acid);color:#101b14}.menu button:after{content:'↗';float:right}.hint{font:12px 'Space Mono';color:#9baea2;margin-top:22px;line-height:1.7}.screen-title{font-size:55px;font-weight:900;line-height:1;text-transform:uppercase;margin:0 0 12px}.copy{font-size:21px;line-height:1.25;color:#c6d5c9}.copy p{margin:.5em 0}.copy b{color:var(--acid)}.row{display:flex;justify-content:space-between;align-items:center;gap:20px;border-bottom:1px solid #43524b;padding:8px 0;font-size:21px}.row button{border:1px solid #72847a;background:#1b302a;padding:5px 13px;min-width:85px}.row button:focus,.row button.selected{outline:2px solid var(--acid);background:var(--acid);color:#101b14}.tiny{font:11px 'Space Mono';line-height:1.5;color:#aab9af}.inputcode{font:700 28px 'Space Mono';color:var(--acid);letter-spacing:.3em}.flash{color:var(--orange)}#loading{position:absolute;inset:0;background:#0b1515;display:grid;place-items:center;font:700 18px 'Space Mono';color:var(--acid);z-index:99;text-align:center;padding:30px}.attract{position:absolute;bottom:5%;left:50%;transform:translateX(-50%);background:var(--acid);color:#111e16;padding:8px 20px;font-size:20px;font-weight:900;letter-spacing:.1em}.damageDir{position:absolute;inset:0;border:5px solid rgba(255,100,60,.45);opacity:0}@media(max-width:700px){.title{font-size:70px}.intro{font-size:18px}.objective strong{font-size:18px}.stat b{font-size:42px}.topline{left:3%;top:3%}}
+</style></head><body><div id="view"></div><div id="vignette"></div><div id="hud"><div class="topline"><div class="tag">HARD<span style="color:#47611c">CORPS</span></div><div class="objective"><div class="eyebrow">CURRENT ASSIGNMENT</div><strong id="objective"></strong><small id="objsub"></small></div></div><div class="hudright"><div class="eyebrow">CLEANUP SCORE</div><div class="score" id="score">000000</div></div><div class="feed" id="feed"></div><div class="cross"><i></i></div><div class="hitmarker" id="hitmarker">×</div><div class="prompt" id="prompt"></div><div class="toast" id="toast"></div><div class="hudbottom"><div class="stat"><div><label>VITALITY</label><br><b id="health">100</b></div><div><label>ARMOR</label><br><b id="armor">25</b></div></div><div class="stat ammo"><div><label id="weaponLabel">VANGUARD / 01</label><br><b id="ammo">18</b> <small id="reserve">/ 90</small></div></div></div><div class="hurt" id="hurt"></div><div id="attractLabel" class="attract" style="display:none">DEMO REEL · PRESS ANY BUTTON</div></div><div id="overlay"><div id="panel"></div></div><div id="loading">BOOTING THE REFINERY…</div>
+<script type="module">
+import * as THREE from 'three';
+import RAPIER from '/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs';
+const $=id=>document.getElementById(id), view=$('view'), panel=$('panel'), overlay=$('overlay'), hud=$('hud');
+const HUB=window.AIHub; let inHub=!!(HUB&&HUB.active); let renderer,scene,camera,world,controller,playerCollider, clock=new THREE.Clock();
+let state='boot', menu='title', menuIndex=0, lastInput=performance.now(), keys={}, mouseLocked=false, padPrev=[], gpCooldown=0, attract=false;
+let settings={invertX:false,invertY:false,sensitivity:1,music:true}; try{Object.assign(settings,JSON.parse(localStorage.getItem('sinFuelSettings')||'{}'))}catch(e){}
+let gun, game, entities=[],targets=[],solidMeshes=[], doors=[], pickups=[], particles=[], moving=[], projectiles=[], messages=[], last=0, elapsed=0, demoT=0, audio, musicTimer=0, musicStep=0, peer=null, connections=[], roomCode='0000', roomStatus='OFFLINE', peerscores={}, race=false;
+const UP=new THREE.Vector3(0,1,0), tmp=new THREE.Vector3(), direction=new THREE.Vector3(), raycaster=new THREE.Raycaster();
+function save(){try{localStorage.setItem('sinFuelSettings',JSON.stringify(settings))}catch(e){}}
+function tone(freq=220,dur=.1,type='square',volume=.04,slide=1){if(!audio)return;let o=audio.createOscillator(),g=audio.createGain();o.type=type;o.frequency.setValueAtTime(freq,audio.currentTime);o.frequency.exponentialRampToValueAtTime(Math.max(30,freq*slide),audio.currentTime+dur);g.gain.setValueAtTime(volume,audio.currentTime);g.gain.exponentialRampToValueAtTime(.001,audio.currentTime+dur);o.connect(g).connect(audio.destination);o.start();o.stop(audio.currentTime+dur)}
+function sound(kind){if(kind==='shot'){tone(90,.13,'sawtooth',.09,.35);tone(500,.05,'square',.025,.3)}if(kind==='hit')tone(900,.08,'square',.035,.6);if(kind==='boom'){tone(75,.35,'sawtooth',.11,.3);tone(130,.24,'triangle',.07,.4)}if(kind==='pickup'){tone(490,.1,'triangle',.05,1.6);setTimeout(()=>tone(700,.13,'triangle',.04,1.4),80)}if(kind==='hack'){tone(300,.14,'square',.04,2);setTimeout(()=>tone(600,.2,'square',.04,1.5),100)}if(kind==='hurt')tone(130,.18,'sawtooth',.05,.6);if(kind==='voice'){for(let i=0;i<4;i++)setTimeout(()=>tone(130+Math.random()*130,.08,'sawtooth',.015,1.4),i*85)}}
+function audioStart(){if(!audio){try{audio=new (window.AudioContext||window.webkitAudioContext)()}catch(e){}}if(audio?.state==='suspended')audio.resume()}
+function music(dt){if(!audio||!settings.music||state!=='playing')return;musicTimer-=dt;if(musicTimer>0)return;musicTimer=.18;let notes=[55,55,73.42,55,82.4,73.42,49,55,55,55,98,82.4,73.42,65.4,49,49];let n=notes[musicStep++%notes.length];tone(n,.15,'sawtooth',.018,.99);if(musicStep%4===1)tone(55,.13,'sine',.035,.45);if(musicStep%4===3)tone(180,.035,'square',.008,.4)}
+function mat(c,em=0){return new THREE.MeshToonMaterial({color:c,emissive:c,emissiveIntensity:em})}const M={ground:mat(0x43514b),wall:mat(0x62716b),dark:mat(0x1c2a28),black:mat(0x101b1b),metal:mat(0x82938a),yellow:mat(0xd0db45),orange:mat(0xea7044),red:mat(0xa83430),green:mat(0x7ddd56,.25),blue:mat(0x45b9b1,.35),skin:mat(0xd9a47f),white:mat(0xcbd7c8),purple:mat(0x85439a)};
+function box(x,y,z,w,h,d,m,collision=true){let mesh=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),m);mesh.position.set(x,y,z);mesh.castShadow=true;mesh.receiveShadow=true;scene.add(mesh);if(collision){world.createCollider(RAPIER.ColliderDesc.cuboid(w/2,h/2,d/2).setTranslation(x,y,z));solidMeshes.push(mesh)}return mesh}
+function cylinder(x,y,z,r,h,m){let mesh=new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,10),m);mesh.position.set(x,y,z);mesh.castShadow=true;scene.add(mesh);return mesh}
+function sign(text,x,y,z,w=4,h=1,color='#d6ff46'){let c=document.createElement('canvas');c.width=1024;c.height=256;let g=c.getContext('2d');g.fillStyle='#172825';g.fillRect(0,0,1024,256);g.strokeStyle=color;g.lineWidth=8;g.strokeRect(8,8,1008,240);g.fillStyle=color;g.font='900 115px sans-serif';g.textAlign='center';g.textBaseline='middle';g.fillText(text,512,132,960);let t=new THREE.CanvasTexture(c);let mesh=new THREE.Mesh(new THREE.PlaneGeometry(w,h),new THREE.MeshBasicMaterial({map:t,side:THREE.DoubleSide}));mesh.position.set(x,y,z);scene.add(mesh);return mesh}
+function lamp(x,z,color=0xd4ff77){let p=new THREE.PointLight(color,75,15);p.position.set(x,5,z);scene.add(p);let m=box(x,5.7,z,1,.12,.25,M.yellow,false);return m}
+function door(z,id){let group=new THREE.Group();scene.add(group);let doorMesh=new THREE.Mesh(new THREE.BoxGeometry(5,4.6,.35),M.dark);doorMesh.position.set(0,2.3,z);scene.add(doorMesh);solidMeshes.push(doorMesh);let stripe=box(0,2.4,z+.2,4.5,.15,.04,M.yellow,false);let col=world.createCollider(RAPIER.ColliderDesc.cuboid(2.5,2.3,.2).setTranslation(0,2.3,z));doors.push({id,mesh:doorMesh,stripe,col,open:false,y:0});box(-3,2.5,z,1,5,1,M.wall);box(3,2.5,z,1,5,1,M.wall);sign('SECURITY LOCK',0,5.05,z+.52,4.8,.55)}
+function terminal(x,z,id,label){let b=box(x,.8,z,1.1,1.6,.8,M.dark,true);box(x,1.7,z,.95,.7,.18,M.blue,false);let s=sign(label,x,2.35,z+.12,1.7,.38);entities.push({type:'terminal',x,z,id,used:false,mesh:b})}
+function barrel(x,z){let mesh=cylinder(x,.65,z,.48,1.3,M.orange);let band=cylinder(x,.65,z,.50,.14,M.yellow);let body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.65,z));world.createCollider(RAPIER.ColliderDesc.cylinder(.65,.48).setMass(8).setRestitution(.2),body);let e={type:'barrel',mesh,band,body,hp:35,dead:false};mesh.userData.entity=e;targets.push(mesh);entities.push(e);moving.push(e)}
+function pickup(x,z,type){let group=new THREE.Group();let core=new THREE.Mesh(new THREE.OctahedronGeometry(.3),type==='health'?M.green:type==='armor'?M.blue:M.yellow);group.add(core);group.position.set(x,.6,z);scene.add(group);pickups.push({group,type,x,z,t:Math.random()*6})}
+function enemy(x,z,boss=false){let group=new THREE.Group();scene.add(group);let body=new THREE.Mesh(new THREE.BoxGeometry(boss?1.4:.8,boss?1.65:1.1,.55),boss?M.purple:M.dark);body.position.y=boss?1.5:1.1;group.add(body);let chest=new THREE.Mesh(new THREE.BoxGeometry(boss?1.45:.84,.25,.6),boss?M.green:M.orange);chest.position.y=boss?1.7:1.25;group.add(chest);let head=new THREE.Mesh(new THREE.BoxGeometry(boss?.72:.48,boss?.72:.48,.46),boss?M.green:M.skin);head.position.y=boss?2.65:1.92;group.add(head);let visor=new THREE.Mesh(new THREE.BoxGeometry(boss?.73:.49,.15,.48),M.black);visor.position.y=boss?2.72:2.02;group.add(visor);let leg1=new THREE.Mesh(new THREE.BoxGeometry(.26,.8,.3),M.black),leg2=leg1.clone();leg1.position.set(-.23,.4,0);leg2.position.set(.23,.4,0);group.add(leg1,leg2);let arm=new THREE.Mesh(new THREE.BoxGeometry(.25,.9,.25),M.dark);arm.position.set(.6,1.1,0);group.add(arm);group.position.set(x,0,z);let e={type:'enemy',group,body,head,leg1,leg2,x,z,hp:boss?340:75,max:boss?340:75,boss,dead:false,cool:1+Math.random()*2,phase:Math.random()*10,stun:0};for(let o of [body,chest,head,visor,leg1,leg2,arm]){o.userData.entity=e;o.userData.head=(o===head||o===visor);targets.push(o)}entities.push(e);return e}
+function build(){if(scene){scene.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material?.map){o.material.map.dispose();o.material.dispose()}})}if(world)world.free();scene=new THREE.Scene();scene.background=new THREE.Color(0x9eaaa0);scene.fog=new THREE.Fog(0x9eaaa0,30,85);camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.05,160);scene.add(camera);gun=new THREE.Group();camera.add(gun);gun.position.set(.38,-.34,-.65);let gunBody=new THREE.Mesh(new THREE.BoxGeometry(.3,.24,.68),M.dark);gun.add(gunBody);let gunTop=new THREE.Mesh(new THREE.BoxGeometry(.21,.1,.48),M.metal);gunTop.position.set(0,.16,-.06);gun.add(gunTop);let gunStripe=new THREE.Mesh(new THREE.BoxGeometry(.31,.035,.3),M.yellow);gunStripe.position.set(0,.03,-.12);gun.add(gunStripe);let gunGrip=new THREE.Mesh(new THREE.BoxGeometry(.14,.24,.15),M.black);gunGrip.position.set(0,-.18,.16);gun.add(gunGrip);let hand=new THREE.Mesh(new THREE.BoxGeometry(.18,.18,.2),M.skin);hand.position.set(.04,-.21,.17);gun.add(hand);world=new RAPIER.World({x:0,y:-9.81,z:0});controller=world.createCharacterController(.02);playerCollider=world.createCollider(RAPIER.ColliderDesc.capsule(.55,.32).setTranslation(0,.9,17));entities=[];targets=[];solidMeshes=[];doors=[];pickups=[];particles=[];moving=[];projectiles=[];
+scene.add(new THREE.HemisphereLight(0xd5f7de,0x293b36,2.1));let sun=new THREE.DirectionalLight(0xffe8c3,2.3);sun.position.set(-10,25,15);scene.add(sun);
+box(0,-.25,-17,22,.5,76,M.ground);box(-11,3,-17,1,6,76,M.wall);box(11,3,-17,1,6,76,M.wall);box(0,3,21,22,6,1,M.wall);box(0,3,-55,22,6,1,M.wall);
+for(let z=18;z>-55;z-=8){box(-10.3,3,z,.25,5.5,.6,M.dark,false);box(10.3,3,z,.25,5.5,.6,M.dark,false);box(0,.012,z,19,.025,.08,M.metal,false);lamp(z%16===2?-8:8,z)}
+for(let z=10;z>-51;z-=12){box(-7,1,z,2,2,2,M.dark);box(7,1,z-3,2.5,2,2,M.metal);box(-7,2.05,z,2.1,.1,2.1,M.yellow,false)}
+box(0,5.9,-20,22,.25,65,M.dark,false);door(-14,'gate');door(-37,'lab');terminal(-7,-6,'gate','SECURITY');terminal(7,-29,'lab','OVERRIDE');
+sign('HARDCORPS  /  NIGHT SHIFT',0,5,20.4,10,1);sign('ELEXIS ENERGY',0,5,-13.4,7,.8);sign('BIOFUEL REFINERY',0,5,-36.4,8,.8);sign('THE FUTURE IS IN YOUR BLOOD',0,5,-54.4,10,.8);
+for(let z of [-23,-27,-31]){cylinder(-9,1.5,z,.75,3,M.metal);cylinder(-9,2.3,z,.78,.5,M.green)}
+for(let [x,z] of [[-3,5],[4,-3],[1,-10],[-4,-20],[3,-25],[-1,-31],[4,-42],[-4,-46]])enemy(x,z);enemy(0,-50,true);for(let [x,z] of [[3,8],[-3,-2],[4,-19],[-4,-27],[4,-44]])barrel(x,z);for(let [x,z,t] of [[-5,13,'health'],[5,4,'ammo'],[-5,-11,'armor'],[5,-22,'health'],[-5,-33,'ammo'],[5,-40,'armor'],[-6,-47,'health']])pickup(x,z,t);
+game={x:0,y:.9,z:17,yaw:0,pitch:0,health:100,armor:25,ammo:18,magazines:[18,8],reserve:90,weapon:0,score:0,kills:0,stage:0,fire:0,reload:0,damage:0,hit:0,toast:0,objective:'BREACH THE REFINERY',sub:'Find the security terminal and open the first gate.',finished:false,foot:0};updateHUD();}
+function objective(stage){game.stage=stage;if(stage===1){game.objective='INTO THE REFINERY';game.sub='Reach the lab override terminal.'}else if(stage===2){game.objective='CUT OFF THE SOURCE';game.sub='Take down the Director in the mutation lab.'}updateHUD()}
+function notify(s,sec=2){$('toast').textContent=s;game.toast=sec}
+function updateHUD(){if(!game)return;$('health').textContent=Math.max(0,Math.ceil(game.health));$('armor').textContent=Math.max(0,Math.ceil(game.armor));$('ammo').textContent=game.ammo;$('reserve').textContent='/ '+game.reserve;$('score').textContent=String(game.score).padStart(6,'0');$('objective').textContent=game.objective;$('objsub').textContent=game.sub;$('weaponLabel').textContent=game.weapon?'RIOT GUN / 02':'VANGUARD / 01'}
+function openDoor(id){let d=doors.find(d=>d.id===id);if(!d||d.open)return;d.open=true;world.removeCollider(d.col,true);solidMeshes=solidMeshes.filter(m=>m!==d.mesh);sound('hack');game.score+=500;objective(id==='gate'?1:2);notify(id==='gate'?'SECURITY GATE OPEN':'LAB ACCESS GRANTED');voice(id==='gate'?'J.C.':'J.C.',id==='gate'?'Gate is open. Try not to redecorate the whole block.':'Lab unlocked. Whatever they are cooking, do not inhale.');}
+function voice(who,text){messages.unshift(who+' // '+text);messages=messages.slice(0,2);$('feed').innerHTML=messages.map(v=>'<div>'+v+'</div>').join('');sound('voice');setTimeout(()=>{messages.pop();$('feed').innerHTML=messages.map(v=>'<div>'+v+'</div>').join('')},7000)}
+function damage(amount){if(attract||game.finished)return;let absorb=Math.min(game.armor,amount*.55);game.armor-=absorb;game.health-=amount-absorb;game.damage=.65;sound('hurt');updateHUD();if(game.health<=0){game.health=0;end(false)}}
+function burst(x,y,z,color=0xffb74b,n=10){for(let i=0;i<n;i++){let m=new THREE.Mesh(new THREE.BoxGeometry(.1,.1,.1),new THREE.MeshBasicMaterial({color}));m.position.set(x,y,z);scene.add(m);particles.push({mesh:m,v:new THREE.Vector3((Math.random()-.5)*6,Math.random()*5,(Math.random()-.5)*6),life:.3+Math.random()*.4})}}
+function explode(e){if(e.dead)return;e.dead=true;let p=e.mesh.position.clone();scene.remove(e.mesh,e.band);world.removeRigidBody(e.body);targets=targets.filter(t=>t!==e.mesh);sound('boom');burst(p.x,p.y,p.z,0xffa634,24);for(let en of entities){if(en.type==='enemy'&&!en.dead&&en.group.position.distanceTo(p)<5)hitEnemy(en,85,false)}if(new THREE.Vector3(game.x,1,game.z).distanceTo(p)<4)damage(35);game.score+=100;updateHUD()}
+function hitEnemy(e,dmg,head){if(e.dead)return;e.hp-=dmg;e.stun=.2;burst(e.group.position.x,e.boss?1.8:1.3,e.group.position.z,head?0xffde8c:0x8ef96c,5);game.hit=.18;sound('hit');if(e.hp<=0){e.dead=true;e.group.rotation.z=Math.PI/2;e.group.position.y=.35;targets=targets.filter(t=>t.userData.entity!==e);game.kills++;game.score+=e.boss?3000:head?350:200;if(head)notify('HEADSHOT +350',1);if(e.boss){voice('BLADE','Your energy plan just got terminated.');end(true)}}updateHUD()}
+function shoot(){if(game.fire>0||game.reload>0||game.finished)return;if(game.ammo<=0){reload();return}game.fire=game.weapon?.55:.16;gun.position.z=-.54;game.ammo--;sound('shot');let count=game.weapon?7:1;for(let i=0;i<count;i++){let x=(Math.random()-.5)*(game.weapon?.06:.006),y=(Math.random()-.5)*(game.weapon?.06:.006);raycaster.setFromCamera(new THREE.Vector2(x,y),camera);let hits=raycaster.intersectObjects([...targets,...solidMeshes],false);if(hits.length){let hit=hits[0],e=hit.object.userData.entity;if(e?.type==='enemy')hitEnemy(e,game.weapon?17:(hit.object.userData.head?75:30),!!hit.object.userData.head);else if(e?.type==='barrel'){e.hp-=35;if(e.hp<=0)explode(e)}else burst(hit.point.x,hit.point.y,hit.point.z,0xffd36c,3)}}updateHUD()}
+function reload(){if(game.reload||game.ammo>= (game.weapon?8:18)||game.reserve<=0)return;game.reload=1.1;notify('RELOADING',1);tone(220,.2,'square',.025,1.3)}
+function switchWeapon(){if(game.reload)return;game.magazines[game.weapon]=game.ammo;game.weapon=1-game.weapon;game.ammo=game.magazines[game.weapon];game.fire=.25;notify(game.weapon?'RIOT GUN':'VANGUARD',1);updateHUD()}
+function interact(){let best=null,dist=3;for(let e of entities)if(e.type==='terminal'&&!e.used){let d=Math.hypot(game.x-e.x,game.z-e.z);if(d<dist){best=e;dist=d}}if(best){if(best.id==='lab'&&game.stage<1){notify('FIRST GATE STILL LOCKED');return}best.used=true;openDoor(best.id)}else notify('NO TERMINAL IN RANGE',.8)}
+function end(win,timed=false){if(game.finished)return;game.finished=true;if(attract)return;game.score+=win?Math.max(0,Math.floor(2000-elapsed*4)):0;updateHUD();sendScore();if(inHub)hubResult();state='end';document.exitPointerLock?.();setTimeout(()=>showEnd(win,timed),600)}
+function showEnd(win,timed=false){state='end';menu='end';overlay.style.display='flex';panel.innerHTML=`<div class="brand">HARDCORPS // MISSION REPORT</div><h1 class="screen-title">${win?'REFINERY<br>RETIRED.':timed?'TIME IS UP.':'OFFICER DOWN.'}</h1><div class="copy"><p>${win?'The fuel stops here. The conspiracy does not.':timed?'Your cleanup score is locked in.':'The city is still counting on you. Try another approach.'}</p><p><b>${String(game.score).padStart(6,'0')}</b> POINTS &nbsp; / &nbsp; ${game.kills} HOSTILES &nbsp; / &nbsp; ${Math.floor(elapsed)} SEC</p>${race?'<p id="rivalResult">RIVAL SCORE // '+(Object.keys(peerscores).length?Math.max(...Object.values(peerscores)):'WAITING')+'</p>':''}</div>${inHub?'<div class="hint">AWAITING SESSION RESULTS</div>':'<div class="menu"><button data-act="restart">RUN IT AGAIN</button><button data-act="title">MAIN MENU</button></div><div class="hint">✕ SELECT &nbsp; · &nbsp; ↑↓ CHOOSE</div>'}`;bindMenu()}
+function menuHTML(){menu='title';state='menu';attract=false;hud.style.display='none';overlay.style.display='flex';$('attractLabel').style.display='none';panel.innerHTML=`<div class="brand">A HARDCORPS CASE FILE / 01</div><h1 class="title">SiN <span>FUEL</span></h1><div class="subtitle">A bad night for big energy.</div><div class="intro">A refinery is turning people into product. You're John Blade. Punch the clock, kick the door, and follow the money.</div><div class="menu"><button data-act="play">START RAID</button><button data-act="online">SCORE RACE</button><button data-act="settings">SETTINGS</button><button data-act="about">ABOUT / CREDITS</button></div><div class="hint">✕ SELECT &nbsp; · &nbsp; ↑↓ CHOOSE<br>CONTROLLER RECOMMENDED &nbsp; / &nbsp; KEYBOARD + MOUSE SUPPORTED</div>`;bindMenu()}
+function settingsHTML(){menu='settings';overlay.style.display='flex';panel.innerHTML=`<div class="brand">HARDCORPS // FIELD OPTIONS</div><h1 class="screen-title">SETTINGS</h1><div class="copy">Fine-tune your aim. Changes save automatically.</div><div class="row">INVERT HORIZONTAL <button data-setting="invertX">${settings.invertX?'ON':'OFF'}</button></div><div class="row">INVERT VERTICAL <button data-setting="invertY">${settings.invertY?'ON':'OFF'}</button></div><div class="row">LOOK SENSITIVITY <button data-setting="sensitivity">${settings.sensitivity.toFixed(1)}×</button></div><div class="row">MUSIC <button data-setting="music">${settings.music?'ON':'OFF'}</button></div><div class="menu"><button data-act="back">BACK</button></div><div class="hint">✕ CHANGE / SELECT &nbsp; · &nbsp; ↑↓ CHOOSE</div>`;bindMenu()}
+function aboutHTML(){menu='about';overlay.style.display='flex';panel.innerHTML=`<div class="brand">HARDCORPS // CASE ARCHIVE</div><h1 class="screen-title">ABOUT / CREDITS</h1><div class="copy"><p><b>SiN FUEL</b> is an original playable homage to SiN: a corporate biotech conspiracy, an irreverent cop, and a very loud night shift.</p><p><b>CONTROLS</b><br>Left stick move · right stick look · R2 fire · □ interact · ○ reload · △ swap weapons · L3 sprint · Options pause.<br>WASD move · mouse look/fire · E interact · R reload · Q swap · Shift sprint · Esc pause.</p><p><b>FIELD NOTES</b><br>Headshots hit harder. Orange barrels explode. Green restores health; blue adds armor; yellow supplies ammo. Use the glowing terminals to open gates. Clear the lab to finish.</p><p><b>SOURCE INFORMATION</b><br>2026-10-29 09:17 · Source: SiN · Three.js r180 WebGPU, Rapier 0.19.3, Gamepad API, Web Audio, PeerJS 1.5.5, AI Hub session 1.3.0. Cel-shaded procedural art; transform animation; synthesized music, effects and gibberish voice. Online: AI Hub parallel score sessions and standalone room-code score race. Testing: lightweight browser checks. Environment: Codex CLI headless, Linux; browser unknown. Model: OpenAI gpt-6.1-terra, ultra. Usage: unknown.</p><p><b>ENGINE FEEDBACK</b><br>Three.js scene composition was straightforward. WebGPU compatibility and integrating physics and networking required care; the headless renderer proved difficult to verify. The game loop and interactions were built from scratch. I would overhaul WebGPU diagnostics to make compatibility failures clearer.</p><p><b>PROMPT FEEDBACK</b><br>The creative and controller constraints were useful. The exact boundary between a full game and a vertical slice was open to interpretation. Multiplayer was the hardest part. A physical-controller playthrough would be the most valuable additional test.</p><p><b>TESTING FEEDBACK</b><br>One test-caught issue: missing initial hub progress, fixed. Zero confirmed game-breaking issues. Most helpful: two-player AI Hub harness. Least helpful: syntax check alone. Headless Vulkan did not display even a minimal WebGPU sample; visual rendering, physical controller and remote networking remain unverified.</p></div><div class="hint">RIGHT STICK / ARROW KEYS TO SCROLL</div><div class="menu"><button data-act="back">BACK</button></div>`;bindMenu();panel.scrollTop=0}
+function onlineHTML(){menu='online';overlay.style.display='flex';panel.innerHTML=`<div class="brand">HARDCORPS // PARALLEL OPERATIONS</div><h1 class="screen-title">SCORE RACE</h1><div class="copy"><p>Race friends through separate copies of the refinery. Highest cleanup score wins. Create a room and share its four-digit code, or set the code and join.</p><p class="inputcode">${roomCode}</p><p>${roomStatus}</p></div><div class="menu"><button data-act="code1000">CODE +1000</button><button data-act="code100">CODE +100</button><button data-act="code10">CODE +10</button><button data-act="code1">CODE +1</button><button data-act="host">CREATE ROOM</button><button data-act="join">JOIN ROOM</button><button data-act="race">START RACE</button><button data-act="back">BACK</button></div><div class="hint">USE THE FOUR CODE BUTTONS TO MATCH YOUR FRIEND.<br>ROOMS USE PEERJS SIGNALING; CONNECTION DEPENDS ON NETWORK CONDITIONS.</div>`;bindMenu()}
+function pauseHTML(){state='paused';menu='pause';overlay.style.display='flex';document.exitPointerLock?.();panel.innerHTML=`<div class="brand">HARDCORPS // PAUSED</div><h1 class="screen-title">TAKE A BREATH.</h1><div class="copy">The refinery can wait a second.</div><div class="menu"><button data-act="resume">RESUME RAID</button><button data-act="settings">SETTINGS</button><button data-act="title">ABANDON RAID</button></div><div class="hint">OPTIONS / ESC TO RESUME</div>`;bindMenu()}
+let returnMenu='title';function touchHTML(){state='menu';menu='touch';overlay.style.display='flex';panel.innerHTML='<div class="brand">HARDCORPS // INPUT REQUIRED</div><h1 class="screen-title">CONTROLLER OR KEYBOARD REQUIRED</h1><div class="copy">Connect a controller or keyboard to play SiN Fuel.</div><div class="menu"><button data-act="settings">SETTINGS</button></div>';bindMenu()}
+function bindMenu(){let nodes=[...panel.querySelectorAll('button')];menuIndex=0;nodes.forEach((b,i)=>{b.addEventListener('click',()=>{lastInput=performance.now();audioStart();if(b.dataset.setting){let k=b.dataset.setting;if(k==='sensitivity')settings[k]=settings[k]>=2? .5:Math.round((settings[k]+.25)*100)/100;else settings[k]=!settings[k];save();settingsHTML();return}act(b.dataset.act)});b.addEventListener('mouseenter',()=>{menuIndex=i;markMenu()})});markMenu()}
+function markMenu(){let nodes=[...panel.querySelectorAll('button')];nodes.forEach((b,i)=>b.classList.toggle('selected',i===menuIndex));if(menu!=='about')nodes[menuIndex]?.scrollIntoView({block:'nearest'})}
+function act(a){switch(a){case 'play':race=false;startGame();break;case 'restart':startGame();break;case 'race':if(!connections.some(c=>c.open)){roomStatus='CONNECT A PEER BEFORE STARTING';onlineHTML();break}race=true;for(let c of connections)if(c.open)c.send({kind:'start'});startGame();break;case 'settings':returnMenu=menu;settingsHTML();break;case 'about':aboutHTML();break;case 'online':onlineHTML();break;case 'back':if(returnMenu==='pause'){returnMenu='title';pauseHTML()}else if(returnMenu==='touch'){returnMenu='title';touchHTML()}else menuHTML();break;case 'resume':state='playing';menu='';overlay.style.display='none';break;case 'title':race=false;build();menuHTML();break;case 'code1000':case 'code100':case 'code10':case 'code1':{let step=Number(a.slice(4));roomCode=String((Number(roomCode)+step)%10000).padStart(4,'0');let old=menuIndex;onlineHTML();menuIndex=old;markMenu();break;}case 'host':network(true);break;case 'join':network(false);break}}
+function network(host){if(!window.Peer){roomStatus='SIGNALING LIBRARY UNAVAILABLE';onlineHTML();return}if(peer)peer.destroy();connections=[];peerscores={};roomStatus='CONNECTING…';onlineHTML();let id='sinfuel-20261029-'+roomCode;peer=host?new Peer(id):new Peer();peer.on('open',()=>{if(host){roomStatus='ROOM OPEN · SHARE '+roomCode;onlineHTML()}else attach(peer.connect(id,{reliable:true}))});peer.on('connection',c=>attach(c));peer.on('error',e=>{roomStatus='CONNECTION ERROR · '+e.type.toUpperCase();if(menu==='online')onlineHTML()})}
+function attach(c){connections.push(c);c.on('open',()=>{roomStatus='CONNECTED · '+connections.filter(x=>x.open).length+' PEER(S)';if(menu==='online')onlineHTML();sendScore()});c.on('data',d=>{if(!d)return;if(d.kind==='start'){if(peer?.id?.startsWith('sinfuel-'))for(let other of connections)if(other!==c&&other.open)other.send(d);race=true;startGame();return}if(d.kind!=='score'||typeof d.score!=='number')return;peerscores[d.id||c.peer]=d.score;if(peer?.id?.startsWith('sinfuel-'))for(let other of connections)if(other!==c&&other.open)other.send(d);if(game)$('feed').textContent='RIVAL SCORE // '+Math.max(...Object.values(peerscores));if($('rivalResult'))$('rivalResult').textContent='RIVAL SCORE // '+Math.max(...Object.values(peerscores))});c.on('close',()=>{connections=connections.filter(x=>x!==c);roomStatus='PEER DISCONNECTED';if(menu==='online')onlineHTML()})}
+function sendScore(){if(!race||!game)return;for(let c of connections)if(c.open)c.send({kind:'score',id:peer?.id||'player',score:game.score})}
+function startGame(isAttract=false){build();elapsed=0;attract=isAttract;demoT=0;state='playing';menu='';overlay.style.display='none';hud.style.display='block';$('attractLabel').style.display=isAttract?'block':'none';if(!isAttract)voice('J.C.','Blade, the refinery is hot. Try not to make it hotter.');if(inHub)HUB.progress({score:0,label:'0 hostiles'});audioStart()}
+function hubResult(){if(inHub&&game)HUB.result({score:game.score,kills:game.kills})}
+function navInput(){let gp=navigator.getGamepads?.()[0];if(!gp){padPrev=[];return null}let btn=gp.buttons.map(b=>b.pressed),pressed=i=>btn[i]&&!padPrev[i];let ax=gp.axes;let vert=ax[1]||0;if(menu==='about'&&Math.abs(ax[3]||0)>.15)panel.scrollTop+=(ax[3]||0)*12;if(state!=='playing'||menu){if(gpCooldown<=0&&(btn[12]||btn[13]||Math.abs(vert)>.65)){let nodes=panel.querySelectorAll('button');if(nodes.length){menuIndex=(menuIndex+(btn[12]||vert<-.65?-1:1)+nodes.length)%nodes.length;markMenu()}gpCooldown=.23}if(pressed(0))panel.querySelectorAll('button')[menuIndex]?.click();if(pressed(9)&&!btn[8]&&(menu==='pause'||menu==='settings')){if(menu==='settings')act('back');else act('resume')}if(pressed(1)){if(menu==='settings'||menu==='about'||menu==='online')act('back');else if(menu==='pause')act('resume')}}else if(!attract){if(pressed(9)&&!btn[8]){pauseHTML()}if(pressed(2))interact();if(pressed(1))reload();if(pressed(3))switchWeapon()}
+if((btn.some(Boolean)||Math.abs(ax[0]||0)>.25||Math.abs(ax[1]||0)>.25||Math.abs(ax[2]||0)>.25||Math.abs(ax[3]||0)>.25)&&!attract)lastInput=performance.now();if(attract&&(btn.some((b,i)=>b&&!padPrev[i])||Math.abs(ax[0]||0)>.25||Math.abs(ax[1]||0)>.25||Math.abs(ax[2]||0)>.25||Math.abs(ax[3]||0)>.25)){build();menuHTML();lastInput=performance.now()}
+padPrev=btn;return gp}
+function moveGame(dt,gp){let mx=(keys['KeyD']?1:0)-(keys['KeyA']?1:0),mz=(keys['KeyS']?1:0)-(keys['KeyW']?1:0),lx=0,ly=0;if(gp){let dead=v=>Math.abs(v)<.13?0:v;mx+=dead(gp.axes[0]||0);mz+=dead(gp.axes[1]||0);lx=dead(gp.axes[2]||0);ly=dead(gp.axes[3]||0);game.yaw-=lx*2.3*dt*settings.sensitivity*(settings.invertX?-1:1);game.pitch-=ly*1.8*dt*settings.sensitivity*(settings.invertY?-1:1)}game.pitch=THREE.MathUtils.clamp(game.pitch,-1.25,1.25);let len=Math.hypot(mx,mz);if(len>1){mx/=len;mz/=len}let speed=(keys['ShiftLeft']||gp?.buttons[10]?.pressed)?7:4.8;let dx=(Math.cos(game.yaw)*mx+Math.sin(game.yaw)*mz)*speed*dt,dz=(-Math.sin(game.yaw)*mx+Math.cos(game.yaw)*mz)*speed*dt;controller.computeColliderMovement(playerCollider,{x:dx,y:-.04,z:dz});let m=controller.computedMovement();let pos=playerCollider.translation();game.x=pos.x+m.x;game.y=pos.y+m.y;game.z=pos.z+m.z;playerCollider.setTranslation({x:game.x,y:game.y,z:game.z});camera.position.set(game.x,game.y+.65,game.z);camera.rotation.order='YXZ';camera.rotation.y=game.yaw;camera.rotation.x=game.pitch;if((keys['Mouse0']||gp?.buttons[7]?.pressed)&&!game.finished)shoot()}
+function demo(dt){demoT+=dt;let t=demoT%65;game.x=Math.sin(t*.5)*2;game.z=17-t*1.08;game.y=.9;playerCollider.setTranslation({x:game.x,y:.9,z:game.z});let live=entities.filter(e=>e.type==='enemy'&&!e.dead&&e.z<game.z&&game.z-e.z<17).sort((a,b)=>b.z-a.z)[0];camera.position.set(game.x,1.6,game.z);camera.rotation.order='YXZ';if(live){game.yaw=Math.atan2(-(live.x-game.x),-(live.z-game.z));game.pitch=Math.atan2((live.boss?1.8:1.35)-1.6,Math.hypot(live.x-game.x,live.z-game.z));camera.rotation.set(game.pitch,game.yaw,0,'YXZ');shoot()}else{game.yaw=Math.sin(t*.4)*.15;camera.rotation.set(0,game.yaw,0,'YXZ')}if(t>22&&!doors[0].open)openDoor('gate');if(t>44&&!doors[1].open)openDoor('lab');if(t>63||game.finished)startGame(true)}
+function tick(dt){if(state!=='playing')return;if(inHub&&HUB.time()<0)return;elapsed+=dt;if(race&&elapsed>=360){end(false,true);return}gun.position.z=THREE.MathUtils.lerp(gun.position.z,-.65,Math.min(1,dt*9));gun.visible=!attract;game.fire=Math.max(0,game.fire-dt);if(game.reload>0){game.reload-=dt;if(game.reload<=0){let max=game.weapon?8:18,n=Math.min(max-game.ammo,game.reserve);game.ammo+=n;game.reserve-=n;updateHUD()}}game.toast-=dt;if(game.toast<=0)$('toast').textContent='';game.damage=Math.max(0,game.damage-dt);game.hit=Math.max(0,game.hit-dt);$('hurt').style.opacity=game.damage;$('hitmarker').style.opacity=game.hit*5;
+if(attract)demo(dt);else moveGame(dt,navigator.getGamepads?.()[0]);music(dt);world.timestep=dt;world.step();for(let e of moving)if(!e.dead){let p=e.body.translation(),q=e.body.rotation();e.mesh.position.set(p.x,p.y,p.z);e.mesh.quaternion.set(q.x,q.y,q.z,q.w);e.band.position.copy(e.mesh.position);e.band.quaternion.copy(e.mesh.quaternion)}
+for(let d of doors)if(d.open&&d.y<5){d.y=Math.min(5,d.y+dt*3);d.mesh.position.y=2.3+d.y;d.stripe.position.y=2.4+d.y}
+for(let e of entities)if(e.type==='enemy'&&!e.dead){let dist=Math.hypot(game.x-e.x,game.z-e.z);e.phase+=dt*5;e.stun=Math.max(0,e.stun-dt);e.group.rotation.y=Math.atan2(game.x-e.x,game.z-e.z);e.leg1.rotation.x=Math.sin(e.phase)*.2;e.leg2.rotation.x=-Math.sin(e.phase)*.2;if(dist<19&&dist>3&&!e.stun&&!doors.some(d=>!d.open&&((e.z<d.mesh.position.z&&game.z>d.mesh.position.z)||(e.z>d.mesh.position.z&&game.z<d.mesh.position.z)))){let v=new THREE.Vector3(game.x-e.x,0,game.z-e.z).normalize();let speed=(e.boss?.9:1.15)*dt;e.x+=v.x*speed;e.z+=v.z*speed;e.group.position.x=e.x;e.group.position.z=e.z}e.cool-=dt;if(dist<20&&e.cool<=0){e.cool=e.boss?.65:1.6+Math.random();let origin=new THREE.Vector3(e.x,e.boss?2:1.4,e.z),target=new THREE.Vector3(game.x,1.5,game.z);raycaster.set(origin,target.clone().sub(origin).normalize());let blocked=raycaster.intersectObjects(solidMeshes,false)[0];if(!blocked||blocked.distance>dist){burst(e.x,e.boss?2:1.4,e.z,0xff7040,3);if(Math.random()<(e.boss?.65:.4))damage(e.boss?14:8)}}}
+for(let p of pickups){p.t+=dt;p.group.rotation.y+=dt*2;p.group.position.y=.65+Math.sin(p.t*3)*.15;if(Math.hypot(game.x-p.x,game.z-p.z)<1.1){if(p.type==='health'&&game.health<100)game.health=Math.min(100,game.health+35);else if(p.type==='armor'&&game.armor<100)game.armor=Math.min(100,game.armor+35);else if(p.type==='ammo')game.reserve=Math.min(180,game.reserve+36);else continue;p.group.visible=false;p.x=999;game.score+=50;sound('pickup');notify(p.type.toUpperCase()+' ACQUIRED',1);updateHUD()}}
+for(let i=particles.length-1;i>=0;i--){let p=particles[i];p.life-=dt;p.v.y-=12*dt;p.mesh.position.addScaledVector(p.v,dt);if(p.life<=0){scene.remove(p.mesh);p.mesh.geometry.dispose();p.mesh.material.dispose();particles.splice(i,1)}}let near=entities.find(e=>e.type==='terminal'&&!e.used&&Math.hypot(game.x-e.x,game.z-e.z)<3);$('prompt').textContent=near?'□ / E  ·  ACCESS '+(near.id==='gate'?'SECURITY':'LAB OVERRIDE'):'';if(inHub)HUB.progress({score:game.score,label:game.kills+' hostiles'});if(Math.floor(elapsed*2)!==Math.floor((elapsed-dt)*2))sendScore()}
+function frame(){requestAnimationFrame(frame);let now=performance.now(),dt=Math.min((now-last)/1000||.016,.05);last=now;let gp=navInput();gpCooldown=Math.max(0,gpCooldown-dt);if(state==='menu'&&menu==='title'&&now-lastInput>10000&&!inHub)startGame(true);if(state==='menu'||state==='paused'){camera.position.set(Math.sin(now*.00018)*5,3.2,13);camera.lookAt(0,1,-20)}tick(dt);renderer.render(scene,camera)}
+window.addEventListener('keydown',e=>{lastInput=performance.now();if(attract){build();menuHTML();return}keys[e.code]=true;if(['ArrowUp','ArrowDown','Space'].includes(e.code))e.preventDefault();if(state==='playing'){if(e.repeat)return;if(e.code==='Escape'){pauseHTML();return}if(e.code==='KeyE')interact();if(e.code==='KeyR')reload();if(e.code==='KeyQ')switchWeapon()}else{if(menu==='about'&&(e.code==='ArrowDown'||e.code==='ArrowUp')){panel.scrollTop+=e.code==='ArrowDown'?80:-80;return}if(e.code==='ArrowDown'||e.code==='ArrowUp'){let n=panel.querySelectorAll('button').length;if(n){menuIndex=(menuIndex+(e.code==='ArrowDown'?1:-1)+n)%n;markMenu()}}if(e.code==='Enter'||e.code==='Space')panel.querySelectorAll('button')[menuIndex]?.click();if(e.code==='Escape'){if(menu==='pause')act('resume');else if(menu!=='title')act('back')}}});window.addEventListener('keyup',e=>keys[e.code]=false);window.addEventListener('mousedown',e=>{lastInput=performance.now();if(attract){build();menuHTML();return}if(state==='playing'){audioStart();if(e.button===0){keys.Mouse0=true;if(document.pointerLockElement!==renderer.domElement)renderer.domElement.requestPointerLock?.()}}});window.addEventListener('mouseup',e=>{if(e.button===0)keys.Mouse0=false});window.addEventListener('mousemove',e=>{if(e.movementX||e.movementY){lastInput=performance.now();if(attract){build();menuHTML();return}}if(state==='playing'&&!attract&&document.pointerLockElement===renderer.domElement){game.yaw-=e.movementX*.002*settings.sensitivity*(settings.invertX?-1:1);game.pitch-=e.movementY*.002*settings.sensitivity*(settings.invertY?-1:1)}});window.addEventListener('resize',()=>{if(!renderer)return;camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+async function init(){try{if(!inHub&&matchMedia('(pointer: coarse)').matches&&!matchMedia('(pointer: fine)').matches){$('loading').style.display='none';touchHTML();return}if(!navigator.gpu)throw new Error('WebGPU is required. Use a WebGPU-capable browser and GPU.');await RAPIER.init();renderer=new THREE.WebGPURenderer({antialias:true});await renderer.init();if(!renderer.backend.isWebGPUBackend)throw new Error('A WebGPU adapter is required; WebGL fallback is disabled.');renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setSize(innerWidth,innerHeight);renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;view.appendChild(renderer.domElement);build();HUB?.probe?.(()=>({scene:state==='playing'?'play':state==='end'?'over':state==='paused'?'menu':'title',menu:state!=='playing',world:elapsed,input:{x:Math.max(-1,Math.min(1,((keys.KeyD?1:0)-(keys.KeyA?1:0))+(navigator.getGamepads?.()[0]?.axes[0]||0))),y:Math.max(-1,Math.min(1,((keys.KeyS?1:0)-(keys.KeyW?1:0))+(navigator.getGamepads?.()[0]?.axes[1]||0))),fire:!!keys.Mouse0||!!navigator.getGamepads?.()[0]?.buttons[7]?.pressed}}));$('loading').style.display='none';if(inHub){HUB.on('time-up',()=>end(false,true));HUB.on('end',()=>{state='end';audio?.suspend();keys={}});let info=await HUB.connect({mode:'parallel',seats:[1,4]});if(info){startGame();HUB.ready()}else{inHub=false;menuHTML()}}else menuHTML();last=performance.now();frame()}catch(e){console.error(e);$('loading').innerHTML='UNABLE TO START<br><br>'+String(e.message||e)+'<br><br>WEBGPU AND AN INTERNET CONNECTION ARE REQUIRED.';HUB?.fail?.(String(e.message||e))}}
+init();
+</script></body></html>

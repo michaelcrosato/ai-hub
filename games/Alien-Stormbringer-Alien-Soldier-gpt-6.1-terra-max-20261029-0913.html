@@ -1,0 +1,1028 @@
+<!doctype html>
+<!-- 
+SOURCE INFORMATION
+Date: 2026-10-29 09:13
+Source: Alien Soldier
+Game: Alien Stormbringer
+Tech: Three.js R180 WebGPURenderer (WebGPU required); Rapier 0.19.3; PeerJS 1.5.5 / WebRTC; Gamepad API; Web Audio API; AI Hub Session Protocol v1 client 1.3.0; HTML, CSS and JavaScript.
+Art Direction: original cel-shaded, angular science-fiction arcade illustration.
+Animation: procedural articulated meshes, motion curves and particle effects.
+Audio: code-synthesized music, sound effects and alien gibberish voice.
+Online: AI Hub parallel score sessions for 1–4 players; standalone PeerJS / WebRTC score races for up to 4 players; standalone two-pilot local co-op.
+Testing: lightweight browser and protocol checks; performance targets and optimization out of scope. Tests used software WebGPU and an emulated gamepad; no physical-controller playtest.
+Environment: Codex CLI (headless); Linux; delivery browser unknown. Test browser: Google Chrome 154, headless and under Xvfb.
+Model: OpenAI, gpt-6.1-terra, reasoning effort max.
+Usage: API cost and token count unknown; session time approximately 15 minutes.
+
+TESTING FEEDBACK
+Issues caught: 2; both fixed. Critical / game-breaking: 1, an incorrect Rapier CDN path that would have prevented startup. The other was oversized pilot head geometry hiding facial detail. Most helpful test: the Xvfb WebGPU visual check, which revealed the pilot issue and distinguished a headless compositor problem from the game. Least helpful test: the initial headless WebGPU screenshot, which captured a blank canvas due to the test compositor.
+
+ENGINE FEEDBACK
+Most liked: expressive Three.js rendering and Rapier's responsive physics. Stuck or guessed wrong: the first Rapier CDN path was wrong, and headless WebGPU screenshots initially appeared blank. Most important custom work: combat, encounters, controller UI, online score racing and synthesized audio. Hardest part: coordinating WebGPU, physics and session lifecycles while verifying rendering headlessly. Remove or overhaul: the renderer's implicit fallback behavior. One change: clearer diagnostics for adapter and backend selection.
+
+PROMPT FEEDBACK
+Most liked: the specific arcade inspiration and controller-first requirements. Confusing: standalone multiplayer scope was open to interpretation, so both local co-op and an online score race were included. Hardest: making a complete boss-rush slice alongside both multiplayer paths. One additional test: a full run with multiple physical controllers, real GPUs and players on separate networks.
+ -->
+<html lang="en">
+<head>
+<script type="importmap">
+{
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+
+<meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#080b19">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="parallel">
+<meta name="hub:session-minutes" content="4">
+<meta name="hub:session-goal" content="Earn the highest score against the three storm bosses">
+<meta name="hub:session-howto" content="Move: left stick. Jump: Cross. Shoot: Square/R2. Dash: Circle.">
+<meta name="hub:webgpu" content="required">
+<title>Alien Stormbringer</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700;800;900&family=Oxanium:wght@400;600;700;800&display=swap');
+:root{color-scheme:dark;--ink:#07101e;--paper:#f2f0de;--cyan:#70fff1;--orange:#ff6a43;--yellow:#ffe186;--muted:#aeb7bd}*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#080b19;color:var(--paper);font-family:'Barlow Condensed',Arial,sans-serif}button{font:inherit;color:inherit;cursor:pointer}button:focus-visible{outline:3px solid var(--cyan);outline-offset:3px}.hidden{display:none!important}#stage,#stage canvas,.texture,.vignette{position:absolute;inset:0;width:100%;height:100%}#stage canvas{display:block}.texture,.vignette{pointer-events:none}.texture{z-index:1;opacity:.15;background:repeating-linear-gradient(0deg,transparent 0px,transparent 3px,#000 4px)}.vignette{z-index:1;background:radial-gradient(ellipse at center,transparent 38%,rgba(4,7,17,.48) 100%)}.screen,#hud,.modal,.result,.loading,.touch-warning,.notice,.message{position:absolute;z-index:2}.loading{inset:0;display:grid;place-content:center;text-align:center;gap:20px;background:#090d1b;letter-spacing:.2em;color:#a8b4bc;font:700 14px 'Oxanium',sans-serif}.mark{font:900 70px 'Barlow Condensed',sans-serif;letter-spacing:-.08em;color:#f4efe1}.mark span{color:var(--orange);font-size:.55em}.dots{color:var(--cyan)}.screen{inset:0}.title-frame{position:absolute;top:7.5%;left:6.2%;width:48%;max-width:680px}.eyebrow,.hud-tag,.tiny,.meter-label,.side-label,.footer,.notice-kicker,.result-label{font-family:'Oxanium',sans-serif;font-weight:700;letter-spacing:.16em;font-size:clamp(10px,.85vw,14px)}.eyebrow{color:var(--cyan);display:flex;align-items:center;gap:10px}.diamond{display:inline-block;background:var(--orange);width:9px;height:9px;transform:rotate(45deg);flex:none}.small-line{display:inline-block;height:1px;width:40px;background:#68918f;margin-left:8px}h1{font-family:'Barlow Condensed',sans-serif;font-weight:900;font-style:italic;font-size:clamp(60px,7.4vw,120px);line-height:.72;letter-spacing:-.035em;margin:3.2vh 0 2vh;text-shadow:3px 5px 0 #0a0e1c;transform:skew(-3deg)}h1 span,h1 strong{display:block}h1 span{color:var(--paper)}h1 strong{color:var(--orange);font-size:.65em;letter-spacing:-.01em;margin-top:.13em}.title-rule{display:flex;align-items:center;gap:12px;color:#efe8d5;font:700 clamp(9px,.72vw,12px) 'Oxanium',sans-serif;letter-spacing:.15em}.title-rule span{display:block;background:var(--cyan);height:3px;width:42px}.title-copy{font-size:clamp(16px,1.45vw,23px);line-height:1.2;margin:2.1vh 0 2.5vh;color:#e7e8da;font-weight:600}.menu-list{display:flex;flex-direction:column;gap:5px;width:min(100%,390px)}.menu-list button,.option{border:0;text-align:left;background:rgba(8,16,27,.78);border-left:3px solid #557b7e;padding:clamp(8px,1.25vh,15px) 16px;color:#e9eee7;font-weight:800;font-size:clamp(17px,1.5vw,23px);letter-spacing:.045em;transition:background .15s,color .15s,transform .15s;display:flex;align-items:center;gap:15px}.menu-list button .arrow{margin-left:auto;opacity:.6}.menu-index{font:700 10px 'Oxanium',sans-serif;color:#75a3a0}.menu-list button.selected,.menu-list button:hover,.option.selected,.option:hover{background:var(--cyan);color:#07111d;border-left-color:var(--orange);transform:translateX(5px)}.menu-list button.selected .menu-index,.menu-list button:hover .menu-index{color:#166c6a}.title-side{position:absolute;right:6.3%;top:12%;text-align:right;text-shadow:2px 3px #0b1420}.side-label{color:#e7efe8}.side-label span{color:var(--orange)}.side-line{width:100%;height:2px;background:linear-gradient(90deg,transparent,var(--cyan));margin:12px 0}.title-side p{font-size:clamp(20px,2.2vw,35px);font-weight:800;line-height:.94;margin:0 0 12px;color:var(--orange)}.title-side p.side-white{color:var(--paper)}.side-number{font:700 10px 'Oxanium';letter-spacing:.18em;color:#b5ceca;line-height:1.4;margin-top:22px}.side-number b{font-size:26px;color:var(--cyan)}.footer{position:absolute;bottom:3.4%;left:6.3%;right:6.3%;display:flex;justify-content:space-between;color:#d1ded5;font-size:clamp(9px,.7vw,12px)}.footer b{color:var(--cyan)}#hud{inset:0;pointer-events:none}.hud-top{position:absolute;top:3.3%;left:4%;right:4%;display:flex;justify-content:space-between;align-items:start}.pilot-hud,.mission-hud{filter:drop-shadow(2px 3px #08101b)}.hud-tag{color:var(--cyan);display:flex;align-items:center;gap:8px}.mission-hud{text-align:right}.mission-hud .hud-tag{justify-content:flex-end}.score{font:800 clamp(24px,3.2vw,48px)/1 'Oxanium';letter-spacing:.06em}.health-wrap{display:flex;align-items:center;gap:10px;margin-top:9px}.health-bg{width:clamp(150px,19vw,300px);height:14px;background:#162a32;transform:skew(-16deg);border:1px solid #90c1b5}.health-fill{height:100%;width:100%;background:linear-gradient(90deg,#65e0c3,#a2ffe2)}#health-number{font:800 22px 'Oxanium'}.meter-label{color:#c6d7d0;font-size:10px;margin-top:5px}.meter-label span{color:var(--orange);margin-left:10px}.boss-hud{position:absolute;top:3.3%;left:33%;width:34%;max-width:620px}.boss-heading{display:flex;justify-content:space-between;align-items:end;font-size:clamp(14px,1.4vw,21px);text-shadow:2px 2px #090e1a}.boss-prefix{color:var(--orange);font:700 9px 'Oxanium';letter-spacing:.1em}.boss-track{height:9px;background:#2b1d27;border:1px solid #e3aa85;transform:skew(-15deg);margin-top:6px}#boss-fill{width:100%;height:100%;background:linear-gradient(90deg,#ff4e45,#ffb55a)}.hud-bottom{position:absolute;bottom:4%;left:4%;right:4%;display:flex;justify-content:space-between;align-items:end}.weapon-card{display:flex;align-items:center;gap:10px;background:rgba(6,13,24,.77);padding:8px 16px;border-left:3px solid var(--cyan)}.weapon-index{font:800 34px 'Oxanium';color:var(--cyan)}.tiny{font-size:9px;color:#adc4bf}.tiny span{color:var(--orange)}#weapon-name{font-weight:900;font-size:26px;letter-spacing:.08em;line-height:1}.heat-track{width:150px;height:4px;background:#283d44;margin-top:5px}.heat-track div{height:100%;background:var(--orange);width:0}.ability-card{text-align:right;font:700 clamp(10px,1vw,15px) 'Oxanium';letter-spacing:.05em;line-height:1.8;text-shadow:2px 2px #06121a}.ability-card i{font-style:normal;color:var(--cyan);font-size:.7em;margin-left:5px}.keycap{font-size:1.5em;color:var(--orange);vertical-align:middle}.hint{color:#b7ccc6;font-size:.7em}.attract-label{position:absolute;left:50%;bottom:5%;transform:translateX(-50%);font:800 14px 'Oxanium';letter-spacing:.18em;color:var(--cyan);animation:pulse 1.2s infinite}.attract-label span{color:var(--orange)}@keyframes pulse{50%{opacity:.4}}.notice{top:40%;left:50%;transform:translate(-50%,-50%);text-align:center;text-shadow:3px 4px #07121c;pointer-events:none;min-width:60%}.notice-kicker{color:var(--cyan);margin-bottom:8px}#notice-title{font-weight:900;font-style:italic;letter-spacing:.02em;font-size:clamp(40px,5vw,78px);line-height:.9;color:var(--paper)}#notice-copy{font:700 clamp(10px,1vw,15px) 'Oxanium';color:var(--orange);letter-spacing:.1em;margin-top:12px}.message{top:26%;left:50%;transform:translateX(-50%);padding:6px 15px;background:#0c222d;color:var(--cyan);font:700 13px 'Oxanium';letter-spacing:.08em}.modal{inset:0;background:rgba(3,7,15,.8);display:grid;place-items:center;padding:3vh 4vw}.modal-panel{width:min(900px,94vw);max-height:92vh;overflow:auto;background:linear-gradient(135deg,#102330,#101420 75%);border:1px solid #66908d;box-shadow:0 0 0 6px #08101b,0 25px 100px #000;padding:clamp(20px,3vw,44px)}.modal-top{display:flex;justify-content:space-between;align-items:start;border-bottom:1px solid #46605e;padding-bottom:15px;margin-bottom:20px}.modal h2,.result h2{font-style:italic;font-size:clamp(35px,4.4vw,65px);line-height:1;margin:12px 0 0;letter-spacing:.01em}.close-button{border:0;background:transparent;color:var(--cyan);font-weight:800;font-size:22px}.close-button small{font:700 11px 'Oxanium';margin-left:6px}.modal-footer{display:flex;gap:30px;border-top:1px solid #46605e;margin-top:22px;padding-top:14px;color:#9bb8b3;font:700 10px 'Oxanium';letter-spacing:.1em}.manual-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 30px}.manual-item{border-bottom:1px solid #344c50;padding:6px 0 12px}.manual-item b{display:block;font-size:clamp(17px,1.6vw,24px);color:var(--cyan);letter-spacing:.04em}.manual-item p{font-size:clamp(15px,1.2vw,18px);line-height:1.2;margin:4px 0;color:#d4dfd8}.manual-lede{font-size:clamp(18px,1.5vw,23px);line-height:1.15;color:#f5e8d2;margin:0 0 16px}.settings-list{display:flex;flex-direction:column;gap:7px}.option{font-size:clamp(17px,1.5vw,22px);padding:10px 15px;width:100%;justify-content:space-between;border-left:3px solid #577b7a}.option span{font-family:'Oxanium';font-size:.65em;letter-spacing:.08em;color:var(--cyan)}.option.selected span,.option:hover span{color:#133b40}.about-text{font-size:16px;line-height:1.35;white-space:pre-wrap;color:#d8e5de;max-height:47vh;overflow:auto}.about-text b{color:var(--cyan)}.result{inset:0;background:linear-gradient(90deg,rgba(6,13,23,.96),rgba(7,15,25,.67) 60%,rgba(7,15,25,.3));padding:15vh 9vw}.result h2{font-size:clamp(58px,7vw,105px);color:var(--orange)}.result p{font-size:24px;max-width:500px}.result-score{font:800 clamp(42px,5vw,72px) 'Oxanium';color:var(--cyan)}.result-label{color:#b2c6c0;margin:0 0 30px}.result-buttons{width:300px}.touch-warning{inset:0;z-index:10;background:#09101d;display:grid;place-content:center;text-align:center;gap:24px;font:800 clamp(22px,4vw,42px) 'Barlow Condensed';letter-spacing:.08em}.touch-warning button{border:2px solid var(--cyan);background:#102833;padding:12px 26px;font:700 18px 'Oxanium'}body.touch-only .touch-warning{display:grid}body.touch-only #title,body.touch-only #hud{display:none!important}body.touch-only .touch-warning:has(~ #modal:not(.hidden)){display:none}@media(max-width:800px){.title-frame{left:5%;width:65%;top:7%}.title-side{right:4%;top:8%}.title-side p{font-size:18px}.title-side .side-number,.title-copy{display:none}h1{font-size:clamp(46px,9vw,72px)}.menu-list{gap:3px}.menu-list button{padding:7px 10px;font-size:16px}.footer{font-size:8px}.boss-hud{top:12%;left:25%;width:50%}.manual-grid{gap:6px 15px}.ability-card{font-size:9px}}
+.network-hud{margin-top:8px;color:var(--cyan);font:700 10px 'Oxanium';letter-spacing:.07em;max-width:42vw}.network-note{font:700 13px/1.4 'Oxanium';color:#9fbcb7;letter-spacing:.04em;margin:18px 0}.room-code{font:800 clamp(48px,8vw,92px) 'Oxanium';letter-spacing:.24em;color:var(--cyan);margin:8px 0}.code-row{display:flex;gap:10px;margin:12px 0 20px}.code-digit{justify-content:center;min-width:75px;font:800 clamp(34px,4vw,52px) 'Oxanium'}.code-digit small{font:700 10px 'Oxanium';align-self:start;color:#a4bfb8}
+
+</style>
+</head>
+<body>
+<div id="stage" aria-label="Alien Stormbringer game view"></div>
+<div class="texture"></div><div class="vignette"></div>
+<div id="touch-warning" class="touch-warning hidden"><div>CONTROLLER OR KEYBOARD REQUIRED</div><button data-action="settings">SETTINGS</button></div>
+<div id="loading" class="loading"><div class="mark">AS<span>✦</span></div><div id="loading-text">IGNITING THE STORM ENGINE <span class="dots">···</span></div></div>
+<div id="title" class="screen hidden">
+  <div class="title-frame"><div class="eyebrow"><span class="diamond"></span> AN ARCADE BOSS RUSH <span class="small-line"></span> 01 / 03</div>
+    <h1><span>ALIEN</span><strong>STORMBRINGER</strong></h1>
+    <div class="title-rule"><span></span><b>THE LAST SKY IS YOURS TO BREAK</b></div>
+    <p class="title-copy">A renegade weapon. Three impossible gods.<br>One very bad day for the empire.</p>
+    <div class="menu-list" id="title-menu">
+      <button data-action="start"><span class="menu-index">01</span> START MISSION <span class="arrow">↗</span></button>
+      <button data-action="coop"><span class="menu-index">02</span> TWO PILOTS <span class="arrow">↗</span></button>
+      <button data-action="online"><span class="menu-index">03</span> ONLINE LINK <span class="arrow">↗</span></button>
+      <button data-action="manual"><span class="menu-index">04</span> FIELD MANUAL <span class="arrow">↗</span></button>
+      <button data-action="settings"><span class="menu-index">05</span> SETTINGS <span class="arrow">↗</span></button>
+      <button data-action="about"><span class="menu-index">06</span> ABOUT / CREDITS <span class="arrow">↗</span></button>
+    </div>
+  </div>
+  <div class="title-side"><div class="side-label">INCOMING TRANSMISSION <span>●</span></div><div class="side-line"></div><p>THEY BUILT A GOD<br>TO SILENCE THE SKY.</p><p class="side-white">THE SKY<br>BUILT YOU.</p><div class="side-number">STORM<br>PROTOCOL <b>001</b></div></div>
+  <div class="footer"><span>✦ &nbsp; PILOT THE IMPOSSIBLE</span><span>CONTROLLER RECOMMENDED &nbsp; / &nbsp; <b>PRESS ✕</b></span></div>
+</div>
+<div id="hud" class="hidden">
+  <div class="hud-top"><div class="pilot-hud"><div class="hud-tag"><span class="diamond"></span> <span id="pilot-label">P1 / STORM PILOT</span></div><div class="health-wrap"><div class="health-bg"><div id="health-fill" class="health-fill"></div></div><span id="health-number">100</span></div><div class="meter-label">VITALITY <span id="lives">◆ ◆ ◆</span></div></div>
+  <div class="mission-hud"><div class="hud-tag">MISSION <span id="mission-num">01</span> / 03</div><div class="score" id="score">000000</div><div class="meter-label">SCORE <span id="combo">×1 CHAIN</span></div><div id="network-hud" class="network-hud hidden"></div></div>
+  </div>
+  <div id="boss-hud" class="boss-hud"><div class="boss-heading"><div><span class="boss-prefix">TARGET ACQUIRED / </span><strong id="boss-name">THE CHOIR ENGINE</strong></div><span id="boss-percent">100%</span></div><div class="boss-track"><div id="boss-fill"></div></div></div>
+  <div class="hud-bottom"><div class="weapon-card"><span class="weapon-index" id="weapon-index">01</span><div><div class="tiny">ACTIVE WEAPON &nbsp; <span> L1 / R1</span></div><div id="weapon-name">NEEDLE</div><div class="heat-track"><div id="heat-fill"></div></div></div></div><div class="ability-card"><div><span class="keycap">○</span> DASH <i id="dash-ready">READY</i></div><div><span class="keycap">△</span> COUNTER <i id="counter-ready">READY</i></div><div class="hint">HOLD L2 TO LOCK & AIM</div></div></div>
+  <div id="attract-label" class="attract-label hidden">AUTO PILOT <span>•</span> PRESS ANY INPUT</div>
+</div>
+<div id="notice" class="notice hidden"><div class="notice-kicker" id="notice-kicker"></div><div id="notice-title"></div><div id="notice-copy"></div></div>
+<div id="message" class="message hidden"></div>
+<div id="modal" class="modal hidden"><div class="modal-panel"><div class="modal-top"><div><div class="eyebrow"><span class="diamond"></span> STORM PROTOCOL / <span id="modal-kicker">ARCHIVE</span></div><h2 id="modal-title">FIELD MANUAL</h2></div><button class="close-button" data-action="back">✕ <small>BACK</small></button></div><div id="modal-content"></div><div class="modal-footer"><span>✕ SELECT</span><span>○ BACK</span><span>R STICK SCROLL</span><span>OPTIONS SETTINGS</span></div></div></div>
+<div id="result" class="result hidden"><div class="eyebrow"><span class="diamond"></span> MISSION REPORT</div><h2 id="result-title">SKY LIBERATED</h2><p id="result-copy"></p><div id="result-score" class="result-score">000000</div><div class="result-label">FINAL SCORE</div><div id="network-result" class="network-hud hidden"></div><div class="menu-list result-buttons"><button data-action="restart">FLY AGAIN <span class="arrow">↗</span></button><button data-action="title">RETURN TO TITLE <span class="arrow">↗</span></button></div></div>
+<script type="module">
+const $ = id => document.getElementById(id);
+const $all = selector => [...document.querySelectorAll(selector)];
+const SOURCE_INFO = "SOURCE INFORMATION\nDate: 2026-10-29 09:13\nSource: Alien Soldier\nGame: Alien Stormbringer\nTech: Three.js R180 WebGPURenderer (WebGPU required); Rapier 0.19.3; PeerJS 1.5.5 / WebRTC; Gamepad API; Web Audio API; AI Hub Session Protocol v1 client 1.3.0; HTML, CSS and JavaScript.\nArt Direction: original cel-shaded, angular science-fiction arcade illustration.\nAnimation: procedural articulated meshes, motion curves and particle effects.\nAudio: code-synthesized music, sound effects and alien gibberish voice.\nOnline: AI Hub parallel score sessions for 1\u20134 players; standalone PeerJS / WebRTC score races for up to 4 players; standalone two-pilot local co-op.\nTesting: lightweight browser and protocol checks; performance targets and optimization out of scope. Tests used software WebGPU and an emulated gamepad; no physical-controller playtest.\nEnvironment: Codex CLI (headless); Linux; delivery browser unknown. Test browser: Google Chrome 154, headless and under Xvfb.\nModel: OpenAI, gpt-6.1-terra, reasoning effort max.\nUsage: API cost and token count unknown; session time approximately 15 minutes.\n\nTESTING FEEDBACK\nIssues caught: 2; both fixed. Critical / game-breaking: 1, an incorrect Rapier CDN path that would have prevented startup. The other was oversized pilot head geometry hiding facial detail. Most helpful test: the Xvfb WebGPU visual check, which revealed the pilot issue and distinguished a headless compositor problem from the game. Least helpful test: the initial headless WebGPU screenshot, which captured a blank canvas due to the test compositor.\n\nENGINE FEEDBACK\nMost liked: expressive Three.js rendering and Rapier's responsive physics. Stuck or guessed wrong: the first Rapier CDN path was wrong, and headless WebGPU screenshots initially appeared blank. Most important custom work: combat, encounters, controller UI, online score racing and synthesized audio. Hardest part: coordinating WebGPU, physics and session lifecycles while verifying rendering headlessly. Remove or overhaul: the renderer's implicit fallback behavior. One change: clearer diagnostics for adapter and backend selection.\n\nPROMPT FEEDBACK\nMost liked: the specific arcade inspiration and controller-first requirements. Confusing: standalone multiplayer scope was open to interpretation, so both local co-op and an online score race were included. Hardest: making a complete boss-rush slice alongside both multiplayer paths. One additional test: a full run with multiple physical controllers, real GPUs and players on separate networks.";
+const STAGES = [
+  {name:'THE CHOIR ENGINE', subtitle:'THE FIRST GOD SINGS IN BULLETS', location:'01 / THE ASH PROCESSION', hp:650, color:0xff7957, sky:0x1a283c, sun:0xf67855, pattern:'choir', interval:1.4, drone:6.5},
+  {name:'GLASS VULTURE', subtitle:'A PREDATOR MADE OF BROKEN PROMISES', location:'02 / THE MIRROR GRAVE', hp:850, color:0x9d7bff, sky:0x171b3e, sun:0xba6eca, pattern:'vulture', interval:1.1, drone:5.5},
+  {name:'THE STATIC THRONE', subtitle:'KILL THE KING. FREE THE WEATHER.', location:'03 / THE LAST SKY', hp:1150, color:0xffd26e, sky:0x2a1633, sun:0xff8a5b, pattern:'throne', interval:.88, drone:4.8}
+];
+const WEAPONS = [
+  {name:'NEEDLE', interval:.13, heat:5, damage:9, speed:23, count:1, spread:0, color:0x86fff1},
+  {name:'FANFIRE', interval:.32, heat:12, damage:6, speed:19, count:5, spread:.14, color:0xffc277},
+  {name:'LANCE', interval:.42, heat:17, damage:32, speed:30, count:1, spread:0, color:0xf7fff4}
+];
+const settings = {invertX:false,invertY:false,music:60,sfx:75};
+try { Object.assign(settings, JSON.parse(localStorage.getItem('storm-settings') || '{}')); } catch (_) {}
+let THREE, RAPIER, scene, camera, renderer, world, scenery, actorLayer, effectLayer, titleActors;
+let players=[], boss=null, bullets=[], enemyBullets=[], drones=[], effects=[], hazards=[];
+let state='loading', modal='', priorState='title', run=null, simTime=0, lastFrame=performance.now(), lastActivity=performance.now(), menuIndex=0, menuStickAt=0, noticeUntil=0, messageUntil=0, touchOnly=false, stoppedByHub=false;
+let keyState={}, keyEdges=new Set(), pointerDown=false, pointerAim=null, padsBefore={}, inputSnapshot={x:0,y:0,fire:false};
+let audio=null, musicNext=0, musicStep=0;
+let arenaMaterials={};
+// Standalone online score race. Signalling is via the public PeerJS service;
+// once connected, only scores and round control cross the WebRTC data channel.
+const network={peer:null,links:[],host:false,inRound:false,step:'choice',status:'',digits:[0,0,0,0],seat:0,scores:{},nextReport:0,token:0};
+let peerLoader=null;
+function loadPeer(){
+  if(window.Peer)return Promise.resolve(window.Peer);
+  if(!peerLoader)peerLoader=new Promise((resolve,reject)=>{const script=document.createElement('script');script.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';script.onload=()=>resolve(window.Peer);script.onerror=()=>{peerLoader=null;reject(new Error('The online library could not be loaded.'));};document.head.appendChild(script);});
+  return peerLoader;
+}
+function closeNetwork(){
+  network.token++;const peer=network.peer;network.peer=null;network.links=[];network.inRound=false;network.host=false;network.step='choice';network.status='';network.seat=0;network.scores={};
+  $('network-hud')?.classList.add('hidden');$('network-result')?.classList.add('hidden');if(peer&&!peer.destroyed)peer.destroy();
+}
+function renderNetwork(){
+  if(modal!=='online')return;
+  const back='<button class="option" data-action="back">BACK <span>○</span></button>';
+  if(network.step==='choice')$('modal-content').innerHTML=`<p class="manual-lede">Race the same three bosses on separate screens. Up to four pilots; highest score wins.</p><div class="settings-list"><button class="option" data-action="host-room">HOST A ROOM <span>CREATE CODE ↗</span></button><button class="option" data-action="join-entry">JOIN A ROOM <span>ENTER CODE ↗</span></button>${back}</div><p class="network-note">Requires internet and a browser that supports WebRTC. Pilots connect using a shared room code.</p>`;
+  else if(network.step==='entry')$('modal-content').innerHTML=`<p class="manual-lede">Enter the host's four-digit code. Select a digit, then use ← / → or ✕ to change it.</p><div class="code-row">${network.digits.map((d,i)=>`<button class="option code-digit" data-action="digit-${i}"><small>0${i+1}</small>${d}</button>`).join('')}</div><div class="settings-list"><button class="option" data-action="join-room">CONNECT TO ROOM <span>↗</span></button>${back}</div><p class="network-note">${network.status}</p>`;
+  else if(network.step==='host')$('modal-content').innerHTML=`<p class="manual-lede">Share this code with the other pilots.</p><div class="room-code">${network.digits.join('')}</div><p class="network-note">${network.status}</p><div class="settings-list"><button class="option" data-action="launch-room">LAUNCH SCORE RACE <span>↗</span></button>${back}</div>`;
+  else $('modal-content').innerHTML=`<p class="manual-lede">${network.status||'CONNECTING TO THE STORM NETWORK…'}</p><div class="settings-list">${back}</div>`;
+  updateFocus();
+}
+function networkDigit(index,delta){network.digits[index]=(network.digits[index]+delta+10)%10;renderNetwork();sfx('select');}
+function netBroadcast(data){for(const item of network.links)if(item.conn.open)item.conn.send(data);}
+function netScores(){return Object.entries(network.scores).sort((a,b)=>Number(a[0])-Number(b[0])).map(([seat,score])=>`P${Number(seat)+1} ${String(Math.floor(score)).padStart(6,'0')}`).join('  /  ');}
+function refreshNetHud(){if(!network.inRound)return;for(const id of ['network-hud','network-result']){$(id).classList.remove('hidden');$(id).textContent='LINK / '+netScores();}}
+function hostRoster(){
+  network.status=`${network.links.length+1} / 4 PILOTS LINKED`;if(modal==='online')renderNetwork();
+  netBroadcast({t:'scores',scores:network.scores});refreshNetHud();
+}
+function networkError(error,peer){
+  if(network.peer!==peer)return;network.status=error?.type==='peer-unavailable'?'ROOM NOT FOUND. CHECK THE CODE AND TRY AGAIN.':error?.type==='unavailable-id'?'ROOM CODE TAKEN. GO BACK AND HOST AGAIN.':'CONNECTION FAILED. CHECK YOUR NETWORK AND TRY AGAIN.';
+  if(network.inRound){$('network-hud').textContent='LINK INTERRUPTED';}else{network.step='error';renderNetwork();}
+}
+async function hostRoom(){
+  closeNetwork();network.host=true;network.step='connecting';network.status='OPENING A ROOM…';renderNetwork();const token=network.token;
+  try{
+    const Peer=await loadPeer();if(token!==network.token)return;const n=new Uint32Array(1);crypto.getRandomValues(n);network.digits=String(n[0]%10000).padStart(4,'0').split('').map(Number);
+    const peer=network.peer=new Peer('alien-stormbringer-'+network.digits.join(''));network.scores={0:0};
+    peer.on('open',()=>{if(network.peer!==peer)return;network.step='host';hostRoster();});
+    peer.on('error',e=>networkError(e,peer));
+    peer.on('connection',conn=>{
+      if(network.peer!==peer)return conn.close();
+      conn.on('open',()=>{
+        const used=new Set(network.links.map(l=>l.seat));const seat=[1,2,3].find(n=>!used.has(n));
+        if(seat===undefined||network.inRound){conn.send({t:'closed'});setTimeout(()=>conn.close(),300);return;}
+        const item={conn,seat};network.links.push(item);network.scores[seat]=0;conn.send({t:'welcome',seat,scores:network.scores});hostRoster();
+        conn.on('data',data=>{if(data&&data.t==='score'&&Number.isFinite(data.score)){network.scores[seat]=Math.max(0,Math.floor(data.score));netBroadcast({t:'scores',scores:network.scores});refreshNetHud();}});
+        conn.on('close',()=>{network.links=network.links.filter(x=>x!==item);delete network.scores[seat];hostRoster();});
+      });
+    });
+  }catch(e){networkError(e,network.peer);}
+}
+async function joinRoom(){
+  const code=network.digits.join('');closeNetwork();network.digits=code.split('').map(Number);network.step='connecting';network.status='FINDING ROOM '+code+'…';renderNetwork();const token=network.token;
+  try{
+    const Peer=await loadPeer();if(token!==network.token)return;const peer=network.peer=new Peer();peer.on('error',e=>networkError(e,peer));
+    peer.on('open',()=>{if(network.peer!==peer)return;const conn=peer.connect('alien-stormbringer-'+code,{reliable:true});network.links=[{conn,seat:0}];
+      conn.on('open',()=>{if(network.peer!==peer)return;network.step='waiting';network.status='LINKED. WAITING FOR THE HOST TO LAUNCH…';renderNetwork();});
+      conn.on('data',data=>{if(!data||network.peer!==peer)return;if(data.t==='welcome'){network.seat=data.seat;network.scores=data.scores||{};}
+        else if(data.t==='scores'){network.scores=data.scores||{};refreshNetHud();}
+        else if(data.t==='start'){network.inRound=true;network.status='LAUNCHING…';renderNetwork();setTimeout(()=>{if(network.peer===peer){startRun(false,false);refreshNetHud();}},1200);}
+        else if(data.t==='closed'){network.status='THE ROOM IS FULL OR ALREADY FLYING.';network.step='error';renderNetwork();}});
+      conn.on('close',()=>{if(network.peer!==peer)return;if(network.inRound){$('network-hud').textContent='LINK INTERRUPTED';}else{network.step='error';network.status='THE HOST CLOSED THE ROOM.';renderNetwork();}});
+    });
+  }catch(e){networkError(e,network.peer);}
+}
+function launchNetwork(){if(!network.host||!network.peer)return;network.inRound=true;network.status='LAUNCHING…';netBroadcast({t:'start'});renderNetwork();const peer=network.peer;setTimeout(()=>{if(network.peer===peer){startRun(false,false);refreshNetHud();}},1200);}
+function networkReport(final=false){
+  if(!network.inRound||!run)return;const score=Math.floor(run.score);network.scores[network.seat]=score;
+  if(network.host)netBroadcast({t:'scores',scores:network.scores,final});else if(network.links[0]?.conn.open)network.links[0].conn.send({t:'score',score,final});refreshNetHud();
+}
+function networkTick(now){if(network.inRound&&now>network.nextReport){network.nextReport=now+1000;networkReport(false);}}
+
+const hubConnect = AIHub.active ? AIHub.connect({mode:'parallel',seats:[1,4]}) : Promise.resolve(null);
+AIHub.probe(() => ({scene: state === 'loading' ? 'ready' : state === 'attract' ? 'play' : state === 'playing' ? 'play' : state === 'result' ? 'over' : state, menu:!!modal, world:simTime, input:inputSnapshot}));
+AIHub.on('time-up', () => { if (run && !run.finished) finishRun(false, 'THE CLOCK HAS SPOKEN'); });
+AIHub.on('end', () => { stoppedByHub=true; stopAudio(); if (run) run.finished=true; });
+
+function saveSettings(){ try{localStorage.setItem('storm-settings',JSON.stringify(settings));}catch(_){} }
+function soundInit(){
+  if(!audio){ const AC=window.AudioContext||window.webkitAudioContext; if(!AC)return; const ctx=new AC(); const master=ctx.createGain(); master.gain.value=.42; master.connect(ctx.destination); audio={ctx,master}; musicNext=ctx.currentTime+.08; }
+  if(audio.ctx.state==='suspended')audio.ctx.resume().catch(()=>{});
+}
+function tone(freq,duration,type='square',volume=.07,slide=1,when=0,channel='sfx'){
+  if(!audio || audio.ctx.state!=='running')return;
+  const {ctx,master}=audio, t=Math.max(ctx.currentTime,when||ctx.currentTime), o=ctx.createOscillator(), g=ctx.createGain();
+  const vol=volume*(channel==='music'?settings.music:settings.sfx)/100;
+  o.type=type; o.frequency.setValueAtTime(Math.max(25,freq),t); o.frequency.exponentialRampToValueAtTime(Math.max(25,freq*slide),t+duration);
+  g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.00011,vol),t+.006);g.gain.exponentialRampToValueAtTime(.0001,t+duration);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+duration+.02);
+}
+function sfx(kind){
+  if(kind==='fire')tone(680,.045,'square',.023,.67);
+  if(kind==='heavy')tone(240,.12,'sawtooth',.05,.38);
+  if(kind==='jump')tone(260,.12,'triangle',.055,2);
+  if(kind==='dash'){tone(105,.18,'sawtooth',.07,3);tone(440,.11,'square',.025,.4);}
+  if(kind==='counter'){tone(850,.22,'sine',.08,1.8);tone(380,.17,'triangle',.07,2);}
+  if(kind==='hurt')tone(170,.22,'sawtooth',.08,.4);
+  if(kind==='explode'){tone(140,.3,'sawtooth',.1,.22);tone(70,.24,'square',.06,.5);}
+  if(kind==='select')tone(520,.07,'square',.035,1.3);
+}
+function babble(){
+  if(!audio||audio.ctx.state!=='running')return;
+  const {ctx,master}=audio, now=ctx.currentTime, vowels=[[420,1500],[650,1150],[310,2200],[510,1750],[380,1900],[620,1250]];
+  vowels.forEach(([f1,f2],i)=>{const t=now+i*.085,osc=ctx.createOscillator(),envelope=ctx.createGain();osc.type='sawtooth';osc.frequency.setValueAtTime(165+[0,55,25,90,15,60][i],t);osc.frequency.linearRampToValueAtTime(195+[0,55,25,90,15,60][i],t+.065);envelope.gain.setValueAtTime(.0001,t);envelope.gain.exponentialRampToValueAtTime(.07*settings.sfx/100+.0001,t+.01);envelope.gain.exponentialRampToValueAtTime(.0001,t+.075);envelope.connect(master);for(const frequency of [f1,f2]){const filter=ctx.createBiquadFilter();filter.type='bandpass';filter.frequency.value=frequency;filter.Q.value=3;osc.connect(filter);filter.connect(envelope);}osc.start(t);osc.stop(t+.08);});
+}
+function musicTick(){
+  if(!audio || audio.ctx.state!=='running' || stoppedByHub)return;
+  const ctx=audio.ctx, pattern=[0,7,10,7,3,7,12,7,0,7,10,7,5,8,12,8], bass=[0,0,3,0,5,5,3,7];
+  if(musicNext < ctx.currentTime-.5)musicNext=ctx.currentTime;
+  while(musicNext<ctx.currentTime+.12){
+    const n=musicStep%16, base=state==='title'?110:98;
+    tone(base*Math.pow(2,pattern[n]/12),.12,'square',.018,.99,musicNext,'music');
+    if(n%2===0)tone(base/2*Math.pow(2,bass[(musicStep>>1)%8]/12),.17,'triangle',.055,.98,musicNext,'music');
+    if(n%4===0)tone(100,.09,'sine',.07,.35,musicNext,'music');
+    if(n%4===2)tone(155,.045,'sawtooth',.018,.5,musicNext,'music');
+    musicNext+=.145;musicStep++;
+  }
+}
+function stopAudio(){ if(audio && audio.ctx.state==='running')audio.ctx.suspend().catch(()=>{}); }
+function activity(physicalControls=false){lastActivity=performance.now(); if(touchOnly&&physicalControls){touchOnly=false;document.body.classList.remove('touch-only');$('touch-warning').classList.add('hidden');} if(state==='attract'){exitAttract();return true;} return false;}
+function showMessage(text,seconds=2){$('message').textContent=text;$('message').classList.remove('hidden');messageUntil=simTime+seconds;}
+function showNotice(kicker,title,copy,seconds=2.5){$('notice-kicker').textContent=kicker;$('notice-title').textContent=title;$('notice-copy').textContent=copy;$('notice').classList.remove('hidden');noticeUntil=simTime+seconds;babble();}
+function showScreen(which){$('title').classList.toggle('hidden',which!=='title');$('hud').classList.toggle('hidden',which!=='playing'&&which!=='attract');$('result').classList.toggle('hidden',which!=='result');$('attract-label').classList.toggle('hidden',which!=='attract');}
+function activeButtons(){let root=modal?$('modal'):state==='title'?$('title'):state==='result'?$('result'):null;const buttons=root?$allIn(root,'button[data-action]').filter(x=>!x.disabled&&x.offsetParent!==null):[];return modal&&buttons.some(x=>!x.classList.contains('close-button'))?buttons.filter(x=>!x.classList.contains('close-button')):buttons;}
+function $allIn(root,sel){return [...root.querySelectorAll(sel)];}
+function updateFocus(){const items=activeButtons();if(!items.length)return;menuIndex=(menuIndex+items.length)%items.length;items.forEach((b,i)=>b.classList.toggle('selected',i===menuIndex));items[menuIndex].scrollIntoView({block:'nearest'});}
+function moveMenu(amount){const items=activeButtons();if(!items.length)return;menuIndex=(menuIndex+amount+items.length)%items.length;updateFocus();sfx('select');}
+function selectMenu(){const items=activeButtons();if(items[menuIndex])items[menuIndex].click();}
+function closeModal(){if(!modal)return;if(modal==='online'&&!network.inRound)closeNetwork();modal='';$('modal').classList.add('hidden');menuIndex=0;updateFocus();}
+function openModal(type){
+  if(state==='attract')exitAttract();
+  priorState=state;modal=type;menuIndex=0;$('modal').classList.remove('hidden');$('modal-kicker').textContent=type==='settings'?'SYSTEM':type==='manual'?'FLIGHT SCHOOL':type==='online'?'ONLINE LINK':'ARCHIVE';$('modal-title').textContent=type==='settings'?'SETTINGS':type==='manual'?'FIELD MANUAL':type==='online'?'ONLINE LINK':'ABOUT / CREDITS';
+  if(type==='manual')$('modal-content').innerHTML=`<p class="manual-lede">Three gods guard the last sky. Break their machines, catch their fire, and keep moving.</p><div class="manual-grid">
+  <div class="manual-item"><b>MOVE / AIM</b><p>Left stick or ← → moves. Right stick aims freely. Hold L2 or X to stand still and aim with the left stick. Shots assist toward the target.</p></div>
+  <div class="manual-item"><b>JUMP / FIRE</b><p>✕ or Space jumps; press again in the air for a double jump. Hold □, R2, Z or left mouse to fire.</p></div>
+  <div class="manual-item"><b>STORM DASH</b><p>○ or Shift dashes through danger. You are briefly invulnerable and damage anything in your path. Wait for the charge to return.</p></div>
+  <div class="manual-item"><b>COUNTER PULSE</b><p>△ or C turns nearby enemy shots into vitality and score. Time it close; the pulse needs a moment to recharge.</p></div>
+  <div class="manual-item"><b>THREE WEAPONS</b><p>L1 / R1 or Q / E cycles Needle, Fanfire and Lance. Firing builds heat; release to cool an overheated weapon.</p></div>
+  <div class="manual-item"><b>TWO PILOTS</b><p>Plug in two pads for couch co-op. With one pad, keyboard is P1 and the pad is P2. Score is shared. Options / Esc opens settings.</p></div></div>`;
+  if(type==='settings')renderSettings();
+  if(type==='online')renderNetwork();
+  if(type==='about'){const pre=document.createElement('div');pre.className='about-text';pre.textContent=SOURCE_INFO;$('modal-content').replaceChildren(pre);}
+  updateFocus();
+}
+function renderSettings(){
+  $('modal-content').innerHTML=`<div class="settings-list"><button class="option" data-action="invert-x">INVERT HORIZONTAL AXIS <span>${settings.invertX?'ON':'OFF'} &nbsp; ↔</span></button><button class="option" data-action="invert-y">INVERT VERTICAL AXIS <span>${settings.invertY?'ON':'OFF'} &nbsp; ↔</span></button><button class="option" data-action="music">MUSIC VOLUME <span>${settings.music}% &nbsp; ↔</span></button><button class="option" data-action="sfx">EFFECTS / VOICE VOLUME <span>${settings.sfx}% &nbsp; ↔</span></button>${priorState==='playing'&&!AIHub.active?'<button class="option" data-action="title">RETURN TO TITLE <span>END RUN ↗</span></button>':''}<button class="option" data-action="back">${priorState==='playing'?'RESUME':'BACK'} <span>○</span></button></div>`;
+  updateFocus();
+}
+function toggleSetting(action,dir=1){if(action==='invert-x')settings.invertX=!settings.invertX;if(action==='invert-y')settings.invertY=!settings.invertY;if(action==='music')settings.music=(settings.music+dir*20+120)%120;if(action==='sfx')settings.sfx=(settings.sfx+dir*20+120)%120;saveSettings();renderSettings();sfx('select');}
+document.addEventListener('click',e=>{
+  const button=e.target.closest('button[data-action]');if(!button)return;
+  if(activity())return;soundInit();const action=button.dataset.action;
+  if(['invert-x','invert-y','music','sfx'].includes(action)){toggleSetting(action);return;}
+  if(action.startsWith('digit-')){networkDigit(Number(action.slice(6)),1);return;}
+  if(action==='host-room'){hostRoom();return;}
+  if(action==='join-entry'){network.step='entry';network.status='SET EACH DIGIT, THEN CONNECT';renderNetwork();return;}
+  if(action==='join-room'){joinRoom();return;}
+  if(action==='launch-room'){launchNetwork();return;}
+  sfx('select');
+  if(action==='settings'){openModal('settings');return;}
+  if(action==='manual'){openModal('manual');return;}
+  if(action==='online'){openModal('online');return;}
+  if(action==='about'){openModal('about');return;}
+  if(action==='back'){closeModal();return;}
+  if(action==='title'){closeModal();toTitle();return;}
+  if(action==='start'){closeModal();startRun(false,false);return;}
+  if(action==='coop'){closeModal();startRun(false,true);return;}
+  if(action==='restart'){closeModal();startRun(false,run?.coop||false);return;}
+});
+document.addEventListener('keydown',e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Shift','Control','Escape'].includes(e.key))e.preventDefault();
+  if(activity(true))return;soundInit();const k=e.key.toLowerCase();if(!keyState[k])keyEdges.add(k);keyState[k]=true;
+  if(e.repeat)return;
+  if(k==='escape'){if(modal)closeModal();else openModal('settings');return;}
+  if(modal||state==='title'||state==='result'){
+    if(modal==='about'&&(k==='arrowdown'||k==='arrowup')){$('modal-content').querySelector('.about-text')?.scrollBy(0,k==='arrowdown'?90:-90);return;}
+    if(k==='arrowdown'||k==='s')moveMenu(1);else if(k==='arrowup'||k==='w')moveMenu(-1);else if(k==='enter'||k===' '){selectMenu();}else if(k==='arrowleft'||k==='arrowright'){const item=activeButtons()[menuIndex];if(item&&modal==='settings'&&['invert-x','invert-y','music','sfx'].includes(item.dataset.action))toggleSetting(item.dataset.action,k==='arrowleft'?-1:1);else if(item&&modal==='online'&&item.dataset.action.startsWith('digit-'))networkDigit(Number(item.dataset.action.slice(6)),k==='arrowleft'?-1:1);}
+  }
+});
+document.addEventListener('keyup',e=>{keyState[e.key.toLowerCase()]=false;});
+document.addEventListener('pointerdown',e=>{if(activity())return;soundInit();if(e.target.tagName!=='BUTTON'&&state==='playing'){pointerDown=true;pointerAim={x:e.clientX,y:e.clientY};}});
+document.addEventListener('pointerup',()=>pointerDown=false);
+document.addEventListener('pointermove',e=>{if(state==='attract')activity();if(pointerDown)pointerAim={x:e.clientX,y:e.clientY};});
+window.addEventListener('blur',()=>{keyState={};pointerDown=false;});
+
+function getPads(){return [...(navigator.getGamepads?.()||[])].filter(Boolean);}
+function padButton(p,i){return !!p?.buttons?.[i]?.pressed;}
+function readPad(p){
+  if(!p)return {x:0,y:0,rx:0,ry:0,buttons:[],edges:[]};
+  const dead=v=>Math.abs(v||0)>.19?v:0, axes=p.axes||[], buttons=(p.buttons||[]).map(b=>!!b.pressed), old=padsBefore[p.index]||[];
+  let x=dead(axes[0]),y=dead(axes[1]),rx=dead(axes[2]),ry=dead(axes[3]);if(settings.invertX){x=-x;rx=-rx;}if(settings.invertY){y=-y;ry=-ry;}
+  if(padButton(p,14))x=-1;if(padButton(p,15))x=1;if(padButton(p,12))y=-1;if(padButton(p,13))y=1;
+  return {x,y,rx,ry,buttons,edges:buttons.map((b,i)=>b&&!old[i])};
+}
+function inputs(){
+  const pads=getPads(), reads=pads.map(readPad), first=reads[0];
+  if(first){
+    const any=first.buttons.some(Boolean)||Math.abs(first.x)>.2||Math.abs(first.y)>.2||Math.abs(first.rx)>.2||Math.abs(first.ry)>.2;
+    if(any){if(activity(true))return {reads:[],pads};soundInit();}
+    if(first.edges[9]&&!first.buttons[8]){if(modal)closeModal();else openModal('settings');}
+    if(modal||state==='title'||state==='result'){
+      if(first.edges[1])closeModal();
+      if(first.edges[0])selectMenu();
+      const scrollTarget=modal==='about'?$('modal-content').querySelector('.about-text'):modal?$('modal').querySelector('.modal-panel'):null;if(scrollTarget&&Math.abs(first.ry)>.2)scrollTarget.scrollTop+=first.ry*16;if(modal==='about'&&Math.abs(first.y)>.2&&scrollTarget)scrollTarget.scrollTop+=first.y*16;
+      const now=performance.now();if(now>menuStickAt&&modal!=='about'){if(first.y>.5||first.edges[13]){moveMenu(1);menuStickAt=now+220;}else if(first.y<-.5||first.edges[12]){moveMenu(-1);menuStickAt=now+220;}else if((modal==='settings'||modal==='online')&&(first.x>.5||first.x<-.5)){const item=activeButtons()[menuIndex];if(item&&modal==='settings'&&['invert-x','invert-y','music','sfx'].includes(item.dataset.action))toggleSetting(item.dataset.action,first.x<0?-1:1);else if(item&&modal==='online'&&item.dataset.action.startsWith('digit-'))networkDigit(Number(item.dataset.action.slice(6)),first.x<0?-1:1);menuStickAt=now+250;}}
+    }
+  }
+  return {reads,pads};
+}
+function controlsFor(index,reads,padCount){
+  const p=run?.coop&&padCount===1?(index===1?reads[0]:null):reads[index];
+  const keyboard=index===0, k=keyState, edge=keyEdges;
+  const x=(keyboard?((k['arrowright']||k.d?1:0)-(k['arrowleft']||k.a?1:0)):0)+(p?.x||0);
+  const y=(keyboard?((k['arrowdown']||k.s?1:0)-(k['arrowup']||k.w?1:0)):0)+(p?.y||0);
+  return {x:Math.max(-1,Math.min(1,x)),y:Math.max(-1,Math.min(1,y)),rx:p?.rx||0,ry:p?.ry||0,
+    fire:!!((keyboard&&(k.z||k.j||pointerDown))||p?.buttons[2]||p?.buttons[7]),
+    jump:!!((keyboard&&edge.has(' '))||p?.edges[0]),dash:!!((keyboard&&(edge.has('shift')||edge.has('k')))||p?.edges[1]),counter:!!((keyboard&&edge.has('c'))||p?.edges[3]),
+    prev:!!((keyboard&&edge.has('q'))||p?.edges[4]),next:!!((keyboard&&edge.has('e'))||p?.edges[5]),lock:!!((keyboard&&(k.x||k.control))||p?.buttons[6]),mouse:keyboard&&pointerDown?pointerAim:null};
+}
+
+function mat(color,emissive=0){const key=`${color}-${emissive}`;if(!arenaMaterials[key])arenaMaterials[key]=new THREE.MeshToonMaterial({color,emissive,emissiveIntensity:emissive?.25:0,gradientMap:arenaMaterials.gradient});return arenaMaterials[key];}
+function mesh(geo,color,x,y,z,sx=1,sy=1,sz=1,outline=false){
+  const obj=new THREE.Mesh(geo,mat(color));obj.position.set(x,y,z);obj.scale.set(sx,sy,sz);
+  if(outline){const edge=new THREE.Mesh(geo,arenaMaterials.outline);edge.scale.setScalar(1.065);obj.add(edge);}return obj;
+}
+function addBox(parent,color,x,y,z,sx,sy,sz,outline=false){const o=mesh(new THREE.BoxGeometry(1,1,1),color,x,y,z,sx,sy,sz,outline);parent.add(o);return o;}
+function addBall(parent,color,x,y,z,r,outline=false){const o=mesh(new THREE.IcosahedronGeometry(1,1),color,x,y,z,r,r,r,outline);parent.add(o);return o;}
+function makePilot(tint=0x78e8dc){
+  const g=new THREE.Group();
+  const body=addBox(g,0x19424e,0,0,0,.7,1,.5,true);body.rotation.z=-.12;
+  addBox(g,tint,0,.13,.29,.57,.59,.14,true).rotation.z=-.12;
+  const head=addBall(g,0x80fff1,.05,.83,0,.46,true);head.scale.set(.43,.48,.37);
+  addBox(g,0x111a2b,.15,.83,.38,.55,.16,.1,true).rotation.z=-.08;
+  addBox(g,0xff8a57,.32,.84,.45,.23,.05,.04);
+  const beak=mesh(new THREE.ConeGeometry(.23,.5,4),0xffb771,.48,.7,.43,1,1,1,true);beak.rotation.z=-Math.PI/2;g.add(beak);
+  for(let i=0;i<3;i++){const fin=addBox(g,tint,-.25-i*.12,1.17+i*.09,-.08,.13,.42,.14,true);fin.rotation.z=-.65-i*.17;}
+  const arm=addBox(g,0x9fe9df,.35,.12,.12,.17,.69,.22,true);arm.rotation.z=1.1;
+  const gun=addBox(g,0xf5e8d4,.67,-.02,.22,.8,.20,.25,true);addBox(g,0xff765a,1.02,-.02,.23,.13,.22,.26);
+  const left=addBox(g,0x142b3b,-.21,-.65,.08,.22,.65,.27,true);left.rotation.z=-.2;
+  const right=addBox(g,0x64c4c0,.22,-.65,-.04,.22,.65,.27,true);right.rotation.z=.2;
+  addBox(g,0xff6b50,-.38,.16,-.2,.22,.67,.4,true);
+  g.userData={left,right,gun,arm};return g;
+}
+function makeBoss(stage){
+  const g=new THREE.Group(), color=stage.color;
+  if(stage.pattern==='choir'){
+    const core=addBall(g,color,0,0,0,1.5,true);core.scale.set(1.2,1,.6);
+    addBall(g,0x102238,0,0,.9,.9,true);addBall(g,0x8effec,0,0,1.55,.42,true);
+    for(let i=0;i<8;i++){let a=i*Math.PI/4;let spike=addBox(g,0xe8bc83,Math.cos(a)*1.8,Math.sin(a)*1.8,0,.32,1.1,.25,true);spike.rotation.z=a-Math.PI/2;}
+    for(let i=-1;i<=1;i+=2){let wing=addBox(g,0xa34b4b,i*2.0,-.2,-.15,1.6,.4,.3,true);wing.rotation.z=i*.35;addBall(g,0xffe5a0,i*2.7,-.45,0,.27,true);}
+  }else if(stage.pattern==='vulture'){
+    addBall(g,0x6d58b8,0,0,0,1.2,true).scale.set(1.2,.85,.6);addBall(g,0x151c35,0,.08,.65,.78,true);addBall(g,0x80fff0,0,.1,1.22,.35,true);
+    for(let side of [-1,1]){for(let j=0;j<4;j++){let feather=addBox(g,j%2?0x59469c:0x987ce1,side*(1.1+j*.38),.35-j*.15,-.2,.55,2.4-j*.22,.22,true);feather.rotation.z=side*(.9+j*.12);}let claw=addBox(g,0xf1c69b,side*.65,-1.1,.1,.28,1.1,.26,true);claw.rotation.z=side*.3;}
+  }else{
+    addBox(g,0xa6505d,0,0,0,2.2,2.8,.8,true);addBox(g,0x302540,0,.15,.5,1.6,2.05,.25,true);addBall(g,0xffca6a,0,.25,.8,.7,true);addBall(g,0xff7354,0,.25,1.35,.32);
+    for(let i=-2;i<=2;i++){const crown=mesh(new THREE.ConeGeometry(.25,1.5,4),0xffdf92,i*.5,1.9+(.5-Math.abs(i)*.15),0,1,1,1,true);g.add(crown);}
+    for(let side of [-1,1]){addBox(g,0xf0b66f,side*1.65,.1,0,.5,2.1,.35,true).rotation.z=side*.25;addBall(g,0xff7957,side*2.1,-.4,0,.52,true);}
+  }
+  return g;
+}
+function makeDrone(){const g=new THREE.Group();addBall(g,0xffaa63,0,0,0,.45,true);addBall(g,0x142d3d,0,0,.4,.24);addBall(g,0x8bfff0,0,0,.6,.12);for(let i of [-1,1]){const w=addBox(g,0xc55959,i*.55,.1,0,.55,.13,.22,true);w.rotation.z=i*.25;}return g;}
+function setupMaterials(){const data=new Uint8Array([45,45,45,255,110,110,110,255,190,190,190,255,255,255,255,255]);const tex=new THREE.DataTexture(data,4,1);tex.minFilter=THREE.NearestFilter;tex.magFilter=THREE.NearestFilter;tex.needsUpdate=true;arenaMaterials.gradient=tex;arenaMaterials.outline=new THREE.MeshBasicMaterial({color:0x08101c,side:THREE.BackSide});arenaMaterials.shotGeo=new THREE.SphereGeometry(.11,8,6);arenaMaterials.enemyShotGeo=new THREE.IcosahedronGeometry(.2,1);arenaMaterials.sparkGeo=new THREE.BoxGeometry(.14,.14,.14);}
+function clearGroup(g){if(!g)return;while(g.children.length)g.remove(g.children[0]);}
+function makeArena(stage){
+  clearGroup(scenery);scene.background=new THREE.Color(stage.sky);
+  const back=new THREE.Group();scenery.add(back);
+  const sun=new THREE.Mesh(new THREE.CircleGeometry(6.5,48),new THREE.MeshBasicMaterial({color:stage.sun}));sun.position.set(18,8.4,-13);back.add(sun);
+  const ring=new THREE.Mesh(new THREE.RingGeometry(7.15,7.28,64),new THREE.MeshBasicMaterial({color:0x85d8ce,transparent:true,opacity:.5,side:THREE.DoubleSide}));ring.position.set(18,8.4,-12.8);back.add(ring);
+  for(let i=0;i<9;i++){const stripe=addBox(back,0x22213c,18,3.0+i*.38,-12.6,12,.14,.04);stripe.material=new THREE.MeshBasicMaterial({color:0x22213c});}
+  for(let i=0;i<34;i++){const star=addBall(back,0xc9e5d9,-2+(i*7.91)%29,4+(i*3.73)%12,-11.5,.035+(i%3)*.025);star.material=new THREE.MeshBasicMaterial({color:i%3?0xa1ddd4:0xffcf8e});}
+  for(let i=0;i<17;i++){
+    const x=-3+i*2.1,h=1.2+(i*37%7)*.7;
+    const tower=addBox(back,i%2?0x28354a:0x30364b,x,h/2,-7.5,1.4,h,1);tower.rotation.z=(i%3-1)*.04;
+    if(i%3===0){addBox(back,0xffb46c,x,h+.15,-7,.13,.45,.05);addBox(back,0x73d5ca,x,h*.6,-6.95,.55,.07,.05);}
+  }
+  for(let i=0;i<9;i++){const p=mesh(new THREE.ConeGeometry(2.1,4.8+(i%3),4),0x344350,i*4-4,0,-5,1,1,1);p.rotation.y=Math.PI/4;back.add(p);}
+  addBox(scenery,0x253b44,12,-.55,0,31,1.1,4,true);
+  addBox(scenery,0x7ae2d3,12,.02,1.8,31,.06,.07);
+  for(let i=-1;i<14;i++){addBox(scenery,i%2?0x395762:0x304a55,i*2,.0,.8,1.75,.10,1.8);addBox(scenery,0xf2936b,i*2-.8,.12,1.77,.1,.13,.1);}
+  for(const p of [{x:8,y:3.1,w:3.5},{x:15,y:4.5,w:3}]){
+    addBox(scenery,0x3d626a,p.x,p.y-.18,0,p.w,.36,1.6,true);addBox(scenery,0x8df4e3,p.x,p.y+.02,.72,p.w,.055,.08);addBox(scenery,0xfeaa75,p.x,p.y-.12,.8,.45,.1,.05);
+  }
+  for(let i=0;i<4;i++){const post=addBox(scenery,0x19333e,1+i*7.5,1,-1.4,.22,2.1,.35,true);addBall(scenery,stage.color,post.position.x,2.1,-1.4,.18);}
+}
+function initWorld(){
+  if(world)world.free();
+  world=new RAPIER.World({x:0,y:-24,z:0});
+  const ground=world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(12,-.6,0));world.createCollider(RAPIER.ColliderDesc.cuboid(16,.6,2),ground);
+  for(const p of [{x:8,y:3.1,w:3.5},{x:15,y:4.5,w:3}]){const b=world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(p.x,p.y-.18,0));world.createCollider(RAPIER.ColliderDesc.cuboid(p.w/2,.18,1),b);}
+}
+function makePlayer(i){
+  const body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(3+i*1.5,1.2,0).lockRotations().enabledTranslations(true,true,false));
+  world.createCollider(RAPIER.ColliderDesc.capsule(.48,.4).setFriction(0).setRestitution(0),body);
+  const model=makePilot(i?0xffb28d:0x78e8dc);actorLayer.add(model);
+  return {i,body,model,hp:100,lives:3,weapon:0,heat:0,overheated:false,shoot:0,dashCooldown:0,dashTime:0,counterCooldown:0,invuln:0,jumps:2,facing:1,aim:0,hitSet:new Set(),alive:true};
+}
+function cleanCombat(){for(const arr of [bullets,enemyBullets,drones,effects,hazards]){for(const x of arr){if(x.mesh)x.mesh.parent?.remove(x.mesh);}arr.length=0;}clearGroup(actorLayer);clearGroup(effectLayer);boss=null;players=[];}
+function makeTitleActors(){clearGroup(titleActors);const p=makePilot();p.scale.setScalar(2.65);p.position.set(16.2,3.3,1);p.rotation.z=-.18;titleActors.add(p);const b=makeBoss(STAGES[0]);b.scale.setScalar(1.18);b.position.set(22.2,8.4,-.5);titleActors.add(b);}
+function toTitle(){closeNetwork();state='title';run=null;stoppedByHub=false;cleanCombat();makeArena(STAGES[0]);makeTitleActors();titleActors.visible=true;showScreen('title');$('notice').classList.add('hidden');$('message').classList.add('hidden');lastActivity=performance.now();menuIndex=0;updateFocus();}
+function startRun(attract=false,coop=false){
+  if(!world)return;closeModal();cleanCombat();initWorld();state=attract?'attract':'playing';run={attract,coop:coop&&!AIHub.active,stage:0,score:0,chain:1,comboTimer:0,stageTime:0,transition:0,finished:false,attractCycle:0};titleActors.visible=false;players.push(makePlayer(0));if(run.coop)players.push(makePlayer(1));
+  showScreen(state);launchStage(0);updateHud();if(run.coop)showMessage('TWO PILOTS / SHARED SCORE',3);
+}
+function launchStage(index){
+  run.stage=index;run.stageTime=0;run.transition=0;const def=STAGES[index];makeArena(def);
+  for(const a of [bullets,enemyBullets,drones,hazards]){for(const o of a)o.mesh?.parent?.remove(o.mesh);a.length=0;}
+  if(boss?.model)actorLayer.remove(boss.model);const model=makeBoss(def);actorLayer.add(model);boss={def,model,hp:def.hp,max:def.hp,x:20.3,y:5.4,t:0,fire:2,drone:4.5,beam:7,dead:false};
+  players.forEach((p,i)=>{p.body.setTranslation({x:3+i*1.5,y:1.3,z:0},true);p.body.setLinvel({x:0,y:0,z:0},true);p.hp=Math.min(100,p.hp+(index?25:0));p.invuln=1.5;});
+  showNotice(def.location,def.name,def.subtitle,2.7);sfx('heavy');
+}
+function finishStage(){if(!run||run.transition||boss.dead)return;boss.dead=true;run.transition=3.5;run.score+=5000*(run.stage+1);burst(boss.x,boss.y,STAGES[run.stage].color,30);sfx('explode');showNotice('TARGET DOWN',run.stage===2?'THE SKY IS FREE':'STORM ADVANCING',`+${5000*(run.stage+1)} POINTS`,3);for(const b of enemyBullets)b.dead=true;}
+function finishRun(won,override){if(!run||run.finished)return;run.finished=true;if(run.attract){startRun(true,false);return;}state='result';showScreen('result');$('result-title').textContent=won?'SKY LIBERATED':'SIGNAL LOST';$('result-copy').textContent=override|| (won?'The last god falls. Somewhere, the sky remembers your name.':'The empire survives this storm. You can bring another.');$('result-score').textContent=String(Math.floor(run.score)).padStart(6,'0');networkReport(true);if(AIHub.active){AIHub.result({score:Math.floor(run.score)});$allIn($('result'),'.result-buttons button').forEach(b=>b.style.display='none');}else $allIn($('result'),'.result-buttons button').forEach(b=>b.style.display=network.inRound&&b.dataset.action==='restart'?'none':'');menuIndex=0;updateFocus();}
+function exitAttract(){toTitle();}
+function projectile(x,y,vx,vy,damage,color,kind='player'){
+  const geo=kind==='player'?arenaMaterials.shotGeo:arenaMaterials.enemyShotGeo;const o=mesh(geo,color,x,y,.55,kind==='player'?1.5:1,kind==='player'?.75:1,1);effectLayer.add(o);
+  const p={x,y,vx,vy,damage,mesh:o,life:3,dead:false};(kind==='player'?bullets:enemyBullets).push(p);return p;
+}
+function burst(x,y,color,count=10){for(let i=0;i<count;i++){const a=Math.random()*Math.PI*2,s=1+Math.random()*5,ob=mesh(arenaMaterials.sparkGeo,color,x,y,1);effectLayer.add(ob);effects.push({mesh:ob,x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:.3+Math.random()*.35,max:.7});}}
+function pulseRing(x,y,color,r=2){const obj=new THREE.Mesh(new THREE.RingGeometry(.9,1,32),new THREE.MeshBasicMaterial({color,transparent:true,opacity:.85,side:THREE.DoubleSide}));obj.position.set(x,y,1);effectLayer.add(obj);effects.push({mesh:obj,x,y,vx:0,vy:0,life:.32,max:.32,ring:r});}
+function shoot(p){
+  if(p.shoot>0||p.overheated)return;const w=WEAPONS[p.weapon],pos=p.body.translation();p.shoot=w.interval;p.heat=Math.min(100,p.heat+w.heat);if(p.heat>=100)p.overheated=true;
+  for(let i=0;i<w.count;i++){const angle=p.aim+(i-(w.count-1)/2)*w.spread;projectile(pos.x+Math.cos(angle)*.8,pos.y+.12+Math.sin(angle)*.8,Math.cos(angle)*w.speed,Math.sin(angle)*w.speed,w.damage,w.color);}
+  sfx(p.weapon===2?'heavy':'fire');
+}
+function hurtPlayer(p,amount){
+  if(p.invuln>0||!p.alive||run.attract)return;p.hp=Math.max(0,p.hp-amount);p.invuln=1.1;run.chain=1;run.comboTimer=0;burst(p.body.translation().x,p.body.translation().y,0xff8972,9);sfx('hurt');
+  if(p.hp<=0){p.lives--;if(p.lives>0){p.hp=100;p.invuln=2.5;p.body.setTranslation({x:3+p.i,y:2,z:0},true);showMessage(`P${p.i+1} REDEPLOYED`,2);}else{p.alive=false;p.model.visible=false;if(players.every(x=>!x.alive))finishRun(false);}}
+}
+function counter(p){if(p.counterCooldown>0)return;p.counterCooldown=3.5;const pos=p.body.translation();let n=0;for(const b of enemyBullets)if(!b.dead&&Math.hypot(b.x-pos.x,b.y-pos.y)<3.2){b.dead=true;n++;burst(b.x,b.y,0x9bffdf,3);}p.hp=Math.min(100,p.hp+n*3);run.score+=n*150;if(n){run.chain=Math.min(9,run.chain+1);run.comboTimer=5;showMessage(`COUNTER ×${n} / VITALITY +${n*3}`,1.3);}pulseRing(pos.x,pos.y,0x8bfff1,3.2);sfx('counter');}
+function startDash(p,control){if(p.dashCooldown>0)return;p.dashCooldown=1.5;p.dashTime=.24;p.invuln=.28;p.hitSet.clear();let x=control.x,y=-control.y;if(Math.hypot(x,y)<.25){x=p.facing;y=0;}let n=Math.hypot(x,y);p.body.setLinvel({x:x/n*20,y:y/n*14,z:0},true);sfx('dash');}
+function autoControls(p){
+  const pos=p.body.translation(),t=run.stageTime;return {x:pos.x<7?1:pos.x>10?-1:Math.sin(t*1.3)*.4,y:0,rx:0,ry:0,fire:true,jump:Math.sin(t*2.1)>.98,dash:Math.sin(t*.8)>.99,counter:Math.sin(t*.55)>.99,prev:false,next:Math.sin(t*.25)>.999,lock:false,mouse:null};
+}
+function stepPlayer(p,control,dt){
+  if(!p.alive)return;const pos=p.body.translation(),vel=p.body.linvel();
+  p.invuln=Math.max(0,p.invuln-dt);p.dashCooldown=Math.max(0,p.dashCooldown-dt);p.counterCooldown=Math.max(0,p.counterCooldown-dt);p.shoot=Math.max(0,p.shoot-dt);p.dashTime=Math.max(0,p.dashTime-dt);
+  p.heat=Math.max(0,p.heat-dt*(control.fire?8:31));if(p.overheated&&p.heat<30)p.overheated=false;
+  let grounded=pos.y<1.02||[{x:8,y:3.1,w:3.5},{x:15,y:4.5,w:3}].some(o=>Math.abs(pos.x-o.x)<o.w/2+.3&&Math.abs(pos.y-(o.y+.88))<.15&&vel.y<=.5);
+  if(grounded)p.jumps=2;
+  if(control.jump&&p.jumps>0){p.body.setLinvel({x:vel.x,y:10.6,z:0},true);p.jumps--;sfx('jump');}
+  if(control.dash)startDash(p,control);if(control.counter)counter(p);
+  if(control.prev)p.weapon=(p.weapon+WEAPONS.length-1)%WEAPONS.length;if(control.next)p.weapon=(p.weapon+1)%WEAPONS.length;
+  if(p.dashTime<=0){const v=p.body.linvel();p.body.setLinvel({x:control.lock?0:control.x*7.3,y:v.y,z:0},true);}
+  if(Math.abs(control.x)>.12&&!control.lock)p.facing=control.x>0?1:-1;
+  if(Math.hypot(control.rx,control.ry)>.25)p.aim=Math.atan2(-control.ry,control.rx);
+  else if(control.lock&&Math.hypot(control.x,control.y)>.2)p.aim=Math.atan2(-control.y,control.x);
+  else if(control.mouse){const v=new THREE.Vector3((control.mouse.x/innerWidth)*2-1,-(control.mouse.y/innerHeight)*2+1,0).unproject(camera);p.aim=Math.atan2(v.y-pos.y,v.x-pos.x);}
+  else if(boss&&!boss.dead)p.aim=Math.atan2(boss.y-pos.y,boss.x-pos.x);
+  else p.aim=p.facing>0?0:Math.PI;
+  if(control.fire)shoot(p);
+  if(p.dashTime>0){if(Math.random()<.55)burst(pos.x,pos.y,0x6bffe4,1);if(boss&&!boss.dead&&Math.hypot(pos.x-boss.x,pos.y-boss.y)<2.2&&!p.hitSet.has(boss)){p.hitSet.add(boss);boss.hp-=65;run.score+=200;burst(boss.x,boss.y,0xffe49c,8);}}
+  const clamped=Math.max(-1.1,Math.min(25,pos.x));if(clamped!==pos.x)p.body.setTranslation({x:clamped,y:pos.y,z:0},true);
+  if(pos.y< -5){p.body.setTranslation({x:3,y:3,z:0},true);hurtPlayer(p,25);}
+  p.model.position.set(pos.x,pos.y,0);p.model.scale.x=p.facing;p.model.visible=p.invuln<=0||Math.floor(p.invuln*14)%2===0;p.model.rotation.z=p.dashTime>0?-.5*p.facing:Math.sin(simTime*10)*Math.min(.07,Math.abs(control.x)*.07);p.model.userData.left.rotation.z=Math.sin(simTime*12)*Math.abs(control.x)*.5;p.model.userData.right.rotation.z=-p.model.userData.left.rotation.z;
+}
+function enemyShot(x,y,angle,speed=5,damage=10,color=0xff795e){projectile(x,y,Math.cos(angle)*speed,Math.sin(angle)*speed,damage,color,'enemy');}
+function targetPlayer(){const living=players.filter(p=>p.alive);return living[Math.floor(Math.random()*living.length)]||players[0];}
+function bossAttack(){
+  const p=targetPlayer();if(!p)return;const pos=p.body.translation(),angle=Math.atan2(pos.y-boss.y,pos.x-boss.x),pattern=boss.def.pattern;
+  if(pattern==='choir'){for(let i=-2;i<=2;i++)enemyShot(boss.x-1,boss.y,angle+i*.21,5.5,9);}
+  else if(pattern==='vulture'){for(let i=0;i<9;i++)enemyShot(boss.x,boss.y,angle+i*Math.PI*2/9+boss.t*.4,4.5,9,0xd8a1ff);for(let i=-1;i<=1;i++)enemyShot(boss.x,boss.y,angle+i*.1,8,11,0xffae85);}
+  else {for(let i=-3;i<=3;i++)enemyShot(boss.x,boss.y,angle+i*.16,6.3,11,0xffca70);for(let i=0;i<6;i++)enemyShot(boss.x,boss.y,i*Math.PI/3+boss.t*.3,3.7,9,0x8df9e9);}
+}
+function spawnDrone(){const model=makeDrone();actorLayer.add(model);drones.push({x:23,y:2+Math.random()*5,model,hp:45,fire:1.3,phase:Math.random()*6,dead:false});}
+function spawnHazard(){const p=targetPlayer();if(!p)return;const x=Math.max(1,Math.min(23,p.body.translation().x));const m=new THREE.Mesh(new THREE.PlaneGeometry(1.2,13),new THREE.MeshBasicMaterial({color:0xffa773,transparent:true,opacity:.2,side:THREE.DoubleSide}));m.position.set(x,6.5,-.5);effectLayer.add(m);hazards.push({x,mesh:m,t:0,hit:false,dead:false});}
+function updateBoss(dt){
+  if(!boss||boss.dead)return;boss.t+=dt;boss.x=20+Math.sin(boss.t*(boss.def.pattern==='vulture'?1.0:.55))*1.2;boss.y=5.5+Math.sin(boss.t*.85)*1.4;boss.model.position.set(boss.x,boss.y,0);boss.model.rotation.z=Math.sin(boss.t*1.2)*.08;
+  boss.fire-=dt;boss.drone-=dt;boss.beam-=dt;if(boss.fire<=0){boss.fire=boss.def.interval;bossAttack();}if(boss.drone<=0){boss.drone=boss.def.drone;if(drones.length<4)spawnDrone();}if(boss.beam<=0&&run.stage>0){boss.beam=run.stage===2?4:6;spawnHazard();}
+  if(run.attract)boss.hp-=dt*(boss.max/30);
+  if(boss.hp<=0)finishStage();
+}
+function updateDrones(dt){for(const d of drones){if(d.dead)continue;d.phase+=dt;d.x-=dt*.7;d.y+=Math.sin(d.phase*2)*dt*.6;d.model.position.set(d.x,d.y,.4);d.model.rotation.z=Math.sin(d.phase*5)*.15;d.fire-=dt;if(d.fire<0){d.fire=2.5;const p=targetPlayer();if(p){const q=p.body.translation();enemyShot(d.x,d.y,Math.atan2(q.y-d.y,q.x-d.x),5,8);}}if(d.x< -2)d.dead=true;}}
+function updateShots(dt){
+  for(const b of bullets){if(b.dead)continue;b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt;b.mesh.position.set(b.x,b.y,.5);if(b.life<=0||b.x< -3||b.x>28||b.y<-.5||b.y>17){b.dead=true;continue;}
+    if(boss&&!boss.dead&&Math.hypot(b.x-boss.x,b.y-boss.y)<1.65){boss.hp-=b.damage;run.score+=10*run.chain;run.comboTimer=3;b.dead=true;burst(b.x,b.y,0xffd1a0,2);continue;}
+    for(const d of drones){if(!d.dead&&Math.hypot(b.x-d.x,b.y-d.y)<.65){d.hp-=b.damage;b.dead=true;burst(b.x,b.y,0xffe8ae,3);if(d.hp<=0){d.dead=true;run.score+=300*run.chain;run.chain=Math.min(9,run.chain+1);run.comboTimer=5;burst(d.x,d.y,0xffa578,12);sfx('explode');}break;}}
+  }
+  for(const b of enemyBullets){if(b.dead)continue;b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt;b.mesh.position.set(b.x,b.y,.65);b.mesh.rotation.z+=dt*5;if(b.life<=0||b.x< -3||b.x>28||b.y<-.5||b.y>17){b.dead=true;continue;}for(const p of players){if(!p.alive)continue;const pos=p.body.translation();if(Math.hypot(b.x-pos.x,b.y-pos.y)<.68){hurtPlayer(p,b.damage);b.dead=true;break;}}}
+  for(const h of hazards){h.t+=dt;h.mesh.material.opacity=h.t<1?.15+.15*Math.sin(h.t*20):.8;if(h.t>=1&&!h.hit){h.hit=true;for(const p of players){const pos=p.body.translation();if(Math.abs(pos.x-h.x)<.85)hurtPlayer(p,20);}pulseRing(h.x,1,0xffaa77,1);sfx('heavy');}if(h.t>1.28)h.dead=true;}
+  for(const arr of [bullets,enemyBullets,drones,hazards])for(let i=arr.length-1;i>=0;i--)if(arr[i].dead){const obj=arr[i].mesh||arr[i].model;obj?.parent?.remove(obj);arr.splice(i,1);}
+}
+function updateEffects(dt){for(let i=effects.length-1;i>=0;i--){const e=effects[i];e.life-=dt;e.x+=e.vx*dt;e.y+=e.vy*dt;e.vy-=dt*3;e.mesh.position.x=e.x;e.mesh.position.y=e.y;e.mesh.rotation.z+=dt*4;const scale=e.ring?(1-e.life/e.max)*e.ring:Math.max(.1,e.life/e.max);e.mesh.scale.setScalar(scale);if(e.mesh.material.transparent)e.mesh.material.opacity=Math.max(0,e.life/e.max);if(e.life<=0){e.mesh.parent?.remove(e.mesh);effects.splice(i,1);}}}
+function updateHud(){if(!run||!players.length)return;const p=players[0],pct=Math.max(0,Math.ceil(p.hp));$('health-fill').style.width=pct+'%';$('health-number').textContent=run.coop?`${pct} / ${Math.ceil(players[1].hp)}`:pct;$('pilot-label').textContent=run.coop?'P1 / P2 VITALITY':'P1 / STORM PILOT';$('lives').textContent='◆ '.repeat(Math.max(0,p.lives));$('score').textContent=String(Math.floor(run.score)).padStart(6,'0');$('combo').textContent=`×${run.chain} CHAIN`;$('mission-num').textContent=String(run.stage+1).padStart(2,'0');$('boss-name').textContent=boss?.def.name||'';const bp=boss?Math.max(0,boss.hp/boss.max*100):0;$('boss-percent').textContent=Math.ceil(bp)+'%';$('boss-fill').style.width=bp+'%';$('weapon-index').textContent=String(p.weapon+1).padStart(2,'0');$('weapon-name').textContent=p.overheated?'COOLING':WEAPONS[p.weapon].name;$('heat-fill').style.width=p.heat+'%';$('dash-ready').textContent=p.dashCooldown>0?p.dashCooldown.toFixed(1)+'s':'READY';$('counter-ready').textContent=p.counterCooldown>0?p.counterCooldown.toFixed(1)+'s':'READY';}
+function resize(){if(!renderer)return;const aspect=innerWidth/innerHeight,halfHeight=8.3;camera.left=-halfHeight*aspect;camera.right=halfHeight*aspect;camera.top=halfHeight;camera.bottom=-halfHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);}
+function animate(now){
+  requestAnimationFrame(animate);const dt=Math.min(.04,Math.max(0,(now-lastFrame)/1000));lastFrame=now;const {reads,pads}=inputs();
+  if(state==='title'&&!modal&&!touchOnly&&!AIHub.active&&now-lastActivity>10000)startRun(true,false);
+  if(state==='title'&&titleActors){titleActors.children.forEach((o,i)=>{o.position.y+=(Math.sin(now*.0015+i)-Math.sin((now-dt*1000)*.0015+i))*.18;o.rotation.z+=dt*(i?-.05:.04);});}
+  const hubReady=!AIHub.active||AIHub.time()>=0;
+  if((state==='playing'||state==='attract')&&!modal&&!stoppedByHub&&hubReady&&run&&!run.finished){
+    simTime+=dt;run.stageTime+=dt;run.comboTimer-=dt;if(run.comboTimer<=0)run.chain=1;
+    for(const p of players){const c=run.attract?autoControls(p):controlsFor(p.i,reads,pads.length);if(p.i===0)inputSnapshot={x:c.x,y:c.y,fire:c.fire,jump:c.jump,dash:c.dash,lock:c.lock};stepPlayer(p,c,dt);}
+    world.timestep=dt||1/60;world.step();updateBoss(dt);updateDrones(dt);updateShots(dt);updateEffects(dt);
+    if(run.transition>0){run.transition-=dt;if(run.transition<=0){if(run.stage<STAGES.length-1)launchStage(run.stage+1);else finishRun(true);}}
+    if(AIHub.active)AIHub.progress({score:Math.floor(run.score),label:`Boss ${run.stage+1} of 3`});
+    updateHud();
+  }else if(state==='title'){simTime+=dt;}
+  if(simTime>noticeUntil)$('notice').classList.add('hidden');if(simTime>messageUntil)$('message').classList.add('hidden');musicTick();
+  networkTick(now);if(renderer&&scene&&camera)renderer.render(scene,camera);
+  for(const p of pads)padsBefore[p.index]=p.buttons.map(b=>!!b.pressed);keyEdges.clear();
+}
+async function boot(){
+  try{
+    touchOnly=matchMedia('(pointer: coarse)').matches&&!matchMedia('(any-pointer: fine)').matches;$('touch-warning').classList.toggle('hidden',!touchOnly);document.body.classList.toggle('touch-only',touchOnly);
+    if(!navigator.gpu)throw new Error('This browser does not provide WebGPU. Open the game in a WebGPU-enabled browser.');
+    const adapter=await navigator.gpu.requestAdapter();if(!adapter)throw new Error('No WebGPU adapter was found. Enable WebGPU in your browser and graphics driver.');
+    $('loading-text').textContent='ASSEMBLING THE STORM ···';
+    [THREE,RAPIER]=await Promise.all([import('/lib/vendor/three/0.180.0/build/three.webgpu.js'),import('/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs').then(m=>m.default)]);
+    await RAPIER.init();setupMaterials();scene=new THREE.Scene();camera=new THREE.OrthographicCamera(-16,16,8,-8,.1,100);camera.position.set(12,7,30);camera.lookAt(12,7,0);
+    renderer=new THREE.WebGPURenderer({antialias:true,alpha:false});await renderer.init();if(!renderer.backend.isWebGPUBackend)throw new Error('WebGPU initialization failed; this game requires WebGPU.');renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));$('stage').appendChild(renderer.domElement);
+    scene.add(new THREE.HemisphereLight(0xc6fff4,0x423043,2.1));const sun=new THREE.DirectionalLight(0xffddbc,3);sun.position.set(-6,12,15);scene.add(sun);
+    scenery=new THREE.Group();actorLayer=new THREE.Group();effectLayer=new THREE.Group();titleActors=new THREE.Group();scene.add(scenery,actorLayer,effectLayer,titleActors);initWorld();resize();window.addEventListener('resize',resize);
+    touchOnly=matchMedia('(pointer: coarse)').matches&&!matchMedia('(any-pointer: fine)').matches;$('touch-warning').classList.toggle('hidden',!touchOnly);document.body.classList.toggle('touch-only',touchOnly);
+    $('loading').classList.add('hidden');const info=await hubConnect;
+    if(info){startRun(false,false);AIHub.ready();}else toTitle();
+    lastFrame=performance.now();requestAnimationFrame(animate);
+  }catch(e){console.error(e);$('loading-text').textContent='STORM ENGINE UNAVAILABLE — '+(e?.message||String(e));AIHub.fail(e?.message||String(e));}
+}
+boot();
+
+</script>
+</body></html>

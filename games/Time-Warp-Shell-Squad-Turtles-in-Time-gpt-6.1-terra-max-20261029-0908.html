@@ -1,0 +1,858 @@
+<!--
+SOURCE INFORMATION
+Date: 2026-10-29 09:08
+Source: Turtles in Time
+Game: Time Warp Shell Squad
+Tech: Three.js r180 WebGPU renderer; Rapier 0.19.3; Web Audio API; Gamepad API; PeerJS 1.5.5 / WebRTC; AI Hub Session Protocol v1 client 1.3.0.
+Art Direction: original cel-shaded, low-poly procedural 3D.
+Animation: procedural joint posing with Rapier physics-driven movement.
+Audio: code-synthesized music, effects, and gibberish voice.
+Online: AI Hub co-op sessions and standalone PeerJS room codes; one to four players.
+Testing: lightweight headless browser and hub checks, including simulated network conditions; details below.
+Environment: Codex CLI (headless); Linux; browser unknown.
+Model: OpenAI, gpt-6.1-terra, reasoning effort max.
+Usage: estimated API cost unknown; token count unknown; session approximately 20 minutes.
+
+TESTING FEEDBACK
+Issues caught during testing and review: 6. Critical or game-breaking issues: 3.
+Most helpful test: the four-player AI Hub network harness.
+Least helpful test: syntax checks alone; they cannot assess gameplay or visuals.
+
+ENGINE FEEDBACK
+Most liked: WebGPU's modern rendering pipeline and Three.js's approachable scene graph.
+Stuck or guessed wrong: WebGPU initialization and browser availability required verification.
+Most important thing built: brawler combat, encounter director, procedural characters, animation, audio, and network synchronization.
+Hardest part: keeping a shared physics-driven world responsive across peers.
+Remove or overhaul: clearer diagnostics when WebGPU initialization fails.
+One change: make WebGPU-only behavior an explicit renderer option.
+
+PROMPT FEEDBACK
+Most liked: the clear creative direction and controller-first arcade focus.
+Confusing: the amount of content implied by a complete vertical slice was open to interpretation.
+Hardest: combining a polished brawler, accessible controller menus, and two co-op transports in one HTML file.
+One test to run: an extended four-player session across real devices and networks, including gamepad play and reconnects.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<script type="importmap">
+{
+  "scopes": {
+    "/lib/vendor/three/0.180.0/": {
+      "three": "/lib/vendor/three/0.180.0/build/three.module.js",
+      "three/webgpu": "/lib/vendor/three/0.180.0/build/three.webgpu.js",
+      "three/tsl": "/lib/vendor/three/0.180.0/build/three.tsl.js",
+      "three/addons/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/examples/jsm/": "/lib/vendor/three/0.180.0/examples/jsm/",
+      "three/src/": "/lib/vendor/three/0.180.0/src/",
+      "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/+esm": "/lib/vendor/extras/lottie-web/5.13.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/+esm": "/lib/vendor/extras/mp4box/0.5.3/index.mjs",
+      "https://cdn.jsdelivr.net/npm/mp4box@2.3.0/+esm": "/lib/vendor/extras/mp4box/2.3.0/index.mjs",
+      "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/+esm": "/lib/vendor/extras/opentype.js/1.3.4/index.mjs"
+    }
+  }
+}
+</script>
+
+<meta charset="utf-8">
+<script>
+/*! aihub-session 1.3.0 — AI Hub Session Protocol v1 client. Paste it into your game unmodified. */
+(function (root) {
+  'use strict';
+  if (root.AIHub) return;
+
+  var VERSION = '1.3.0';
+  var HELLO_EVERY_MS = 500;
+  var HELLO_TIMEOUT_MS = 10000;
+  var PROGRESS_EVERY_MS = 1000;
+  /** The hub's welcome may change these; a newer hub never needs a newer copy of this file for it. */
+  var limits = { maxBytes: 16384, ratePerS: 20, burst: 40 };
+
+  var framed = false;
+  try {
+    framed = root.parent && root.parent !== root;
+  } catch (e) {
+    framed = true;
+  }
+  var search = String(root.location && root.location.search);
+  var flagged = /[?&]aihub=/.test(search);
+  var seedArg = /[?&]aihub-seed=(\d+)/.exec(search);
+
+  var hub = {
+    version: VERSION,
+    protocol: 1,
+    /** True when the hub launched this page for a session (?aihub=1 inside a frame). */
+    active: !!(flagged && framed),
+    me: null,
+    host: null,
+    isHost: false,
+    players: [],
+    mode: null,
+    seed: 0,
+    limitMs: 0,
+    round: 0,
+    /** True when the hub shows the round's splash and collects every player's ready: call ready() once loaded, with no prompt. */
+    splash: false,
+    /** True when the hub seeded Math.random for this round (side by side): every copy draws the same numbers. */
+    seeded: false,
+  };
+
+  /** A storage that lives and dies with the page: the Storage methods, and items as properties too. */
+  function memoryStorage() {
+    var data = Object.create(null);
+    var api = {
+      getItem: function (k) {
+        k = String(k);
+        return k in data ? data[k] : null;
+      },
+      setItem: function (k, v) {
+        data[String(k)] = String(v);
+      },
+      removeItem: function (k) {
+        delete data[String(k)];
+      },
+      clear: function () {
+        for (var k in data) delete data[k];
+      },
+      key: function (i) {
+        var keys = Object.keys(data);
+        return i >= 0 && i < keys.length ? keys[i] : null;
+      },
+    };
+    if (typeof Proxy !== 'function') return api;
+    return new Proxy(api, {
+      get: function (t, k) {
+        if (k === 'length') return Object.keys(data).length;
+        if (typeof k === 'symbol' || k in t) return t[k];
+        return k in data ? data[k] : undefined;
+      },
+      set: function (t, k, v) {
+        if (typeof k !== 'symbol') data[k] = String(v);
+        return true;
+      },
+      has: function (t, k) {
+        return k in data || k in t;
+      },
+      deleteProperty: function (t, k) {
+        delete data[k];
+        return true;
+      },
+      ownKeys: function () {
+        return Object.keys(data);
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        return k in data ? { value: data[k], writable: true, enumerable: true, configurable: true } : undefined;
+      },
+    });
+  }
+
+  /** mulberry32: numbers in [0, 1), the same sequence everywhere for the same 32-bit start. */
+  function generator(a) {
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // A fair start: in a session the game gets an empty storage of its own, so
+  // every round starts as a first launch (no saved unlocks, upgrades or runs),
+  // and nothing the round saves touches the player's own saves.
+  if (hub.active) {
+    for (var s = 0, stores = ['localStorage', 'sessionStorage']; s < stores.length; s++) {
+      try {
+        Object.defineProperty(root, stores[s], { configurable: true, value: memoryStorage() });
+      } catch (e) {
+        warn('could not give the game a fresh ' + stores[s]);
+      }
+    }
+  }
+
+  // Side by side: before any of the game's own scripts run, Math.random becomes
+  // a generator seeded by the hub, so every copy builds the same start.
+  var realRandom = Math.random;
+  var seededRandom = null;
+  if (hub.active && seedArg) {
+    Math.random = seededRandom = generator(Number(seedArg[1]) >>> 0);
+    hub.seeded = true;
+  }
+
+  // In a session the hub owns fullscreen: a game that asks for it gets the
+  // hub's whole page, so the scoreboard and the hub's cards stay on top. The
+  // hub says when its page goes in and out, so the game's own toggle and its
+  // fullscreenchange listeners work as they always did.
+  var fullscreenOn = false;
+  if (hub.active && root.Element && root.document) {
+    var asks = function (on) {
+      return function () {
+        post('fullscreen', { on: on });
+        return Promise.resolve();
+      };
+    };
+    var proto = root.Element.prototype;
+    proto.requestFullscreen = proto.webkitRequestFullscreen = asks(true);
+    root.document.exitFullscreen = root.document.webkitExitFullscreen = asks(false);
+    var shown = function () {
+      return fullscreenOn ? root.document.documentElement || null : null;
+    };
+    try {
+      Object.defineProperty(root.document, 'fullscreenElement', { configurable: true, get: shown });
+      Object.defineProperty(root.document, 'webkitFullscreenElement', { configurable: true, get: shown });
+    } catch (e) {}
+  }
+
+  /**
+   * No hub after all: play on, with Math.random the page's own again. The
+   * empty storage stays: the game has read it already, and what it writes
+   * must never land on the player's real saves.
+   */
+  function standAlone() {
+    hub.active = false;
+    if (seededRandom && Math.random === seededRandom) Math.random = realRandom;
+    hub.seeded = false;
+  }
+
+  var origin = '*';
+  var welcomed = false;
+  var ended = false;
+  var connecting = null;
+  var goAt = null;
+  var sentReady = false;
+  var reported = false;
+  var handlers = {};
+  var pending = {};
+  var tokens = limits.burst;
+  var refilled = now();
+  var probeFn = null;
+  var lastProgress = -Infinity;
+  var nextProgress = null;
+  var progressTimer = null;
+
+  function now() {
+    return root.performance && root.performance.now ? root.performance.now() : Date.now();
+  }
+
+  function warn(text) {
+    if (root.console) root.console.warn('[AIHub] ' + text);
+  }
+
+  function own(o, k) {
+    return Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  /** This client's own fields, which no welcome may overwrite. */
+  var KEEP = { aihub: 1, type: 1, version: 1, protocol: 1, active: 1, seeded: 1 };
+
+  /** A plain JSON copy, or undefined when it is not JSON. */
+  function json(value) {
+    try {
+      var text = JSON.stringify(value);
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function post(type, fields) {
+    var msg = { aihub: 1, type: type };
+    for (var key in fields) if (own(fields, key)) msg[key] = fields[key];
+    try {
+      root.parent.postMessage(msg, origin);
+    } catch (e) {
+      warn('could not reach the hub: ' + e.message);
+    }
+  }
+
+  function emit(type, args) {
+    var list = handlers[type];
+    if (!list || !list.length || pending[type]) {
+      (pending[type] = pending[type] || []).push(args);
+      return;
+    }
+    for (var i = 0; i < list.length; i++) {
+      try {
+        list[i].apply(null, args);
+      } catch (e) {
+        setTimeout(function () {
+          throw e;
+        });
+      }
+    }
+  }
+
+  function onMessage(event) {
+    if (event.source !== root.parent) return;
+    var m = event.data;
+    if (!m || m.aihub !== 1 || typeof m.type !== 'string') return;
+    if (m.type === 'welcome') {
+      if (welcomed) return;
+      welcomed = true;
+      origin = event.origin && event.origin !== 'null' ? event.origin : '*';
+      // Every field the hub sends is kept, so a newer hub can add one without a newer client.
+      for (var key in m) {
+        if (!own(m, key) || KEEP[key] || typeof hub[key] === 'function') continue;
+        hub[key] = m[key];
+      }
+      hub.players = (m.players || []).slice();
+      hub.seed = m.seed >>> 0;
+      hub.isHost = m.me === m.host;
+      hub.splash = m.splash === true;
+      if (m.limits) {
+        for (var l in limits) if (own(limits, l) && Number(m.limits[l]) > 0) limits[l] = Number(m.limits[l]);
+        tokens = limits.burst;
+      }
+      if (connecting) connecting.resolve(info());
+      return;
+    }
+    if (m.type === 'fullscreen') {
+      fullscreenOn = m.on === true;
+      try {
+        root.document.dispatchEvent(new root.Event('fullscreenchange'));
+      } catch (e) {}
+      return;
+    }
+    if (!welcomed || ended) return;
+    if (m.type === 'start') {
+      goAt = now() + Number(m.in || 0);
+      emit('start', [{ in: Number(m.in || 0) }]);
+    } else if (m.type === 'message') {
+      emit('message', [m.data, m.from]);
+    } else if (m.type === 'leave') {
+      hub.players = hub.players.filter(function (p) {
+        return p.id !== m.id;
+      });
+      emit('leave', [{ id: m.id, reason: m.reason }]);
+    } else if (m.type === 'time-up') {
+      emit('time-up', [{ graceMs: m.graceMs }]);
+    } else if (m.type === 'end') {
+      ended = true;
+      if (progressTimer) clearTimeout(progressTimer);
+      emit('end', [{ reason: m.reason, standings: m.standings || null }]);
+    } else {
+      // An event this client has never heard of: hand it on as it came.
+      var detail = {};
+      for (var k in m) if (own(m, k) && k !== 'aihub' && k !== 'type') detail[k] = m[k];
+      emit(m.type, [detail]);
+    }
+  }
+
+  function info() {
+    var out = {};
+    for (var key in hub) if (own(hub, key) && typeof hub[key] !== 'function' && !KEEP[key]) out[key] = hub[key];
+    out.players = hub.players.slice();
+    return out;
+  }
+
+  /** Join the session. Resolves with the round's info, or null when there is no hub: play normally. */
+  hub.connect = function (opts) {
+    if (connecting) return connecting.promise;
+    var done;
+    var promise = new Promise(function (resolve) {
+      done = resolve;
+    });
+    connecting = { promise: promise, resolve: done };
+    if (!hub.active) {
+      done(null);
+      return promise;
+    }
+    opts = opts || {};
+    root.addEventListener('message', onMessage);
+    var started = now();
+    var hello = function () {
+      if (welcomed) return;
+      if (now() - started > HELLO_TIMEOUT_MS) {
+        standAlone();
+        warn('no hub answered; playing normally');
+        done(null);
+        return;
+      }
+      post('hello', { v: 1, client: VERSION, mode: opts.mode || null, seats: opts.seats || null });
+      setTimeout(hello, HELLO_EVERY_MS);
+    };
+    hello();
+    return promise;
+  };
+
+  /** Everything is loaded: at once when info.splash, otherwise from the player's ready gesture. */
+  hub.ready = function () {
+    if (!welcomed || sentReady || ended) return;
+    sentReady = true;
+    post('ready', {});
+  };
+
+  hub.on = function (type, fn) {
+    (handlers[type] = handlers[type] || []).push(fn);
+    if (pending[type] && !pending[type].flushing) {
+      pending[type].flushing = true;
+      setTimeout(function () {
+        var queued = pending[type];
+        delete pending[type];
+        for (var i = 0; i < queued.length; i++) emit(type, queued[i]);
+      });
+    }
+    return function () {
+      var list = handlers[type] || [];
+      var at = list.indexOf(fn);
+      if (at !== -1) list.splice(at, 1);
+    };
+  };
+
+  /** Send JSON data to every other player, or to one with {to: id}. {reliable: false} may drop or reorder. */
+  hub.send = function (data, opts) {
+    if (!welcomed || ended) return false;
+    opts = opts || {};
+    var text;
+    try {
+      text = JSON.stringify(data);
+    } catch (e) {
+      warn('send: data is not JSON');
+      return false;
+    }
+    if (text === undefined) return false;
+    if (text.length > limits.maxBytes) {
+      warn('send: message over ' + limits.maxBytes + ' bytes dropped');
+      return false;
+    }
+    var t = now();
+    tokens = Math.min(limits.burst, tokens + ((t - refilled) / 1000) * limits.ratePerS);
+    refilled = t;
+    if (tokens < 1) {
+      warn('send: over ' + limits.ratePerS + ' messages a second, dropped');
+      return false;
+    }
+    tokens -= 1;
+    var fields = { data: JSON.parse(text), reliable: opts.reliable !== false };
+    if (opts.to !== undefined && opts.to !== null) fields.to = opts.to;
+    post('send', fields);
+    return true;
+  };
+
+  /** Milliseconds since the synchronized start: negative during the countdown, -Infinity before start. */
+  hub.time = function () {
+    return goAt === null ? -Infinity : now() - goAt;
+  };
+
+  /** A seeded random number generator (0 ≤ n < 1), the same sequence on every device for the same label. */
+  hub.rng = function (label) {
+    var h = 2166136261;
+    var s = String(label === undefined ? '' : label);
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return generator((hub.seed ^ h) >>> 0);
+  };
+
+  /** A number the hub can rank: finite, given as a number or as text. Not null, '' or true, which JSON or Number would make 0. */
+  function finite(v) {
+    return (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && isFinite(v);
+  }
+
+  /**
+   * The whole outcome as plain JSON, field by field: the hub checks and trims
+   * it, so new optional fields need no new client. A field that is not JSON
+   * (a cycle, a BigInt) is left out, not the whole outcome.
+   */
+  function outcomeOf(outcome) {
+    if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
+      warn('the outcome is not a plain object');
+      return null;
+    }
+    var copy = {};
+    for (var key in outcome) {
+      if (!own(outcome, key)) continue;
+      var value = json(outcome[key]);
+      if (value !== undefined) copy[key] = value;
+      else if (outcome[key] !== undefined) warn('the outcome\'s ' + key + ' is not JSON: left out');
+    }
+    return copy;
+  }
+
+  /** Race and side by side: report your own outcome once, {time: ms} (lower wins) or {score: n} (higher wins), with optional stats and awards. */
+  hub.result = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    var given = outcome || {};
+    delete fields.time;
+    delete fields.score;
+    if (finite(given.time)) fields.time = Number(given.time);
+    if (finite(given.score)) fields.score = Number(given.score);
+    if (!own(fields, 'time') && !own(fields, 'score')) return warn('result needs a finite time or score');
+    reported = true;
+    if (progressTimer) clearTimeout(progressTimer);
+    post('result', fields);
+  };
+
+  /** Versus and co-op: the host reports the standings once, best first, ties grouped: [[2], [0, 3], [1]]. */
+  hub.finish = function (outcome) {
+    if (!welcomed || ended || reported) return;
+    if (!hub.isHost) return warn('finish is for the host only');
+    var fields = outcomeOf(outcome);
+    if (!fields) return;
+    if (!Array.isArray(fields.standings)) return warn('finish needs standings');
+    reported = true;
+    post('finish', fields);
+  };
+
+  function sendProgress() {
+    progressTimer = null;
+    if (!nextProgress || ended || reported) return;
+    lastProgress = now();
+    post('progress', nextProgress);
+    nextProgress = null;
+  }
+
+  /** Your standing during play, for the hub's scoreboard: {score, label}. Call it as often as you like; the hub hears it about once a second. */
+  hub.progress = function (p) {
+    if (!welcomed || ended || reported || !p || !finite(p.score)) return;
+    nextProgress = { score: Number(p.score) };
+    if (p.label != null) nextProgress.label = String(p.label).slice(0, 24);
+    var wait = lastProgress + PROGRESS_EVERY_MS - now();
+    if (wait <= 0) sendProgress();
+    else if (!progressTimer) progressTimer = setTimeout(sendProgress, wait);
+  };
+
+  /** For the harness, in or out of a session: fn() → { scene, menu, world, input }, read with inspect(). */
+  hub.probe = function (fn) {
+    probeFn = typeof fn === 'function' ? fn : null;
+  };
+
+  hub.inspect = function () {
+    if (!probeFn) return null;
+    try {
+      return JSON.parse(JSON.stringify(probeFn()));
+    } catch (e) {
+      return { error: String((e && e.message) || e) };
+    }
+  };
+
+  /** The game cannot run here (no WebGL, failed load): the hub skips it. */
+  hub.fail = function (message) {
+    if (!hub.active) return;
+    post('error', { message: String(message || 'error').slice(0, 500), fatal: true });
+  };
+
+  root.AIHub = hub;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<meta name="theme-color" content="#071c27">
+<meta name="hub:session" content="1">
+<meta name="hub:session-players" content="1-4">
+<meta name="hub:session-mode" content="co-op">
+<meta name="hub:session-minutes" content="6">
+<meta name="hub:session-goal" content="Team up and shut down the time machine">
+<meta name="hub:session-howto" content="Stick move · Cross jump · Square attack · Triangle heavy · R1 special">
+<meta name="hub:webgpu" content="required">
+<title>Time Warp Shell Squad</title>
+<style>@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700;800;900&family=DM+Sans:wght@400;500;600;700;800&display=swap');
+:root{font-family:'DM Sans',system-ui,sans-serif;color:#f4f8ec;background:#071c27;--ink:#f7f7ec;--mint:#b5f3c0;--yellow:#f9d86d;--dark:#102b34;--muted:#a9bfc0}*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden}button{font:inherit;color:inherit;cursor:pointer}button:focus{outline:none}button.selected,button:focus-visible{outline:3px solid #f9d86d!important;outline-offset:3px}button:disabled{opacity:.46;cursor:default}#game{position:absolute;width:100%;height:100%;display:block}.vignette{position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,rgba(3,22,30,.58),transparent 56%),linear-gradient(0deg,rgba(2,15,23,.5),transparent 25%)}#ui{position:absolute;inset:0;pointer-events:none}.screen{position:absolute;inset:0;pointer-events:auto}.hidden{display:none!important}.boot{position:absolute;z-index:20;inset:0;background:#0b2830;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;color:#c7e8dc;font-weight:800;letter-spacing:.18em;font-size:11px}.boot-logo{font:900 70px/.8 'Barlow Condensed',sans-serif;color:#b9f4bd;letter-spacing:-.08em;transform:skew(-7deg)}.boot-logo span{color:#f9d86d}.loading-line{width:180px;height:3px;background:#345a5e;overflow:hidden}.loading-line i{display:block;width:50%;height:100%;background:#b5f3c0;animation:load 1.1s infinite alternate}@keyframes load{from{transform:translateX(-100%)}to{transform:translateX(200%)}}
+.title-screen{background:linear-gradient(90deg,rgba(4,24,31,.98) 0%,rgba(4,24,31,.93) 33%,rgba(4,24,31,.44) 54%,rgba(4,24,31,.02) 72%)}.brand{position:absolute;top:4%;left:4.5%;right:4.5%;display:flex;align-items:center;gap:12px;letter-spacing:.11em}.brand-mark{font:900 23px 'Barlow Condensed',sans-serif;color:#062830;background:#bbefbc;border-radius:5px;padding:3px 5px;transform:rotate(-7deg)}.brand-mark span{color:#32705d}.brand b{display:block;font-size:11px}.brand small{display:block;color:#8caeae;font-size:8px;margin-top:4px}.corner-chip{margin-left:auto;font-size:10px;font-weight:800;color:#d3ebd5;border:1px solid #8bb8a0;background:#0c3039aa;padding:10px 15px;border-radius:20px}.live-dot{display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:#b8f4b5;box-shadow:0 0 10px #b8f4b5}.title-copy{position:absolute;top:17%;left:7.5%;width:min(42%,570px)}.eyebrow{font-size:10px;letter-spacing:.18em;font-weight:800;color:#b8edc2;display:flex;align-items:center;gap:10px}.eyebrow .star{font-size:20px;color:#f9d86d}.eyebrow .line{height:1px;width:50px;background:#a3d4ba}h1,h2{font-family:'Barlow Condensed',Impact,sans-serif;text-transform:uppercase;margin:0;letter-spacing:-.02em}h1{font-size:clamp(60px,8.4vw,132px);font-weight:900;line-height:.72;margin:24px 0 22px;transform:skew(-4deg);text-shadow:4px 5px 0 #123a3c}h1 span{font-size:.45em;display:block;line-height:1.15;color:#f9d86d;letter-spacing:.045em}h1 strong{color:#c5f3c5}h1 strong:after{content:'✦';font-size:.2em;color:#f9d86d;vertical-align:top;margin-left:10px}.tagline{font:800 clamp(15px,1.55vw,23px)/1.05 'Barlow Condensed',sans-serif;letter-spacing:.06em;color:#fff}.tagline em{font-style:normal;color:#f9d86d}.description{color:#b9ceca;font-size:clamp(12px,.95vw,15px);line-height:1.5;max-width:390px;margin:10px 0 18px}.title-menu{max-width:410px}.menu button,.panel-cta{border:1px solid #72938e;background:#15353c;border-radius:4px;min-height:45px;padding:0 16px;font:800 15px 'DM Sans',sans-serif;letter-spacing:.045em;text-align:left;display:flex;align-items:center;gap:10px}.menu button:hover,.panel-cta:hover{background:#24514d}.menu button b,.panel-cta b{margin-left:auto;font-size:17px}.menu button.primary,.panel-cta.primary{background:#c3f1bd;border-color:#c3f1bd;color:#123333}.menu button.primary:hover,.panel-cta.primary:hover{background:#e0ffdb}.title-menu>.primary{width:100%;height:57px}.menu-icon{font-size:13px;background:#173c3b;color:#c3f1bd;border-radius:50%;height:27px;width:27px;display:grid;place-items:center}.title-menu button small{font-size:8px;letter-spacing:.1em;color:#538075}.menu-row{display:flex;gap:8px;margin-top:8px}.menu-row button{flex:1}.text-links{display:flex;align-items:center;gap:15px;margin-top:8px;color:#8eadaa}.text-links button{border:0;background:transparent;min-height:32px;padding:0;font-size:10px;color:#bed5cb;letter-spacing:.11em}.text-links button:hover{color:white;background:transparent}.title-right{position:absolute;right:4.5%;top:18%;bottom:13%;width:38%;pointer-events:none}.issue{position:absolute;top:0;right:0;border:1px solid #b0d2ba;background:#153d3bbd;border-radius:4px;text-align:center;padding:7px 10px;font-size:9px;font-weight:700;letter-spacing:.15em}.issue b{font:900 24px 'Barlow Condensed';color:#f9d86d}.issue span{font-size:8px}.right-caption{position:absolute;bottom:0;right:0;text-align:right;text-shadow:2px 2px 1px #123c36}.right-caption span{font-size:10px;letter-spacing:.15em;color:#f9d86d}.right-caption b{display:block;font:900 27px/.95 'Barlow Condensed';margin:9px 0}.right-caption small{font-size:9px;letter-spacing:.1em}.title-footer{position:absolute;bottom:3%;left:4.5%;right:4.5%;display:flex;justify-content:space-between;border-top:1px solid #8fae9a66;padding-top:12px;color:#a9c9bd;font-size:9px;font-weight:700;letter-spacing:.11em}.title-footer b{color:#f9d86d;margin-right:6px}
+.overlay{display:flex;align-items:center;justify-content:center;background:#061a22c9;backdrop-filter:blur(6px);padding:25px}.panel{position:relative;background:#102c33;border:1px solid #6c9a8e;box-shadow:0 18px 90px #001014aa;border-radius:7px;padding:30px 36px;max-height:94vh;overflow:auto}.wide-panel{width:min(830px,94vw)}.compact-panel{width:min(520px,94vw)}.panel-top{display:flex;justify-content:space-between;align-items:center;font-size:10px;letter-spacing:.18em;color:#a7d8bc;font-weight:800;margin-bottom:13px}.close{background:none;border:1px solid #5d827c;color:#bad5c8;width:31px;height:31px;border-radius:50%;font-size:13px}.panel h2{font-size:clamp(40px,5vw,62px);line-height:.92;color:#f6fae8;font-weight:900;transform:skew(-3deg)}.panel h2 em{font-style:normal;color:#b9efbc}.panel-lead{font-size:15px;color:#b5cac6;margin:13px 0 24px}.guide-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 18px}.guide-item{display:flex;gap:12px;padding:12px;background:#163b40;border:1px solid #315854;border-radius:4px}.guide-icon{flex:none;width:37px;height:37px;display:grid;place-items:center;border-radius:50%;background:#c0efbd;color:#163d37;font-size:18px;font-weight:900}.guide-item b{font-size:13px;letter-spacing:.06em;color:#f8edd2}.guide-item p{font-size:14px;line-height:1.35;color:#aac4bc;margin:5px 0 0}.panel-cta{margin-top:20px;min-width:180px}.panel-foot{border-top:1px solid #41655d;margin-top:20px;padding-top:13px;color:#8caaa1;font-size:9px;letter-spacing:.14em;font-weight:800}.panel-foot span{float:right}.stack-menu{display:grid;gap:9px}.stack-menu button{min-height:52px}.fine{font-size:12px;line-height:1.5;color:#9eb8ae}.settings-list{display:grid;gap:5px}.settings-list button{min-height:42px}.settings-list button span{flex:1}.settings-list button b{color:#f9d86d;margin:0}.settings-list button small{width:35px;text-align:right;color:#9cbdb0}.settings-list .primary b{color:#163831;margin-left:auto}.about-content{font-size:14px;line-height:1.55;color:#c2d5ca;min-height:215px}.about-content p{margin:7px 0}.about-content strong{color:#f3f4df}.about-controls{display:flex;gap:8px;margin-top:16px}.about-controls button{flex:1;justify-content:center}.code-display,.room-code{background:#0a242c;border:1px solid #496e65;border-radius:5px;text-align:center;font:900 40px 'Barlow Condensed';letter-spacing:.28em;color:#f9d86d;padding:9px 0;margin:0 0 15px}.keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.keypad button{justify-content:center;font-size:20px;min-height:40px}.keypad .keypad-go{background:#c3f1bd;color:#123333}.status{font-size:12px;color:#f9d86d;min-height:18px;margin-top:10px}.roster{display:flex;gap:7px;margin-bottom:15px}.roster span{flex:1;text-align:center;background:#1e4143;border:1px solid #456d62;border-radius:4px;padding:10px 3px;color:#a9d6bc;font-size:10px;font-weight:800}.roster span.filled{background:#345b4c;color:#e4f5da}.end-panel{text-align:center}.end-panel .panel-top{justify-content:center}.end-star{font-size:60px;color:#f9d86d}.end-score{margin:20px 0;background:#163b40;padding:12px}.end-score span{display:block;color:#9ab9aa;font-size:10px;letter-spacing:.14em}.end-score b{font:900 34px 'Barlow Condensed';color:#f9d86d}.end-panel .stack-menu button{text-align:left}
+.hud{pointer-events:none}.hud-top{position:absolute;top:4%;left:4%;right:4%;display:flex;justify-content:space-between;align-items:flex-start}.hero-card{display:flex;gap:10px;background:#0a2830db;border:1px solid #6e9c88;border-radius:5px;padding:8px;min-width:240px;box-shadow:3px 3px 0 #05191e80}.portrait{width:47px;height:47px;display:grid;place-items:center;background:#b8edb8;color:#174235;font-size:28px;border:3px solid #d5f9c8}.hero-info{flex:1}.hero-name{display:flex;justify-content:space-between;font-size:12px;letter-spacing:.1em;margin:1px 0 5px}.hero-name span{color:#f8d274}.health-track,.power-track,.boss-track{height:9px;background:#35564b;border-radius:2px;overflow:hidden}.health-track i,.power-track i,.boss-track i{height:100%;display:block;width:100%;background:#bbf4b6;transition:width .16s}.special-row{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:8px;font-weight:800;color:#a8bfb4}.power-track{height:5px;flex:1}.power-track i{background:#f8d578;width:40%}.special-row b{font-size:9px;color:#f8d578}.hud-center{text-align:center;background:#10353bd9;border:1px solid #6e9985;border-radius:4px;padding:8px 15px;color:#e5f4d9;font:900 14px 'Barlow Condensed';letter-spacing:.1em}.stage-sub{color:#f9d86d;font:800 9px 'DM Sans';letter-spacing:.12em;margin-top:4px}.score-card{text-align:right;text-shadow:2px 2px #173333}.score-card small{display:block;font-size:9px;font-weight:800;letter-spacing:.14em;color:#c5e1c7}.score-card b{display:block;font:900 29px/.9 'Barlow Condensed';letter-spacing:.04em;color:#fff}.score-card span{display:block;color:#f9d86d;font:900 14px 'Barlow Condensed';margin-top:4px}.hud-bottom{position:absolute;bottom:4%;left:4%;right:4%;display:flex;justify-content:space-between;align-items:end}.control-strip{display:flex;gap:6px;flex-wrap:wrap}.control-strip span,.pause-hint{background:#0a2830d9;border:1px solid #5b8276;padding:7px 9px;border-radius:3px;color:#bdd4c4;font-size:11px;font-weight:800;letter-spacing:.06em}.control-strip b{color:#f8d578;font-size:12px}.pause-hint b{color:#f8d578}.boss-hud{position:absolute;left:30%;right:30%;bottom:11%;background:#1e3033d9;padding:8px 10px;border:1px solid #d48a75;border-radius:4px}.boss-hud div:first-child{display:flex;justify-content:space-between;font:800 10px 'DM Sans';letter-spacing:.07em}.boss-hud span{color:#efa185;font-size:8px}.boss-track{height:7px;margin-top:6px}.boss-track i{background:#f17b68}.banner{position:absolute;left:50%;top:19%;transform:translateX(-50%) skew(-5deg);text-align:center;white-space:nowrap;text-shadow:3px 4px #153d39}.banner small{display:block;font-size:12px;font-weight:800;letter-spacing:.23em;color:#fff}.banner strong{display:block;font:900 clamp(44px,6vw,85px)/.9 'Barlow Condensed';color:#f7d573}.go-arrow{position:absolute;right:8%;top:43%;color:#f9d86d;font:900 48px 'Barlow Condensed';text-shadow:3px 3px #783e31;animation:pulse .5s infinite alternate}.go-arrow span{display:block;font-size:45px}@keyframes pulse{to{transform:translateX(12px)}}.attract-tag{position:absolute;top:15%;left:50%;transform:translateX(-50%);background:#10353bea;border:1px solid #a3d3aa;padding:10px 15px;border-radius:3px;font-size:10px;font-weight:800;letter-spacing:.13em}.attract-tag small{color:#f9d86d;margin-left:15px}
+@media(max-height:760px){.title-copy{top:15%}h1{font-size:clamp(56px,7vw,104px);margin:14px 0}.description{margin:8px 0}.title-menu>.primary{height:48px}.panel{padding:22px 28px}.guide-item{padding:8px}.guide-item p{font-size:13px}.panel-foot{margin-top:12px}.brand{top:3%}}@media(max-width:760px){.title-screen{background:linear-gradient(90deg,#061c23ef,#061c23bd 70%,#061c2355)}.title-copy{left:6%;width:75%;top:18%}.title-right{display:none}.corner-chip{display:none}.title-footer span:last-child{display:none}.hud-center{display:none}.hero-card{min-width:190px}.control-strip span{font-size:8px;padding:5px}.boss-hud{left:15%;right:15%}.guide-grid{grid-template-columns:1fr}.panel{overflow-y:auto}.about-content{min-height:0}}
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Time Warp Shell Squad game view"></canvas>
+<div class="vignette"></div>
+<div id="boot" class="boot"><div class="boot-logo">TW<span>SS</span></div><div class="loading-line"><i></i></div><p id="boot-text">WARMING UP THE TIME MACHINE</p></div>
+<div id="ui">
+  <div id="title" class="screen title-screen hidden">
+    <header class="brand"><div class="brand-mark">T<span>W</span></div><div><b>SHELL SQUAD</b><small>ARCADE DIVISION · EST. TOMORROW</small></div><div class="corner-chip"><span class="live-dot"></span> SELECT YOUR ADVENTURE</div></header>
+    <div class="title-copy">
+      <div class="eyebrow"><span class="star">✦</span> A TIME-TOSSIN’ ARCADE BRAWL <span class="line"></span></div>
+      <h1><span>TIME WARP</span><strong>SHELL<br>SQUAD</strong></h1>
+      <p class="tagline">THE CLOCK IS BUSTED.<br><em>SO ARE THE BAD GUYS.</em></p>
+      <p class="description">Punch through the past, save tomorrow, and look good doing it. One to four heroes. A whole lotta trouble.</p>
+      <div class="title-menu menu" id="title-menu">
+        <button data-action="play" class="primary"><span class="menu-icon">▶</span><span>PLAY THE DEMO</span><small>SOLO ADVENTURE</small><b>↗</b></button>
+        <div class="menu-row"><button data-action="online"><span>ONLINE CO-OP</span><b>↗</b></button><button data-action="how"><span>HOW TO PLAY</span><b>↗</b></button></div>
+        <div class="text-links"><button data-action="settings">SETTINGS</button><span>·</span><button data-action="about">ABOUT / CREDITS</button></div>
+      </div>
+    </div>
+    <div class="title-right"><div class="issue">ISSUE <b>01</b><br><span>THE RIFT JOB</span></div><div class="right-caption"><span>01 / 03</span><b>PAST. FUTURE.<br>YOUR FISTS.</b><small>AN ORIGINAL ARCADE ADVENTURE</small></div></div>
+    <footer class="title-footer"><span><b>✦</b> GRAB A PAD. SAVE THE TIMELINE.</span><span>© THE SHELL SQUAD · PRESS ANY BUTTON TO WAKE AUDIO</span></footer>
+  </div>
+  <div id="hud" class="hud hidden">
+    <div class="hud-top"><div class="hero-card"><div class="portrait">✦</div><div class="hero-info"><div class="hero-name"><b id="player-name">SHELL 01</b><span id="lives">♥ ♥ ♥</span></div><div class="health-track"><i id="health-bar"></i></div><div class="special-row"><span>RIFT POWER</span><div class="power-track"><i id="power-bar"></i></div><b id="power-label">R1</b></div></div></div><div class="hud-center"><span id="stage-label">01 · NEON DOCKS</span><div class="stage-sub" id="objective">CLEAR THE BLOCK</div></div><div class="score-card"><small>TEAM SCORE</small><b id="score">000000</b><span id="combo"></span></div></div>
+    <div class="hud-bottom"><div class="control-strip"><span><b>□</b> COMBO</span><span><b>△</b> HEAVY</span><span><b>×</b> JUMP</span><span><b>○</b> DODGE</span><span><b>L1</b> GRAB</span><span><b>R1</b> SPECIAL</span></div><div class="pause-hint">OPTIONS <b>Ⅱ</b></div></div>
+    <div id="boss-hud" class="boss-hud hidden"><div><b id="boss-name">THE CLOCKWORK KING</b><span>TIME’S UP, PAL.</span></div><div class="boss-track"><i id="boss-bar"></i></div></div>
+    <div id="banner" class="banner hidden"><small id="banner-small"></small><strong id="banner-big"></strong></div>
+    <div id="go-arrow" class="go-arrow hidden">GO <span>➜</span></div>
+    <div id="attract-tag" class="attract-tag hidden"><span class="live-dot"></span> ATTRACT MODE <small>PRESS ANY BUTTON TO PLAY</small></div>
+  </div>
+  <div id="how" class="screen overlay hidden"><div class="panel wide-panel"><div class="panel-top"><span>FIELD GUIDE / 01</span><button data-action="back" class="close">✕</button></div><h2>LET’S <em>RUMBLE.</em></h2><p class="panel-lead">The timeline won’t fix itself. Here’s the short version.</p><div class="guide-grid"><div class="guide-item"><div class="guide-icon">◉</div><div><b>MOVE &amp; LINE UP</b><p>Left stick / WASD moves through the street. Line up with enemies before swinging.</p></div></div><div class="guide-item"><div class="guide-icon">□</div><div><b>CHAIN A COMBO</b><p>Square / J punches. Hit again to chain three strikes. Triangle / U lands a heavy launcher.</p></div></div><div class="guide-item"><div class="guide-icon">×</div><div><b>JUMP &amp; DODGE</b><p>Cross / K jumps. Circle / L dodges through danger; you’re briefly invincible.</p></div></div><div class="guide-item"><div class="guide-icon">L1</div><div><b>GRAB &amp; TOSS</b><p>L1 / O grabs a nearby foe and throws them into the crowd. Big fun, bigger damage.</p></div></div><div class="guide-item"><div class="guide-icon">R1</div><div><b>RIFT SPECIAL</b><p>Build power by landing hits. R1 / I unleashes a screen-shaking blast when full.</p></div></div><div class="guide-item"><div class="guide-icon">✚</div><div><b>STAY IN THE FIGHT</b><p>Smash crates for healing snacks. Clear each wave, then follow the GO arrow.</p></div></div></div><button data-action="play" class="primary panel-cta">LET’S GO <b>↗</b></button><div class="panel-foot">CROSS / ENTER SELECT <span>CIRCLE / ESC BACK</span></div></div></div>
+  <div id="online" class="screen overlay hidden"><div class="panel compact-panel"><div class="panel-top"><span>THE SQUAD / ONLINE</span><button data-action="back" class="close">✕</button></div><h2>BETTER <em>TOGETHER.</em></h2><p class="panel-lead">Bring up to three friends into your timeline.</p><div class="stack-menu menu"><button data-action="host" class="primary">CREATE A ROOM <b>↗</b></button><button data-action="join">JOIN WITH A CODE <b>↗</b></button><button data-action="back">BACK <b>←</b></button></div><p class="fine">Online play needs an internet connection. Room codes use a public WebRTC signaling service.</p><div class="panel-foot">CROSS / ENTER SELECT <span>CIRCLE / ESC BACK</span></div></div></div>
+  <div id="join" class="screen overlay hidden"><div class="panel compact-panel"><div class="panel-top"><span>THE SQUAD / JOIN ROOM</span><button data-action="back-online" class="close">✕</button></div><h2>ENTER THE <em>CODE.</em></h2><p class="panel-lead">Use the pad or type the four digits.</p><div id="code-display" class="code-display">– – – –</div><div class="keypad menu"><button data-digit="1">1</button><button data-digit="2">2</button><button data-digit="3">3</button><button data-digit="4">4</button><button data-digit="5">5</button><button data-digit="6">6</button><button data-digit="7">7</button><button data-digit="8">8</button><button data-digit="9">9</button><button data-action="erase">⌫</button><button data-digit="0">0</button><button data-action="connect" class="keypad-go">GO ↗</button></div><div id="join-status" class="status"></div><div class="panel-foot">CROSS / ENTER SELECT <span>CIRCLE / ESC BACK</span></div></div></div>
+  <div id="lobby" class="screen overlay hidden"><div class="panel compact-panel"><div class="panel-top"><span>THE SQUAD / ROOM</span><button data-action="leave" class="close">✕</button></div><h2>ROUND UP <em>THE CREW.</em></h2><p class="panel-lead" id="lobby-lead">Share this code with your squad.</p><div class="room-code" id="room-code">– – – –</div><div class="roster" id="roster"></div><div class="stack-menu menu"><button data-action="start-room" class="primary" id="start-room">START ADVENTURE <b>↗</b></button><button data-action="leave">LEAVE ROOM <b>←</b></button></div><div id="lobby-status" class="status">Opening the rift…</div><div class="panel-foot">CROSS / ENTER SELECT <span>CIRCLE / ESC BACK</span></div></div></div>
+  <div id="about" class="screen overlay hidden"><div class="panel wide-panel about-panel"><div class="panel-top"><span id="about-kicker">THE FINE PRINT / 01</span><button data-action="back" class="close">✕</button></div><h2 id="about-heading">ABOUT <em>THE GAME.</em></h2><div id="about-content" class="about-content"></div><div class="about-controls menu"><button data-action="about-prev">← PREVIOUS</button><button data-action="about-next" class="primary">NEXT PAGE →</button><button data-action="back">CLOSE</button></div><div class="panel-foot">LEFT / RIGHT CHANGE PAGE <span>CIRCLE / ESC BACK</span></div></div></div>
+  <div id="settings" class="screen overlay hidden"><div class="panel compact-panel"><div class="panel-top"><span>YOUR SETUP</span><button data-action="settings-close" class="close">✕</button></div><h2>MAKE IT <em>YOURS.</em></h2><p class="panel-lead">Change these anytime. Your squad keeps moving online.</p><div class="settings-list menu"><button data-setting="music"><span>MUSIC VOLUME</span><b id="setting-music">70%</b><small>← →</small></button><button data-setting="sfx"><span>SFX VOLUME</span><b id="setting-sfx">80%</b><small>← →</small></button><button data-setting="invertX"><span>INVERT PAD HORIZONTAL</span><b id="setting-invertX">OFF</b><small>← →</small></button><button data-setting="invertY"><span>INVERT PAD VERTICAL</span><b id="setting-invertY">OFF</b><small>← →</small></button><button data-setting="shake"><span>SCREEN SHAKE</span><b id="setting-shake">ON</b><small>← →</small></button><button data-action="fullscreen"><span>FULLSCREEN</span><b>TOGGLE</b><small>↗</small></button><button data-action="settings-close" class="primary">DONE <b>✓</b></button></div><div class="panel-foot">LEFT / RIGHT ADJUST <span>CIRCLE / ESC CLOSE</span></div></div></div>
+  <div id="over" class="screen overlay hidden"><div class="panel compact-panel end-panel"><div class="panel-top"><span>END OF ISSUE / 01</span></div><div class="end-star">✦</div><h2 id="over-heading">TIMELINE <em>SAVED!</em></h2><p id="over-copy" class="panel-lead">The future owes you a slice. Nice work, squad.</p><div class="end-score"><span>TEAM SCORE</span><b id="end-score">000000</b></div><div class="stack-menu menu" id="end-menu"><button data-action="play" class="primary">PLAY AGAIN <b>↗</b></button><button data-action="title">TITLE SCREEN <b>←</b></button></div></div></div>
+  <div id="unsupported" class="screen overlay hidden"><div class="panel compact-panel"><div class="panel-top"><span>THE TIME MACHINE NEEDS A HAND</span></div><h2>WEBGPU <em>REQUIRED.</em></h2><p class="panel-lead" id="unsupported-message">This game needs a browser with WebGPU enabled.</p><p class="fine">Try a current WebGPU-capable browser on a supported device. The game also needs an internet connection to load its libraries.</p><button data-action="settings" class="primary panel-cta">SETTINGS <b>↗</b></button></div></div>
+  <div id="touch-only" class="screen overlay hidden"><div class="panel compact-panel"><div class="panel-top"><span>ONE MORE THING</span></div><h2>BRING A <em>CONTROLLER.</em></h2><p class="panel-lead">Controller or keyboard required</p><p class="fine">Connect a controller or press a key to enter the arcade.</p><button data-action="settings" class="primary panel-cta">SETTINGS <b>↗</b></button></div></div>
+</div>
+<script type="module">/* Time Warp Shell Squad — game code, original work. */
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const mix = (a,b,t) => a+(b-a)*t;
+const rnd = (a,b) => a + Math.random()*(b-a);
+const screens = ['title','how','online','join','lobby','about','over','unsupported'];
+const DEFAULT_SETTINGS = { music: 70, sfx: 80, invertX: false, invertY: false, shake: true };
+let settings = {...DEFAULT_SETTINGS};
+try { Object.assign(settings, JSON.parse(localStorage.getItem('twss-settings') || '{}')); } catch (_) {}
+const S = {screen:'boot', menu:false, menuIndex:0, previousScreen:'title', running:false, attract:false, worldTime:0, input:{x:0,y:0,fire:false}, lastInput:performance.now(), stage:0, wave:0, score:0, combo:0, comboTime:0, gate:false, ended:false, ready:false, bannerTime:0, shake:0, isTouch:matchMedia('(pointer: coarse)').matches && !matchMedia('(any-pointer: fine)').matches, hardwareSeen:false, net:null, roomCode:'', aboutPage:0, joinCode:'', players:[], enemies:[], pickups:[], props:[], projectiles:[], particles:[], actorSeq:0, netClock:0, snapshotAt:-Infinity, showBoss:false, finishSent:false};
+let THREE, RAPIER, renderer, scene, camera, world, clock, sky, light, titleActors=[], stageGroups=[], floorMesh;
+let audioCtx=null, masterGain=null, musicGain=null, sfxGain=null, musicStep=0, musicNext=0;
+let lastFrame=performance.now();
+const held=new Set(), pressed=new Set();
+let previousPad=[], previousPadDir='';
+const ENEMIES={grunt:{hp:3.3,speed:2.2,damage:10,score:100},ranger:{hp:3.3,speed:1.7,damage:9,score:150},brute:{hp:7.8,speed:1.45,damage:19,score:250},boss:{hp:42,speed:1.35,damage:22,score:2500}};
+const STAGES=[
+  {style:'city',name:'NEON DOCKS',era:'199X',sky:0x72c7bd,fog:0x8dcab6,ground:0x5d9b8e,accent:0xffcf70,waves:[['grunt','grunt','ranger'],['grunt','brute','ranger','grunt']]},
+  {style:'wild',name:'JURASSIC JOYRIDE',era:'65 MILLION BC',sky:0xe5b784,fog:0xeac29a,ground:0x8eaa74,accent:0xffe1a3,waves:[['grunt','ranger','brute'],['brute','grunt','ranger','grunt']]},
+  {style:'clock',name:'CLOCKWORK CITADEL',era:'TOMORROW',sky:0x9b91c0,fog:0xb7a5ce,ground:0x776e9c,accent:0xf7b26c,waves:[['ranger','brute','grunt','ranger'],['boss','grunt','ranger']]}
+];
+const PLAYER_COLORS=[0x60c67d,0x5ebbd1,0xe59c5c,0xb68ee3];
+const BAND_COLORS=[0xe77461,0x55aad2,0xe9be61,0xc59ae0];
+const ABOUT_PAGES=[
+ {heading:'ABOUT <em>THE GAME.</em>',text:`<p><strong>Time Warp Shell Squad</strong> is an original arcade brawler inspired by the time-hopping energy of <strong>Turtles in Time</strong>. Rescue three eras from a clockwork invasion.</p><p><strong>Made for:</strong> 1–4 players, keyboard or standard gamepad. Online rooms use WebRTC; AI Hub sessions use its co-op session transport.</p><p><strong>Controls:</strong> stick / WASD move; Cross / K jump; Square / J attack; Triangle / U heavy; Circle / L dodge; L1 / O grab; R1 / I special; Options / Esc settings.</p><p>Original procedural art, music, sound effects and gibberish voice. No third-party game assets are used.</p>`},
+ {heading:'SOURCE <em>INFORMATION.</em>',text:`<p><strong>Date:</strong> 2026-10-29 09:08 · <strong>Source:</strong> Turtles in Time</p><p><strong>Tech:</strong> Three.js r180 WebGPU renderer; Rapier 0.19.3; Web Audio API; Gamepad API; PeerJS 1.5.5 / WebRTC; AI Hub Session Protocol v1 client 1.3.0.</p><p><strong>Art:</strong> original cel-shaded, low-poly procedural 3D. <strong>Animation:</strong> procedural joint posing and physics-driven movement.</p><p><strong>Audio:</strong> code-synthesized music, effects and gibberish voice. <strong>Online:</strong> AI Hub co-op and standalone PeerJS rooms, 1–4 players.</p><p><strong>Testing:</strong> lightweight browser and hub checks; see testing feedback. <strong>Environment:</strong> Codex CLI (headless); Linux; browser unknown. <strong>Model:</strong> OpenAI gpt-6.1-terra, reasoning effort max. <strong>Usage:</strong> API cost and token count unknown; session approximately 20 minutes.</p>`},
+ {heading:'TESTING &amp; <em>ENGINE.</em>',text:`<p><strong>Testing feedback:</strong> six issues found during testing and review, including three game-breaking issues. Most helpful: the four-player AI Hub network harness. Least helpful: syntax checks alone, which cannot assess gameplay or visuals.</p><p><strong>Engine — most liked:</strong> WebGPU’s modern rendering pipeline and Three.js’s approachable scene graph. <strong>Got stuck or guessed wrong:</strong> WebGPU initialization and browser availability required verification.</p><p><strong>Built ourselves:</strong> the brawler combat, encounter director, procedural characters, animation, audio and network synchronization. <strong>Hardest part:</strong> keeping a shared physics-driven world responsive across peers.</p><p><strong>Overhaul:</strong> clearer diagnostics when WebGPU initialization fails. <strong>One change:</strong> make WebGPU-only behavior an explicit renderer option.</p>`},
+ {heading:'PROMPT <em>FEEDBACK.</em>',text:`<p><strong>Most liked:</strong> the clear creative direction and controller-first arcade focus.</p><p><strong>Confusing:</strong> the desired amount of content in a “complete vertical slice” was open to interpretation.</p><p><strong>Hardest:</strong> combining a polished brawler, accessible controller menus and two co-op transports in a single HTML file.</p><p><strong>One test to run:</strong> an extended four-player session across real devices and networks, including gamepad play and reconnects.</p>`}
+];
+function updateSettings(){for(const k of ['music','sfx','invertX','invertY','shake']) $("setting-"+k).textContent=typeof settings[k]==='boolean'?(settings[k]?'ON':'OFF'):settings[k]+'%'; if(musicGain)musicGain.gain.value=settings.music/100*.21;if(sfxGain)sfxGain.gain.value=settings.sfx/100*.32; try{localStorage.setItem('twss-settings',JSON.stringify(settings))}catch(_){} }
+function settingChange(k,dir=1){if(typeof settings[k]==='boolean') settings[k]=!settings[k]; else settings[k]=clamp(settings[k]+dir*10,0,100);updateSettings();sfx('ui');}
+function showScreen(id){S.screen=id;for(const s of screens) $(s).classList.toggle('hidden',s!==id);$('hud').classList.toggle('hidden',id!=='play');S.menuIndex=0;refreshSelection();}
+function activeButtons(){let root=S.menu?$('settings'):$(S.screen); if(!root)return [];return [...root.querySelectorAll('.menu button,.panel-cta')].filter(b=>!b.disabled&&b.offsetParent!==null);}
+function refreshSelection(){document.querySelectorAll('button.selected').forEach(b=>b.classList.remove('selected'));let bs=activeButtons();if(bs.length){S.menuIndex=(S.menuIndex+bs.length)%bs.length;bs[S.menuIndex].classList.add('selected');}}
+function moveMenu(delta){const bs=activeButtons();if(!bs.length)return;S.menuIndex=(S.menuIndex+delta+bs.length)%bs.length;refreshSelection();sfx('ui');}
+function activateSelected(){const bs=activeButtons();if(bs[S.menuIndex])bs[S.menuIndex].click();}
+function openSettings(){if(S.menu){closeSettings();return;}S.menu=true;S.menuIndex=0;$('settings').classList.remove('hidden');$('touch-only').classList.add('hidden');updateSettings();refreshSelection();}
+function closeSettings(){S.menu=false;$('settings').classList.add('hidden');S.menuIndex=0;if(S.isTouch&&!S.hardwareSeen)$('touch-only').classList.remove('hidden');refreshSelection();}
+function showAbout(){let p=ABOUT_PAGES[S.aboutPage];$('about-kicker').textContent='THE FINE PRINT / '+String(S.aboutPage+1).padStart(2,'0');$('about-heading').innerHTML=p.heading;$('about-content').innerHTML=p.text;}
+function setJoinCode(){ $('code-display').textContent=(S.joinCode.padEnd(4,'–').split('').join(' ')); }
+function setBanner(small,big,time=2.5){$('banner-small').textContent=small;$('banner-big').textContent=big;S.bannerTime=time;$('banner').classList.remove('hidden');}
+function openTitle(){disconnectNetwork();S.running=false;S.attract=false;S.ended=false;S.lastInput=performance.now();$('attract-tag').classList.add('hidden');$('boss-hud').classList.add('hidden');showScreen('title');makeTitleScene();}
+function firstInput(){S.lastInput=performance.now();S.hardwareSeen=true;$('touch-only').classList.add('hidden');startAudio();if(S.attract){openTitle();return true;}if(AIHub.active&&!AIHub.splash&&!S.ready){AIHub.ready();S.ready=true;}return false;}
+function back(){if(S.menu)return closeSettings();if(S.screen==='title')return;if(S.screen==='online')return showScreen('title');if(S.screen==='join')return showScreen('online');if(S.screen==='lobby')return disconnectNetwork(),showScreen('online');if(S.screen==='about'||S.screen==='how')return showScreen('title');if(S.screen==='over'&&!AIHub.active)return openTitle();if(S.screen==='play')return openSettings();}
+function handleAction(action){
+ sfx('ui');switch(action){
+ case 'play': if(S.net&&S.net.kind==='peer')disconnectNetwork();startRun(false);break;
+ case 'online':showScreen('online');break;
+ case 'how':showScreen('how');break;
+ case 'about':S.aboutPage=0;showAbout();showScreen('about');break;
+ case 'about-prev':S.aboutPage=(S.aboutPage+ABOUT_PAGES.length-1)%ABOUT_PAGES.length;showAbout();break;
+ case 'about-next':S.aboutPage=(S.aboutPage+1)%ABOUT_PAGES.length;showAbout();break;
+ case 'settings':openSettings();break;
+ case 'settings-close':closeSettings();break;
+ case 'back':back();break;
+ case 'back-online':showScreen('online');break;
+ case 'title':openTitle();break;
+ case 'fullscreen': if(!document.fullscreenElement)document.documentElement.requestFullscreen?.().catch(()=>{});else document.exitFullscreen?.().catch(()=>{});break;
+ case 'host':createRoom();break;
+ case 'join':S.joinCode='';setJoinCode();$('join-status').textContent='';showScreen('join');break;
+ case 'erase':S.joinCode=S.joinCode.slice(0,-1);setJoinCode();break;
+ case 'connect':joinRoom();break;
+ case 'leave':disconnectNetwork();showScreen('online');break;
+ case 'start-room':beginRoom();break;
+ }}
+document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(!(S.isTouch&&!S.hardwareSeen)&&firstInput())return;if(b.dataset.digit!==undefined){if(S.joinCode.length<4)S.joinCode+=b.dataset.digit;setJoinCode();sfx('ui');}else if(b.dataset.setting)settingChange(b.dataset.setting,1);else if(b.dataset.action)handleAction(b.dataset.action);});
+document.addEventListener('keydown',e=>{if(e.repeat)return;if(firstInput()){e.preventDefault();return;}held.add(e.code);pressed.add(e.code);if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code))e.preventDefault();if(e.code==='Escape'){if(S.menu)closeSettings();else if(S.screen==='play')openSettings();else back();return;}
+ if(S.screen==='join'&&!S.menu&&/^(Digit|Numpad)[0-9]$/.test(e.code)){if(S.joinCode.length<4)S.joinCode+=e.code.slice(-1);setJoinCode();return;}
+ if(S.screen==='join'&&!S.menu&&e.code==='Backspace'){S.joinCode=S.joinCode.slice(0,-1);setJoinCode();return;}
+ if(S.screen!=='play'||S.menu){if(e.code==='ArrowDown'||e.code==='KeyS')moveMenu(S.screen==='join'&&!S.menu?3:1);else if(e.code==='ArrowUp'||e.code==='KeyW')moveMenu(S.screen==='join'&&!S.menu?-3:-1);else if(e.code==='ArrowLeft'||e.code==='ArrowRight'){let d=e.code==='ArrowRight'?1:-1;let b=activeButtons()[S.menuIndex];if(b?.dataset.setting)settingChange(b.dataset.setting,d);else if(S.screen==='about'&&!S.menu){S.aboutPage=(S.aboutPage+d+ABOUT_PAGES.length)%ABOUT_PAGES.length;showAbout();}else moveMenu(d);}else if(e.code==='Enter'||e.code==='Space')activateSelected();}
+});
+document.addEventListener('keyup',e=>held.delete(e.code));
+window.addEventListener('blur',()=>{held.clear();pressed.clear();});
+window.addEventListener('gamepadconnected',()=>{S.hardwareSeen=true;$('touch-only').classList.add('hidden');S.lastInput=performance.now();});
+window.addEventListener('pointerdown',()=>{S.lastInput=performance.now();if(S.attract)openTitle();});
+window.addEventListener('pointermove',e=>{if(e.movementX||e.movementY){S.lastInput=performance.now();if(S.attract)openTitle();}});
+function readPad(){let pad=[...(navigator.getGamepads?.()||[])].find(Boolean);let b=Array.from({length:16},(_,i)=>!!pad?.buttons?.[i]?.pressed);const prev=previousPad;const edge=i=>b[i]&&!prev[i];let x=pad?.axes?.[0]||0,y=pad?.axes?.[1]||0;if(Math.abs(x)<.2)x=0;if(Math.abs(y)<.2)y=0;
+ let any=b.some((v,i)=>v&&!previousPad[i])||Math.abs(x)>.35||Math.abs(y)>.35;if(any){if(firstInput()){previousPad=b;return {x:0,y:0,b,edge:()=>false};}}
+ if(edge(9)&&!b[8]){if(S.menu)closeSettings();else if(S.screen==='play')openSettings();}
+ if(S.screen!=='play'||S.menu){const dir=b[12]||y<-.6?'up':b[13]||y>.6?'down':b[14]||x<-.6?'left':b[15]||x>.6?'right':'';if(dir&&dir!==previousPadDir){const d=dir==='down'||dir==='right'?1:-1;const current=activeButtons()[S.menuIndex];if((dir==='left'||dir==='right')&&current?.dataset.setting)settingChange(current.dataset.setting,d);else if((dir==='left'||dir==='right')&&S.screen==='about'&&!S.menu){S.aboutPage=(S.aboutPage+d+ABOUT_PAGES.length)%ABOUT_PAGES.length;showAbout();}else moveMenu(S.screen==='join'&&!S.menu&&(dir==='up'||dir==='down')?d*3:d);}previousPadDir=dir;if(edge(0))activateSelected();if(edge(1))back();}else previousPadDir='';
+ previousPad=b;return {x,y,b,edge};}
+function sampleInput(pad){let x=(held.has('ArrowRight')||held.has('KeyD')?1:0)-(held.has('ArrowLeft')||held.has('KeyA')?1:0);let y=(held.has('ArrowDown')||held.has('KeyS')?1:0)-(held.has('ArrowUp')||held.has('KeyW')?1:0);if(!x){x=pad.x+(pad.b[15]?1:0)-(pad.b[14]?1:0);if(settings.invertX)x=-x;}if(!y){y=pad.y+(pad.b[13]?1:0)-(pad.b[12]?1:0);if(settings.invertY)y=-y;}return {x:clamp(x,-1,1),y:clamp(y,-1,1),fire:held.has('KeyJ')||pad.b[2]||held.has('KeyK')||pad.b[0],attack:pressed.has('KeyJ')||pad.edge(2),jump:pressed.has('KeyK')||pressed.has('Space')||pad.edge(0),heavy:pressed.has('KeyU')||pad.edge(3),dodge:pressed.has('KeyL')||pad.edge(1),grab:pressed.has('KeyO')||pad.edge(4),special:pressed.has('KeyI')||pad.edge(5)};}
+function startAudio(){try{if(!audioCtx){audioCtx=new AudioContext();masterGain=audioCtx.createGain();masterGain.gain.value=.65;masterGain.connect(audioCtx.destination);musicGain=audioCtx.createGain();musicGain.connect(masterGain);sfxGain=audioCtx.createGain();sfxGain.connect(masterGain);updateSettings();musicNext=audioCtx.currentTime+.05;}if(audioCtx.state==='suspended')audioCtx.resume().catch(()=>{});}catch(_){} }
+function tone(freq,duration,type='square',gain=.15,when=0,target=sfxGain,slide=1){if(!audioCtx||!target)return;const t=Math.max(audioCtx.currentTime,when||audioCtx.currentTime),o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type=type;o.frequency.setValueAtTime(Math.max(30,freq),t);o.frequency.exponentialRampToValueAtTime(Math.max(30,freq*slide),t+duration);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.0002,gain),t+.01);g.gain.exponentialRampToValueAtTime(.0001,t+duration);o.connect(g);g.connect(target);o.start(t);o.stop(t+duration+.02);}
+function sfx(type){if(!audioCtx||audioCtx.state!=='running')return;switch(type){case'ui':tone(520,.06,'triangle',.08);break;case'hit':tone(150,.12,'sawtooth',.22,0,sfxGain,.3);tone(560,.07,'square',.08,0,sfxGain,.45);break;case'heavy':tone(110,.22,'sawtooth',.3,0,sfxGain,.3);tone(360,.15,'square',.1,0,sfxGain,.45);break;case'jump':tone(360,.14,'triangle',.13,0,sfxGain,2);break;case'dodge':tone(480,.14,'sine',.1,0,sfxGain,.35);break;case'power':tone(160,.42,'sawtooth',.18,0,sfxGain,4);tone(440,.3,'square',.09,0,sfxGain,1.6);break;case'hurt':tone(180,.2,'square',.13,0,sfxGain,.55);break;case'pick':tone(660,.14,'triangle',.12,0,sfxGain,1.7);break;case'voice':for(let i=0;i<3;i++)tone(230+i*55,.085,'square',.055,audioCtx.currentTime+i*.085,sfxGain,1.28);break;case'win':for(let i=0;i<4;i++)tone([392,494,587,784][i],.17,'square',.09,audioCtx.currentTime+i*.1,musicGain);break;}}
+function musicTick(){if(!audioCtx||audioCtx.state!=='running'||S.ended)return;if(musicNext<audioCtx.currentTime-.2)musicNext=audioCtx.currentTime;const notes=[110,110,165,146.83,130.81,130.81,196,174.61,110,110,165,146.83,130.81,164.81,196,220];while(musicNext<audioCtx.currentTime+.12){let k=musicStep%16;let n=notes[k];if(k%2===0)tone(n,.13,'triangle',.18,musicNext,musicGain,.92);if(k%4===0)tone(70,.10,'sine',.22,musicNext,musicGain,.55);if(k%4===2)tone(185,.035,'square',.05,musicNext,musicGain,.5);if(k%2===1)tone(n*4,.09,'square',.035,musicNext,musicGain,.98);musicStep++;musicNext+=.145;}}
+
+const mats=new Map(), geos=new Map();let dynamicGroup,decorGroup;
+function mat(color,kind='toon',opts={}){let key=kind+':'+color+':'+JSON.stringify(opts);if(mats.has(key))return mats.get(key);let m=kind==='basic'?new THREE.MeshBasicMaterial({color,...opts}):new THREE.MeshToonMaterial({color,gradientMap:toonRamp,...opts});mats.set(key,m);return m;}
+let toonRamp;
+function geo(kind,...args){let key=kind+args.join(',');if(geos.has(key))return geos.get(key);let g;if(kind==='box')g=new THREE.BoxGeometry(...args);else if(kind==='sphere')g=new THREE.SphereGeometry(...args);else if(kind==='cylinder')g=new THREE.CylinderGeometry(...args);else if(kind==='cone')g=new THREE.ConeGeometry(...args);else if(kind==='torus')g=new THREE.TorusGeometry(...args);else if(kind==='ring')g=new THREE.RingGeometry(...args);else if(kind==='circle')g=new THREE.CircleGeometry(...args);else if(kind==='plane')g=new THREE.PlaneGeometry(...args);else if(kind==='icosa')g=new THREE.IcosahedronGeometry(...args);geos.set(key,g);return g;}
+function piece(parent,geometry,color,x=0,y=0,z=0,sx=1,sy=1,sz=1,outline=false,kind='toon'){let m=new THREE.Mesh(geometry,mat(color,kind));m.position.set(x,y,z);m.scale.set(sx,sy,sz);m.castShadow=true;m.receiveShadow=true;parent.add(m);if(outline){let edge=new THREE.Mesh(geometry,mat(0x102d2d,'basic',{side:THREE.BackSide}));edge.scale.setScalar(1.08);m.add(edge);}return m;}
+function cube(p,c,x,y,z,sx,sy,sz,o=false){return piece(p,geo('box',1,1,1),c,x,y,z,sx,sy,sz,o)}
+function ball(p,c,x,y,z,sx,sy,sz,o=false){return piece(p,geo('sphere',1,12,8),c,x,y,z,sx,sy,sz,o)}
+function sign(p,text,x,y,z,w=3,h=1,bg='#153b3a',fg='#d9f1c2'){let c=document.createElement('canvas');c.width=512;c.height=160;let q=c.getContext('2d');q.fillStyle=bg;q.fillRect(0,0,512,160);q.strokeStyle='#c2e7bd';q.lineWidth=8;q.strokeRect(5,5,502,150);q.fillStyle=fg;q.font='900 56px sans-serif';q.textAlign='center';q.textBaseline='middle';q.fillText(text,256,80,470);let t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;let m=new THREE.Mesh(geo('plane',1,1),new THREE.MeshBasicMaterial({map:t,side:THREE.DoubleSide}));m.position.set(x,y,z);m.scale.set(w,h,1);p.add(m);return m;}
+function initGraphics(){
+ const rampData=new Uint8Array([55,55,55,255,130,130,130,255,205,205,205,255,255,255,255,255]);toonRamp=new THREE.DataTexture(rampData,4,1,THREE.RGBAFormat);toonRamp.magFilter=THREE.NearestFilter;toonRamp.minFilter=THREE.NearestFilter;toonRamp.needsUpdate=true;
+ scene=new THREE.Scene();scene.background=new THREE.Color(0x72c7bd);scene.fog=new THREE.Fog(0x8dcab6,25,70);
+ camera=new THREE.OrthographicCamera(-10,10,6,-6,.1,150);camera.position.set(2,8,17);camera.lookAt(2,1,0);
+ const hemi=new THREE.HemisphereLight(0xe1fff1,0x6c6571,2.0);scene.add(hemi);light=new THREE.DirectionalLight(0xffefd2,2.3);light.position.set(-4,12,8);light.castShadow=true;light.shadow.mapSize.set(1024,1024);light.shadow.camera.left=-20;light.shadow.camera.right=20;light.shadow.camera.top=15;light.shadow.camera.bottom=-15;light.shadow.normalBias=.035;scene.add(light);scene.add(light.target);
+ decorGroup=new THREE.Group();dynamicGroup=new THREE.Group();scene.add(decorGroup,dynamicGroup);makeWorld();resize();
+}
+function resize(){if(!camera||!renderer)return;const aspect=innerWidth/innerHeight, height=11.3;camera.left=-height*aspect/2;camera.right=height*aspect/2;camera.top=height/2;camera.bottom=-height/2;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);renderer.setPixelRatio(Math.min(devicePixelRatio||1,2));}
+window.addEventListener('resize',resize);
+function makeWorld(){
+ for(let stage=0;stage<STAGES.length;stage++){
+  let group=new THREE.Group(),base=stage*36,def=STAGES[stage];stageGroups.push(group);decorGroup.add(group);
+  cube(group,def.ground,base+12,-.22,0,40,.38,10);cube(group,def.style==='city'?0x92c4a5:def.style==='wild'?0xc9c18b:0xaaa0bf,base+12,-.005,-3.9,40,.08,.85);cube(group,0x315952,base+12,-.02,3.95,40,.1,.28);
+  for(let n=-1;n<15;n++){let x=base+n*2.7;cube(group,def.style==='city'?0xb3d6b5:def.style==='wild'?0xdec99f:0xd0bfca,x,.005,1.45,1.2,.025,.075);cube(group,0x416c61,x,-.005,-2.55,1.4,.025,.04);}
+  let sun=piece(group,geo('circle',3.25,32),def.accent,base+15,9.8,-17,1,1,1,false,'basic');
+  if(def.style==='city'){
+   for(let i=-1;i<11;i++){let x=base+i*4.2-2,h=3+(i%4+4)%4*1.05;cube(group,i%2?0x448f89:0x377b78,x,h/2,-7,3.9,h,2.2);cube(group,0x2d6f70,x,h+.13,-7,4.05,.25,2.3);for(let j=0;j<2;j++)for(let k=0;k<3;k++)cube(group,(i+j+k)%3===0?0xf5d995:0x9bdbb6,x-1+j*1.7,1+k*1.05,-5.86,.6,.45,.04);}
+   for(let i=0;i<4;i++){let x=base+3+i*10;cube(group,0x32534e,x,2,-4.3,.14,4,.14);let arm=cube(group,0x32534e,x+.45,3.9,-4.3,1,.14,.14);ball(group,0xf9df9f,x+.9,3.65,-4.25,.25,.25,.25);}
+   sign(group,'NEON DOCKS',base+4,5.5,-5.7,3.5,.9);sign(group,'TOMORROW TODAY!',base+24,6,-5.7,4.2,.85,'#d88c67','#fff0c6');
+  }else if(def.style==='wild'){
+   for(let i=-1;i<10;i++){let x=base+i*4.5,h=2+(i%3+3)%3*.8;piece(group,geo('cone',1,1,5),i%2?0x759b74:0x7ca183,x,h/2+1,-8,3,h*2,2);cube(group,0x6c8564,x,1,-6,1.5,2,1.4);}
+   for(let i=0;i<7;i++){let x=base+i*6-2;piece(group,geo('cylinder',.15,.27,1,7),0x7a7053,x,1.5,-4.9,1,3,1);for(let j=0;j<4;j++){let leaf=piece(group,geo('sphere',1,7,5),j%2?0x3d8f69:0x5ca777,x+(j-1.5)*.58,3,-4.9,.9,.23,.43);leaf.rotation.z=(j-1.5)*-.25;}}
+   sign(group,'DINO DETOUR',base+9,4.8,-5.8,3.3,.8,'#8b7854','#ffe6ae');
+  }else{
+   for(let i=-1;i<10;i++){let x=base+i*4.5,h=3+(i%3+3)%3;cube(group,i%2?0x696a92:0x5b6889,x,h/2,-7,3.2,h,2);piece(group,geo('cone',1,1,5),0xd5a47e,x,h+.65,-7,2,1.5,1.4);for(let k=0;k<3;k++)cube(group,0xffdfad,x,1+k*.85,-5.96,.45,.5,.05);}
+   for(let i=0;i<4;i++){let x=base+i*9+2;let ring=piece(group,geo('torus',1.2,.14,7,20),0xf8ce8b,x,4.3,-5.7,1,1,1);cube(group,0xf8ce8b,x,4.3,-5.55,.12,1.7,.12);let hand=cube(group,0xf8ce8b,x+.38,4.5,-5.52,.9,.12,.12);hand.rotation.z=.5;}
+   sign(group,'THE LAST MINUTE',base+20,6,-5.7,4,.85,'#624e79','#ffdba6');
+  }
+ }
+}
+function updateTheme(index){let d=STAGES[clamp(index,0,STAGES.length-1)];if(!scene)return;scene.background.setHex(d.sky);scene.fog.color.setHex(d.fog);}
+function createHero(colorIndex=0){
+ const root=new THREE.Group(),body=new THREE.Group();root.add(body);const green=PLAYER_COLORS[colorIndex%4],band=BAND_COLORS[colorIndex%4];
+ let shell=ball(body,0x327c56,-.04,1.11,-.22,.67,.79,.42,true);cube(body,0x1c5a45,0,1.15,-.58,.7,.77,.06);
+ ball(body,green,0,1.13,.10,.52,.68,.36,true);ball(body,0xe7c98b,.03,1.1,.42,.36,.48,.12,true);
+ cube(body,0x6d4c36,0,.97,.39,.91,.19,.15,true);cube(body,0xe8c76d,.13,.97,.49,.22,.19,.09,true);
+ let head=ball(body,green,.04,2.05,.07,.61,.53,.49,true);ball(body,green,.24,1.92,.43,.45,.24,.28,true);
+ let mask=cube(body,band,.08,2.13,.48,1.03,.22,.12,true);ball(body,0xfaf7dc,-.08,2.14,.57,.13,.13,.055);ball(body,0xfaf7dc,.31,2.14,.57,.13,.13,.055);ball(body,0x123c34,-.04,2.14,.62,.045,.075,.03);ball(body,0x123c34,.35,2.14,.62,.045,.075,.03);
+ let smile=cube(body,0x24523e,.3,1.83,.684,.20,.035,.04);smile.rotation.z=-.1;
+ let larm=new THREE.Group(),rarm=new THREE.Group();body.add(larm,rarm);larm.position.set(-.48,1.55,0);rarm.position.set(.48,1.55,0);
+ for(const a of [larm,rarm]){ball(a,green,0,-.26,.04,.23,.42,.23,true);cube(a,band,0,-.38,.05,.42,.16,.42);ball(a,green,0,-.58,.07,.25,.22,.25,true);}
+ let lleg=new THREE.Group(),rleg=new THREE.Group();body.add(lleg,rleg);lleg.position.set(-.26,.64,0);rleg.position.set(.26,.64,0);for(const leg of [lleg,rleg]){ball(leg,green,0,-.25,0,.23,.41,.22,true);cube(leg,band,0,-.35,.02,.39,.13,.37);ball(leg,0x377956,.08,-.57,.12,.29,.16,.34,true);}
+ let shadow=piece(root,geo('circle',.72,24),0x163d35,0,.015,0,1,.55,1,false,'basic');shadow.rotation.x=-Math.PI/2;shadow.material=mat(0x173f38,'basic',{transparent:true,opacity:.28,depthWrite:false});
+ root.userData={body,larm,rarm,lleg,rleg,shadow,kind:'hero',band};return root;
+}
+function createFoe(type){
+ const root=new THREE.Group(),body=new THREE.Group();root.add(body);let boss=type==='boss',brute=type==='brute',ranger=type==='ranger',primary=boss?0xc86575:brute?0xa782c3:ranger?0x6f99d4:0x8b86ba,secondary=boss?0x653d5b:0x474861;
+ if(boss)body.scale.setScalar(1.55);else if(brute)body.scale.setScalar(1.16);
+ ball(body,secondary,0,1.1,0,.62,.72,.38,true);cube(body,primary,0,1.2,.24,.94,.91,.42,true);cube(body,0xe0bd7b,0,1.18,.49,.31,.31,.08,true);ball(body,primary,0,2.02,.04,.56,.48,.42,true);cube(body,secondary,0,2.04,.41,.85,.28,.1,true);cube(body,0xfbe893,-.22,2.06,.48,.18,.10,.06);cube(body,0xfbe893,.22,2.06,.48,.18,.10,.06);
+ if(boss){piece(body,geo('torus',.66,.08,6,16),0xf6d482,0,2.28,-.04,1,1,1,true);cube(body,0xf9d176,0,2.65,.01,.18,.53,.18,true);}else if(ranger){piece(body,geo('cone',.3,.5,5),0xeecf86,0,2.57,0,1,1,1,true);}else{cube(body,0xe7c77b,0,2.5,0,.6,.10,.4);}
+ let larm=new THREE.Group(),rarm=new THREE.Group();body.add(larm,rarm);larm.position.set(-.53,1.5,0);rarm.position.set(.53,1.5,0);for(const a of [larm,rarm]){ball(a,primary,0,-.3,0,.23,.43,.24,true);ball(a,secondary,0,-.62,.1,.27,.23,.27,true);}
+ let lleg=new THREE.Group(),rleg=new THREE.Group();body.add(lleg,rleg);lleg.position.set(-.24,.62,0);rleg.position.set(.24,.62,0);for(const l of [lleg,rleg]){cube(l,primary,0,-.27,0,.31,.55,.34,true);ball(l,secondary,.06,-.55,.10,.27,.16,.31,true);}
+ let shadow=piece(root,geo('circle',.7,20),0x223f36,0,.016,0,boss?1.5:1,brute?1.2:1,1,false,'basic');shadow.rotation.x=-Math.PI/2;shadow.material=mat(0x173f38,'basic',{transparent:true,opacity:.25,depthWrite:false});
+ let telegraph=piece(root,geo('ring',.74,.9,24),0xf8d36d,0,.025,0,boss?1.6:1,boss?1.6:1,1,false,'basic');telegraph.rotation.x=-Math.PI/2;telegraph.visible=false;root.userData={body,larm,rarm,lleg,rleg,shadow,telegraph,kind:type};return root;
+}
+function animateActor(a,t){if(!a.mesh)return;const u=a.mesh.userData,speed=Math.abs(a.vx||0)+Math.abs(a.vz||0),walk=Math.sin(t*10+(a.id||0)*2)*Math.min(1,speed/2);u.body.position.y=(a.mesh.position.y>0.16?.08:Math.abs(walk)*.035);u.body.rotation.z=(a.actionTimer>0?(a.action==='dodge'?-.35:a.action==='heavy'?.18:-.12):0);u.lleg.rotation.z=walk*.35;u.rleg.rotation.z=-walk*.35;u.larm.rotation.z=-walk*.28-(a.actionTimer>0?.7:0);u.rarm.rotation.z=walk*.28+(a.actionTimer>0?(a.action==='heavy'?1.7:1.15):0);u.body.scale.x=Math.abs(u.body.scale.x)*(a.facing<0?-1:1);if(u.telegraph){u.telegraph.visible=a.action==='wind'&&a.actionTimer>0;u.telegraph.material=mat(0xf8d36d,'basic',{transparent:true,opacity:.85,depthWrite:false,side:THREE.DoubleSide});}}
+function syncActor(a){let p=a.body?.translation?.()||a.pos;if(!p||!a.mesh)return;a.mesh.position.set(p.x,Math.max(0,p.y-.78),p.z);a.pos={x:p.x,y:p.y,z:p.z};}
+function makeTitleScene(){if(!dynamicGroup)return;for(let i=dynamicGroup.children.length-1;i>=0;i--)dynamicGroup.remove(dynamicGroup.children[i]);titleActors=[];updateTheme(0);let hero=createHero(0),friend=createHero(1),foe=createFoe('brute');hero.position.set(2.0,0,.6);friend.position.set(4.3,0,-1.0);foe.position.set(6.5,0,.1);dynamicGroup.add(hero,friend,foe);titleActors=[hero,friend,foe];camera.position.set(1.4,8.4,17);camera.lookAt(1.4,1,0);}
+function burst(x,y,z,color=0xffd86c,count=9){if(!dynamicGroup)return;for(let i=0;i<count;i++){let mesh=piece(dynamicGroup,geo('icosa',.13,0),color,x,y,z,1,1,1,false,'basic');let p={mesh,vx:rnd(-3,3),vy:rnd(1.5,5),vz:rnd(-2,2),life:rnd(.25,.6),max:.6};S.particles.push(p);}}
+function updateParticles(dt){for(let i=S.particles.length-1;i>=0;i--){let p=S.particles[i];p.life-=dt;p.mesh.position.x+=p.vx*dt;p.mesh.position.y+=p.vy*dt;p.mesh.position.z+=p.vz*dt;p.vy-=12*dt;p.mesh.rotation.x+=dt*6;p.mesh.scale.setScalar(Math.max(.01,p.life/p.max));if(p.life<=0){dynamicGroup.remove(p.mesh);S.particles.splice(i,1);}}}
+
+function resetWorld(){if(world)world.free();world=new RAPIER.World({x:0,y:-18,z:0});const floor=world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(STAGES.length*18,-.38,0));world.createCollider(RAPIER.ColliderDesc.cuboid(Math.max(100,STAGES.length*20),.38,5.1).setFriction(.5),floor);for(let i=dynamicGroup.children.length-1;i>=0;i--)dynamicGroup.remove(dynamicGroup.children[i]);S.players=[];S.enemies=[];S.props=[];S.pickups=[];S.projectiles=[];S.particles=[];S.actorSeq=0;}
+function rigidActor(x,z){let rb=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.78,z).lockRotations().setLinearDamping(.7));world.createCollider(RAPIER.ColliderDesc.capsule(.32,.32).setFriction(0).setRestitution(0),rb);return rb;}
+function makePlayer(id,name,index){let mesh=createHero(index),body=rigidActor(-2-index*.7,(index%2)*.9-.45);dynamicGroup.add(mesh);let p={id,name:name||'SHELL '+String(index+1).padStart(2,'0'),index,mesh,body,pos:{x:-2,y:.78,z:0},hp:100,lives:3,energy:40,facing:1,cooldown:0,invuln:0,actionTimer:0,action:'idle',comboStep:0,stun:0,dead:false,vx:0,vz:0,score:0};syncActor(p);return p;}
+function makeEnemy(type,x,z,id){let mesh=createFoe(type),body=rigidActor(x,z);dynamicGroup.add(mesh);let def=ENEMIES[type];let a={id:id??++S.actorSeq,type,mesh,body,pos:{x,y:.78,z},hp:def.hp,maxhp:def.hp,facing:-1,cooldown:rnd(.5,1.5),wind:0,windTarget:null,stun:0,knock:0,actionTimer:0,action:'idle',attacks:0,vx:0,vz:0,thrown:0,hitOthers:new Set()};syncActor(a);S.enemies.push(a);return a;}
+function removeActor(a,arr){let i=arr.indexOf(a);if(i>=0)arr.splice(i,1);if(a.mesh)dynamicGroup.remove(a.mesh);if(a.body&&world)world.removeRigidBody(a.body);}
+function spawnCrate(x,z,id){let mesh=new THREE.Group();cube(mesh,0xd89d65,0,.45,0,.9,.9,.9,true);cube(mesh,0x8c5f46,0,.45,.47,.88,.12,.05);cube(mesh,0x8c5f46,0,.45,.48,.12,.85,.05);dynamicGroup.add(mesh);let body=world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x,.5,z).lockRotations().setLinearDamping(2));world.createCollider(RAPIER.ColliderDesc.cuboid(.45,.45,.45),body);let p={id:id??++S.actorSeq,mesh,body,hp:2};S.props.push(p);return p;}
+function removeProp(p){removeActor(p,S.props);}
+function spawnPickup(x,z,id){let m=new THREE.Group();let base=piece(m,geo('cylinder',.38,.38,.12,16),0xf2c966,0,0,0,1,1,1,true);cube(m,0xf4dfb0,0,.08,0,.32,.07,.10);cube(m,0xf4dfb0,0,.08,0,.10,.07,.32);dynamicGroup.add(m);let p={id:id??++S.actorSeq,mesh:m,x,z,life:20};m.position.set(x,.35,z);S.pickups.push(p);return p;}
+function clearLoose(){for(let p of [...S.props])removeProp(p);for(let p of S.pickups)dynamicGroup.remove(p.mesh);S.pickups=[];for(let p of S.projectiles)dynamicGroup.remove(p.mesh);S.projectiles=[];}
+function stageCenter(){return S.stage*36+S.wave*12;}
+function spawnWave(){S.gate=false;$('go-arrow').classList.add('hidden');let wave=STAGES[S.stage].waves[S.wave],center=stageCenter();wave.forEach((type,i)=>makeEnemy(type,center+3.3+i*1.05,(i%3-1)*1.25));spawnCrate(center+2,-2.7);spawnCrate(center+7,2.7);setBanner(STAGES[S.stage].era, S.wave===0?STAGES[S.stage].name:'INCOMING!',2.5);sfx('voice');}
+function startRun(attract=false,roster){
+ resetWorld();S.attract=attract;S.running=true;S.ended=false;S.finishSent=false;S.stage=0;S.wave=0;S.score=0;S.combo=0;S.comboTime=0;S.worldTime=0;S.netClock=0;S.snapshotAt=-Infinity;S.gate=false;S.bannerTime=0;
+ const ps=roster||S.net?.players||[{id:0,name:'SHELL 01'}];ps.forEach((p,i)=>S.players.push(makePlayer(p.id,p.name,i)));if(!S.net||S.net.isHost)spawnWave();
+ updateTheme(0);showScreen('play');$('attract-tag').classList.toggle('hidden',!attract);$('boss-hud').classList.add('hidden');if(attract)setBanner('DEMO REEL','SHELLS ON PARADE!',2);else if(!S.net?.isHost&&S.net)setBanner('CO-OP','JOINING THE SQUAD!',2);updateHUD();
+}
+function localPlayer(){if(S.net?.server)return null;return S.players.find(p=>p.id===(S.net?.me??0))||null;}
+function actorDistance(a,b){let pa=a.pos,pb=b.pos;return Math.hypot(pa.x-pb.x,(pa.z-pb.z)*1.35);}
+function actionPlayer(p,action,authoritative=true){if(!p||p.dead||p.cooldown>0)return false;
+ if(action==='jump'){if(p.pos.y>1.05)return false;let v=p.body.linvel();p.body.setLinvel({x:v.x,y:8,z:v.z},true);p.action='jump';p.actionTimer=.25;p.cooldown=.18;sfx('jump');return true;}
+ if(action==='dodge'){p.action='dodge';p.actionTimer=.34;p.invuln=.42;p.cooldown=.48;let v=p.body.linvel();p.body.setLinvel({x:p.facing*7.4,y:v.y,z:v.z},true);sfx('dodge');return true;}
+ if(action==='special'&&p.energy<100)return false;
+ p.action=action;p.actionTimer=action==='heavy'?.38:action==='special'?.5:.24;p.cooldown=action==='heavy'?.55:action==='special'?.7:action==='grab'?.5:.22;
+ if(action==='special'){p.energy=0;p.invuln=1;sfx('power');S.shake=.38;burst(p.pos.x,1.6,p.pos.z,0xaff8c3,22);if(authoritative)for(const e of [...S.enemies])if(actorDistance(p,e)<4.4)hitEnemy(e,p,4.3,5);return true;}
+ if(action==='grab'){let foes=S.enemies.filter(e=>actorDistance(p,e)<1.8&&Math.abs(e.pos.z-p.pos.z)<1.1&&e.type!=='boss').sort((a,b)=>actorDistance(p,a)-actorDistance(p,b));if(authoritative&&foes[0]){let e=foes[0];e.thrown=1.5;e.hitOthers.clear();hitEnemy(e,p,2.4,8);e.body.setLinvel({x:p.facing*10,y:5,z:0},true);setBanner('NICE CATCH','YEET!',.6);}else if(!foes.length){p.cooldown=.25;}sfx('heavy');return true;}
+ let heavy=action==='heavy';p.comboStep=heavy?0:(p.comboStep%3)+1;let reach=heavy?2.3:1.65,damage=heavy?2.4:(p.comboStep===3?1.8:1.1),power=heavy?5:p.comboStep===3?4:2.4;
+ sfx(heavy?'heavy':'hit');if(authoritative){for(let e of [...S.enemies]){let dx=e.pos.x-p.pos.x;if(Math.abs(dx)<reach&&dx*p.facing>-.48&&Math.abs(e.pos.z-p.pos.z)<1.05&&Math.abs(e.pos.y-p.pos.y)<2){hitEnemy(e,p,S.attract?8:damage,power);}}for(let c of [...S.props]){let q=c.body.translation(),dx=q.x-p.pos.x;if(Math.abs(dx)<reach&&dx*p.facing>-.5&&Math.abs(q.z-p.pos.z)<1.1){c.hp-=heavy?2:1;burst(q.x,.9,q.z,0xe3b076,6);if(c.hp<=0){removeProp(c);spawnPickup(q.x,q.z);}}}}
+ return true;
+}
+function hitEnemy(e,p,damage,power){if(!e||!S.enemies.includes(e))return;e.hp-=damage;e.stun=.32;e.knock=.3;e.actionTimer=.2;e.action='hurt';e.facing=e.pos.x<p.pos.x?1:-1;let v=e.body.linvel();e.body.setLinvel({x:p.facing*power,y:Math.max(v.y,power>4?3.2:1.5),z:v.z},true);p.energy=clamp(p.energy+(damage>2?15:10),0,100);S.combo++;S.comboTime=2.2;S.score+=Math.round(20*damage);p.score+=Math.round(20*damage);burst(e.pos.x,1.4+Math.max(0,e.pos.y-.78),e.pos.z,damage>2?0xffce73:0xf8f6c8,8);S.shake=damage>2?.16:.08;if(e.hp<=0){S.score+=ENEMIES[e.type].score;p.score+=ENEMIES[e.type].score;burst(e.pos.x,1.2,e.pos.z,0xd8eab8,15);removeActor(e,S.enemies);}}
+function hurtPlayer(p,damage,fromX){if(!p||p.dead||p.invuln>0||S.attract)return;p.hp-=damage;p.invuln=.9;p.action='hurt';p.actionTimer=.35;p.stun=.25;let direction=p.pos.x>=fromX?1:-1;let v=p.body.linvel();p.body.setLinvel({x:direction*4,y:3,z:v.z},true);S.shake=.2;sfx('hurt');burst(p.pos.x,1.3,p.pos.z,0xf17e76,7);if(p.hp<=0){p.lives--;if(p.lives>0){p.hp=100;p.invuln=2;p.body.setTranslation({x:stageCenter()-1,y:1.2,z:0},true);setBanner('BACK IN THE FIGHT',p.name+' RETURNS!',1.4);}else{p.hp=0;p.dead=true;p.mesh.visible=false;setBanner('OUT OF TIME',p.name+' IS DOWN!',1.2);}}}
+function shoot(e,target,spread=0){let m=ball(dynamicGroup,0xffd476,e.pos.x,1.1,e.pos.z,.2,.2,.2,false);let dx=target.pos.x-e.pos.x,dz=target.pos.z-e.pos.z+spread,d=Math.hypot(dx,dz)||1;S.projectiles.push({mesh:m,x:e.pos.x,z:e.pos.z,vx:dx/d*5,vz:dz/d*5,life:3,damage:ENEMIES[e.type].damage});sfx('dodge');}
+function stepEnemies(dt){for(const e of [...S.enemies]){if(!S.enemies.includes(e))continue;e.cooldown-=dt;e.stun=Math.max(0,e.stun-dt);e.knock=Math.max(0,e.knock-dt);e.actionTimer=Math.max(0,e.actionTimer-dt);e.thrown=Math.max(0,e.thrown-dt);syncActor(e);if(e.thrown>0){for(let other of [...S.enemies])if(other!==e&&!e.hitOthers.has(other.id)&&actorDistance(e,other)<.9){e.hitOthers.add(other.id);let owner=S.players.find(p=>!p.dead);if(owner)hitEnemy(other,owner,2.2,5);}}
+ let targets=S.players.filter(p=>!p.dead);if(!targets.length)continue;let target=targets.reduce((a,b)=>actorDistance(e,a)<actorDistance(e,b)?a:b),dx=target.pos.x-e.pos.x,dz=target.pos.z-e.pos.z,dist=Math.hypot(dx,dz);e.facing=dx<0?-1:1;
+ if(e.wind>0){e.wind-=dt;e.vx=e.vz=0;if(e.wind<=0){e.action='attack';e.actionTimer=.25;if(e.type==='boss'&&e.attacks%2===0){shoot(e,target,-1.5);shoot(e,target);shoot(e,target,1.5);}else if(e.type==='ranger'&&dist>2)shoot(e,target);else for(const p of targets)if(Math.abs(p.pos.x-e.pos.x)<(e.type==='boss'?2.4:1.45)&&Math.abs(p.pos.z-e.pos.z)<1.2)hurtPlayer(p,ENEMIES[e.type].damage,e.pos.x);e.attacks++;e.cooldown=e.type==='boss'?1.5:rnd(1.25,2.2);}}
+ else if(!e.stun&&!e.knock){const desired=e.type==='ranger'?3.4:e.type==='boss'?1.9:1.2;if(e.type==='boss'&&e.cooldown<=0&&dist<5&&e.attacks%2===0){e.vx=e.vz=0;e.wind=.65;e.action='wind';e.actionTimer=e.wind;}else if(dist>desired){e.vx=clamp(dx,-1,1)*ENEMIES[e.type].speed;e.vz=clamp(dz,-1,1)*ENEMIES[e.type].speed*.7;}else{e.vx=e.vz=0;if(e.cooldown<=0){e.wind=e.type==='boss'?.65:.45;e.action='wind';e.actionTimer=e.wind;}}let v=e.body.linvel();e.body.setLinvel({x:e.vx,y:v.y,z:e.vz},true);}
+ animateActor(e,S.worldTime);
+ }}
+function stepProjectiles(dt){for(let i=S.projectiles.length-1;i>=0;i--){let b=S.projectiles[i];b.life-=dt;b.x+=b.vx*dt;b.z+=b.vz*dt;b.mesh.position.set(b.x,1.1,b.z);for(let p of S.players)if(!p.dead&&Math.hypot(p.pos.x-b.x,p.pos.z-b.z)<.65){hurtPlayer(p,b.damage,b.x-b.vx);b.life=0;}if(b.life<=0){dynamicGroup.remove(b.mesh);S.projectiles.splice(i,1);}}}
+function stepPickups(dt){for(let i=S.pickups.length-1;i>=0;i--){let p=S.pickups[i];p.life-=dt;p.mesh.rotation.y+=dt*2;p.mesh.position.y=.35+Math.sin(S.worldTime*5+i)*.10;let taker=S.players.find(a=>!a.dead&&Math.hypot(a.pos.x-p.x,a.pos.z-p.z)<.75);if(taker){taker.hp=clamp(taker.hp+30,0,100);taker.energy=clamp(taker.energy+15,0,100);S.score+=100;sfx('pick');burst(p.x,.4,p.z,0xf9dc83,8);p.life=0;}if(p.life<=0){dynamicGroup.remove(p.mesh);S.pickups.splice(i,1);}}}
+function stepPlayer(p,input,dt,local=true){if(!p||p.dead)return;p.cooldown=Math.max(0,p.cooldown-dt);p.invuln=Math.max(0,p.invuln-dt);p.stun=Math.max(0,p.stun-dt);p.actionTimer=Math.max(0,p.actionTimer-dt);if(p.invuln>0)p.mesh.visible=Math.floor(p.invuln*12)%2===0;else p.mesh.visible=true;
+ if(p.stun<=0&&(p.action!=='dodge'||p.actionTimer<=0)){let v=p.body.linvel(),scale=p.actionTimer>0&&p.action==='heavy'?.45:1;p.vx=input.x*4.4*scale;p.vz=input.y*3.5*scale;if(Math.abs(input.x)>.15)p.facing=input.x>0?1:-1;p.body.setLinvel({x:p.vx,y:v.y,z:p.vz},true);}
+ if(local){for(const a of ['jump','dodge','attack','heavy','grab','special'])if(input[a]){let auth=!S.net||S.net.isHost;if(actionPlayer(p,a,auth)&&!auth)S.net.send({t:'action',a,at:networkTime(),x:round(p.pos.x),y:round(p.pos.y),z:round(p.pos.z),face:p.facing},{to:S.net.host});}}
+}
+function clampBody(a,minX,maxX){let p=a.body.translation(),x=clamp(p.x,minX,maxX),z=clamp(p.z,-3.4,3.4);if(x!==p.x||z!==p.z)a.body.setTranslation({x,y:p.y,z},true);}
+function advanceWave(){if(S.wave<STAGES[S.stage].waves.length-1){S.wave++;clearLoose();spawnWave();}else if(S.stage<STAGES.length-1){S.stage++;S.wave=0;clearLoose();for(const [i,p] of S.players.entries()){p.body.setTranslation({x:stageCenter()-2-i*.5,y:.8,z:(i%2)*1-.5},true);p.invuln=1.5;syncActor(p);}updateTheme(S.stage);spawnWave();}else endRun(true);}
+function stepDirector(){if(!S.gate&&S.enemies.length===0){S.gate=true;sfx('win');if(S.stage===STAGES.length-1&&S.wave===STAGES[S.stage].waves.length-1){endRun(true);return;}setBanner('BLOCK CLEAR','WAY TO GO!',1.6);$('go-arrow').classList.remove('hidden');}
+ if(S.gate&&S.players.some(p=>!p.dead&&p.pos.x>stageCenter()+8))advanceWave();if(S.players.length&&S.players.every(p=>p.dead))endRun(false);}
+function updateHUD(){let p=localPlayer()||S.players[0];if(p){$('player-name').textContent=p.name;$('health-bar').style.width=clamp(p.hp,0,100)+'%';$('power-bar').style.width=clamp(p.energy,0,100)+'%';$('power-label').textContent=p.energy>=100?'READY!':'R1';$('lives').textContent='♥ '.repeat(Math.max(0,p.lives)).trim();} $('score').textContent=String(Math.max(0,Math.round(S.score))).padStart(6,'0');$('combo').textContent=S.combo>1&&S.comboTime>0?S.combo+' HIT COMBO!':'';$('stage-label').textContent=String(S.stage+1).padStart(2,'0')+' · '+STAGES[S.stage].name;$('objective').textContent=S.gate?'FOLLOW THE GO ARROW':'CLEAR THE BLOCK';$('go-arrow').classList.toggle('hidden',!S.gate);let boss=S.enemies.find(e=>e.type==='boss');$('boss-hud').classList.toggle('hidden',!boss);if(boss)$('boss-bar').style.width=clamp(100*boss.hp/boss.maxhp,0,100)+'%';}
+function endRun(won){if(S.ended)return;S.ended=true;S.running=false;S.gate=false;if(S.attract){setTimeout(()=>{if(S.attract)startRun(true)},3500);return;}if(S.net?.isHost){S.net.send({t:'end',won,score:S.score});if(S.net.kind==='hub')hubFinish(won);}showEnd(won);}
+function showEnd(won){$('over-heading').innerHTML=won?'TIMELINE <em>SAVED!</em>':'TIME’S <em>UP!</em>';$('over-copy').textContent=won?'The future owes you a slice. Nice work, squad.':'Even heroes need a rematch. The timeline believes in you.';$('end-score').textContent=String(Math.round(S.score)).padStart(6,'0');$('end-menu').classList.toggle('hidden',AIHub.active);showScreen('over');if(won)sfx('win');}
+function autoInput(p){let result={x:0,y:0,attack:false,heavy:false,jump:false,dodge:false,grab:false,special:false,fire:false};if(!p)return result;if(S.gate){result.x=1;let beat=Math.floor(S.worldTime*2)%7;if(p.cooldown<=0&&beat===1)result.jump=true;else if(p.cooldown<=0&&beat===4)result.dodge=true;return result;}let e=S.enemies.reduce((best,n)=>!best||actorDistance(p,n)<actorDistance(p,best)?n:best,null);if(!e)return result;let dx=e.pos.x-p.pos.x,dz=e.pos.z-p.pos.z;if(Math.abs(dx)>1.05)result.x=Math.sign(dx);if(Math.abs(dz)>.36)result.y=Math.sign(dz);if(p.cooldown<=0&&Math.abs(dx)<1.9&&Math.abs(dz)<1){p.facing=dx>=0?1:-1;result.fire=true;if(p.energy>=100)result.special=true;else {let beat=Math.floor(S.worldTime*2)%6;if(beat===0&&e.type!=='boss')result.grab=true;else if(beat===2)result.heavy=true;else result.attack=true;}}return result;}
+
+function networkTime(){return AIHub.active?AIHub.time():performance.now();}
+function round(n){return Math.round(n*100)/100;}
+function sendSnapshot(){if(!S.net?.isHost||!S.running)return;let packet={t:'state',at:networkTime(),stage:S.stage,wave:S.wave,gate:S.gate?1:0,score:S.score,
+ p:S.players.map(p=>[p.id,round(p.pos.x),round(p.pos.y),round(p.pos.z),round(p.hp),p.lives,round(p.energy),p.facing,p.action,round(p.actionTimer),p.dead?1:0]),
+ e:S.enemies.map(e=>[e.id,e.type,round(e.pos.x),round(e.pos.y),round(e.pos.z),round(e.hp),e.facing,e.action,round(e.actionTimer)]),
+ c:S.props.map(c=>{let p=c.body.translation();return[c.id,round(p.x),round(p.z),c.hp]}),u:S.pickups.map(p=>[p.id,round(p.x),round(p.z)]),f:S.projectiles.map(b=>[round(b.x),round(b.z)])};S.net.send(packet,{reliable:false});}
+function applySnapshot(d){if(!S.running||S.net?.isHost||d.at<=S.snapshotAt)return;S.snapshotAt=d.at;let changed=d.stage!==S.stage;S.stage=clamp(d.stage|0,0,STAGES.length-1);S.wave=clamp(d.wave|0,0,STAGES[S.stage].waves.length-1);S.gate=!!d.gate;S.score=d.score||0;if(changed){updateTheme(S.stage);setBanner(STAGES[S.stage].era,STAGES[S.stage].name,2);}
+ const liveP=new Set();for(const row of d.p||[]){let [id,x,y,z,hp,lives,energy,face,action,at,dead]=row;liveP.add(id);let p=S.players.find(o=>o.id===id);if(!p){let index=S.players.length,info=S.net.players.find(o=>o.id===id);p=makePlayer(id,info?.name,index);S.players.push(p);}p.hp=hp;p.lives=lives;p.energy=energy;p.dead=!!dead;p.mesh.visible=!dead;if(id!==S.net.me||changed){p.body.setTranslation({x,y,z},true);p.facing=face;p.action=action;p.actionTimer=at;syncActor(p);}}
+ for(const p of [...S.players])if(!liveP.has(p.id))removeActor(p,S.players);
+ const liveE=new Set();for(const row of d.e||[]){let [id,type,x,y,z,hp,face,action,at]=row;liveE.add(id);let e=S.enemies.find(o=>o.id===id);if(!e)e=makeEnemy(type,x,z,id);if(hp<e.hp)burst(x,1.3,z,0xf7df9c,5);e.hp=hp;e.facing=face;e.action=action;e.actionTimer=at;e.target={x,y,z};}
+ for(const e of [...S.enemies])if(!liveE.has(e.id)){burst(e.pos.x,1.2,e.pos.z,0xd8eab8,7);removeActor(e,S.enemies);}
+ const liveC=new Set();for(const [id,x,z,hp] of d.c||[]){liveC.add(id);let c=S.props.find(o=>o.id===id);if(!c)c=spawnCrate(x,z,id);c.hp=hp;c.body.setTranslation({x,y:.5,z},true);}for(const c of [...S.props])if(!liveC.has(c.id))removeProp(c);
+ const liveU=new Set();for(const [id,x,z] of d.u||[]){liveU.add(id);if(!S.pickups.some(o=>o.id===id))spawnPickup(x,z,id);}for(const p of [...S.pickups])if(!liveU.has(p.id)){dynamicGroup.remove(p.mesh);S.pickups.splice(S.pickups.indexOf(p),1);}
+ while(S.projectiles.length>(d.f||[]).length){let p=S.projectiles.pop();dynamicGroup.remove(p.mesh);}for(let i=0;i<(d.f||[]).length;i++){let p=S.projectiles[i];if(!p){let m=ball(dynamicGroup,0xffd476,0,1.1,0,.2,.2,.2);p={mesh:m};S.projectiles.push(p);}p.x=d.f[i][0];p.z=d.f[i][1];p.mesh.position.set(p.x,1.1,p.z);}}
+function receiveGame(d,from){if(!d||typeof d.t!=='string'||!S.net)return;if(d.t==='state'&&!S.net.isHost){applySnapshot(d);return;}if(d.t==='input'&&S.net.isHost&&S.running){let p=S.players.find(x=>x.id===from);if(!p||p.dead)return;let y=clamp(Number(d.y)||.78,.5,5),x=clamp(Number(d.x)||0,stageCenter()-7,stageCenter()+14),z=clamp(Number(d.z)||0,-3.4,3.4);p.body.setTranslation({x,y,z},true);p.facing=d.face===-1?-1:1;p.vx=Number(d.vx)||0;p.vz=Number(d.vz)||0;syncActor(p);return;}if(d.t==='action'&&S.net.isHost&&S.running){let p=S.players.find(x=>x.id===from);if(!p||p.dead)return;if(Number.isFinite(d.x)&&Number.isFinite(d.z)){let v=p.body.translation();p.body.setTranslation({x:clamp(d.x,stageCenter()-7,stageCenter()+14),y:clamp(d.y||v.y,.5,5),z:clamp(d.z,-3.4,3.4)},true);p.facing=d.face===-1?-1:1;syncActor(p);}if(['attack','heavy','special','grab','dodge','jump'].includes(d.a))actionPlayer(p,d.a,true);return;}if(d.t==='end'&&!S.net.isHost){S.score=d.score||0;S.ended=true;S.running=false;showEnd(!!d.won);}}
+function networkTick(dt){if(!S.net||!S.running)return;S.netClock+=dt;if(S.netClock<.1)return;S.netClock=0;if(S.net.isHost)sendSnapshot();else{let p=localPlayer();if(p){let q=p.body.translation();S.net.send({t:'input',at:networkTime(),x:round(q.x),y:round(q.y),z:round(q.z),vx:round(p.vx),vz:round(p.vz),face:p.facing},{to:S.net.host,reliable:false});}}}
+function removePlayer(id){let p=S.players.find(o=>o.id===id);if(p)removeActor(p,S.players);if(S.net)S.net.players=S.net.players.filter(p=>p.id!==id);renderRoster();}
+function hubFinish(won){if(!S.net?.isHost||S.finishSent)return;S.finishSent=true;let ids=S.net.players.map(p=>p.id);let scores={};for(const p of S.players)scores[p.id]=Math.round(p.score);AIHub.finish({standings:[ids],scores,won:!!won});}
+async function connectHub(){let info=await AIHub.connect({mode:'co-op',seats:[1,4]});if(!info)return false;S.net={kind:'hub',me:info.me,host:info.host,isHost:info.isHost,server:info.server,players:info.players,send:(d,opt)=>AIHub.send(d,opt)};
+ AIHub.on('message',receiveGame);AIHub.on('leave',({id})=>removePlayer(id));AIHub.on('time-up',()=>{if(S.net?.isHost){hubFinish(false);if(!S.ended){S.ended=true;S.running=false;showEnd(false);}}});AIHub.on('end',()=>{S.ended=true;S.running=false;held.clear();if(masterGain&&audioCtx)masterGain.gain.setTargetAtTime(.0001,audioCtx.currentTime,.1);if(S.screen!=='over')showEnd(false);});AIHub.on('start',()=>{S.bannerTime=0;$('banner').classList.add('hidden');startAudio();});startRun(false,info.players);if(info.splash){AIHub.ready();S.ready=true;}else{setBanner('READY UP','PRESS ANY KEY TO READY',9999);}return true;}
+function peerError(err,where){let msg=err?.type==='unavailable-id'?'That room code is busy. Create another room.':err?.type==='peer-unavailable'?'No room found for that code. Check it and try again.':'Connection failed. Check your internet and try again.';$(where).textContent=msg;}
+async function loadPeer(){let m=await import('https://esm.sh/peerjs@1.5.5');return m.default||m.Peer;}
+function renderRoster(){if(!S.net||S.net.kind!=='peer')return;let roster=$('roster');roster.replaceChildren();for(let i=0;i<4;i++){let span=document.createElement('span'),p=S.net.players.find(v=>v.id===i);span.className=p?'filled':'';span.textContent=p?p.name:'OPEN SLOT';roster.appendChild(span);} $('start-room').classList.toggle('hidden',!S.net.isHost);$('lobby-lead').textContent=S.net.isHost?'Share this code with your squad.':'You’re in! Waiting for the host.';}
+let networkGeneration=0;
+async function createRoom(){if(AIHub.active)return;disconnectNetwork();const generation=networkGeneration;showScreen('lobby');$('room-code').textContent='— — — —';$('lobby-status').textContent='Opening the rift…';$('start-room').disabled=true;try{const Peer=await loadPeer();if(generation!==networkGeneration)return;let code=String(crypto.getRandomValues(new Uint32Array(1))[0]%10000).padStart(4,'0'),peer=new Peer('twss-v1-'+code),connections=new Map();let net={kind:'peer',me:0,host:0,isHost:true,players:[{id:0,name:'SHELL 01'}],peer,connections,send:(d,opt={})=>{if(opt.to!==undefined){let c=connections.get(opt.to);if(c?.open)c.send(d);}else for(let c of connections.values())if(c.open)c.send(d);}};S.net=net;S.roomCode=code;$('room-code').textContent=code.split('').join(' ');renderRoster();peer.on('open',()=>{$('lobby-status').textContent='Room ready. Friends can join now.';$('start-room').disabled=false;refreshSelection();});peer.on('error',e=>{peerError(e,'lobby-status');$('start-room').disabled=true;});peer.on('connection',conn=>{if(S.net!==net)return conn.close();if(S.running||connections.size>=3){conn.on('open',()=>{conn.send({t:'reject',reason:'This room has already started or is full.'});setTimeout(()=>conn.close(),300);});return;}let id=[1,2,3].find(i=>!connections.has(i));connections.set(id,conn);conn.on('open',()=>{net.players.push({id,name:'SHELL 0'+(id+1)});conn.send({t:'welcome',id,players:net.players,code});net.send({t:'roster',players:net.players});renderRoster();});conn.on('data',d=>receiveGame(d,id));conn.on('close',()=>{connections.delete(id);removePlayer(id);net.send({t:'roster',players:net.players});});});}catch(e){console.error(e);$('lobby-status').textContent='Could not load the online service.';}}
+async function joinRoom(){if(AIHub.active||S.joining)return;if(S.joinCode.length!==4){$('join-status').textContent='Enter all four digits first.';return;}let code=S.joinCode;disconnectNetwork();const generation=networkGeneration;S.joining=true;$('join-status').textContent='Finding your squad…';try{const Peer=await loadPeer();if(generation!==networkGeneration)return;const peer=new Peer(),net={kind:'peer',me:-1,host:0,isHost:false,players:[],peer,conn:null,send:(d)=>{if(net.conn?.open)net.conn.send(d);}};S.net=net;let timeout=setTimeout(()=>{if(S.net===net&&net.me<0){S.joining=false;disconnectNetwork();$('join-status').textContent='Could not connect. Check the code and try again.';}},18000);peer.on('error',e=>{clearTimeout(timeout);S.joining=false;const where=S.screen==='lobby'?'lobby-status':'join-status';if(S.net===net)disconnectNetwork();peerError(e,where);});peer.on('open',()=>{let conn=peer.connect('twss-v1-'+code,{reliable:true});net.conn=conn;conn.on('data',d=>{if(d.t==='reject'){$('join-status').textContent=d.reason;disconnectNetwork();return;}if(d.t==='welcome'){clearTimeout(timeout);S.joining=false;net.me=d.id;net.players=d.players;S.roomCode=code;$('room-code').textContent=code.split('').join(' ');$('lobby-status').textContent='Connected to the squad.';showScreen('lobby');renderRoster();return;}if(d.t==='roster'){net.players=d.players;renderRoster();return;}if(d.t==='start'){net.players=d.players;startRun(false,d.players);return;}receiveGame(d,0);});conn.on('close',()=>{if(S.net!==net)return;if(S.running){S.running=false;S.ended=true;showEnd(false);$('over-copy').textContent='The host left the room.';}else{$('lobby-status').textContent='The host closed the room.';}});});}catch(e){S.joining=false;console.error(e);$('join-status').textContent='Could not load the online service.';}}
+function beginRoom(){if(!S.net||!S.net.isHost||S.net.kind!=='peer')return;S.net.send({t:'start',players:S.net.players});startRun(false,S.net.players);}
+function disconnectNetwork(){networkGeneration++;S.joining=false;if(!S.net||S.net.kind==='hub')return;let n=S.net;S.net=null;try{n.peer?.destroy()}catch(_){} }
+
+AIHub.probe(()=>({scene:S.screen==='play'?(AIHub.active&&AIHub.time()<0?'ready':'play'):S.screen==='over'?'over':S.screen==='title'?'title':S.screen==='boot'?'ready':'menu',menu:S.menu,world:S.worldTime,input:{x:S.input.x,y:S.input.y,fire:S.input.fire}}));
+function tickGame(dt,input){let playing=(!AIHub.active||AIHub.time()>=0);if(!playing)return;let shared=!!S.net;if(S.menu&&!shared)return;S.worldTime+=dt;S.comboTime-=dt;if(S.comboTime<=0)S.combo=0;S.bannerTime-=dt;if(S.bannerTime<=0)$('banner').classList.add('hidden');
+ let mine=localPlayer();if(S.attract)input=autoInput(mine);if(S.menu)input={x:0,y:0,fire:false};S.input=input;stepPlayer(mine,input,dt,true);
+ if(!S.net||S.net.isHost){for(const p of S.players)if(p!==mine){p.cooldown=Math.max(0,p.cooldown-dt);p.invuln=Math.max(0,p.invuln-dt);p.actionTimer=Math.max(0,p.actionTimer-dt);}
+  stepEnemies(dt);stepProjectiles(dt);stepPickups(dt);
+ }else{for(const e of S.enemies){if(e.target){let q=e.body.translation();e.body.setTranslation({x:mix(q.x,e.target.x,Math.min(1,dt*9)),y:mix(q.y,e.target.y,Math.min(1,dt*9)),z:mix(q.z,e.target.z,Math.min(1,dt*9))},true);}e.actionTimer=Math.max(0,e.actionTimer-dt);}for(const p of S.pickups){p.mesh.rotation.y+=dt*2;p.mesh.position.y=.35+Math.sin(S.worldTime*5)*.1;}}
+ world.timestep=dt;world.step();let min=stageCenter()-7,max=stageCenter()+(S.gate?14:8);for(const p of S.players){clampBody(p,min,max);syncActor(p);animateActor(p,S.worldTime);}for(const e of S.enemies){clampBody(e,min,max);syncActor(e);animateActor(e,S.worldTime);}for(const c of S.props){let q=c.body.translation();c.mesh.position.set(q.x,q.y-.45,q.z);}if(!S.net||S.net.isHost)stepDirector();updateParticles(dt);networkTick(dt);updateHUD();
+ let focus=mine||S.players.find(p=>!p.dead);if(focus){let target=clamp(focus.pos.x+2,stageCenter()-1,stageCenter()+9);camera.position.x=mix(camera.position.x,target,Math.min(1,dt*3));let shake=settings.shake?S.shake:0;camera.position.y=8+(shake?rnd(-shake,shake):0);camera.position.z=17;camera.lookAt(camera.position.x,1,0);light.position.x=camera.position.x-4;light.target.position.x=camera.position.x;}
+ S.shake=Math.max(0,S.shake-dt*1.8);
+}
+function updateLoop(){const now=performance.now();let elapsed=clamp((now-lastFrame)/1000,.001,.15);lastFrame=now;let pad=readPad(),input=sampleInput(pad);S.input={x:input.x,y:input.y,fire:input.fire};if(S.screen==='title'&&!S.menu){for(let i=0;i<titleActors.length;i++){let fake={mesh:titleActors[i],id:i,vx:.4,vz:0,actionTimer:0,facing:i===2?-1:1};animateActor(fake,now/1000);}}if(['title','how','online','join','about'].includes(S.screen)&&!S.menu&&!S.net&&now-S.lastInput>=10000)startRun(true);if(S.screen==='play'&&S.running){while(elapsed>0){let dt=Math.min(.05,elapsed);tickGame(dt,input);elapsed-=dt;}}pressed.clear();musicTick();}
+function frame(){try{renderer.render(scene,camera);}catch(e){console.error('Render failed',e);fatal('WebGPU could not render this scene. '+(e?.message||''));return;}requestAnimationFrame(frame);}
+function fatal(message){$('boot').classList.add('hidden');$('unsupported-message').textContent=message;S.running=false;showScreen('unsupported');if(AIHub.active)AIHub.fail(message);if(S.isTouch&&!S.hardwareSeen)$('touch-only').classList.remove('hidden');}
+async function boot(){
+ const hubConnect=AIHub.active?AIHub.connect({mode:'co-op',seats:[1,4]}):null;
+ try{if(!navigator.gpu)throw new Error('WebGPU is unavailable in this browser or context. Open this file in a current WebGPU-capable browser.');let adapter=await navigator.gpu.requestAdapter();if(!adapter)throw new Error('No WebGPU adapter was found on this device.');$('boot-text').textContent='ASSEMBLING THE SQUAD';let mods=await Promise.all([import('/lib/vendor/three/0.180.0/build/three.webgpu.js'),import('/lib/vendor/rapier/0.19.3/rapier3d-compat/rapier.mjs')]);THREE=mods[0];RAPIER=mods[1].default||mods[1];await RAPIER.init();renderer=new THREE.WebGPURenderer({canvas:$('game'),antialias:true,alpha:false});renderer._getFallback=null;await renderer.init();renderer.backend.device?.lost?.then(info=>{if(info.reason!=='destroyed')fatal('The WebGPU device was lost. Restart the game to try again.');});renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFShadowMap;renderer.toneMapping=THREE.NoToneMapping;initGraphics();$('boot').classList.add('hidden');if(hubConnect){await hubConnect;if(!(await connectHub()))openTitle();}else openTitle();if(S.isTouch&&!S.hardwareSeen)$('touch-only').classList.remove('hidden');updateSettings();lastFrame=performance.now();setInterval(updateLoop,16);requestAnimationFrame(frame);
+ }catch(e){console.error(e);fatal(e?.message||'The game could not start. Check WebGPU and the internet connection.');}}
+boot();
+</script>
+</body>
+</html>
