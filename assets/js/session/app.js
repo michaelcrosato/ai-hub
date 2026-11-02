@@ -1086,7 +1086,7 @@ function splashCard(cur) {
     'div',
     { class: 'results__card is-next' },
     h('p', { class: 'eyebrow' }, `Next up · ${formatProgress(state.format, state.history, state.totals)}`),
-    h('div', { class: 'reel', 'aria-hidden': 'true' }, h('div', { class: 'reel__strip', style: { '--n': reel.length } }, reel.map((n) => h('span', {}, n)), h('span', { class: 'is-it' }, cur.name))),
+    reel.length > 0 && h('div', { class: 'reel', 'aria-hidden': 'true' }, h('div', { class: 'reel__strip', style: { '--n': reel.length } }, reel.map((n) => h('span', {}, n)), h('span', { class: 'is-it' }, cur.name))),
     h('h2', { class: 'next__name' }, cur.name),
     h(
       'p',
