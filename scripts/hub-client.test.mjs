@@ -16,7 +16,7 @@ test('the client in lib/hub/session.js is a registered release', async () => {
 
 test('the reference games carry the current client, unmodified', async () => {
   const current = describeClient(await read('lib/hub/session.js'));
-  for (const path of ['lib/hub/examples/arena.html', 'lib/hub/examples/race.html']) {
+  for (const path of ['lib/hub/examples/arena.html', 'lib/hub/examples/ghost.html']) {
     const copies = findClients(await read(path));
     assert.equal(copies.length, 1, path);
     assert.equal(copies[0].version, current.version, path);

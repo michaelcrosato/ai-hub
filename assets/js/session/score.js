@@ -4,7 +4,7 @@
  * A player scores one point for every player they beat. Whoever left or sat
  * the round out is placed last by the round (lib/hub/round.js), so they count
  * as beaten and every round of N players is worth the same. Tied players share
- * a place. First place is a win; in co-op only when the team won.
+ * a place. First place is a win; in a team result only when the team won.
  *
  * A session ends by its format, and the Party format adds the hub's own
  * awards as bonus points at the end (docs/session-hub.md).
@@ -21,14 +21,14 @@ export function placesOf(standings) {
   return places;
 }
 
-/** Map of id → { place, points, win } for a played round. */
-export function scoreRound({ standings, mode, won }) {
+/** Map of id → { place, points, win } for a played round; `won` (true or false) makes it a team result. */
+export function scoreRound({ standings, won }) {
   const places = placesOf(standings);
   const out = new Map();
   for (const [id, place] of places) {
     let beaten = 0;
     for (const other of places.values()) if (other > place) beaten++;
-    out.set(id, { place, points: beaten, win: place === 1 && (mode !== 'co-op' || won === true) });
+    out.set(id, { place, points: beaten, win: place === 1 && won !== false });
   }
   return out;
 }
@@ -57,7 +57,7 @@ export function addRound(totals, entries) {
 
 /**
  * The live scoreboard during a round, in the order the round will rank it
- * (lib/hub/round.js, rankRace): whoever finished on time, fastest first; then
+ * (lib/hub/round.js, rankResults): whoever finished on time, fastest first; then
  * everyone else by score, from their result or their latest progress; then
  * those with nothing yet; players who left go last. Rows are
  * { id, result?, progress?, out? }.

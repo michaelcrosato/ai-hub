@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-import { prepareSideBySide, checkRetrofit } from './lib/retrofit.mjs';
+import { prepareParallel, checkRetrofit } from './lib/retrofit.mjs';
 import { findClients } from './lib/hub-client.mjs';
 
 const client = await readFile(new URL('../lib/hub/session.js', import.meta.url), 'utf8');
@@ -19,7 +19,7 @@ const PAGE = `<!doctype html>
 `;
 
 test('the client and the metas go in right after <meta charset>, before every script, and nothing else moves', () => {
-  const { text, at } = prepareSideBySide(PAGE, { client });
+  const { text, at } = prepareParallel(PAGE, { client });
   assert.equal(text.slice(0, at), PAGE.slice(0, at));
   assert.ok(text.endsWith(PAGE.slice(at)), 'everything after the insertion point is untouched');
   assert.ok(PAGE.slice(0, at).endsWith('<meta charset="utf-8">'));
@@ -27,31 +27,31 @@ test('the client and the metas go in right after <meta charset>, before every sc
   assert.ok(copy.pristine);
   assert.ok(copy.start < text.indexOf('<script type="importmap">'));
   assert.match(text, /<meta name="hub:session-mode" content="parallel">/);
-  assert.match(text, /<meta name="hub:session-minutes" content="4">/);
+  assert.doesNotMatch(text, /hub:session-minutes/, 'the round length is the game’s to give, not the tool’s');
 });
 
 test('with a script before the charset, or no charset, the block goes before the first script; with no head, after <html>', () => {
   const early = '<html><head><script>var a = Math.random();</script><meta charset="utf-8"></head></html>';
-  const { text } = prepareSideBySide(early, { client });
+  const { text } = prepareParallel(early, { client });
   assert.ok(findClients(text)[0].start < text.indexOf('var a'));
   const bare = '<!doctype html><html><body><p>hi</p></body></html>';
-  const out = prepareSideBySide(bare, { client });
+  const out = prepareParallel(bare, { client });
   assert.ok(out.text.startsWith('<!doctype html><html>\n<meta name="hub:session"'));
 });
 
 test('a CRLF page stays CRLF', () => {
-  const { text } = prepareSideBySide(PAGE.replace(/\n/g, '\r\n'), { client });
+  const { text } = prepareParallel(PAGE.replace(/\n/g, '\r\n'), { client });
   assert.ok(!/[^\r]\n/.test(text));
   assert.ok(findClients(text)[0].pristine);
 });
 
 test('a page that already declares a session, or carries a client, is left alone', () => {
-  assert.match(prepareSideBySide('<head><meta name="hub:session" content="1"></head>', { client }).skipped, /already declares/);
-  assert.match(prepareSideBySide(`<head><script>${client}</script></head>`, { client }).skipped, /already carries/);
+  assert.match(prepareParallel('<head><meta name="hub:session" content="1"></head>', { client }).skipped, /already declares/);
+  assert.match(prepareParallel(`<head><script>${client}</script></head>`, { client }).skipped, /already carries/);
 });
 
 test('the static check names what the model still has to do, and nothing once it is done', () => {
-  const { text } = prepareSideBySide(PAGE, { client });
+  const { text } = prepareParallel(PAGE, { client });
   assert.deepEqual(checkRetrofit(text), [
     'hub:session-goal is empty',
     'hub:session-howto is empty',

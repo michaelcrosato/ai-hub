@@ -19,7 +19,8 @@ the same for every game, so players learn it once.
   player who left or sat out without reporting counts as beaten; one who
   reported and then left keeps their place. Tied players share a place. Every
   round of four is worth three points to its winner, whatever the game.
-- **First place is a win**; in co-op only when the team won (`won: true`).
+- **First place is a win**; in a team result (a shared world's `finish` with
+  `won`) only when the team won.
 - The **table** orders players by points, then wins, then the better average
   place (`assets/js/session/score.js`).
 
@@ -53,9 +54,10 @@ whose `data/overrides.json` entry says `"session": "0"` is never dealt:
 `scripts/hub-check.mjs --record` writes that, with a `sessionNote`, for a game
 that fails the check, and takes it off again when the game passes.
 
-Parallel games far outnumber the ones played together (race,
-versus, co-op), so the deal keeps them as two decks and alternates between
-them while both have games, starting with one played together. Each deck is
+Parallel and ghost games, where each player has a world of their own, far
+outnumber the shared worlds, so the deal keeps them as two decks and
+alternates between them while both have games, starting with a shared world.
+Each deck is
 shuffled from the session's seed and played through before any of its games
 comes round again.
 
@@ -98,7 +100,7 @@ round-by-round story.
 
 ### The live scoreboard
 
-Parallel and race games report `AIHub.progress({ score, label })`.
+Parallel and ghost games report `AIHub.progress({ score, label })`.
 The client passes the latest on at most once a second; each player's bridge
 hands it to its own page and sends it to every other player's page over the
 mesh, unreliable (`{k:'p'}`). It never reaches a game and never touches
@@ -108,7 +110,7 @@ score); it folds to one button, remembered per device
 (`localStorage['ai-hub:board']`), and leaves with the corner bar.
 
 The host's page also feeds each player's last progress to the round
-(`round.progress(id, score)`): a player still in a race or parallel round
+(`round.progress(id, score)`): a player still in a parallel or ghost round
 who never reports a result is ranked by it.
 
 ### What is kept
@@ -132,23 +134,26 @@ to the welcome's origin.
 |---|---|---|---|
 | game | `hello` | `v: 1, client, mode, seats` | every 500 ms until welcomed; after 10 s the game plays alone |
 | hub | `welcome` | `me, host, players, mode, seed, limitMs, round, splash?, limits, server?` | once; a 1.3.0 client keeps any field the hub adds |
-| game | `ready` | | once: loaded (`splash`), or within 45 s of the round's start from a gesture |
+| game | `ready` | | once, when loaded: the hub's card collects the players' ready (`splash`) |
 | hub | `start` | `in` | milliseconds until play begins |
 | game | `send` | `data, to?, reliable` | after welcome, until end; within `limits` |
 | hub | `message` | `from, data` | |
-| game | `progress` | `score, label?` | parallel and race; about once a second (the page drops any closer than half a second) |
+| game | `progress` | `score, label?` | parallel and ghost; about once a second (the page drops any closer than half a second) |
 | hub | `leave` | `id, reason` | final for the round |
-| game | `result` | `time` or `score`, `stats?`, `awards?` | parallel and race; once |
-| game | `finish` | `standings, scores?, won?, stats?, awards?` | versus, co-op; the host; once |
-| hub | `time-up` | `graceMs` | at the limit: 1.5 × `hub:session-minutes`, at most 15 minutes |
+| game | `result` | `time` or `score`, `stats?`, `awards?` | parallel and ghost; once |
+| game | `finish` | `standings, scores?, won?, stats?, awards?` | shared world; the host; once |
+| hub | `time-up` | `graceMs` | at the limit: 1.5 × `hub:session-minutes`, at most 15 minutes; 15 minutes for a game that gives no length |
 | hub | `end` | `reason, standings?` | last |
 | game | `error` | `message, fatal` | `AIHub.fail()` |
 | game | `fullscreen` | `on` | whenever the game calls `requestFullscreen()` or `exitFullscreen()` in a session: the page puts itself in fullscreen, so its board and cards stay over the game |
 | hub | `fullscreen` | `on` | whenever the page goes in or out of fullscreen: the client keeps the game's `document.fullscreenElement` right and fires `fullscreenchange` |
 
-In a parallel round, the page's address carries the round's seed
+For a game tagged parallel or ghost, the page's address carries the round's seed
 (`?aihub=1&aihub-seed=…`), and the client seeds `Math.random` with it before
-the game's own scripts run.
+the game's own scripts run. A game still tagged race plays as ghost but keeps
+the unseeded start it was built for (ids it makes from `Math.random` must
+differ between its copies), and the check asks no progress of it, as race
+never did.
 
 ### Between the players' pages
 
@@ -171,7 +176,7 @@ host's state broadcast every second.
 ### Known limits, and what is next
 
 - **The round lives in the session host's tab.** If that tab leaves, a shared
-  world (versus, co-op) is void. A race or parallel round is scored by
+  world is void. A parallel or ghost round is scored by
   the next host from the last status every tab holds: each player's result,
   or else their last progress, with the old host last; it counts toward the
   format like any played round. The next step is for the new host to resume
@@ -186,7 +191,7 @@ host's state broadcast every second.
   more copy with no player of its own: it is welcomed with `server: true`
   and `me` = `host` = the id after the players', must be ready before the
   start, is never ranked, and voids the round if it goes. The harness and
-  `hub-check` play one such round for every versus and co-op game. The
+  `hub-check` play one such round for every shared-world game. The
   session page never asks for a server yet: the server program, where it
   runs, how it joins a session (a member with no seat) and the lobby's switch
   come when servers are wanted.

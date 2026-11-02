@@ -6,7 +6,7 @@ import { eligible, pickNext, sessionPool, roundGame } from '../assets/js/session
 import { placesOf, scoreRound, addRound, leaderboard, liveOrder, formatOver, formatProgress, sessionAwards, finalTable } from '../assets/js/session/score.js';
 import { createLocalNet } from '../assets/js/session/local.js';
 
-const game = (slug, extra = {}) => ({ slug, name: slug, type: 'Game', session: '1', sessionPlayers: '2-4', sessionMode: 'race', ...extra });
+const game = (slug, extra = {}) => ({ slug, name: slug, type: 'Game', session: '1', sessionPlayers: '2-4', sessionMode: 'shared-world', ...extra });
 
 test('every generated name fits the protocol: two listed words, letters and a space, 16 characters at most', () => {
   for (const a of ADJECTIVES) for (const b of ANIMALS) assert.match(`${a} ${b}`, /^[A-Za-z]+ [A-Za-z]+$/), assert.ok(`${a} ${b}`.length <= 16);
@@ -92,17 +92,20 @@ test('Random Mode plays every game once before any comes round again, in an orde
 
 test('a player scores one point per player beaten; ties share a place; leavers placed last score nothing', () => {
   assert.deepEqual([...placesOf([[2], [0, 3], [1]])], [[2, 1], [0, 2], [3, 2], [1, 4]]);
-  const scored = scoreRound({ standings: [[2], [0, 3], [1]], mode: 'versus' });
+  const scored = scoreRound({ standings: [[2], [0, 3], [1]] });
   assert.deepEqual(Object.fromEntries([...scored].map(([id, r]) => [id, [r.place, r.points, r.win]])), {
     0: [2, 1, false],
     1: [4, 0, false],
     2: [1, 3, true],
     3: [2, 1, false],
   });
-  const coop = scoreRound({ standings: [[0, 1, 2]], mode: 'co-op', won: true });
-  assert.ok([...coop.values()].every((r) => r.points === 0 && r.win));
-  const lost = scoreRound({ standings: [[0, 1]], mode: 'co-op', won: false });
+  // won makes it a team result, in any shared world: first place is a win only when the team won.
+  const team = scoreRound({ standings: [[0, 1, 2]], won: true });
+  assert.ok([...team.values()].every((r) => r.points === 0 && r.win));
+  const lost = scoreRound({ standings: [[0, 1]], won: false });
   assert.ok([...lost.values()].every((r) => !r.win));
+  const ranked = scoreRound({ standings: [[1], [0]], won: false });
+  assert.deepEqual([...ranked.values()].map((r) => r.win), [false, false], 'a lost team result has no winner, whatever the order');
 });
 
 test('the table adds rounds up and ranks by points, then wins, then average place', () => {
@@ -238,9 +241,9 @@ test("the clock takes the host's time from the quickest round trip", async () =>
   clock.stop();
 });
 
-test('the deal alternates games played together with parallel ones, so a few shared worlds are not buried', () => {
-  const together = ['race1', 'race2'].map((s) => game(s));
-  const side = Array.from({ length: 30 }, (_, i) => game(`side${i}`, { sessionMode: 'parallel' }));
+test('the deal alternates shared worlds with parallel and ghost games, so a few shared worlds are not buried', () => {
+  const together = ['world1', 'world2'].map((s) => game(s));
+  const side = Array.from({ length: 30 }, (_, i) => game(`side${i}`, { sessionMode: i % 3 ? 'parallel' : 'ghost' }));
   let state = { seed: 7, n: 3, cycle: 0, played: [] };
   const dealt = [];
   for (let i = 0; i < 10; i++) {
@@ -248,10 +251,10 @@ test('the deal alternates games played together with parallel ones, so a few sha
     dealt.push(next.game.slug);
     state = { ...state, cycle: next.cycle, played: next.played };
   }
-  assert.deepEqual(dealt.map((slug) => slug.startsWith('race')), [true, false, true, false, true, false, true, false, true, false]);
+  assert.deepEqual(dealt.map((slug) => slug.startsWith('world')), [true, false, true, false, true, false, true, false, true, false]);
   const sides = dealt.filter((slug) => slug.startsWith('side'));
-  assert.equal(new Set(sides).size, sides.length, 'the together deck starting over brings no parallel game round again');
-  assert.deepEqual(new Set(dealt.slice(0, 4).filter((slug) => slug.startsWith('race'))), new Set(['race1', 'race2']));
+  assert.equal(new Set(sides).size, sides.length, 'the shared-world deck starting over brings no parallel or ghost game round again');
+  assert.deepEqual(new Set(dealt.slice(0, 4).filter((slug) => slug.startsWith('world'))), new Set(['world1', 'world2']));
   const alone = pickNext(side, { seed: 7, n: 2 });
   assert.ok(alone.game.slug.startsWith('side'), 'with one deck, the deal is that deck');
 });

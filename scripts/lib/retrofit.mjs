@@ -3,13 +3,13 @@
  *
  * It puts the session client and the parallel metas into an existing game
  * page, before any of the game's own scripts, and leaves everything else
- * byte for byte as it was. A model then wires the game to them (README,
- * "Parallel"); checkRetrofit() says what is still missing.
+ * byte for byte as it was. A model then wires the game to them
+ * (lib/hub/README.md); checkRetrofit() says what is still missing.
  */
 
 import { findClients } from './hub-client.mjs';
 
-export const SIDE_BY_SIDE = Object.freeze({ mode: 'parallel', players: '1-4', minutes: 4 });
+export const PARALLEL = Object.freeze({ mode: 'parallel', players: '1-4' });
 
 const SCRIPT = /<script\b/i;
 const CHARSET = /<meta\b[^>]*\bcharset\b[^>]*>/i;
@@ -32,13 +32,13 @@ function insertionPoint(html) {
   return 0;
 }
 
-/** The metas and the client, as they go into the page. */
-export function sessionBlock({ client, minutes = SIDE_BY_SIDE.minutes, goal = '', howto = '', eol = '\n' }) {
+/** The metas and the client, as they go into the page; hub:session-minutes only when `minutes` is given. */
+export function sessionBlock({ client, minutes = null, goal = '', howto = '', eol = '\n' }) {
   const metas = [
     ['hub:session', '1'],
-    ['hub:session-players', SIDE_BY_SIDE.players],
-    ['hub:session-mode', SIDE_BY_SIDE.mode],
-    ['hub:session-minutes', String(minutes)],
+    ['hub:session-players', PARALLEL.players],
+    ['hub:session-mode', PARALLEL.mode],
+    ...(Number(minutes) > 0 ? [['hub:session-minutes', String(minutes)]] : []),
     ['hub:session-goal', goal],
     ['hub:session-howto', howto],
   ].map(([name, content]) => `<meta name="${name}" content="${escapeAttr(content)}">`);
@@ -49,7 +49,7 @@ export function sessionBlock({ client, minutes = SIDE_BY_SIDE.minutes, goal = ''
  * Add the session client and the parallel metas to a game page. Returns
  * the new text, or the reason it was left alone.
  */
-export function prepareSideBySide(html, { client, minutes } = {}) {
+export function prepareParallel(html, { client, minutes } = {}) {
   if (/<meta\b[^>]*name\s*=\s*["']?hub:session["'\s>]/i.test(html)) return { skipped: 'it already declares hub:session' };
   if (findClients(html).length) return { skipped: 'it already carries a session client' };
   const eol = html.includes('\r\n') ? '\r\n' : '\n';
@@ -66,7 +66,7 @@ export function checkRetrofit(html) {
     return m ? (m[0].match(/content\s*=\s*"([^"]*)"/i)?.[1] ?? m[0].match(/content\s*=\s*'([^']*)'/i)?.[1] ?? null) : null;
   };
   if (meta('hub:session') !== '1') problems.push('hub:session is not 1');
-  if (meta('hub:session-mode') !== SIDE_BY_SIDE.mode) problems.push(`hub:session-mode is not ${SIDE_BY_SIDE.mode}`);
+  if (meta('hub:session-mode') !== PARALLEL.mode) problems.push(`hub:session-mode is not ${PARALLEL.mode}`);
   const goal = (meta('hub:session-goal') ?? '').trim();
   const howto = (meta('hub:session-howto') ?? '').trim();
   if (!goal) problems.push('hub:session-goal is empty');

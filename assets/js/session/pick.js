@@ -9,6 +9,7 @@
  */
 
 import { sessionOf, sameKey } from '../manifest.js';
+import { SELF_REPORTED } from '../../../lib/hub/round.js';
 import { isVisible, shelfOf } from '../filter.js';
 import { shuffleDeck } from '../explore/deck.js';
 
@@ -61,16 +62,16 @@ export function roundGame(cur, games) {
   return { game, build: builds.find((b) => b.path === cur.path) || builds[0] };
 }
 
-/** Parallel (each plays alone) or together (one course or one world): the two decks the deal alternates. */
-export const deckOf = (game) => (sessionOf(game)?.mode === 'parallel' ? 'side' : 'together');
+/** Each player in a world of their own (parallel, ghost) or all in one (shared world): the two decks the deal alternates. */
+export const deckOf = (game) => (SELF_REPORTED.includes(sessionOf(game)?.mode) ? 'own' : 'shared');
 
 /**
  * The next game, and the cycle and played list that follow it. Null when
  * nothing fits `n` players.
  *
- * Parallel games far outnumber the ones played together, so a single
+ * Parallel and ghost games far outnumber the shared worlds, so a single
  * shuffle would bury the few shared worlds. While both decks have games, the
- * deal alternates between them, starting with a game played together. Within
+ * deal alternates between them, starting with a shared world. Within
  * a deck it deals games, not builds: one build of each lineage, picked at
  * random, and no lineage comes round again until the deck is played through,
  * so a source with hundreds of runs is one game among the others.
@@ -80,7 +81,7 @@ export function pickNext(games, { seed, n, cycle = 0, played = [], webgpu = fals
   if (!pool.length) return null;
   const decks = new Set(pool.map(deckOf));
   const last = played.length ? pool.find((game) => game.slug === played.at(-1)) : null;
-  const want = decks.size > 1 ? (last && deckOf(last) === 'together' ? 'side' : 'together') : [...decks][0];
+  const want = decks.size > 1 ? (last && deckOf(last) === 'shared' ? 'own' : 'shared') : [...decks][0];
   const lineages = new Map();
   for (const game of pool.filter((g) => deckOf(g) === want)) {
     const key = lineageKey(game);

@@ -4,7 +4,7 @@
  *
  *   node scripts/retrofit.mjs pick [--wave 1] [--limit N]
  *       which games to do: one build of each title, readable code first
- *   node scripts/retrofit.mjs prepare <games…> [--minutes 4]
+ *   node scripts/retrofit.mjs prepare <games…> [--minutes N]
  *       the tool step alone: the session client and the parallel metas,
  *       first in <head> (scripts/lib/retrofit.mjs)
  *   node scripts/retrofit.mjs check <games…>
@@ -45,7 +45,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { checkRetrofit, prepareSideBySide, changedLines } from './lib/retrofit.mjs';
+import { checkRetrofit, prepareParallel, changedLines } from './lib/retrofit.mjs';
 import { normalize, sessionOf } from '../assets/js/manifest.js';
 import { lineageKey } from '../assets/js/session/pick.js';
 
@@ -226,7 +226,7 @@ async function retrofitOne(arg, agents, prompt) {
   await recover(page);
   const originalText = await readFile(page, 'utf8');
   const client = await readFile(path.join(ROOT, 'lib/hub/session.js'), 'utf8');
-  const prepared = prepareSideBySide(originalText, { client, minutes: Number(value('minutes', 4)) });
+  const prepared = prepareParallel(originalText, { client, minutes: Number(value('minutes', 0)) || null });
   const today = new Date().toISOString().slice(0, 10);
   const log = async (entry) => {
     await mkdir(path.dirname(LEDGER), { recursive: true });
@@ -424,14 +424,14 @@ async function pick() {
 async function main() {
   if (command === 'pick') return pick();
   if (!['prepare', 'check', 'run'].includes(command) || !targets.length) {
-    console.log('Usage: node scripts/retrofit.mjs pick [--wave 1] [--limit N]\n       node scripts/retrofit.mjs prepare|check|run <games…> [--agent "<command>"…] [--jobs N] [--budget 150] [--max-cost 1] [--minutes 4] [--timeout 20] [--browser-args "<flags>"] [--again] [--dry-run]');
+    console.log('Usage: node scripts/retrofit.mjs pick [--wave 1] [--limit N]\n       node scripts/retrofit.mjs prepare|check|run <games…> [--agent "<command>"…] [--jobs N] [--budget 150] [--max-cost 1] [--minutes N] [--timeout 20] [--browser-args "<flags>"] [--again] [--dry-run]');
     process.exit(2);
   }
   if (command === 'prepare') {
     const client = await readFile(path.join(ROOT, 'lib/hub/session.js'), 'utf8');
     for (const arg of targets) {
       const page = await resolveGame(arg);
-      const out = prepareSideBySide(await readFile(page, 'utf8'), { client, minutes: Number(value('minutes', 4)) });
+      const out = prepareParallel(await readFile(page, 'utf8'), { client, minutes: Number(value('minutes', 0)) || null });
       if (out.skipped) console.log(`skipped  ${rel(page)}: ${out.skipped}`);
       else {
         await writeFile(page, out.text);
@@ -456,7 +456,8 @@ async function main() {
     process.exit(2);
   }
   const readme = await readFile(path.join(ROOT, 'lib/hub/README.md'), 'utf8');
-  const contract = readme.slice(readme.indexOf('## Parallel'), readme.indexOf('\n## Rules')).trim();
+  // The protocol from its modes to its rules: everything a game does, without the testing and the reference.
+  const contract = readme.slice(readme.indexOf('## Modes'), readme.indexOf('\n## Test it')).trim().replace(/\n+---$/, '');
   const prompt = (await readFile(path.join(ROOT, 'lib/hub/retrofit.md'), 'utf8'))
     .split('\n---\n')
     .slice(1)

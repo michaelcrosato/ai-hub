@@ -3,9 +3,9 @@
 The prompt `scripts/retrofit.mjs` gives a model for each game, after its tool
 step has put the session client and the parallel metas at the top of the
 page. The model works in a copy of the game in a folder of its own: `{{file}}`
-is the game's page there, `{{contract}}` the section "Parallel" of
-[`README.md`](README.md) word for word (the same text for every game, so a
-batch reads it from the cache), `{{budget}}` the most lines a try may change,
+is the game's page there, `{{contract}}` the protocol in
+[`README.md`](README.md) from *Modes* to *Rules*, word for word (the same text
+for every game, so a batch reads it from the cache), `{{budget}}` the most lines a try may change,
 and `{{notes}}` what the last try's check said, if there was one.
 
 ---
@@ -18,7 +18,8 @@ audio and difficulty stay exactly as they are.
 
 A tool has already put the session client (`session.js`, which defines
 `window.AIHub`) and the `hub:session` meta tags at the top of `<head>`. This is
-the protocol's section on parallel; the hub checks the game against it:
+the protocol; the game is upgraded to its parallel mode, and the hub checks it
+against it:
 
 <protocol>
 {{contract}}
@@ -30,9 +31,9 @@ Do only this:
    clear finish, otherwise its score (higher wins).
 2. Fill `hub:session-goal` (how to win, at most 60 characters) and
    `hub:session-howto` (the controls, at most 80 characters), in plain words
-   for someone who has never seen the game. Set `hub:session-minutes` to a
-   typical round of 2 to 8 minutes if 4 is wrong for this game. If the game
-   cannot run at all without WebGPU, also add
+   for someone who has never seen the game. If a round of the game has a
+   fixed length, add `<meta name="hub:session-minutes" content="…">` with it.
+   If the game cannot run at all without WebGPU, also add
    `<meta name="hub:webgpu" content="required">`.
 3. In session mode (`AIHub.active` is true): skip the title screen, attract
    mode and menus; `await AIHub.connect({ mode: 'parallel', seats: [1, 4] })`;
@@ -41,14 +42,12 @@ Do only this:
    answers `null`, carry on as when `AIHub.active` is false.
 4. Whenever the score changes, call
    `AIHub.progress({ score: <number>, label: <short text> })`, where a higher
-   score is further ahead and `label` is at most 24 characters ("Level 3",
-   "Lap 2 of 3").
+   score is further ahead and `label` is short text for the scoreboard.
 5. When the run ends (finished, died, out of lives), call
    `AIHub.result({ time })` or `AIHub.result({ score })` once. In
    `AIHub.on('time-up', …)`, report the current score at once if the run is
    still going.
-6. In `AIHub.on('end', …)`, stop input and sound and leave the final screen.
-   No "play again".
+6. In `AIHub.on('end', …)`, stop input and sound.
 7. If the game deals its pieces, cards, board or level layout from one
    function using `Math.random`, make that function draw from
    `AIHub.rng('deal')` in session mode, so every copy gets the same deal all
@@ -64,9 +63,8 @@ game an empty storage), and `Math.random` is already seeded: add no code for
 either. You are done when the game would pass the checks the protocol
 describes; you need not run them, the hub does.
 
-If the game has no score and no finish (a toy, a sandbox, a tool), or cannot
-fit a round of at most 15 minutes, change nothing and reply with one line:
-`NOT PARALLEL: <why>`.
+If the game has no score and no finish, change nothing and reply with one
+line: `NOT PARALLEL: <why>`.
 
 Otherwise reply with: the score or time used, the end condition, and every line
 you changed.

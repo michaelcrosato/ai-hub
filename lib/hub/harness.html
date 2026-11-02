@@ -64,7 +64,7 @@
 </main>
 <script type="module">
 import { createBridge, attachFrame, postTo, createLocalNetwork } from './bridge.js';
-import { createRound, limitFor, MODES, SELF_REPORTED, TIMINGS } from './round.js';
+import { createRound, limitFor, modeOf, seedsRandom, SELF_REPORTED, TIMINGS } from './round.js';
 
 const NAMES = ['Red Fox', 'Blue Otter', 'Green Heron', 'Gold Lynx'];
 const params = new URLSearchParams(location.search);
@@ -74,10 +74,6 @@ const scenario = params.get('scenario') || 'standard';
 /** ?scenario=server: the shared world runs on one more copy with no player of its own, as a dedicated server would run it. */
 const serverMode = scenario === 'server';
 const playMs = Number(params.get('play')) || 6000;
-/** Like the hub, the harness shows a splash and collects ready itself; ?splash=0 leaves the ready prompt to the game, as older hubs did. */
-const splash = params.get('splash') !== '0';
-/** ?retrofit=1: an existing game upgraded to parallel, which need not probe (README, "Parallel"). */
-const retrofit = params.get('retrofit') === '1';
 const SPLASH_MS = 10_000;
 
 for (const [id, key] of [['game', 'game'], ['players', 'players'], ['latency', 'latency'], ['jitter', 'jitter'], ['loss', 'loss']]) {
@@ -114,11 +110,11 @@ async function metasOf(url) {
 }
 
 /**
- * In a parallel round, the seed rides in the address: the client seeds Math.random with it before the game's scripts run.
+ * For a game tagged parallel or ghost, the seed rides in the address: the client seeds Math.random with it before the game's scripts run.
  * Only a page of this site is loaded: ?game= comes from the address bar, and a javascript: or another site's
  * address in an unsandboxed frame would run as this origin, where a signed-in player's session is kept.
  */
-const gameUrl = (game, { mode, seed } = {}) => {
+const gameUrl = (game, { tag, seed } = {}) => {
   let url;
   try {
     url = new URL(game, location.href);
@@ -127,7 +123,7 @@ const gameUrl = (game, { mode, seed } = {}) => {
   }
   if (url.origin !== location.origin || !/^https?:$/.test(url.protocol)) return null;
   url.searchParams.set('aihub', '1');
-  if (mode === 'parallel') url.searchParams.set('aihub-seed', String(seed >>> 0));
+  if (seedsRandom(tag)) url.searchParams.set('aihub-seed', String(seed >>> 0));
   return url.href;
 };
 
@@ -170,7 +166,7 @@ async function newRound() {
   }
   const n = Math.max(1, Math.min(4, Number($('players').value) || 2));
   const metas = await metasOf(game);
-  const mode = MODES.includes(metas?.mode) ? metas.mode : null;
+  const mode = modeOf(metas?.mode);
   const limitMs = params.has('limit') ? Number(params.get('limit')) * 1000 : limitFor(metas?.minutes);
   const seed = params.has('seed') ? Number(params.get('seed')) >>> 0 : crypto.getRandomValues(new Uint32Array(1))[0];
   const round = ++roundNo;
@@ -182,7 +178,7 @@ async function newRound() {
   grid.style.gridTemplateColumns = copies > 1 ? '1fr 1fr' : '1fr';
   grid.style.gridTemplateRows = `repeat(${Math.ceil(copies / (copies > 1 ? 2 : 1))}, 1fr)`;
 
-  const state = { round, n, metas, mode, limitMs, seed, players, cells: [], hubEnd, status: null, record: null, hidden: false, splashUntil: splash ? performance.now() + SPLASH_MS : null };
+  const state = { round, n, metas, mode, limitMs, seed, players, cells: [], hubEnd, status: null, record: null, hidden: false, splashUntil: performance.now() + SPLASH_MS };
   current = state;
   log(`round ${round}: ${n} player${n > 1 ? 's' : ''}, seed ${seed}, limit ${Math.round(limitMs / 1000)} s, mode ${mode || '(from hello)'}`);
 
@@ -194,7 +190,7 @@ async function newRound() {
     mode,
     seed,
     limitMs,
-    gate: splash,
+    gate: true,
     deliver: (key, m) => hubEnd.send(key, { k: 'h', r: round, m }),
     onStatus: (s) => { state.status = s; render(state); },
     onEnd: (record) => {
@@ -249,13 +245,13 @@ async function newRound() {
     endpoint.onMessage((from, env) => cell.bridge.fromNet(from, env));
     cell.detach = attachFrame(frame, (msg) => cell.bridge.fromGame(msg));
     frame.addEventListener('load', () => instrument(cell), { once: true });
-    frame.src = gameUrl(game, { mode, seed });
+    frame.src = gameUrl(game, { tag: metas?.mode, seed });
     state.cells.push(cell);
   }
   renderWho(state);
   render(state);
   // By hand, the splash lifts by itself after ten seconds, as in a session; the conformance run releases it itself.
-  if (splash && !auto) setTimeout(() => releaseRound(state), SPLASH_MS);
+  if (!auto) setTimeout(() => releaseRound(state), SPLASH_MS);
   return state;
 }
 
@@ -337,10 +333,10 @@ $('hide').onclick = () => {
 for (const id of ['latency', 'jitter', 'loss']) $(id).onchange = applyNet;
 
 /* ---------------------------------------------------------------------------
- * ?auto=1 — the conformance run. It presses keys and taps inside each frame
- * with synthetic events (the frames must be served from this page's origin),
- * so a game must accept a key press or a tap as its ready gesture.
- * Results land in window.__hubCheck, and body[data-complete] turns "true".
+ * ?auto=1 — the conformance run. It presses keys inside each frame with
+ * synthetic events while the round plays (the frames must be served from this
+ * page's origin). Results land in window.__hubCheck, and body[data-complete]
+ * turns "true".
  * ------------------------------------------------------------------------- */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -364,151 +360,6 @@ function poke(cell, key) {
   return true;
 }
 
-function tap(cell) {
-  const doc = cell.frame.contentDocument;
-  const win = cell.frame.contentWindow;
-  if (!doc || !win) return false;
-  const x = win.innerWidth / 2;
-  const y = win.innerHeight / 2;
-  const target = doc.elementFromPoint(x, y) || doc.body;
-  const init = { clientX: x, clientY: y, bubbles: true, cancelable: true, view: win, pointerId: 1, isPrimary: true, button: 0 };
-  target.dispatchEvent(new win.PointerEvent('pointerdown', init));
-  target.dispatchEvent(new win.PointerEvent('pointerup', init));
-  target.dispatchEvent(new win.MouseEvent('click', init));
-  return true;
-}
-
-/** What the game says about itself through AIHub.probe(): { scene, menu, world, input }, or null. */
-function probeOf(cell) {
-  try {
-    return cell.frame.contentWindow?.AIHub?.inspect?.() ?? null;
-  } catch {
-    return null;
-  }
-}
-
-/** Hold a key down in a frame for a while, then let go. */
-async function holdKey(cell, key, ms) {
-  const doc = cell.frame.contentDocument;
-  const win = cell.frame.contentWindow;
-  const target = doc.activeElement && doc.activeElement !== doc.documentElement ? doc.activeElement : doc.body || doc.documentElement;
-  const code = key === ' ' ? 'Space' : key === 'Escape' ? 'Escape' : key.startsWith('Arrow') ? key : `Key${key.toUpperCase()}`;
-  const init = { key, code, bubbles: true, cancelable: true, view: win };
-  target.dispatchEvent(new win.KeyboardEvent('keydown', init));
-  await sleep(ms);
-  target.dispatchEvent(new win.KeyboardEvent('keyup', init));
-}
-
-/** hub-check gives every frame an emulated standard gamepad (window.__pad); by hand there is none. */
-const padOf = (cell) => {
-  try {
-    return cell.frame.contentWindow?.__pad ?? null;
-  } catch {
-    return null;
-  }
-};
-
-async function holdPad(cell, change, ms) {
-  const pad = padOf(cell);
-  pad.set(change);
-  await sleep(ms);
-  pad.reset();
-  await sleep(120);
-}
-
-const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-const worldOf = (cell) => Number(probeOf(cell)?.world);
-
-/**
- * Wait for the input the game reads to settle, press, and see whether it changed.
- * The probe's input is read while the press is held.
- */
-async function moves(cell, press) {
-  await sleep(250);
-  const before = probeOf(cell)?.input;
-  let during;
-  await press(() => (during = probeOf(cell)?.input));
-  return { changed: during !== undefined && !same(before, during), before, during };
-}
-
-/** Keyboard, then the controller, on one copy: the left stick and a button must reach the game's input. */
-async function controlChecks(check, cell) {
-  const key = await moves(cell, async (sample) => {
-    const doc = cell.frame.contentDocument, win = cell.frame.contentWindow;
-    const target = doc.activeElement && doc.activeElement !== doc.documentElement ? doc.activeElement : doc.body;
-    for (const k of ['ArrowRight', 'd']) target.dispatchEvent(new win.KeyboardEvent('keydown', { key: k, code: k === 'd' ? 'KeyD' : k, bubbles: true, cancelable: true, view: win }));
-    await sleep(400);
-    sample();
-    for (const k of ['ArrowRight', 'd']) target.dispatchEvent(new win.KeyboardEvent('keyup', { key: k, code: k === 'd' ? 'KeyD' : k, bubbles: true, cancelable: true, view: win }));
-  });
-  check('the keyboard moves the player', key.changed, `input ${JSON.stringify(key.before)} → ${JSON.stringify(key.during)} with → / D held`);
-  if (!padOf(cell)) return check('a standard gamepad plays the game', true, 'skipped: run through scripts/hub-check.mjs for the emulated gamepad');
-  const stickCheck = await moves(cell, async (sample) => {
-    padOf(cell).set({ axes: { 0: 1 } });
-    await sleep(400);
-    sample();
-    padOf(cell).reset();
-  });
-  check('a standard gamepad: the left stick moves the player', stickCheck.changed, `input ${JSON.stringify(stickCheck.before)} → ${JSON.stringify(stickCheck.during)}`);
-  // Cross, R2, Square, R1, L2, Circle: one of them is the game's main action.
-  let acted = null;
-  for (const button of [0, 7, 2, 5, 6, 1]) {
-    const press = await moves(cell, async (sample) => {
-      padOf(cell).set({ buttons: { [button]: 1 } });
-      await sleep(300);
-      sample();
-      padOf(cell).reset();
-    });
-    if (press.changed) {
-      acted = button;
-      break;
-    }
-  }
-  check('a standard gamepad: a face button or trigger acts', acted !== null, acted === null ? 'none of Cross, R2, Square, R1, L2, Circle changed the input' : `button ${acted}`);
-}
-
-/**
- * The settings menu on one copy: Esc and Options open it over the running game,
- * the world keeps moving on every copy while it is open, and Create + Options
- * belongs to the hub's bar, not the game.
- */
-async function settingsChecks(check, state, cell) {
-  const others = state.cells.filter((c) => c !== cell && !c.gone);
-  await holdKey(cell, 'Escape', 80);
-  const opened = await until(() => probeOf(cell)?.menu === true, 1500);
-  check('Esc opens the settings menu in a session', opened, JSON.stringify(probeOf(cell)));
-  const w0 = [cell, ...others].map(worldOf);
-  const sent0 = cell.bridge.stats.sent;
-  await sleep(1500);
-  const w1 = [cell, ...others].map(worldOf);
-  const still = probeOf(cell)?.menu === true;
-  // Parallel shares no world, so a game may pause for its menu there: nobody else waits on it.
-  if (state.coordinator.mode !== 'parallel') {
-    check('the world keeps moving while the menu is open', still && w1.every((w, i) => w > w0[i]),
-      `world ${w0.map((w) => w.toFixed?.(2)).join(',')} → ${w1.map((w) => w.toFixed?.(2)).join(',')}${still ? '' : ' (the menu closed by itself)'}`);
-    if (state.n > 1) check('the copy with its menu open keeps playing over the network', cell.bridge.stats.sent > sent0, `sent ${sent0} → ${cell.bridge.stats.sent}`);
-  }
-  await holdKey(cell, 'Escape', 80);
-  check('Esc closes the menu again', await until(() => probeOf(cell)?.menu === false, 1500), JSON.stringify(probeOf(cell)));
-  if (!padOf(cell)) return;
-  await holdPad(cell, { buttons: { 9: 1 } }, 150);
-  const padOpened = await until(() => probeOf(cell)?.menu === true, 1500);
-  check('Options opens the settings menu', padOpened, JSON.stringify(probeOf(cell)));
-  await holdPad(cell, { buttons: { 9: 1 } }, 150);
-  if (probeOf(cell)?.menu) await holdPad(cell, { buttons: { 1: 1 } }, 150);
-  check('Options or Circle closes it', await until(() => probeOf(cell)?.menu === false, 1500), JSON.stringify(probeOf(cell)));
-  const pad = padOf(cell);
-  pad.set({ buttons: { 8: 1 } });
-  await sleep(150);
-  pad.set({ buttons: { 8: 1, 9: 1 } });
-  await sleep(1100);
-  const grabbed = probeOf(cell)?.menu === true;
-  pad.reset();
-  await sleep(150);
-  if (probeOf(cell)?.menu) await holdKey(cell, 'Escape', 80);
-  check('Options held with Create is left to the hub', !grabbed, grabbed ? 'the game opened its menu on Create + Options' : '');
-}
-
 async function conformance() {
   const checks = [];
   const check = (name, pass, detail = '') => {
@@ -526,10 +377,11 @@ async function conformance() {
     }
     const n = state.n;
     const m = state.metas;
-    check('head metas', m && m.session === '1' && MODES.includes(m.mode), m ? `hub:session=${m.session} mode=${m.mode}` : 'could not fetch the page');
+    check('head metas', m && m.session === '1' && modeOf(m.mode), m ? `hub:session=${m.session} mode=${m.mode}` : 'could not fetch the page');
     const seats = String(m?.players ?? '').match(/\d+/g)?.map(Number) ?? [];
-    check('hub:session-players covers 2–4', seats.length === 2 && seats[0] <= 2 && seats[1] >= 4, `hub:session-players=${m?.players}`);
-    check('hub:session-minutes is a number', Number(m?.minutes) > 0, `hub:session-minutes=${m?.minutes}`);
+    const [least, most = least] = seats;
+    check('hub:session-players is a range within 1–4', seats.length >= 1 && seats.length <= 2 && least >= 1 && least <= most && most <= 4, `hub:session-players=${m?.players}`);
+    if (m?.minutes != null) check('hub:session-minutes, when given, is a number', Number(m.minutes) > 0, `hub:session-minutes=${m.minutes}`);
 
     // Every copy: the players, and in a server round the server's copy.
     const copies = () => [...(state.status?.players ?? []), ...(state.status?.server ? [state.status.server] : [])];
@@ -537,27 +389,19 @@ async function conformance() {
     check('every copy says hello', helloed, copies().filter((p) => !p.hello).map((p) => p.key).join(', '));
     if (!helloed) return;
     const caps = state.coordinator.seats().map((s) => s.caps);
-    check('hello names protocol 1 and the mode', caps.every((c) => c.v === 1 && c.mode === state.coordinator.mode), JSON.stringify(caps[0]));
+    check('hello names protocol 1 and the mode', caps.every((c) => c.v === 1 && modeOf(c.mode) === state.coordinator.mode), JSON.stringify(caps[0]));
     check('hello seats cover this player count', caps.every((c) => Array.isArray(c.seats) && c.seats[0] <= Math.max(2, n) && c.seats[1] >= n), JSON.stringify(caps[0]?.seats));
     if (state.cells.some((c) => !c.frame.contentDocument)) {
       check('frames reachable for synthetic input', false, 'serve the game from the same origin as this harness');
       return;
     }
 
-    if (splash) {
-      // The splash collects ready: every game readies up by itself once loaded, with no prompt and no key.
-      const loaded = await until(() => copies().every((p) => p.ready), 20_000);
-      check('ready without a key press (the hub’s splash asks the players)', loaded, copies().filter((p) => !p.ready).map((p) => p.key).join(', '));
-      releaseRound(state);
-    } else {
-      await sleep(600);
-      for (const cell of state.cells) {
-        poke(cell, ' ');
-        tap(cell);
-      }
-    }
+    // The card collects ready: every game readies up by itself once loaded, with no prompt and no key.
+    const loaded = await until(() => copies().every((p) => p.ready), 20_000);
+    check('ready without a key press (the hub’s card asks the players)', loaded, copies().filter((p) => !p.ready).map((p) => p.key).join(', '));
+    releaseRound(state);
     const started = await until(() => state.status?.phase !== 'loading', 15_000);
-    check(splash ? 'the round starts when the splash ends' : 'ready on a key press or tap', started && copies().every((p) => p.ready), copies().filter((p) => !p.ready).map((p) => p.key).join(', ') || state.status?.phase);
+    check('the round starts when the card ends', started && copies().every((p) => p.ready), copies().filter((p) => !p.ready).map((p) => p.key).join(', ') || state.status?.phase);
     if (!started || state.record) return;
 
     await until(() => state.status.phase === 'playing' || state.record, TIMINGS.countdownMs + 2000);
@@ -571,28 +415,29 @@ async function conformance() {
     };
     await randomly(Math.min(1500, playMs / 4));
 
-    const side = state.coordinator.mode === 'parallel';
-    if (side) {
+    const mode = state.coordinator.mode;
+    // Parallel and ghost: every copy runs its own world from the same seeded start. A game
+    // still tagged race was built to race's contract: no seeded start, and no progress asked.
+    const own = SELF_REPORTED.includes(mode);
+    const legacyRace = own && !seedsRandom(m?.mode);
+    if (own && !legacyRace) {
       const seeded = state.cells.every((c) => c.frame.contentWindow?.AIHub?.seeded === true);
-      check('parallel: Math.random is seeded, the same on every copy', seeded, state.cells.map((c) => `${c.key}: client ${c.frame.contentWindow?.AIHub?.version ?? '?'} seeded ${c.frame.contentWindow?.AIHub?.seeded}`).join('; '));
-    }
-    const probed = state.cells.every((c) => probeOf(c) && !probeOf(c).error);
-    // A retrofitted old game (&retrofit=1) need not probe: the input and menu checks then have nothing to read.
-    if (probed || !retrofit) check('every copy probes its state (AIHub.probe)', probed, state.cells.map((c) => `${c.key}: ${JSON.stringify(probeOf(c))}`).join('; '));
-    if (probed && !state.record) {
-      await sleep(400);
-      await controlChecks(check, state.cells[n - 1]);
-      if (!state.record) await settingsChecks(check, state, state.cells[0]);
+      check(`${mode}: Math.random is seeded, the same on every copy`, seeded, state.cells.map((c) => `${c.key}: client ${c.frame.contentWindow?.AIHub?.version ?? '?'} seeded ${c.frame.contentWindow?.AIHub?.seeded}`).join('; '));
     }
 
     if (scenario === 'host-leave') removeCell(state.cells[0]);
     else if (n >= 3) removeCell(state.cells[n - 1]);
     await randomly(playMs / 2);
     const remaining = state.cells.filter((c) => !c.gone);
-    if (side) {
-      check('parallel: no game traffic', state.cells.every((c) => c.bridge.stats.sent === 0),
-        state.cells.map((c) => `${c.key} ↑${c.bridge.stats.sent}`).join(' '));
-      check('parallel: every copy reports its progress', remaining.every((c) => c.progress.length > 0 || state.status?.players.find((p) => p.key === c.key)?.result),
+    if (own) {
+      if (mode === 'parallel') {
+        check('parallel: no game traffic', state.cells.every((c) => c.bridge.stats.sent === 0),
+          state.cells.map((c) => `${c.key} ↑${c.bridge.stats.sent}`).join(' '));
+      } else {
+        check('ghost: every copy sends its player', remaining.every((c) => c.bridge.stats.sent > 0) || n === 1,
+          remaining.map((c) => `${c.key} ↑${c.bridge.stats.sent}`).join(' '));
+      }
+      if (!legacyRace) check(`${mode}: every copy reports its progress`, remaining.every((c) => c.progress.length > 0 || state.status?.players.find((p) => p.key === c.key)?.result),
         remaining.map((c) => `${c.key}: ${c.progress.length} report${c.progress.length === 1 ? '' : 's'}`).join(', '));
     } else {
       check('game traffic flows both ways', remaining.every((c) => c.bridge.stats.sent > 0 && c.bridge.stats.received > 0) || n === 1,

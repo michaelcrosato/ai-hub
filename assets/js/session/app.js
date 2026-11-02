@@ -32,7 +32,7 @@ import { loadManifest, normalize, sessionOf } from '../manifest.js';
 import { fnv1a } from '../color.js';
 import { createPlayer } from '../ui/player.js';
 import { createBridge, attachFrame, postTo, cleanProgress } from '/lib/hub/bridge.js';
-import { createRound, limitFor, rankRace, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
+import { createRound, limitFor, rankResults, seedsRandom, MODE_NAMES, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
@@ -77,8 +77,8 @@ const overlay = document.getElementById('results');
 
 /** The reference games, one per kind of round, for a session with nothing else to play. */
 const EXAMPLES = [
-  { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Versus: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'versus', sessionMinutes: '2', sessionGoal: 'First to ten stars wins', sessionHowto: 'Move: arrows, WASD or a stick · sprint: Space or Cross · or hold a finger' },
-  { slug: 'hub-example-race', name: 'Comet Dash', tagline: 'Race with ghosts', path: '/lib/hub/examples/race.html', themeColor: '#0f1b2e', sessionMode: 'race', sessionMinutes: '1', sessionGoal: 'Fastest to the end of the course wins', sessionHowto: 'Steer: ← →, A D or a stick · boost: Space or Cross · or drag a finger' },
+  { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Shared world: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'shared-world', sessionMinutes: '2', sessionGoal: 'First to ten stars wins', sessionHowto: 'Move: arrows, WASD or a stick · sprint: Space or Cross · or hold a finger' },
+  { slug: 'hub-example-ghost', name: 'Comet Dash', tagline: 'Ghost: race the others’ ghosts', path: '/lib/hub/examples/ghost.html', themeColor: '#0f1b2e', sessionMode: 'ghost', sessionMinutes: '1', sessionGoal: 'Fastest to the end of the course wins', sessionHowto: 'Steer: ← →, A D or a stick · boost: Space or Cross · or drag a finger' },
   { slug: 'hub-example-parallel', name: 'Starfall', tagline: 'Parallel: one minute of falling stars', path: '/lib/hub/examples/parallel.html', themeColor: '#15103a', sessionMode: 'parallel', sessionPlayers: '1-4', sessionMinutes: '1', sessionGoal: 'Most points in one minute: catch stars, dodge rocks', sessionHowto: 'Move: ← →, A D or a stick · dash: Space or Cross · or drag a finger' },
 ].map((g) => normalize({ sessionPlayers: '2-4', ...g, type: 'Game', session: '1', tags: ['touch'], builds: [{ id: 'current', path: g.path }] }));
 
@@ -117,13 +117,13 @@ const player = createPlayer(document.getElementById('player'), {
 });
 
 /**
- * The game's address in a round. In a parallel round, the seed rides in it too: the
- * client seeds Math.random with it before the game's own scripts run, so every
- * copy starts the same (lib/hub/README.md, "Parallel").
+ * The game's address in a round. For a game tagged parallel or ghost, the seed
+ * rides in it too: the client seeds Math.random with it before the game's own
+ * scripts run, so every copy starts the same (lib/hub/README.md, "The client").
  */
 function roundSrc(path, cur) {
   const join = path.includes('?') ? '&' : '?';
-  return cur?.mode === 'parallel' ? `${path}${join}aihub=1&aihub-seed=${cur.seed >>> 0}` : `${path}${join}aihub=1`;
+  return cur?.seeded ? `${path}${join}aihub=1&aihub-seed=${cur.seed >>> 0}` : `${path}${join}aihub=1`;
 }
 
 /* --- who is here ----------------------------------------------------------- */
@@ -231,7 +231,7 @@ function takeOver() {
 
 /**
  * The round's coordinator left with the old host's tab. A shared world dies
- * with its host, but a race or a parallel round needs none: score it from
+ * with its host, but a parallel or ghost round needs none: score it from
  * the last status this tab saw, each player's result or else their last
  * progress, instead of throwing away what the others played. Null when there
  * is nothing to score.
@@ -246,7 +246,7 @@ function scoreLeftRound(cur) {
     else if (!p.out && p.key !== cur.coordinator && boardRound === cur.round && progressById.has(p.id)) results.set(p.id, { score: progressById.get(p.id).score, fallback: true });
   }
   if (!results.size) return null;
-  const ranked = rankRace(results, players.filter((p) => !p.out || results.has(p.id)).map((p) => p.id));
+  const ranked = rankResults(results, players.filter((p) => !p.out || results.has(p.id)).map((p) => p.id));
   const gone = players.filter((p) => p.out && !results.has(p.id)).map((p) => p.id);
   const scores = Object.fromEntries([...results].map(([id, r]) => [id, Number.isFinite(r.time) ? r.time : r.score]));
   return { status: 'played', reason: 'host-left', standings: gone.length ? [...ranked, gone] : ranked, players, results: Object.fromEntries(results), scores };
@@ -287,6 +287,7 @@ function startRound({ under = false } = {}) {
     name: game.name,
     path: game.path,
     mode: info.mode,
+    seeded: seedsRandom(game.sessionMode),
     limitMs: limits.limitMs ?? limitFor(info.minutes),
     seed: fnv1a(`${state.seed}:${round}`),
     players,
@@ -433,7 +434,7 @@ function withRoundRecorded(s, record) {
   };
   let totals = s.totals;
   if (record.status === 'played' && record.standings) {
-    const scored = scoreRound({ standings: record.standings, mode: cur.mode, won: record.won });
+    const scored = scoreRound({ standings: record.standings, won: record.won });
     for (const [id, r] of scored) {
       const p = record.players.find((q) => q.id === id);
       const raw = record.results?.[id] ?? (record.scores ? { score: record.scores[id] } : null);
@@ -1013,10 +1014,13 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const statsLine = (stats) =>
   stats ? Object.entries(stats).map(([name, value]) => `${name} ${typeof value === 'number' ? Math.round(value * 100) / 100 : value}`).join(' · ') : '';
 
+/** A shared world that said whether the team won: shown as the team's result, without medals. */
+const teamResult = (entry) => typeof entry.won === 'boolean';
+
 function headline(entry) {
   if (entry.status !== 'played') return `No points this round: ${REASONS[entry.reason] ?? entry.reason}.`;
   const winners = entry.rows.filter((r) => r.place === 1);
-  if (entry.mode === 'co-op') return entry.won ? 'The team did it!' : 'So close. The team fell short.';
+  if (teamResult(entry)) return entry.won ? 'The team did it!' : 'So close. The team fell short.';
   if (winners.length === entry.rows.length && winners.length > 1) return 'Dead heat!';
   if (winners.length > 1) return `${names(winners.map((r) => r.name))} share the win!`;
   return winners.length ? `${winners[0].name} wins!` : 'Round over';
@@ -1037,7 +1041,7 @@ function resultsCard(entry) {
           h(
             'li',
             { style: { '--i': i } },
-            h('span', { class: 'results__place' }, row.place <= 3 && entry.mode !== 'co-op' ? MEDALS[row.place - 1] : String(row.place)),
+            h('span', { class: 'results__place' }, row.place <= 3 && !teamResult(entry) ? MEDALS[row.place - 1] : String(row.place)),
             swatch(row.slot),
             h(
               'span',
@@ -1064,7 +1068,6 @@ function resultsCard(entry) {
   );
 }
 
-const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op', parallel: 'Parallel' };
 
 /** Host: skip the rest of the results; the splash starts its countdown now. */
 function nextGameNow() {
@@ -1091,7 +1094,7 @@ function splashCard(cur) {
     h(
       'p',
       { class: 'next__mode' },
-      h('span', { class: 'chip' }, MODE_LINES[cur.mode] ?? 'Game'),
+      h('span', { class: 'chip' }, MODE_NAMES[cur.mode] ?? 'Game'),
       ' ',
       `${cur.players.length} player${cur.players.length === 1 ? '' : 's'}`
     ),
@@ -1236,7 +1239,7 @@ function endScreen() {
           {},
           `Round ${e.round}: ${e.name} — `,
           e.status === 'played'
-            ? e.mode === 'co-op'
+            ? teamResult(e)
               ? e.won ? 'the team won' : 'the team fell short'
               : `won by ${names(e.rows.filter((r) => r.place === 1).map((r) => r.name))}`
             : 'no points'

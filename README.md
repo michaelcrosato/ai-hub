@@ -425,15 +425,21 @@ What a game must do is the **AI Hub Session Protocol**, specified in
 [`lib/hub/README.md`](lib/hub/README.md) and served at
 <https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md>. That page is the
 whole interface: it is the one thing handed to whichever agent builds a game.
-A game declares the one mode it plays best together:
+The page holds only the interface and the hub's facts: no example values,
+suggested numbers or design advice, since an agent takes any of those as the
+way to build the game. A game declares one of three modes:
 
 - **Parallel**: everyone plays their own copy, from the same
   start, on the same clock; the hub draws a live scoreboard from each copy's
   progress. Every game with a score or a finish can do it, with no networking,
   and it is how the existing library joins sessions.
-- **Race**: one course, each copy running its own player, the others solid
-  rivals in it.
-- **Versus** and **co-op**: one world, run by the host's copy.
+- **Ghost**: parallel, and each copy also shows the other players'
+  characters while they are in the same area of the game, without them
+  touching its world.
+- **Shared world**: one world for everyone, run by the host's copy.
+
+Games tagged with the older modes keep working: `race` plays as ghost, `co-op`
+and `versus` as a shared world.
 
 In short: the `hub:session` metas in the head, the small `session.js` client
 pasted in unmodified as the first script, a round reported with its stats and
@@ -448,10 +454,10 @@ A game that declares it shows a *Hub session* line in its details
 with `has:session`. Those fields never become rails. A parallel game is
 not a multiplayer game on the wall: each player plays alone.
 
-Games that play in sessions: **Blaze Cup** (versus, in teams), **Arwingdings**,
-**Merry-Go-Kart 64**, **Brine Line 64** and **Urethane Switchyard** (races and
-score runs on one shared course, rivals solid), and **Grand Theft Motto III**
-(the whole campaign, co-op).
+Games that play in sessions include **Blaze Cup** (a shared world, in teams),
+**Arwingdings**, **Merry-Go-Kart 64**, **Brine Line 64** and **Urethane
+Switchyard** (tagged race, so played as ghost), and **Grand Theft Motto III**
+(a shared world: the whole campaign, together).
 
 To test a game against the protocol, open the harness, which loads 1–4 copies
 next to each other on a simulated network:
@@ -462,13 +468,14 @@ http://localhost:4173/lib/hub/harness.html?game=/games/mygame.html&players=4&lat
 ```
 
 `node scripts/hub-check.mjs games/mygame.html` runs the automatic conformance
-checks with Playwright: a parallel game at 1 and 2 players, a race or a
-shared world at 2, 3 and 4 on a bad network, each with a player leaving, then
-the game on its own. `--record` writes the verdict into `data/overrides.json`,
-where a failing game gets `"session": "0"` and is never dealt. The three
-examples in `lib/hub/examples/` (**Starfall**, parallel; a race with
-ghosts; a versus arena) are the plain reference games and pass it; the
-session games above are the full ones.
+checks with Playwright: a parallel game at 1 and 2 players, a ghost game or a
+shared world at 2, 3 and 4 on a bad network (within the seats it declares),
+each with a player leaving, then the game on its own. `--record` writes the
+verdict into `data/overrides.json`, where a failing game gets `"session": "0"`
+and is never dealt. The three examples in `lib/hub/examples/` (**Starfall**,
+parallel; **Comet Dash**, ghost; **Star Arena**, a shared world) are the hub's
+reference games and pass it; the protocol page does not link them, so no agent
+copies them.
 
 ### Bringing the library to sessions
 

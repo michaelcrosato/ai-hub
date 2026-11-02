@@ -9,8 +9,8 @@
  *            and the countdown runs out by itself;
  *   round 2: everyone presses Ready (a click, Enter, the controller's Cross),
  *            which starts it at once; then the host closes its tab and the
- *            next seat takes over (a shared world would be void; this race or
- *            parallel round is scored from what the next host saw);
+ *            next seat takes over (a shared world would be void; a parallel
+ *            or ghost round is scored from what the next host saw);
  *   round 3: the three who are left; Create + Options hands one tab's corner
  *            bar to the controller and Circle gives it back;
  *   round 4: the host's 🎲 skips it; in round 5 a guest's ✕ (held, then
@@ -33,6 +33,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { staticHandler } from './lib/serve.mjs';
+import { SELF_REPORTED } from '../lib/hub/round.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = createRequire(import.meta.url)('playwright');
@@ -185,8 +186,8 @@ try {
   await waitFor(pages[1], started, null, 20_000);
   await play([pages[2], pages[3], pages[4]], 2_000);
   const mode2 = (await session(pages[2])).state.current.mode;
-  // A race or parallel round outlives its host: let the scoreboard hear from the players first.
-  if (['race', 'parallel'].includes(mode2)) await waitFor(pages[2], () => Object.keys(window.__session?.progress ?? {}).length >= 2, null, 15_000);
+  // A parallel or ghost round outlives its host: let the scoreboard hear from the players first.
+  if (SELF_REPORTED.includes(mode2)) await waitFor(pages[2], () => Object.keys(window.__session?.progress ?? {}).length >= 2, null, 15_000);
   log(`round 2 under way (${(await session(pages[2])).state.current.name}, ${mode2}); the host leaves`);
   await pages[1].close();
   delete pages[1];
@@ -194,8 +195,8 @@ try {
   state = (await session(pages[2])).state;
   assert.equal(state.host, 'seat2', 'the next seat took over');
   assert.equal(state.history[1].reason, 'host-left');
-  if (['race', 'parallel'].includes(mode2)) {
-    assert.equal(state.history[1].status, 'played', 'a race or parallel round is scored from what the new host saw');
+  if (SELF_REPORTED.includes(mode2)) {
+    assert.equal(state.history[1].status, 'played', 'a parallel or ghost round is scored from what the new host saw');
     assert.equal(state.history[1].rows.find((row) => row.key === 'seat1').place, state.history[1].rows.length, 'the host who left comes last');
     log(`round 2 scored after the host left: ${state.history[1].rows.map((row) => `${row.name} +${row.points}`).join(', ')}; seat 2 hosts now`);
   } else {

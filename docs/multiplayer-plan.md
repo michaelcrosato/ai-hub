@@ -8,15 +8,27 @@ needs, is [`lib/hub/README.md`](../lib/hub/README.md), served at
 <https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md>. What the hub does
 around a round is [`session-hub.md`](session-hub.md).
 
+**Nov 2, 2026: three modes, and the protocol cut to the interface.** A game
+declares **parallel**, **ghost** (parallel, plus the other players'
+characters shown while they are in the same area of the game, never touching
+a world; `Math.random` seeded as in parallel) or **shared world** (one world
+for everyone, run by the host's copy). Older tags still play: `race` as ghost,
+`co-op` and `versus` as a shared world. The protocol page now holds only the
+interface and the hub's facts: no controller standard, settings menu, probe,
+round-length advice or example values, since an agent takes any hint as the
+way to build a game. `hub:session-minutes` is optional; a game that gives no
+length gets the longest round. The dated log below keeps the names of its
+day.
+
 ## The short version
 
 Every game on the hub should be playable with friends, at the level of
 "together" it can honestly support. The cheapest level, **parallel**,
 reaches almost the whole library: everyone plays their own copy of the same
 game at the same time, from the same start, and the hub shows who is ahead.
-A shared course (**race**) and a shared world (**versus**, **co-op**) are
-the best party games and cost more work, so new games build them where the
-genre suits.
+**Ghost** (the other players seen in your own world) and a **shared world**
+(everyone in one world, run by the host) build on it where a game suits
+them.
 
 The audit kept version 2's chassis and changed its armour:
 
@@ -25,7 +37,7 @@ The audit kept version 2's chassis and changed its armour:
   mode as the new baseline, added to the library by a tool and a cheap model; the
   host's copy runs every shared world, each copy owning its own player.
 - **Changed**: watching stays on state, as version 2 decided, but asks no
-  game for a new ability. A watcher of a shared world or a race is a copy
+  game for a new ability. A watcher of a shared world is a copy
   with no player of its own, drawn from the traffic every copy already gets;
   in parallel mode, the live scoreboard is the view. That cuts the hardest,
   costliest per-game ability (snapshot, restore, mirror) out of the roadmap.
@@ -62,9 +74,9 @@ change.
    Friends talk where they already do. The hub shows only the names it
    generates.
 3. **Every game can be played together, at its honest level.** A game with a
-   score or a finish gets parallel; a racer a shared track; a fighting
-   game real versus. A game declares the one level it plays best, and nothing
-   fakes a level it can't support.
+   score or a finish gets parallel; a game with a hero, ghost; a game with
+   online multiplayer of its own, a shared world. A game declares the one
+   level it plays best, and nothing fakes a level it can't support.
 4. **The hub owns everything around a round; the game owns only the round.**
    Invite, lobby, seats, names, network, clock, card, scoreboard, results,
    history: the hub's. A game plays one round and reports how it went.
@@ -85,16 +97,17 @@ change.
 8. **Smooth beats strict.** No anti-cheat among friends. Each device moves
    its own player at once; in head-to-head play, the player who gets hit
    decides.
-9. **Party pace.** Rounds of 2–8 minutes, capped at 15; about fifteen seconds
-   from one game's end to the next game's start. Nobody watches a loading
-   bar.
+9. **Party pace.** About fifteen seconds from one game's end to the next
+   game's start; nobody watches a loading bar. A round's length is the
+   game's own: the hub calls time at 1.5 × the length a game gives, at most
+   15 minutes, and at 15 minutes when it gives none.
 10. **Every round ranks.** One point for every player beaten, whatever the
     game, so a session can mix Solitaire and a kart racer.
 11. **A fair start.** Same seed, same rules, same limit; nothing saved on a
     device carries into a round. In parallel mode, the same seed gives the same
     start, not the same whole game, and the protocol says so.
-12. **Runs where your friends are.** Any modern browser, keyboard and mouse
-    or a controller. WebGPU may make a game look better; a game that truly
+12. **Runs where your friends are.** Any modern browser. WebGPU may make a
+    game look better; a game that truly
     needs it says so, and the hub deals it only when every player's browser
     has it.
 13. **Standardize the plumbing, keep the feel.** The hub changes games to
@@ -127,23 +140,24 @@ for watching; the platform evidence above turned that around.)
 
 ## Part 3. Modes
 
-Version 2's six formats collapse into four modes a game can declare, plus
-features of the hub that need nothing from a game.
+Version 2's six formats collapse into three modes a game can declare (four
+from Oct 28 to Nov 2), plus features of the hub that need nothing from a
+game.
 
 | Version 2 | Now |
 |---|---|
-| 0 Watch | Parallel: the live scoreboard (*Now*). Shared worlds and races: a copy with no player of its own, fed the same traffic (*Later*) |
+| 0 Watch | Parallel and ghost: the live scoreboard (*Now*). Shared worlds: a copy with no player of its own, fed the same traffic (*Later*) |
 | 1 Parallel | Mode `parallel`, client 1.3.0 (*Now*) |
-| 2 Ghosts | Mode `race`; ghosts or solid rivals is a drawing choice the game makes |
-| 3 Together | Modes `versus` and `co-op`: the host's copy runs the world |
-| 4 Natural multiplayer | Whichever of the three a game plays best |
+| 2 Ghosts | Mode `ghost`: parallel, plus the other players shown while they are in the same area, never touching a world (`race` until Nov 2) |
+| 3 Together | Mode `shared-world`: the host's copy runs the world (`versus` and `co-op` until Nov 2) |
+| 4 Natural multiplayer | A shared world, in whatever form the game's own multiplayer takes |
 | 5 Couch and remote couch | Couch co-op on one screen stays each game's own (up to four controllers), unchanged. Remote couch co-op is **pinned**: friends far away would need the host's screen streamed to them as video |
 
 **One mode per game.** A list of modes per game would mean a code path and a
 conformance run per mode in every game, for a choice the hub never needs to
 make. The lobby needs no new picker either: the deal alternates between the
-parallel games and the ones played together, so a dozen shared worlds are
-not buried under hundreds of parallel games.
+parallel and ghost games and the shared worlds, so a dozen shared worlds are
+not buried under hundreds of the others.
 
 **Parallel in seven steps** (the protocol has them in full): declare the
 metas, paste the client first in `<head>`, skip the title in a session and
@@ -211,8 +225,8 @@ Playwright. Nothing here needs cc-matrix.
    then `hub-check --retrofit`: two players with one leaving, no traffic,
    progress and a seeded start expected; and the game on its own compared
    with the original (still draws, no new errors, client inactive,
-   `Math.random` untouched). The full controller and settings-menu checks
-   stay for new games: an old game keeps the controls it had.
+   `Math.random` untouched). Since Nov 2 no game is checked for controls or
+   a menu: every game keeps its own.
 5. **Retry and escalate**: a second try told what the check found, then the
    next model up; past `--max-cost` dollars for one game (default $1) it
    stops. A game none of them can wire is put back byte for byte, with a
@@ -532,7 +546,7 @@ layout: an ai-hub change, made when the first cc-matrix builds come in.
 | 5 | Which builds first | One build of each title, readable and without WebGPU: wave 1, 228 games (`pick --wave 1`) |
 | 6 | Phones | Built the cheap way: a seat with only a touch screen is dealt touch-tagged games while any fit; no work per game |
 | 7 | Live scoreboard on or off by default | On, folded with a tap, remembered per device (built) |
-| 8 | Controller required for parallel retrofits | No: an old game keeps its own controls; new games use the full standard |
+| 8 | Controller required for parallel retrofits | No: since Nov 2 no game is asked for a controller standard; every game keeps its own controls |
 | 9 | More than four players | Parallel first, up to eight, later |
 
 ---

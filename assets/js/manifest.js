@@ -8,6 +8,8 @@
  * metadata now, room for more later".
  */
 
+import { modeOf, MODE_NAMES } from '../../lib/hub/round.js';
+
 /** Fields that describe a specific game rather than classify it. Never a rail.
  *  The drawer reuses this to decide which fields are worth listing as facts. */
 export const NOT_A_FACET = new Set([
@@ -67,7 +69,6 @@ export function playersOf(game) {
 
 /** The AI Hub Session Protocol versions this hub can run (lib/hub/README.md). */
 export const SESSION_PROTOCOLS = [1];
-const SESSION_MODES = { versus: 'Versus', 'co-op': 'Co-op', race: 'Race', parallel: 'Parallel' };
 
 /**
  * What a game says about playing it in an AI Hub session, read off its
@@ -80,10 +81,10 @@ export function sessionOf(game) {
   if (!Number.isInteger(version) || version < 1) return null;
   const [low, high = low] = (String(game.sessionPlayers ?? '').match(/\d+/g) || []).map(Number);
   const seats = low ? [low, high] : [2, 4];
-  const mode = SESSION_MODES[game.sessionMode] ? game.sessionMode : null;
+  const mode = modeOf(game.sessionMode);
   const minutes = Number(game.sessionMinutes) > 0 ? Number(game.sessionMinutes) : null;
   const parts = [seats[0] === seats[1] ? `${seats[0]} players` : `${seats[0]}–${seats[1]} players`];
-  if (mode) parts.push(SESSION_MODES[mode]);
+  if (mode) parts.push(MODE_NAMES[mode]);
   if (minutes) parts.push(`about ${minutes} min`);
   const line = (text, most) => String(text ?? '').trim().slice(0, most) || null;
   return {

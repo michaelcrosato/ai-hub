@@ -2,39 +2,38 @@
 /**
  * hub-check.mjs — does a game keep the AI Hub Session Protocol?
  *
- * Runs lib/hub/harness.html?auto=1 against each game with 2, 3 and 4 players
- * on a poor network (150 ± 50 ms, 5% loss): hello, ready without a prompt
- * under the hub's splash, the keyboard and an emulated standard gamepad (a
- * PS5 DualSense in the browser's standard mapping) reaching the player, the
- * settings menu opening over a world that keeps moving, traffic, a player
- * leaving, time-up and a valid result. Then once more with the host leaving.
- * Then the game on its own, outside a session: the controller alone, and then
- * the keyboard alone, get from its title to play and open and close its menu.
- * Before any game script runs, every frame in session mode gets alert,
- * confirm, prompt, window.open and socket constructors wrapped, so calling
- * them is caught. Needs Playwright, which is not a dependency (see shots.mjs).
+ * Runs lib/hub/harness.html?auto=1 against each game, at the player counts its
+ * hub:session-players allows: hello, ready under the hub's card with no key
+ * press, the start, traffic, a player leaving, time-up and a valid result. Then
+ * once more with the host leaving. Then the game on its own, outside a session:
+ * it opens, Enter and Space are pressed, and it must draw its screen with no
+ * errors, the session client inactive and Math.random left alone. Before any
+ * game script runs, every frame in session mode gets alert, confirm, prompt,
+ * window.open and socket constructors wrapped, so calling them is caught.
+ * Needs Playwright, which is not a dependency (see shots.mjs).
  *
- * A shared world (versus, co-op) is also played once at 2 players with its
- * world hosted by one more copy that has no player of its own, as a dedicated
- * server would host it (README, "Versus and co-op"). It is reported like any
- * run; --record does not hold it against a game, since no server runs yet.
+ * Parallel is played at 1 and 2 players: nothing is shared, so more copies
+ * prove nothing more. Its checks expect Math.random seeded the same on every
+ * copy, progress from every copy, and no game traffic.
  *
- * A parallel game (hub:session-mode parallel) is played at 1 and 2
- * players, and once with a player leaving: nothing is shared, so more copies
- * prove nothing more. Its checks expect no game traffic, progress, and
- * Math.random seeded the same on every copy.
+ * Ghost and shared world are played at 2, 3 and 4 players on a poor network
+ * (150 ± 50 ms, 5% loss). Ghost is checked like parallel, except that every
+ * copy sends its player. A shared world wants traffic both ways, and is
+ * played once more at 2 players with its world hosted by one more copy that
+ * has no player of its own, as a dedicated server would host it (README,
+ * "Shared world"). That run is reported like any; --record does not hold it
+ * against a game, since no server runs yet.
  *
- * --retrofit is for an existing game upgraded to parallel (README,
- * "Parallel"): it need not probe, it is played once, at 2 players with one of
- * them leaving, and on its own it must simply still work, so that check opens
- * the page, presses Enter and Space, and wants no errors and a drawn screen.
- * With --original <path>, errors the original page already had are forgiven.
- * --draws-only does only that last part, for any page: the retrofit runs it
- * on a game before spending a model on it, since a page this browser cannot
- * run cannot be checked here. A WebGPU-only game without WebGPU is caught even
+ * --retrofit is for an existing game upgraded to parallel: it is played once,
+ * at 2 players with one of them leaving. With --original <path>, errors the
+ * original page already had are forgiven when it is opened on its own.
+ * --draws-only does only that last part, for any page: the retrofit runs it on
+ * a game before spending a model on it, since a page this browser cannot run
+ * cannot be checked here. A WebGPU-only game without WebGPU is caught even
  * when its title screen shows: it asked for an adapter, got none, and drew
- * nothing with WebGL or a 2D canvas instead. --browser-args passes flags to Chromium; on a machine
- * without a GPU, SwiftShader gives such games a software adapter:
+ * nothing with WebGL or a 2D canvas instead. --browser-args passes flags to
+ * Chromium; on a machine without a GPU, SwiftShader gives such games a
+ * software adapter:
  *   --browser-args "--enable-unsafe-webgpu --enable-features=Vulkan --use-vulkan=swiftshader --use-webgpu-adapter=swiftshader --use-angle=swiftshader"
  *
  * Every game's pasted client is also read from disk and must be exactly a
@@ -57,10 +56,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { staticHandler } from './lib/serve.mjs';
+import { modeOf, SELF_REPORTED } from '../lib/hub/round.js';
 import { findClients } from './lib/hub-client.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const EXAMPLES = ['/lib/hub/examples/arena.html', '/lib/hub/examples/race.html', '/lib/hub/examples/parallel.html'];
+const EXAMPLES = ['/lib/hub/examples/arena.html', '/lib/hub/examples/ghost.html', '/lib/hub/examples/parallel.html'];
 const PAGE_MS = 300_000;
 
 const args = process.argv.slice(2);
@@ -84,19 +84,24 @@ const asPath = (g) => (g.startsWith('/') || /^https?:/.test(g) ? g : `/${g}`);
 const games = args.filter((a) => !a.startsWith('--')).map(asPath);
 if (!games.length) games.push(...EXAMPLES);
 
-/** The player counts to try: as asked, or by the game's mode. Parallel shares nothing, so 1 and 2 say it all. */
-function countsFor(mode) {
+/**
+ * The player counts to try: as asked, or by the game's mode, within the seats
+ * the game takes. Parallel shares nothing, so 1 and 2 say it all.
+ */
+function countsFor(mode, [least, most]) {
   const list = asked ?? (mode === 'parallel' ? '1,2' : '2,3,4');
-  return list.split(',').map(Number).filter((n) => n >= 1 && n <= 4);
+  return list.split(',').map(Number).filter((n) => n >= 1 && n <= 4 && (asked || (n >= least && n <= most)));
 }
 
-/** The game's session mode, read from its head. */
-async function modeOf(game) {
+/** The game's session mode (older tags read as today's) and its seats, from its head. */
+async function headOf(game) {
   try {
     const html = await (await fetch(/^https?:/.test(game) ? game : `${base}${game}`)).text();
-    return html.match(/<meta\s+name=["']hub:session-mode["']\s+content=["']([^"']+)["']/i)?.[1] ?? null;
+    const meta = (name) => html.match(new RegExp(`<meta\\s+name=["']${name}["']\\s+content=["']([^"']+)["']`, 'i'))?.[1] ?? null;
+    const [least = 1, most = least] = (meta('hub:session-players')?.match(/\d+/g) ?? []).map(Number);
+    return { mode: modeOf(meta('hub:session-mode')), seats: [least, most] };
   } catch {
-    return null;
+    return { mode: null, seats: [1, 4] };
   }
 }
 
@@ -109,37 +114,10 @@ try {
 }
 
 /**
- * Runs in every frame before its own scripts. Every page gets an emulated
- * standard gamepad, connected on its first press like a real one, driven
- * through window.__pad. Only session-mode pages are watched for dialogs and sockets.
+ * Runs in every frame before its own scripts: it notes what the page asks of
+ * the graphics stack, and session-mode pages are watched for dialogs and sockets.
  */
 function watch() {
-  const buttons = Array.from({ length: 17 }, () => ({ pressed: false, touched: false, value: 0 }));
-  const pad = { id: 'DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)', index: 0, connected: true, mapping: 'standard', axes: [0, 0, 0, 0], buttons, timestamp: 0, vibrationActuator: null };
-  let plugged = false;
-  window.__pad = {
-    set({ buttons: down = {}, axes = {} } = {}) {
-      for (const [i, v] of Object.entries(down)) {
-        const value = Number(v) || 0;
-        Object.assign(buttons[i], { pressed: value > 0.5, touched: value > 0, value });
-      }
-      for (const [i, v] of Object.entries(axes)) pad.axes[i] = v;
-      pad.timestamp = performance.now();
-      if (!plugged) {
-        plugged = true;
-        const event = new Event('gamepadconnected');
-        event.gamepad = pad;
-        dispatchEvent(event);
-      }
-    },
-    reset() {
-      for (const b of buttons) Object.assign(b, { pressed: false, touched: false, value: 0 });
-      pad.axes.fill(0);
-      pad.timestamp = performance.now();
-    },
-  };
-  Object.defineProperty(Navigator.prototype, 'getGamepads', { configurable: true, value: () => [plugged ? pad : null, null, null, null] });
-
   // What the page asked of the graphics stack: a WebGPU adapter it never got, and
   // no WebGL drawing instead, means this browser cannot run it (a title screen may still show).
   const gfx = (window.__gfx = { askedForWebGPU: false, gotAdapter: false, webgl: false, twoD: false });
@@ -208,13 +186,14 @@ try {
       runs.push({ game, players: 0, scenario: 'static', pass: client.pass, checks: [client] });
       if (!asJson && !client.pass) console.log(`FAIL  ${game}  ✗ ${client.name} — ${client.detail}`);
     }
-    const mode = await modeOf(game);
-    const counts = countsFor(mode);
+    const { mode, seats } = await headOf(game);
+    const counts = countsFor(mode, seats);
     // A retrofit is played once, at 2 players with one leaving: nothing is shared, so that says it all.
     const plan = retrofit && !asked ? [] : counts.map((n) => ({ n, scenario: 'standard' }));
-    plan.push({ n: retrofit && !asked ? 2 : Math.max(2, Math.min(3, Math.max(...counts))), scenario: 'host-leave' });
+    const leaving = retrofit && !asked ? 2 : Math.max(2, Math.min(3, Math.max(...counts, 0)));
+    if (asked || leaving <= seats[1]) plan.push({ n: leaving, scenario: 'host-leave' });
     // A shared world must also run on a copy with no player of its own, as a server would run it.
-    if (!retrofit && ['versus', 'co-op'].includes(mode)) plan.push({ n: 2, scenario: 'server' });
+    if (!retrofit && mode && !SELF_REPORTED.includes(mode) && (asked || (seats[0] <= 2 && seats[1] >= 2))) plan.push({ n: 2, scenario: 'server' });
     for (const { n, scenario } of plan) {
       const context = await browser.newContext({ viewport: { width: 1280, height: 860 } });
       await context.addInitScript(watch);
@@ -223,7 +202,7 @@ try {
       const warnings = [];
       page.on('pageerror', (e) => pageErrors.push(e.message));
       page.on('console', (m) => m.text().startsWith('[AIHub]') && warnings.push(m.text()));
-      const query = { game, players: n, latency: 150, jitter: 50, loss: 5, auto: 1, scenario, play: 8000, ...(retrofit ? { retrofit: 1 } : {}) };
+      const query = { game, players: n, latency: 150, jitter: 50, loss: 5, auto: 1, scenario, play: 8000 };
       const url = `${base}/lib/hub/harness.html?${new URLSearchParams(query)}`;
       await page.goto(url);
       // The harness times every step itself; this only catches a page that stopped answering.
@@ -248,10 +227,10 @@ try {
       await context.close();
     }
     if (solo) {
-      const report = retrofit ? await stillWorks(game, original && asPath(original)) : await alone(game);
+      const report = await stillWorks(game, original && asPath(original));
       runs.push({ game, players: 1, scenario: 'alone', pass: report.pass, checks: report.checks });
       if (!asJson) {
-        console.log(`${report.pass ? 'PASS' : 'FAIL'}  ${game}  on its own (${retrofit ? 'as before the retrofit' : 'controller, then keyboard'})`);
+        console.log(`${report.pass ? 'PASS' : 'FAIL'}  ${game}  on its own`);
         for (const c of report.checks) if (!c.pass) console.log(`        ✗ ${c.name}${c.detail ? ` — ${c.detail}` : ''}`);
       }
     }
@@ -261,81 +240,6 @@ try {
   server?.close();
 }
 
-/**
- * The game outside a session, as someone at the wall plays it: first with
- * only the controller, Cross until it plays (its menus' defaults), then
- * Options to open its menu and Options or Circle to close it; then, on a
- * fresh page, the same with only the keyboard: Enter or Space, then Esc.
- */
-async function alone(game) {
-  const checks = [];
-  const check = (name, pass, detail = '') => checks.push({ name, pass: !!pass, detail });
-  const url = /^https?:/.test(game) ? game : `${base}${game}`;
-  for (const device of ['controller', 'keyboard']) {
-    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    await context.addInitScript(watch);
-    const page = await context.newPage();
-    const errors = [];
-    page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(url);
-    const probe = () => page.evaluate(() => window.AIHub?.inspect?.() ?? null).catch(() => null);
-    const wait = async (test, ms) => {
-      const end = Date.now() + ms;
-      for (;;) {
-        const p = await probe();
-        if (test(p)) return p;
-        if (Date.now() > end) return p;
-        await page.waitForTimeout(150);
-      }
-    };
-    const press = async (what) => {
-      if (device === 'controller') {
-        await page.evaluate((b) => window.__pad.set({ buttons: { [b]: 1 } }), what);
-        await page.waitForTimeout(160);
-        await page.evaluate(() => window.__pad.reset());
-      } else {
-        await page.keyboard.press(what);
-      }
-      await page.waitForTimeout(450);
-    };
-    const first = await wait((p) => p && !p.error, 20_000);
-    if (!first || first.error) {
-      check(`on its own: the game probes its state (${device})`, false, JSON.stringify(first));
-      await context.close();
-      continue;
-    }
-    const start = device === 'controller' ? [0] : ['Enter', 'Space'];
-    let state = first;
-    for (let i = 0; i < 14 && state?.scene !== 'play'; i++) {
-      await press(start[i % start.length]);
-      state = await probe();
-    }
-    check(`on its own: the ${device} alone gets from the title to play`, state?.scene === 'play', `scene ${first.scene} → ${state?.scene}`);
-    if (state?.scene === 'play') {
-      const open = device === 'controller' ? 9 : 'Escape';
-      await press(open);
-      const opened = await wait((p) => p?.menu === true, 1500);
-      check(`on its own: ${device === 'controller' ? 'Options' : 'Esc'} opens the menu`, opened?.menu === true, JSON.stringify(opened));
-      await press(open);
-      let closed = await wait((p) => p?.menu === false, 1000);
-      if (closed?.menu && device === 'controller') {
-        await press(1);
-        closed = await wait((p) => p?.menu === false, 1000);
-      }
-      check(`on its own: ${device === 'controller' ? 'Options or Circle' : 'Esc'} closes it`, closed?.menu === false, JSON.stringify(closed));
-    }
-    check(`on its own: no errors (${device})`, !errors.length, errors.slice(0, 3).join('; '));
-    await context.close();
-  }
-  return { pass: checks.every((c) => c.pass), checks };
-}
-
-/**
- * A retrofitted game on its own: open it as someone at the wall would, press
- * Enter and Space a few times, and see that it still runs: no errors (none
- * beyond what the original page already had), the client inactive and
- * Math.random left alone, and something drawn on the screen.
- */
 /** The pasted client, read from disk: one copy, exactly a released one. Null for a game served from elsewhere. */
 async function clientCheck(game) {
   if (/^https?:/.test(game)) return null;
@@ -358,6 +262,12 @@ async function clientCheck(game) {
   return { name, pass: copies[0].pristine, detail: copies[0].pristine ? copies[0].version : `${copies[0].version ?? 'unknown'} edited: paste lib/hub/session.js again` };
 }
 
+/**
+ * The game on its own: open it as someone at the wall would, press Enter and
+ * Space a few times, and see that it still runs: no errors (none beyond what
+ * an original page already had), the client inactive and Math.random left
+ * alone, and something drawn on the screen.
+ */
 async function stillWorks(game, before, { bare = false } = {}) {
   const checks = [];
   const check = (name, pass, detail = '') => checks.push({ name, pass: !!pass, detail });
@@ -397,7 +307,8 @@ async function stillWorks(game, before, { bare = false } = {}) {
   const fresh = after.errors.filter((e) => !known.has(e));
   if (!bare) {
     check('on its own: the session client is there and inactive', after.hub && after.hub.active === false, JSON.stringify(after.hub));
-    check('on its own: Math.random is left alone', after.hub && after.hub.seeded === false, JSON.stringify(after.hub));
+    // A client before 1.3.0 has no seeded flag: it never seeds.
+    check('on its own: Math.random is left alone', after.hub && after.hub.seeded !== true, JSON.stringify(after.hub));
   }
   const g = after.gfx;
   const noWebGPU = g?.askedForWebGPU && !g.gotAdapter && !g.webgl && !g.twoD;

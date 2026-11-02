@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
-import { createRound, rankRace, checkStandings, limitFor, SLOT_COLORS } from '../lib/hub/round.js';
+import { createRound, rankResults, checkStandings, limitFor, modeOf, seedsRandom, MODES, MODE_NAMES, SELF_REPORTED, SLOT_COLORS, TIMINGS } from '../lib/hub/round.js';
 import { createBridge, createLocalNetwork, LIMITS } from '../lib/hub/bridge.js';
 import { sessionOf, NOT_A_FACET } from '../assets/js/manifest.js';
 
@@ -373,7 +373,7 @@ test('a round starts three seconds after everyone is ready, and calls time at th
   assert.equal(round.record.reason, 'no-result', 'versus with no finish from the host');
 });
 
-test("the host's finish ends a versus round; players already gone are placed last", () => {
+test("the host's finish ends a shared world; players already gone are placed last", () => {
   const { round, to, ended, allHello, allReady, clock } = setup({ n: 4 });
   allHello();
   allReady();
@@ -548,7 +548,7 @@ test('a race ends as soon as every racer has reported', () => {
   assert.deepEqual(round.record.standings, [[1], [0]]);
 });
 
-test('parallel: each copy reports itself, nothing waits on a host, and the round ranks like a race', () => {
+test('parallel: each copy reports itself, nothing waits on a host, and the round ranks finishers by time, then score', () => {
   const { round, clock, allHello, allReady, to } = setup({ n: 3, mode: 'parallel', limitMs: 30_000 });
   allHello();
   allReady();
@@ -564,7 +564,7 @@ test('parallel: each copy reports itself, nothing waits on a host, and the round
   assert.deepEqual(round.record.standings, [[2], [1], [0]]);
   assert.deepEqual(round.record.stats, { 1: { stars: 12 } });
   assert.deepEqual(round.record.awards, [{ id: 1, title: 'Star streak' }]);
-  assert.match(round.record.issues.map((i) => i.problem).join('|'), /finish is for versus and co-op; parallel games report result/);
+  assert.match(round.record.issues.map((i) => i.problem).join('|'), /finish is for a shared world; parallel games report result/);
 });
 
 test('a fatal error voids the round only when it comes from the host of a shared world', () => {
@@ -589,16 +589,17 @@ test('timeUp() and abort() end a round on the hub’s say-so', () => {
   assert.deepEqual(s.to('k1', 'end').map((m) => m.reason), ['session-ended']);
 });
 
-test('race ranking groups ties, and standings checks catch every mistake', () => {
+test('parallel and ghost ranking groups ties, and standings checks catch every mistake', () => {
   const results = new Map([[0, { time: 5 }], [1, { time: 5 }], [2, { score: 10 }], [3, { score: 30 }]]);
-  assert.deepEqual(rankRace(results, [0, 1, 2, 3, 4]), [[0, 1], [3], [2], [4]]);
+  assert.deepEqual(rankResults(results, [0, 1, 2, 3, 4]), [[0, 1], [3], [2], [4]]);
   assert.deepEqual(checkStandings([[1], 0], [0, 1], [0, 1, 2]), { ok: true, standings: [[1], [0], [2]] });
   assert.match(checkStandings([[0], [0, 1]], [0, 1], [0, 1]).problem, /twice/);
   assert.match(checkStandings([[0], [5]], [0], [0, 1]).problem, /unknown/);
   assert.match(checkStandings('first', [0], [0]).problem, /not an array/);
   assert.equal(limitFor(4), 360_000);
   assert.equal(limitFor(30), 900_000);
-  assert.equal(limitFor(undefined), 450_000);
+  assert.equal(limitFor(undefined), TIMINGS.maxRoundMs, 'a game that gives no length gets the longest round');
+  assert.equal(limitFor('none'), TIMINGS.maxRoundMs);
 });
 
 test('a server, a copy with no player of its own, hosts the world, is never ranked, and takes the round with it when it goes', () => {
@@ -797,17 +798,18 @@ test('the client reports the splash, and hands the harness whatever the game pro
   assert.equal(hub.splash, true);
 });
 
-test('the spec and the three examples carry the client byte for byte', async () => {
+test('the three examples carry the client byte for byte, and the spec links to it', async () => {
   const client = await read('lib/hub/session.js');
   assert.match(client, /^\/\*! aihub-session 1\.3\.0 /);
-  for (const file of ['lib/hub/README.md', 'lib/hub/examples/arena.html', 'lib/hub/examples/race.html', 'lib/hub/examples/parallel.html']) {
+  assert.match(await read('lib/hub/README.md'), /raw\.githubusercontent\.com\/michaelcrosato\/ai-hub\/main\/lib\/hub\/session\.js/);
+  for (const file of ['lib/hub/examples/arena.html', 'lib/hub/examples/ghost.html', 'lib/hub/examples/parallel.html']) {
     assert.ok((await read(file)).includes(client), `${file} must contain lib/hub/session.js unchanged`);
   }
 });
 
 test('the examples declare session support in their heads', async () => {
   const { parseHead } = await import('./lib/parse.mjs');
-  for (const [file, mode, seats] of [['lib/hub/examples/arena.html', 'versus', [2, 4]], ['lib/hub/examples/race.html', 'race', [2, 4]], ['lib/hub/examples/parallel.html', 'parallel', [1, 4]]]) {
+  for (const [file, mode, seats] of [['lib/hub/examples/arena.html', 'shared-world', [2, 4]], ['lib/hub/examples/ghost.html', 'ghost', [2, 4]], ['lib/hub/examples/parallel.html', 'parallel', [1, 4]]]) {
     const { hub } = parseHead(await read(file));
     assert.equal(hub.session, '1');
     assert.equal(hub.sessionMode, mode);
@@ -822,15 +824,66 @@ test('a game’s session support reads as one line, and none of its fields becom
   assert.deepEqual(sessionOf(game), {
     version: 1,
     seats: [2, 4],
-    mode: 'race',
+    mode: 'ghost',
     minutes: 4,
     goal: 'First over the line',
     howto: 'Steer ← →',
     supported: true,
-    label: '2–4 players · Race · about 4 min',
+    label: '2–4 players · Ghost · about 4 min',
   });
+  assert.equal(sessionOf({ session: '1', sessionMode: 'co-op' }).label, '2–4 players · Shared world');
+  assert.equal(sessionOf({ session: '1', sessionMode: 'shared-world' }).minutes, null, 'the length is optional');
   assert.equal(sessionOf({ session: '1', sessionGoal: 'x'.repeat(90) }).goal.length, 60);
   assert.equal(sessionOf({ session: '2' }).supported, false);
   assert.equal(sessionOf({ session: '1', sessionPlayers: '4' }).label, '4 players');
   for (const key of Object.keys(game)) assert.ok(NOT_A_FACET.has(key));
+});
+
+test('three modes, one name each; older tags play as today’s: race as ghost, co-op and versus as a shared world', () => {
+  assert.deepEqual(MODES, ['parallel', 'ghost', 'shared-world']);
+  assert.deepEqual(MODE_NAMES, { parallel: 'Parallel', ghost: 'Ghost', 'shared-world': 'Shared world' });
+  assert.deepEqual(SELF_REPORTED, ['parallel', 'ghost']);
+  for (const [tag, mode] of [['parallel', 'parallel'], ['ghost', 'ghost'], ['shared-world', 'shared-world'], ['race', 'ghost'], ['co-op', 'shared-world'], ['versus', 'shared-world'], [' Ghost ', 'ghost'], ['sideways', null], [undefined, null]]) {
+    assert.equal(modeOf(tag), mode, `${tag} reads as ${mode}`);
+  }
+  // A round dealt under an older tag runs as today's mode, and hellos in either word agree with it.
+  const { round, to, allHello, allReady, clock } = setup({ n: 2, mode: 'race' });
+  assert.equal(round.mode, 'ghost');
+  allHello();
+  assert.equal(to('k1', 'welcome')[0].mode, 'ghost');
+  round.receive('k0', { type: 'hello', v: 1, mode: 'ghost' });
+  allReady();
+  clock.advance(4_000);
+  round.receive('k0', { type: 'result', time: 9_000 });
+  round.receive('k1', { type: 'result', score: 30 });
+  assert.equal(round.record.status, 'played', 'a ghost round ends when every player has a result');
+  assert.deepEqual(round.record.standings, [[0], [1]]);
+  assert.deepEqual(round.record.issues, []);
+  const shared = setup({ n: 2, mode: null });
+  shared.round.receive('k0', { type: 'hello', v: 1, mode: 'versus' });
+  shared.round.receive('k1', { type: 'hello', v: 1, mode: 'shared-world' });
+  assert.equal(shared.round.mode, 'shared-world', 'the first hello names the mode');
+  assert.equal(shared.to('k1', 'welcome')[0].mode, 'shared-world');
+});
+
+test('ghost rounds carry the seed in the game’s address, like parallel; shared worlds and games still tagged race do not', () => {
+  for (const tag of ['parallel', 'ghost', ' Ghost ']) assert.equal(seedsRandom(tag), true, tag);
+  // race was built for an unseeded start: ids made from Math.random must differ between its copies.
+  for (const tag of ['race', 'shared-world', 'co-op', 'versus', null]) assert.equal(seedsRandom(tag), false, String(tag));
+});
+
+test('won makes a team result in any shared world; a game tagged co-op that leaves it out lost', () => {
+  const finishWith = (tag, extra) => {
+    const { round, allHello, allReady, clock } = setup({ n: 2, mode: tag });
+    allHello();
+    allReady();
+    clock.advance(4_000);
+    round.receive('k0', { type: 'finish', standings: [[0, 1]], ...extra });
+    return round.record;
+  };
+  assert.equal(finishWith('shared-world', { won: true }).won, true);
+  assert.equal(finishWith('versus', { won: false }).won, false);
+  assert.equal(finishWith('shared-world', {}).won, undefined, 'no won: a ranking, with medals');
+  assert.equal(finishWith('co-op', {}).won, false, 'co-op always read a missing won as a loss');
+  assert.equal(finishWith('co-op', { won: true }).won, true);
 });
