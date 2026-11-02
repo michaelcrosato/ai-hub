@@ -1,10 +1,10 @@
 /**
- * retrofit.mjs — the part of a side-by-side retrofit that needs no model.
+ * retrofit.mjs — the part of a parallel retrofit that needs no model.
  *
- * It puts the session client and the side-by-side metas into an existing game
+ * It puts the session client and the parallel metas into an existing game
  * page, before any of the game's own scripts, and leaves everything else
  * byte for byte as it was. A model then wires the game to them (README,
- * "Side by side"); checkRetrofit() says what is still missing.
+ * "Parallel"); checkRetrofit() says what is still missing.
  */
 
 import { findClients } from './hub-client.mjs';
@@ -46,7 +46,7 @@ export function sessionBlock({ client, minutes = SIDE_BY_SIDE.minutes, goal = ''
 }
 
 /**
- * Add the session client and the side-by-side metas to a game page. Returns
+ * Add the session client and the parallel metas to a game page. Returns
  * the new text, or the reason it was left alone.
  */
 export function prepareSideBySide(html, { client, minutes } = {}) {

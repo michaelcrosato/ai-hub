@@ -238,7 +238,7 @@ test("the clock takes the host's time from the quickest round trip", async () =>
   clock.stop();
 });
 
-test('the deal alternates games played together with side-by-side ones, so a few shared worlds are not buried', () => {
+test('the deal alternates games played together with parallel ones, so a few shared worlds are not buried', () => {
   const together = ['race1', 'race2'].map((s) => game(s));
   const side = Array.from({ length: 30 }, (_, i) => game(`side${i}`, { sessionMode: 'parallel' }));
   let state = { seed: 7, n: 3, cycle: 0, played: [] };
@@ -250,7 +250,7 @@ test('the deal alternates games played together with side-by-side ones, so a few
   }
   assert.deepEqual(dealt.map((slug) => slug.startsWith('race')), [true, false, true, false, true, false, true, false, true, false]);
   const sides = dealt.filter((slug) => slug.startsWith('side'));
-  assert.equal(new Set(sides).size, sides.length, 'the together deck starting over brings no side-by-side game round again');
+  assert.equal(new Set(sides).size, sides.length, 'the together deck starting over brings no parallel game round again');
   assert.deepEqual(new Set(dealt.slice(0, 4).filter((slug) => slug.startsWith('race'))), new Set(['race1', 'race2']));
   const alone = pickNext(side, { seed: 7, n: 2 });
   assert.ok(alone.game.slug.startsWith('side'), 'with one deck, the deal is that deck');

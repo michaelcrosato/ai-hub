@@ -15,7 +15,7 @@ game that fails it out of sessions.
 
 - Client: https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/session.js (also in the appendix)
 - Harness: https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/harness.html (run from a folder of your own: *Test it*)
-- Examples, one per mode: [parallel.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/parallel.html) (side by side),
+- Examples, one per mode: [parallel.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/parallel.html) (parallel),
   [race.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/race.html) (race),
   [arena.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/arena.html) (versus)
 
@@ -31,16 +31,16 @@ A game declares the one way it plays best together:
 | A course everyone runs at once | `race` | their own player on one shared course, the others in it as rivals |
 | One world everyone shares | `versus` or `co-op` | one world, run by the host's copy (or a server), every player in it |
 
-**Side by side** (`parallel`) is the minimum, and every game with a score or
-a finish can do it: read *Side by side* and *Rules*. Race, versus and co-op
-take more work and make the best party games: read *Side by side* first, then
+**Parallel** is the minimum, and every game with a score or
+a finish can do it: read *Parallel* and *Rules*. Race, versus and co-op
+take more work and make the best party games: read *Parallel* first, then
 *Playing together*.
 
 To ask an agent for it, add this to the game's prompt:
 
 > This game must support AI Hub sessions. Follow
 > https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/README.md
-> (AI Hub Session Protocol v1): pick the mode the game plays best together (side by side,
+> (AI Hub Session Protocol v1): pick the mode the game plays best together (parallel,
 > race, versus or co-op), add the hub:session meta tags, paste session.js in
 > unmodified as the first script in <head>, implement session mode, report
 > progress and a result (in versus or co-op, run the shared world even when
@@ -51,7 +51,7 @@ To ask an agent for it, add this to the game's prompt:
 
 ---
 
-## Side by side
+## Parallel
 
 Everyone plays their own copy of the game, from the same start, on the same
 clock. Nothing passes between the copies: each tells the hub its score as it
@@ -77,8 +77,8 @@ networking for this.
    game starts: write them for someone who has never seen it.
 
 2. **Paste the client** (`session.js`, the appendix) unmodified, as the
-   **first script in `<head>`**, right after `<meta charset>`. Side by side,
-   it seeds `Math.random` before any of your own code runs, so every copy
+   **first script in `<head>`**, right after `<meta charset>`. In a parallel
+   round it seeds `Math.random` before any of your own code runs, so every copy
    builds the same start.
 
 3. **In a session, skip the title.** `AIHub.active` is true from the first
@@ -144,7 +144,7 @@ function finish() { run.over = true; AIHub.result({ score: run.score }); }
 **Starfall** ([parallel.html](https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/examples/parallel.html))
 is the whole pattern in a small game.
 
-### What side by side allows
+### What parallel allows
 
 - **Pausing.** Nothing is shared, so a menu may pause your own run. The
   hub's clock keeps going.
@@ -233,7 +233,7 @@ key (or Circle) closes it. Only settings that change this device belong in it
 (volume, quality, controls); "Quit" or "Restart" do nothing in a session.
 In a shared world (race, versus, co-op) the menu never pauses: the host keeps
 simulating, every copy keeps sending, and the player with the menu open just
-idles. Side by side, and out of a session, it may pause.
+idles. In parallel mode, and out of a session, it may pause.
 
 ### The probe
 
@@ -251,7 +251,7 @@ AIHub.probe(() => ({
 
 ### An existing game, upgraded
 
-An existing game brought to side by side (the hub upgrades its library this
+An existing game brought to parallel (the hub upgrades its library this
 way) changes only what the seven steps need, and keeps its controls, menus
 and feel exactly as they were. The controller, the settings menu and the
 probe are then welcome but not required, and the hub's check compares the
@@ -265,7 +265,7 @@ Race, versus and co-op: everyone plays in one place, the same track, the same
 pitch, the same park, and they can touch. Do the seven steps of *Side by
 side* first, with three differences: declare your own mode
 (`hub:session-mode`), connect with it, and don't expect `Math.random` to be
-seeded (it isn't, outside side by side: ids made from it must differ between
+seeded (it isn't, outside parallel: ids made from it must differ between
 copies). Then:
 
 - **Seats.** `hub:session-players` must cover 2, 3 and 4. Start it at 1 when
@@ -455,7 +455,7 @@ It is final for the round: remove or freeze their player and carry on.
 - In versus, when only one player is left, the host finishes at once.
 - If the **host** of a versus or co-op round leaves, isn't ready, or has its
   tab hidden for more than 20 seconds, the round is void.
-- A race or side-by-side round goes on when a player leaves.
+- A race or parallel round goes on when a player leaves.
 - If the game cannot run at all here (no WebGL, a failed load), call
   `AIHub.fail('why')`: from the host of a shared world it voids the round,
   from anyone else it counts as leaving.
@@ -486,7 +486,7 @@ used.
 
 ## Results
 
-`result()` (side by side, race) and `finish()` (versus, co-op) may carry the
+`result()` (parallel, race) and `finish()` (versus, co-op) may carry the
 round's highlights, which the hub shows on the results and keeps:
 
 ```js
@@ -574,7 +574,7 @@ python3 -m http.server 8000
 
 Then open:
 
-- Side by side: `http://localhost:8000/harness.html?game=mygame.html&players=2&auto=1`
+- Parallel: `http://localhost:8000/harness.html?game=mygame.html&players=2&auto=1`
 - Race, versus, co-op: `…&players=4&latency=150&jitter=50&loss=5&auto=1`, and
   again with `&scenario=host-leave`; versus and co-op once more with
   `&players=2&scenario=server`
@@ -584,7 +584,7 @@ The checklist on the right fills in as it runs; the result is in
 `document.body.dataset.complete` becomes `"true"` at the end, for a headless
 browser to wait on. **A game passes when `window.__hubCheck.pass` is true**:
 
-- **Side by side**: at 1 and 2 players, and with a player leaving. Checked:
+- **Parallel**: at 1 and 2 players, and with a player leaving. Checked:
   the metas; hello and ready under the card with no key press; the round
   starts; `Math.random` seeded the same on every copy; progress from every
   copy; no game traffic; a valid result, and every copy told it ended; no
@@ -632,13 +632,13 @@ own.
 | `AIHub.active` | `true` in session mode, from the first line |
 | `AIHub.connect({ mode, seats })` | → `Promise<info \| null>`; `null` means play normally |
 | `AIHub.me`, `.host`, `.isHost`, `.players`, `.mode`, `.seed`, `.limitMs`, `.round`, `.splash`, `.server` | the round, after `connect()` |
-| `AIHub.seeded` | `true` when the hub seeded `Math.random` (side by side) |
+| `AIHub.seeded` | `true` when the hub seeded `Math.random` (parallel) |
 | `AIHub.ready()` | once: as soon as loaded under the card, otherwise from the ready gesture |
 | `AIHub.on(event, fn)` | returns a function that removes the handler |
 | `AIHub.time()` | ms since the start; negative during the countdown; `-Infinity` before `start` |
 | `AIHub.rng(label)` | a seeded generator of numbers in `[0, 1)`, one stream per label |
-| `AIHub.progress({ score, label })` | side by side and race: your standing, as often as you like; the hub hears it about once a second |
-| `AIHub.result({ time \| score, stats?, awards? })` | side by side and race: once, about yourself |
+| `AIHub.progress({ score, label })` | parallel and race: your standing, as often as you like; the hub hears it about once a second |
+| `AIHub.result({ time \| score, stats?, awards? })` | parallel and race: once, about yourself |
 | `AIHub.finish({ standings, scores?, won?, stats?, awards? })` | versus and co-op: the host, once |
 | `AIHub.send(data, { to, reliable })` | race, versus, co-op; `to` one player id, or everyone else; returns `false` when dropped |
 | `AIHub.fail(message)` | the game cannot run here |
@@ -665,15 +665,15 @@ Each player scores one point for every player they beat, so every round of
 four is worth three points to its winner, whatever the game. Between rounds
 the hub shows the results over your frame, then its card for the next game
 while that game loads: about fifteen seconds from one round's end to the next
-one's start. Side-by-side and race games show on a live scoreboard from their
-progress. The hub deals games from two decks, side by side and played
+one's start. Parallel and race games show on a live scoreboard from their
+progress. The hub deals games from two decks, parallel and played
 together, in turn, so the few shared worlds come round as often as the many
-side-by-side games.
+parallel games.
 
 ### Versions
 
 This is protocol **1**, client **1.3.0**. 1.1.0 added stats and awards;
-1.2.0 the card (`splash`), `probe()` and `inspect()`; 1.3.0 side by side
+1.2.0 the card (`splash`), `probe()` and `inspect()`; 1.3.0 parallel
 (`parallel`, `progress()`, the seeded `Math.random`), a storage of the
 game's own in a session, fullscreen handed to the hub, and made the client
 pass on any welcome field or event a newer hub adds. Games on older clients

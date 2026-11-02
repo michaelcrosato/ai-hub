@@ -67,7 +67,7 @@ export function playersOf(game) {
 
 /** The AI Hub Session Protocol versions this hub can run (lib/hub/README.md). */
 export const SESSION_PROTOCOLS = [1];
-const SESSION_MODES = { versus: 'Versus', 'co-op': 'Co-op', race: 'Race', parallel: 'Side by side' };
+const SESSION_MODES = { versus: 'Versus', 'co-op': 'Co-op', race: 'Race', parallel: 'Parallel' };
 
 /**
  * What a game says about playing it in an AI Hub session, read off its

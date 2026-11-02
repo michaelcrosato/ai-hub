@@ -19,13 +19,13 @@
  * server would host it (README, "Versus and co-op"). It is reported like any
  * run; --record does not hold it against a game, since no server runs yet.
  *
- * A side-by-side game (hub:session-mode parallel) is played at 1 and 2
+ * A parallel game (hub:session-mode parallel) is played at 1 and 2
  * players, and once with a player leaving: nothing is shared, so more copies
  * prove nothing more. Its checks expect no game traffic, progress, and
  * Math.random seeded the same on every copy.
  *
- * --retrofit is for an existing game upgraded to side by side (README, "Side
- * by side"): it need not probe, it is played once, at 2 players with one of
+ * --retrofit is for an existing game upgraded to parallel (README,
+ * "Parallel"): it need not probe, it is played once, at 2 players with one of
  * them leaving, and on its own it must simply still work, so that check opens
  * the page, presses Enter and Space, and wants no errors and a drawn screen.
  * With --original <path>, errors the original page already had are forgiven.
@@ -84,7 +84,7 @@ const asPath = (g) => (g.startsWith('/') || /^https?:/.test(g) ? g : `/${g}`);
 const games = args.filter((a) => !a.startsWith('--')).map(asPath);
 if (!games.length) games.push(...EXAMPLES);
 
-/** The player counts to try: as asked, or by the game's mode. Side by side shares nothing, so 1 and 2 say it all. */
+/** The player counts to try: as asked, or by the game's mode. Parallel shares nothing, so 1 and 2 say it all. */
 function countsFor(mode) {
   const list = asked ?? (mode === 'parallel' ? '1,2' : '2,3,4');
   return list.split(',').map(Number).filter((n) => n >= 1 && n <= 4);

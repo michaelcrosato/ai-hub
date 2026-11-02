@@ -79,7 +79,7 @@ const overlay = document.getElementById('results');
 const EXAMPLES = [
   { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Versus: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'versus', sessionMinutes: '2', sessionGoal: 'First to ten stars wins', sessionHowto: 'Move: arrows, WASD or a stick · sprint: Space or Cross · or hold a finger' },
   { slug: 'hub-example-race', name: 'Comet Dash', tagline: 'Race with ghosts', path: '/lib/hub/examples/race.html', themeColor: '#0f1b2e', sessionMode: 'race', sessionMinutes: '1', sessionGoal: 'Fastest to the end of the course wins', sessionHowto: 'Steer: ← →, A D or a stick · boost: Space or Cross · or drag a finger' },
-  { slug: 'hub-example-parallel', name: 'Starfall', tagline: 'Side by side: one minute of falling stars', path: '/lib/hub/examples/parallel.html', themeColor: '#15103a', sessionMode: 'parallel', sessionPlayers: '1-4', sessionMinutes: '1', sessionGoal: 'Most points in one minute: catch stars, dodge rocks', sessionHowto: 'Move: ← →, A D or a stick · dash: Space or Cross · or drag a finger' },
+  { slug: 'hub-example-parallel', name: 'Starfall', tagline: 'Parallel: one minute of falling stars', path: '/lib/hub/examples/parallel.html', themeColor: '#15103a', sessionMode: 'parallel', sessionPlayers: '1-4', sessionMinutes: '1', sessionGoal: 'Most points in one minute: catch stars, dodge rocks', sessionHowto: 'Move: ← →, A D or a stick · dash: Space or Cross · or drag a finger' },
 ].map((g) => normalize({ sessionPlayers: '2-4', ...g, type: 'Game', session: '1', tags: ['touch'], builds: [{ id: 'current', path: g.path }] }));
 
 let pool = [];
@@ -117,9 +117,9 @@ const player = createPlayer(document.getElementById('player'), {
 });
 
 /**
- * The game's address in a round. Side by side, the seed rides in it too: the
+ * The game's address in a round. In a parallel round, the seed rides in it too: the
  * client seeds Math.random with it before the game's own scripts run, so every
- * copy starts the same (lib/hub/README.md, "Side by side").
+ * copy starts the same (lib/hub/README.md, "Parallel").
  */
 function roundSrc(path, cur) {
   const join = path.includes('?') ? '&' : '?';
@@ -231,7 +231,7 @@ function takeOver() {
 
 /**
  * The round's coordinator left with the old host's tab. A shared world dies
- * with its host, but a race or a side-by-side round needs none: score it from
+ * with its host, but a race or a parallel round needs none: score it from
  * the last status this tab saw, each player's result or else their last
  * progress, instead of throwing away what the others played. Null when there
  * is nothing to score.
@@ -1064,7 +1064,7 @@ function resultsCard(entry) {
   );
 }
 
-const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op', parallel: 'Side by side' };
+const MODE_LINES = { race: 'Race', versus: 'Versus', 'co-op': 'Co-op', parallel: 'Parallel' };
 
 /** Host: skip the rest of the results; the splash starts its countdown now. */
 function nextGameNow() {

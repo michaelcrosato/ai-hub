@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * retrofit.mjs — bring existing games to side by side, a game at a time.
+ * retrofit.mjs — bring existing games to parallel, a game at a time.
  *
  *   node scripts/retrofit.mjs pick [--wave 1] [--limit N]
  *       which games to do: one build of each title, readable code first
  *   node scripts/retrofit.mjs prepare <games…> [--minutes 4]
- *       the tool step alone: the session client and the side-by-side metas,
+ *       the tool step alone: the session client and the parallel metas,
  *       first in <head> (scripts/lib/retrofit.mjs)
  *   node scripts/retrofit.mjs check <games…>
  *       what each page still lacks, read from its text
@@ -55,7 +55,7 @@ const OVERRIDES = path.join(ROOT, 'data', 'overrides.json');
 /** The original beside the game while it is checked: a leading _ keeps the scan from ever listing it. */
 const BEFORE = '_before-retrofit.';
 const backupOf = (target) => path.join(path.dirname(target), BEFORE + path.basename(target));
-const NOTE = 'side by side:';
+const NOTE = 'parallel:';
 
 const argv = process.argv.slice(2);
 const command = argv.shift();
@@ -318,7 +318,7 @@ async function retrofitOne(arg, agents, prompt) {
         const { cost, text: words } = readReply(reply.out);
         spent += cost ?? 0;
         const seconds = Math.round((Date.now() - started) / 1000);
-        const unfit = words.match(/NOT SIDE BY SIDE:\s*(.+)/)?.[1]?.trim();
+        const unfit = words.match(/NOT PARALLEL:\s*(.+)/)?.[1]?.trim();
         if (unfit) {
           await log({ outcome: 'unfit', tier, attempt, agent, seconds, cost, reason: unfit.slice(0, 300) });
           await noteGame(page, `unfit (${today}): ${unfit}`);
@@ -456,7 +456,7 @@ async function main() {
     process.exit(2);
   }
   const readme = await readFile(path.join(ROOT, 'lib/hub/README.md'), 'utf8');
-  const contract = readme.slice(readme.indexOf('## Side by side'), readme.indexOf('\n## Rules')).trim();
+  const contract = readme.slice(readme.indexOf('## Parallel'), readme.indexOf('\n## Rules')).trim();
   const prompt = (await readFile(path.join(ROOT, 'lib/hub/retrofit.md'), 'utf8'))
     .split('\n---\n')
     .slice(1)

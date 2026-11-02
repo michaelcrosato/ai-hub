@@ -427,7 +427,7 @@ What a game must do is the **AI Hub Session Protocol**, specified in
 whole interface: it is the one thing handed to whichever agent builds a game.
 A game declares the one mode it plays best together:
 
-- **Side by side** (`parallel`): everyone plays their own copy, from the same
+- **Parallel**: everyone plays their own copy, from the same
   start, on the same clock; the hub draws a live scoreboard from each copy's
   progress. Every game with a score or a finish can do it, with no networking,
   and it is how the existing library joins sessions.
@@ -444,8 +444,8 @@ scoreboard, what travels where) is in
 why, is [`docs/multiplayer-plan.md`](docs/multiplayer-plan.md).
 
 A game that declares it shows a *Hub session* line in its details
-(`1–4 players · Side by side · about 4 min`), and the Catalogue finds them all
-with `has:session`. Those fields never become rails. A side-by-side game is
+(`1–4 players · Parallel · about 4 min`), and the Catalogue finds them all
+with `has:session`. Those fields never become rails. A parallel game is
 not a multiplayer game on the wall: each player plays alone.
 
 Games that play in sessions: **Blaze Cup** (versus, in teams), **Arwingdings**,
@@ -454,7 +454,7 @@ score runs on one shared course, rivals solid), and **Grand Theft Motto III**
 (the whole campaign, co-op).
 
 To test a game against the protocol, open the harness, which loads 1–4 copies
-side by side on a simulated network:
+next to each other on a simulated network:
 
 ```
 pnpm dev
@@ -462,11 +462,11 @@ http://localhost:4173/lib/hub/harness.html?game=/games/mygame.html&players=4&lat
 ```
 
 `node scripts/hub-check.mjs games/mygame.html` runs the automatic conformance
-checks with Playwright: a side-by-side game at 1 and 2 players, a race or a
+checks with Playwright: a parallel game at 1 and 2 players, a race or a
 shared world at 2, 3 and 4 on a bad network, each with a player leaving, then
 the game on its own. `--record` writes the verdict into `data/overrides.json`,
 where a failing game gets `"session": "0"` and is never dealt. The three
-examples in `lib/hub/examples/` (**Starfall**, side by side; a race with
+examples in `lib/hub/examples/` (**Starfall**, parallel; a race with
 ghosts; a versus arena) are the plain reference games and pass it; the
 session games above are the full ones.
 
@@ -494,7 +494,7 @@ node scripts/retrofit.mjs run $(cat .cache/pilot.txt) --jobs 2 \
   --agent "claude -p --model claude-sonnet-5-5 --max-turns 30 --permission-mode acceptEdits --output-format json"
 ```
 
-`retrofit.mjs` brings an existing game to side by side, game by game:
+`retrofit.mjs` brings an existing game to parallel, game by game:
 
 - It first asks whether this browser can run the game at all
   (`hub-check --draws-only`), and spends nothing on one it can't: a WebGPU-only
@@ -504,7 +504,7 @@ node scripts/retrofit.mjs run $(cat .cache/pilot.txt) --jobs 2 \
 - A tool step puts the client and the metas first in its head (`prepare`).
 - A model, cheapest first, wires the score, the end and the session steps from
   the prompt in [`lib/hub/retrofit.md`](lib/hub/retrofit.md), which quotes the
-  protocol's side-by-side section word for word. It works on a copy of the
+  protocol's parallel section word for word. It works on a copy of the
   game in a folder of its own, so it can change nothing else and two jobs
   never meet.
 - The static check (`check`), a budget of 150 changed lines, and
@@ -553,8 +553,8 @@ leaves, the next seat takes over, and a round it was running is void.
   the browser, as `localStorage['ai-hub:relay-only']`).
 - While no game in the library declares `hub:session`, the reference games
   are dealt instead, so a session always has something to play.
-- Side-by-side games far outnumber the ones played together, so the deal
-  alternates between the two, and a side-by-side round shows a live
+- Parallel games far outnumber the ones played together, so the deal
+  alternates between the two, and a parallel round shows a live
   scoreboard over the game, top right, folded with a tap.
 - A session nobody ended is ended after a day without activity (an hourly
   job, `supabase/migrations/0005_end_stale_sessions.sql`).
@@ -762,7 +762,7 @@ scripts/
   audit3d.mjs     static rules every 3D game must pass (seconds)
   hub-check.mjs   a game against the session protocol, for its mode; --record keeps the verdict
   hub-client.mjs  every game's pasted session client, upgraded by script
-  retrofit.mjs    an existing game brought to side by side: tool, model, checks
+  retrofit.mjs    an existing game brought to parallel: tool, model, checks
   session-browser.mjs  a whole session in four tabs, end to end
   check3d.py      one 3D game in headless browsers, WebGL2 and WebGPU
   sweep3d.py      check3d over many games, grouped by error signature

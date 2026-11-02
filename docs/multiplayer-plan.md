@@ -11,7 +11,7 @@ around a round is [`session-hub.md`](session-hub.md).
 ## The short version
 
 Every game on the hub should be playable with friends, at the level of
-"together" it can honestly support. The cheapest level, **side by side**,
+"together" it can honestly support. The cheapest level, **parallel**,
 reaches almost the whole library: everyone plays their own copy of the same
 game at the same time, from the same start, and the hub shows who is ahead.
 A shared course (**race**) and a shared world (**versus**, **co-op**) are
@@ -21,13 +21,13 @@ genre suits.
 The audit kept version 2's chassis and changed its armour:
 
 - **Kept**: the hub owns everything around a round; one network; friends
-  only, no talking in games; one point for every player beaten; side by side
-  as the new baseline, added to the library by a tool and a cheap model; the
+  only, no talking in games; one point for every player beaten; parallel
+  mode as the new baseline, added to the library by a tool and a cheap model; the
   host's copy runs every shared world, each copy owning its own player.
 - **Changed**: watching stays on state, as version 2 decided, but asks no
   game for a new ability. A watcher of a shared world or a race is a copy
   with no player of its own, drawn from the traffic every copy already gets;
-  side by side, the live scoreboard is the view. That cuts the hardest,
+  in parallel mode, the live scoreboard is the view. That cuts the hardest,
   costliest per-game ability (snapshot, restore, mirror) out of the roadmap.
   Dedicated servers: the games are made ready now, with one rule that the
   check tests; the server itself is built when it is wanted.
@@ -41,7 +41,7 @@ The audit kept version 2's chassis and changed its armour:
   never needs re-pasting for most new features, plus a script that upgrades
   every pasted copy; a retrofit runner with spend caps that puts back every
   game it cannot wire; a deal that plays one build of each title and only
-  games every seat can run; and a database change so side-by-side rounds are
+  games every seat can run; and a database change so parallel rounds are
   kept.
 - **Next, first**: *Again*. Most of the library is shooters and action games
   with lives, so in a one-run round the first player out waits for minutes.
@@ -62,7 +62,7 @@ change.
    Friends talk where they already do. The hub shows only the names it
    generates.
 3. **Every game can be played together, at its honest level.** A game with a
-   score or a finish gets side by side; a racer a shared track; a fighting
+   score or a finish gets parallel; a racer a shared track; a fighting
    game real versus. A game declares the one level it plays best, and nothing
    fakes a level it can't support.
 4. **The hub owns everything around a round; the game owns only the round.**
@@ -80,7 +80,7 @@ change.
    players' direct peer-to-peer links.
 7. **State, not video.** Every player runs their own copy, moves their own
    player instantly and never waits on the network. A watcher runs a copy
-   too, with no player of its own; side by side, the hub's scoreboard is the
+   too, with no player of its own; in parallel mode, the hub's scoreboard is the
    view.
 8. **Smooth beats strict.** No anti-cheat among friends. Each device moves
    its own player at once; in head-to-head play, the player who gets hit
@@ -91,7 +91,7 @@ change.
 10. **Every round ranks.** One point for every player beaten, whatever the
     game, so a session can mix Solitaire and a kart racer.
 11. **A fair start.** Same seed, same rules, same limit; nothing saved on a
-    device carries into a round. Side by side, the same seed gives the same
+    device carries into a round. In parallel mode, the same seed gives the same
     start, not the same whole game, and the protocol says so.
 12. **Runs where your friends are.** Any modern browser, keyboard and mouse
     or a controller. WebGPU may make a game look better; a game that truly
@@ -115,9 +115,9 @@ change.
 |---|---|---|---|
 | 1 | Every mode, one network | **Kept** | Games still speak only through `AIHub.send`. Progress (new) rides the peer links, as game traffic does. |
 | 2 | The hub may change games to standardize them | **Kept, made cheap** | A pasted client is now upgraded by script (`scripts/hub-client.mjs`), verified by hash, never by a model; and 1.3.0 passes on any field or event a newer hub adds, so most future features need no re-paste at all. |
-| 3 | Watching runs on state, not video | **Kept, without the per-game ability** | Video would need the hub to reach into the game's frame: a capture cannot be handed across frames (tested: `DataCloneError`), so it would tie every game to the hub's origin. It misses the HUDs that most canvas games draw in page elements, and the playing machine pays for the encoding (25–43 ms a 720p frame in software, measured here). State costs a shared world or a race nothing new: a copy with no player of its own draws everything from the snapshots and samples every copy already gets. Side by side shares nothing to draw, so there the live scoreboard is the view, and *Again* keeps everyone playing. What is cut is snapshot, restore and mirror as a per-game ability. |
+| 3 | Watching runs on state, not video | **Kept, without the per-game ability** | Video would need the hub to reach into the game's frame: a capture cannot be handed across frames (tested: `DataCloneError`), so it would tie every game to the hub's origin. It misses the HUDs that most canvas games draw in page elements, and the playing machine pays for the encoding (25–43 ms a 720p frame in software, measured here). State costs a shared world or a race nothing new: a copy with no player of its own draws everything from the snapshots and samples every copy already gets. Parallel shares nothing to draw, so there the live scoreboard is the view, and *Again* keeps everyone playing. What is cut is snapshot, restore and mirror as a per-game ability. |
 | 4 | The host is the server, built so a dedicated server can take over later | **Kept: the games are made ready now, the server is built when wanted** | The host's copy runs every shared world today. What multiplies across thousands of games is each game's own part, so that goes in now: a shared world must run when its host is a copy with no player of its own (`AIHub.server`), and `hub-check` plays one such round for every versus and co-op game. Two old rules stay as guidance (the world in plain data apart from drawing; nothing read back from the GPU). Built once, and likely to change before it is needed, so built later: the server program, where it runs, how it joins a session, and the lobby's switch. |
-| 5 | Side by side reaches the library through a tool and a cheap model | **Kept, run by the hub** | cc-matrix is out of scope, so `scripts/retrofit.mjs` runs it: tool step, model, checks, a retry, the next model, a ledger of cost and pass rate. |
+| 5 | Parallel reaches the library through a tool and a cheap model | **Kept, run by the hub** | cc-matrix is out of scope, so `scripts/retrofit.mjs` runs it: tool step, model, checks, a retry, the next model, a ledger of cost and pass rate. |
 
 The owner decided both on Oct 29: no video, and servers prepared in the
 games now but built when they are wanted. (The audit first leaned to video
@@ -132,8 +132,8 @@ features of the hub that need nothing from a game.
 
 | Version 2 | Now |
 |---|---|
-| 0 Watch | Side by side: the live scoreboard (*Now*). Shared worlds and races: a copy with no player of its own, fed the same traffic (*Later*) |
-| 1 Side by side | Mode `parallel`, client 1.3.0 (*Now*) |
+| 0 Watch | Parallel: the live scoreboard (*Now*). Shared worlds and races: a copy with no player of its own, fed the same traffic (*Later*) |
+| 1 Parallel | Mode `parallel`, client 1.3.0 (*Now*) |
 | 2 Ghosts | Mode `race`; ghosts or solid rivals is a drawing choice the game makes |
 | 3 Together | Modes `versus` and `co-op`: the host's copy runs the world |
 | 4 Natural multiplayer | Whichever of the three a game plays best |
@@ -142,10 +142,10 @@ features of the hub that need nothing from a game.
 **One mode per game.** A list of modes per game would mean a code path and a
 conformance run per mode in every game, for a choice the hub never needs to
 make. The lobby needs no new picker either: the deal alternates between the
-side-by-side games and the ones played together, so a dozen shared worlds are
-not buried under hundreds of side-by-side games.
+parallel games and the ones played together, so a dozen shared worlds are
+not buried under hundreds of parallel games.
 
-**Side by side, in seven steps** (the protocol has them in full): declare the
+**Parallel in seven steps** (the protocol has them in full): declare the
 metas, paste the client first in `<head>`, skip the title in a session and
 connect, start on the clock, report progress, report the result once, go
 quiet at the end. Pausing is allowed (nothing is shared); there is no
@@ -197,11 +197,11 @@ Playwright. Nothing here needs cc-matrix.
    WebGL or a 2D canvas). On a machine without a GPU, SwiftShader gives such games a
    software adapter (`--browser-args`, tested here).
 2. **Tool, no model** (`retrofit.mjs prepare`): the client and the
-   side-by-side metas go first in `<head>`, after `<meta charset>`, before
+   parallel metas go first in `<head>`, after `<meta charset>`, before
    every script. Dry-run over the whole library: 1,825 pages prepared, every
    one with the client before its first script and its own bytes untouched.
 3. **Model** (the prompt in [`lib/hub/retrofit.md`](../lib/hub/retrofit.md),
-   which quotes the protocol's side-by-side section word for word, about
+   which quotes the protocol's parallel section word for word, about
    2,000 tokens in all): find the score and the end, fill the goal and
    controls lines, wire connect, ready, start, progress, result and end;
    nothing else. A game with no score and no finish is declared unfit and
@@ -262,12 +262,12 @@ Haiku 5.5 exited twice without a word before Sonnet 5.5 said it was unfit,
 so a tier-1 exit that changes nothing should end the game's Haiku tries.
 And the agents gave none of the 26 `stats` or `awards` (the retrofit prompt,
 `lib/hub/retrofit.md`, never asks; Slick and Skid has them, added by hand
-after the pilot), so their rounds have no highlights: in a live session the side-by-side round stored results with neither,
+after the pilot), so their rounds have no highlights: in a live session the parallel round stored results with neither,
 while its kart race stored stats. The prompt should ask for up to six stats.
 Games that pause on `blur` (Slick and Skid) pause in the harness, where two
 copies share one page; in a session each player has a window of their own.
 Three passing games (Starflock, Slick and Skid, Gloomkeep) were played in
-the harness with 2 players: a full side-by-side round each, every check
+the harness with 2 players: a full parallel round each, every check
 passed.
 
 **The estimate the pilot replaced.** List prices per million tokens
@@ -355,7 +355,7 @@ games or so a night.
 
 **Now: client 1.3.0, built Oct 29**
 
-- Mode `parallel` (side by side): the client seeds `Math.random` from the
+- Mode `parallel`: the client seeds `Math.random` from the
   address, `AIHub.progress()`, the round ranks it like a race, the harness and
   `hub-check` check it, and a reference game (**Starfall**) passes them.
 - A fair start the client enforces: in a session the game gets an empty
@@ -367,9 +367,9 @@ games or so a night.
   focus.
 - Rounds keep their result: a player who reported and then left keeps their
   place; a player who never reports is ranked by their last progress; when
-  the session host leaves a race or side-by-side round, the new host scores
+  the session host leaves a race or parallel round, the new host scores
   it from the last status every tab holds instead of voiding it.
-- The deal: side-by-side games alternate with games played together; one
+- The deal: parallel games alternate with games played together; one
   build of each title until every title has had its turn (678 builds are Star
   Fox 64); a game that needs WebGPU only when every seat has it (a real
   adapter, measured at join); touch-tagged games, while any fit, when a seat
@@ -416,13 +416,13 @@ games or so a night.
 
 Then the hub alone, no game changes:
 
-- **Again**, before wave 1 is dealt. Side by side
-  becomes "best attempt in the window": a player whose run ends early starts
+- **Again**, before wave 1 is dealt. Parallel
+  mode becomes "best attempt in the window": a player whose run ends early starts
   a fresh one (the hub reloads their frame on the same seed) and their best
   counts. 44% of the library's games are shooters and 22% action games,
   mostly with lives; in a one-run round the first player out waits for
   minutes.
-- **Hub awards** for side-by-side rounds (a personal best, the most
+- **Hub awards** for parallel rounds (a personal best, the most
   attempts, a win on the first try), so no retrofit has to make any.
 - Rounds that survive the session host leaving: the new host resumes the
   round rather than scoring it at once, and a grace of about 15 seconds
@@ -469,7 +469,7 @@ Then the hub alone, no game changes:
   on in session mode, so most WebGPU-only builds can be dealt to any group.
   Then the minified track: a model that reads minified code, or a build of
   the same title that isn't minified.
-- More than four players: side by side shares nothing, so up to eight there
+- More than four players: parallel shares nothing, so up to eight there
   first. Both that and watcher seats are schema and seat-colour changes
   (slot 0–3, place 1–4, points 0–3), not network ones.
 
@@ -526,14 +526,14 @@ layout: an ai-hub change, made when the first cc-matrix builds come in.
 | # | Decision | Recommendation |
 |---|---|---|
 | 1 | Decisions 3 and 4 | Decided Oct 29: state, not video, and no video anywhere (remote couch pinned); dedicated servers prepared in the games now, built when wanted |
-| 2 | Side by side as "best attempt in the window", with *Again* | Yes: after the pilot, before wave 1 is dealt; no game changes |
+| 2 | Parallel as "best attempt in the window", with *Again* | Yes: after the pilot, before wave 1 is dealt; no game changes |
 | 3 | WebGPU-only games: drop "no fallback" in cc-matrix, or rely on `hub:webgpu`? | Both work; dropping it lets every friend play every new game |
 | 4 | Retrofit tiers and cap | Confirmed by the pilot: Haiku 5.5, then Sonnet 5.5, $1 a game. 81% passed, 92% of them on Haiku 5.5; $0.39 a game (median); no game passed past $1.18 |
 | 5 | Which builds first | One build of each title, readable and without WebGPU: wave 1, 228 games (`pick --wave 1`) |
 | 6 | Phones | Built the cheap way: a seat with only a touch screen is dealt touch-tagged games while any fit; no work per game |
 | 7 | Live scoreboard on or off by default | On, folded with a tap, remembered per device (built) |
-| 8 | Controller required for side-by-side retrofits | No: an old game keeps its own controls; new games use the full standard |
-| 9 | More than four players | Side by side first, up to eight, later |
+| 8 | Controller required for parallel retrofits | No: an old game keeps its own controls; new games use the full standard |
+| 9 | More than four players | Parallel first, up to eight, later |
 
 ---
 
@@ -564,7 +564,7 @@ Measured or read in this audit (Oct 29, 2026):
   without a probe, four.
 - **Census** (all 1,831 entries): as in Part 4; plus 1,540 entry files call
   `Math.random`, 356 use three's `generateUUID` and 151 make ids from
-  `Math.random` (why seeding stays side-by-side only); 1,043 put
+  `Math.random` (why seeding stays parallel only); 1,043 put
   `<meta charset>` where a client inserted at the very top of `<head>` would
   push it past byte 1,024 (why it goes after the charset).
 - **cc-matrix**: 25 runs (22 Star Fox 64, 3 Mario Kart 64), $105.81 reported
@@ -574,7 +574,7 @@ Measured or read in this audit (Oct 29, 2026):
   the hub page take fullscreen when the frame asks by message, and the frame
   hears it back.
 - **Database**: `session_rounds.mode` allowed only versus, co-op and race, so
-  a side-by-side round would not have been saved; 0008 was checked on
+  a parallel round would not have been saved; 0008 was checked on
   Postgres 16 against 0002's table.
 - **The versus example, rewritten to own its player**: bots through the
   harness at 150 ± 50 ms and 5% loss, with the host on each seat in turn: a

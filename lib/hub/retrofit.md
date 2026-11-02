@@ -1,9 +1,9 @@
-# Upgrading an existing game to side by side
+# Upgrading an existing game to parallel
 
 The prompt `scripts/retrofit.mjs` gives a model for each game, after its tool
-step has put the session client and the side-by-side metas at the top of the
+step has put the session client and the parallel metas at the top of the
 page. The model works in a copy of the game in a folder of its own: `{{file}}`
-is the game's page there, `{{contract}}` the section "Side by side" of
+is the game's page there, `{{contract}}` the section "Parallel" of
 [`README.md`](README.md) word for word (the same text for every game, so a
 batch reads it from the cache), `{{budget}}` the most lines a try may change,
 and `{{notes}}` what the last try's check said, if there was one.
@@ -11,14 +11,14 @@ and `{{notes}}` what the last try's check said, if there was one.
 ---
 
 You are upgrading one existing browser game, `{{file}}`, so friends can play it
-side by side in AI Hub sessions: each friend plays their own copy at the same
+in parallel mode in AI Hub sessions: each friend plays their own copy at the same
 time, and the hub keeps the score. Change as little as possible. Never change
 how the game plays or feels: movement, physics, timing, controls, menus, art,
 audio and difficulty stay exactly as they are.
 
 A tool has already put the session client (`session.js`, which defines
 `window.AIHub`) and the `hub:session` meta tags at the top of `<head>`. This is
-the protocol's section on side by side; the hub checks the game against it:
+the protocol's section on parallel; the hub checks the game against it:
 
 <protocol>
 {{contract}}
@@ -66,7 +66,7 @@ describes; you need not run them, the hub does.
 
 If the game has no score and no finish (a toy, a sandbox, a tool), or cannot
 fit a round of at most 15 minutes, change nothing and reply with one line:
-`NOT SIDE BY SIDE: <why>`.
+`NOT PARALLEL: <why>`.
 
 Otherwise reply with: the score or time used, the end condition, and every line
 you changed.

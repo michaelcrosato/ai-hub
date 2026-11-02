@@ -1,4 +1,4 @@
-// The part of a side-by-side retrofit that needs no model (scripts/lib/retrofit.mjs):
+// The part of a parallel retrofit that needs no model (scripts/lib/retrofit.mjs):
 // the client and the metas go in first, and nothing else in the page moves.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

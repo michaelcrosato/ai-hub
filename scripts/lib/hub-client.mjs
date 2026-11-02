@@ -3,7 +3,7 @@
  * upgraded without a model.
  *
  * Every session game pastes lib/hub/session.js unmodified (lib/hub/README.md,
- * "Side by side"). A pasted copy runs from its banner, `/*! aihub-session
+ * "Parallel"). A pasted copy runs from its banner, `/*! aihub-session
  * X.Y.Z`, to the client's last line. It is pristine when its text is, line
  * endings aside, exactly a released client: RELEASES holds each one's
  * SHA-256. Only a pristine copy is ever replaced, so a client someone edited

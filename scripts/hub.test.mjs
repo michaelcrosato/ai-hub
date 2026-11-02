@@ -227,7 +227,7 @@ test('the client seeds the same generator on every device, one stream per label'
   assert.ok(take(a.hub.rng('x')).every((n) => n >= 0 && n < 1));
 });
 
-test('side by side: with aihub-seed in its address, the client seeds Math.random before the game runs', async () => {
+test('parallel: with aihub-seed in its address, the client seeds Math.random before the game runs', async () => {
   const a = await loadClient({ search: '?aihub=1&aihub-seed=4242' });
   const b = await loadClient({ search: '?aihub-seed=4242&aihub=1' });
   const take = (c) => Array.from({ length: 6 }, () => c.math.random());
@@ -240,7 +240,7 @@ test('side by side: with aihub-seed in its address, the client seeds Math.random
   for (const options of [{ search: '?aihub=1' }, { search: '?aihub-seed=4242' }, { search: '?aihub=1&aihub-seed=4242', framed: false }]) {
     const c = await loadClient(options);
     assert.equal(c.hub.seeded, false, JSON.stringify(options));
-    assert.equal(c.math.random, Math.random, 'Math.random is left alone outside side by side');
+    assert.equal(c.math.random, Math.random, 'Math.random is left alone outside parallel');
   }
 });
 
@@ -510,7 +510,7 @@ test('a racer who finished and then left keeps their place', () => {
   assert.deepEqual(round.record.standings, [[0], [1], [2]]);
 });
 
-test('a player still in a race or side by side who never reports is ranked by their last progress', () => {
+test('a player still in a race or a parallel round who never reports is ranked by their last progress', () => {
   const { round, clock, allHello, allReady } = setup({ n: 3, mode: 'parallel', limitMs: 30_000 });
   allHello();
   allReady();
@@ -548,7 +548,7 @@ test('a race ends as soon as every racer has reported', () => {
   assert.deepEqual(round.record.standings, [[1], [0]]);
 });
 
-test('side by side: each copy reports itself, nothing waits on a host, and the round ranks like a race', () => {
+test('parallel: each copy reports itself, nothing waits on a host, and the round ranks like a race', () => {
   const { round, clock, allHello, allReady, to } = setup({ n: 3, mode: 'parallel', limitMs: 30_000 });
   allHello();
   allReady();

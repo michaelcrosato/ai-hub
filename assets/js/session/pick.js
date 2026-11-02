@@ -61,14 +61,14 @@ export function roundGame(cur, games) {
   return { game, build: builds.find((b) => b.path === cur.path) || builds[0] };
 }
 
-/** Side by side (each plays alone) or together (one course or one world): the two decks the deal alternates. */
+/** Parallel (each plays alone) or together (one course or one world): the two decks the deal alternates. */
 export const deckOf = (game) => (sessionOf(game)?.mode === 'parallel' ? 'side' : 'together');
 
 /**
  * The next game, and the cycle and played list that follow it. Null when
  * nothing fits `n` players.
  *
- * Side-by-side games far outnumber the ones played together, so a single
+ * Parallel games far outnumber the ones played together, so a single
  * shuffle would bury the few shared worlds. While both decks have games, the
  * deal alternates between them, starting with a game played together. Within
  * a deck it deals games, not builds: one build of each lineage, picked at
