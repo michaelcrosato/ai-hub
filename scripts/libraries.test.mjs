@@ -78,6 +78,15 @@ test("a project receives scoped addon imports and keeps each explicitly requeste
   assert.deepEqual([...localizeGameLibraries(result.files, manifest).files], [...result.files], "re-import is byte stable");
 });
 
+test("shelf addons resolve three to the page's own entry files, so .min pages load one core", () => {
+  const html =
+    '<head><script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.min.js","three/webgpu":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.min.js","three/tsl":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.tsl.min.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"}}</script></head><script type="module">import * as T from "three/webgpu"; import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";</script>';
+  const map = mapOf(localizeGameLibraries(new Map([["index.html", html]]), manifest).files.get("index.html"));
+  const scope = map.scopes["/lib/vendor/three/0.180.0/"];
+  for (const key of ["three", "three/webgpu", "three/tsl"]) assert.equal(scope[key], map.imports[key], key);
+  assert.equal(scope["three/webgpu"], "/lib/vendor/three/0.180.0/build/three.webgpu.min.js");
+});
+
 test("bare modules get defaults before preloads; existing shared-kit mappings stay intact", () => {
   const html =
     '<head><link rel="modulepreload" href="main.js"></head><script type="module">import { Scene } from "three"; import R from "@dimforge/rapier2d-deterministic";</script>';

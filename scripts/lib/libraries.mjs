@@ -191,8 +191,16 @@ export function localizeGameLibraries(sources, manifest) {
       used.set(`three@${primary.version}`, primary);
       if (!threeRecords.includes(primary)) threeRecords.push(primary);
     }
-    for (const record of threeRecords)
-      scopes[record.base] = { ...threeImports(record, undefined, manifest.externalImports), ...scopes[record.base] };
+    // Addons on the shelf must resolve three to the same entry files as the page: the
+    // .min builds import three.core.min.js, the others three.core.js, and two cores break TSL.
+    for (const record of threeRecords) {
+      const own = Object.fromEntries(
+        Object.entries(imports).filter(
+          ([key, value]) => (key === "three" || key.startsWith("three/")) && typeof value === "string" && value.startsWith(record.base),
+        ),
+      );
+      scopes[record.base] = { ...threeImports(record, undefined, manifest.externalImports), ...own, ...scopes[record.base] };
+    }
     for (const specifier of bare) {
       if (!specifier.startsWith("@dimforge/") || mapped(specifier)) continue;
       const pinned = [...used.values()].filter((r) => r.name === specifier);
