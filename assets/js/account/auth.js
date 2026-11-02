@@ -47,7 +47,10 @@ export async function currentUser() {
     current = describe(data.session?.user);
     watch();
   } catch {
-    current = null;
+    // Slow or offline, not signed out: the stored session stays, the next
+    // call asks again, and the watcher announces it once it loads.
+    watch();
+    return null;
   }
   return current;
 }
@@ -84,6 +87,8 @@ export async function signInWithGoogle(returnTo = location.href) {
 export async function signInAsGuest() {
   const user = await currentUser();
   if (user) return user;
+  // A stored sign-in that couldn't be read just now is never replaced by a guest.
+  if (hasSession()) throw new Error('Your account could not be reached just now. Try again.');
   const sb = await client();
   const { data, error } = await sb.auth.signInAnonymously();
   if (error) throw error;

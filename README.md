@@ -611,6 +611,9 @@ How it's built:
   SQL editor.
 - The page code is in `assets/js/account/`. It loads the vendored
   supabase-js only for a signed-in device.
+- A sign-in is kept in the browser storage of one address, so
+  `vercel.json` sends every other one (deployment URLs, the old
+  `ai-hub-five-mu.vercel.app`) to `crosato-arcade.vercel.app`.
 - If Supabase is unreachable or paused, sign-in hides and everything else
   works as before. The free project pauses after about a week without use;
   resume it from the Supabase dashboard.

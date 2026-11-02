@@ -98,6 +98,16 @@ test('sign-in only ever returns to a page on this site, never to /auth/ itself',
   assert.equal(safeReturn('javascript:alert(1)', origin), '/');
 });
 
+test('every other address of the site sends you to the one your sign-in is kept on', async () => {
+  // A sign-in lives in one origin's storage: a deployment URL or an old alias would always be signed out.
+  const { redirects } = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url), 'utf8'));
+  const canonical = redirects.find((r) => r.missing?.some((m) => m.type === 'host'));
+  const host = canonical.missing.find((m) => m.type === 'host').value;
+  assert.equal(host, 'crosato-arcade.vercel.app');
+  assert.equal(canonical.source, '/:path*');
+  assert.equal(canonical.destination, `https://${host}/:path*`);
+});
+
 test('play time reads plainly', () => {
   assert.equal(duration(20), 'under a minute');
   assert.equal(duration(125), '2 min');
