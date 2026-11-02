@@ -7,22 +7,36 @@
 
 import { INDEX_FILE } from './layout.mjs';
 
+/** Never imported: VCS and editor state, OS litter, dependency trees, and env files of every kind. */
+const CLUTTER =
+  /(^|\/)(__MACOSX|node_modules|bower_components|\.git|\.svn|\.hg|\.idea|\.vscode|\.cache|\.parcel-cache|\.next|\.DS_Store|Thumbs\.db|desktop\.ini|\.env([-._ ~][^/]*)?)(\/|$)/i;
+
 /**
- * Never imported: VCS and editor state, OS litter, dependency trees, and the
- * files that most often hold secrets. A packaged project can carry a `.env`
- * with a live API key, and games/ is served to the public.
+ * Credentials, never imported either: a packaged project can carry a `.env`
+ * with a live API key, a deploy key or a cloud login, and games/ is served to
+ * the public. The import's report names each one, so a key that travelled
+ * with a game can be rotated. (A `.env.example` and its kind are clutter.)
  */
-export const JUNK =
-  /(^|\/)(__MACOSX|node_modules|bower_components|\.git|\.svn|\.hg|\.idea|\.vscode|\.cache|\.parcel-cache|\.next|\.DS_Store|Thumbs\.db|desktop\.ini|\.env(\.[^/]*)?|\.npmrc|[^/]*\.(pem|key|p12|pfx|keystore)|id_(rsa|ed25519)[^/]*)(\/|$)/i;
-
-export const isJunk = (p) => JUNK.test(p);
-
-/** The subset of junk that is worth a warning when it sits in a kept source
- *  package: a real .env or key, not a harmless `.env.example`. */
-const SECRET =
-  /(^|\/)(\.env(\.(?!example$|sample$|template$|dist$)[^/]*)?|\.npmrc|[^/]*\.(pem|key|p12|pfx|keystore)|id_(rsa|ed25519)[^/.]*)$/i;
+const SECRET = new RegExp(
+  `(^|/)(${[
+    // Folders of logins and deploy state.
+    '\\.(aws|azure|docker|gnupg|kube|netlify|ssh|terraform|vercel)',
+    // .env, .env.local, .env-prod, ".env copy", .env~
+    '\\.env(?![-._ ~](example|sample|template|dist)$)([-._ ~][^/]*)?',
+    '\\.envrc|\\.dev\\.vars|\\.npmrc|\\.yarnrc\\.yml|\\.pypirc|[._]netrc|\\.pgpass|\\.htpasswd|\\.git-credentials',
+    // Private keys and keystores.
+    '[^/]*\\.(pem|key|p12|pfx|keystore|jks|ppk)|id_(rsa|dsa|ecdsa|ed25519)[^/]*',
+    // Cloud service logins.
+    'credentials\\.json|client_secret[^/]*\\.json|service[-_]account[^/]*\\.json|[^/]*-adminsdk-[^/]*\\.json',
+    // Terraform state and variables.
+    '[^/]*\\.tfstate(\\.[^/]*)?|[^/]*\\.tfvars(\\.json)?',
+  ].join('|')})(/|$)`,
+  'i'
+);
 
 export const isSecret = (p) => SECRET.test(p);
+
+export const isJunk = (p) => CLUTTER.test(p) || isSecret(p);
 
 export const HTML = /\.html?$/i;
 

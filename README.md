@@ -167,8 +167,11 @@ What it does, so you do not have to:
   hub would point at the hub, not the game. Unpacked pages get those rewritten
   to relative paths. Anything it cannot fix (a bundle that builds URLs at
   runtime) is listed so you know which to rebuild with a relative base.
-- **Secrets and clutter.** `.env` files, keys, `.git`, `node_modules` and
-  `__MACOSX` are never copied into `games/`, which is public.
+- **Secrets and clutter.** `.env` files, private keys and other credentials
+  (`.aws/`, `.ssh/`, `.vercel/`, `.git-credentials`, `.netrc`,
+  `credentials.json`…), `.git`, `node_modules` and `__MACOSX` are never copied
+  into `games/`, which is public, and a symbolic link is never followed. The
+  report names what was left out, so a live key that came along can be rotated.
 - **Source.** Opaque archives stay at their original input location. The importer
   does not copy them into the repository or deployment. Keep your originals;
   a successful runtime import is not a backup of source files or private data.

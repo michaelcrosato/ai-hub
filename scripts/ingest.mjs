@@ -12,7 +12,8 @@
  *     reported rather than half-imported
  *   - rewrites `/assets/…` style references in unpacked pages to relative ones,
  *     because inside the hub they would resolve against the hub, not the game
- *   - never copies secrets or clutter: .env files, keys, .git, node_modules
+ *   - never copies secrets or clutter (.env files, keys, cloud logins, .git,
+ *     node_modules) and never follows a symbolic link; the report names both
  *   - leaves opaque source archives in place, avoiding accidental backup publication
  *
  * Usage:  node scripts/ingest.mjs <file|folder|zip>... [options]
@@ -21,7 +22,7 @@
  *   --dry-run         show what would happen, write nothing
  */
 
-import { readdir, stat, readFile, writeFile, mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
+import { readdir, stat, lstat, readlink, readFile, writeFile, mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
@@ -29,7 +30,7 @@ import path from 'node:path';
 
 import { scan, pool, mb, ROOT, GAMES_DIR, ADDED_FILE, SOURCE_DATES_FILE } from './scan.mjs';
 import { openZip } from './lib/zip.mjs';
-import { isJunk, isContainer, HTML, chooseWebRoot, packageName, UNINFORMATIVE_NAME } from './lib/intake.mjs';
+import { isJunk, isSecret, isContainer, HTML, chooseWebRoot, packageName, UNINFORMATIVE_NAME } from './lib/intake.mjs';
 import { INDEX_FILE, classify } from './lib/layout.mjs';
 import { parseHead, splitTitle, slugify, parseVersion, relativizeRefs } from './lib/parse.mjs';
 import { emptyRegistry, fingerprint, provenance, decide, PIPELINE } from './lib/import-registry.mjs';
@@ -82,6 +83,7 @@ const report = {
   sources: [],
   leftovers: [],
   secrets: [],
+  links: [],
   ignored: 0,
   libraries: [],
   dependencies: [],
@@ -185,6 +187,16 @@ const shown = (abs) => {
   return rel && !rel.startsWith('..') ? posix(sourcePrefix, rel) : home(abs);
 };
 
+/**
+ * A symbolic link is never followed: a pack can carry `game.html ->
+ * ~/.ssh/id_ed25519`, and games/ is public. The report says where it points,
+ * so what belongs can be imported by its own path.
+ */
+async function skipLink(abs) {
+  const target = await readlink(abs).then((to) => home(path.resolve(path.dirname(abs), to)), () => '?');
+  report.links.push(`${shown(abs)}  → ${target}`);
+}
+
 const claim = (rel) => {
   const parts = rel.toLowerCase().split('/');
   for (let i = 1; i <= parts.length; i++) claimed.add(parts.slice(0, i).join('/'));
@@ -223,6 +235,7 @@ const titleOf = (buf) => parseHead(buf.subarray(0, 256 * 1024).toString('utf8'))
 
 /* --- what is already on the wall ----------------------------------------- */
 
+/** Every real file under `dir`; links are never followed. A `budget` with `secrets` and `links` lists collects what was left out. */
 async function listTree(dir, base = dir, maxFiles = Infinity, budget = { count: 0 }) {
   let entries;
   try {
@@ -234,8 +247,12 @@ async function listTree(dir, base = dir, maxFiles = Infinity, budget = { count: 
   for (const entry of entries.sort((a,b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
     const abs = path.join(dir, entry.name);
     const rel = path.relative(base, abs).split(path.sep).join('/');
-    if (isJunk(rel)) continue;
-    if (entry.isDirectory()) out.push(...(await listTree(abs, base, maxFiles, budget)));
+    if (isJunk(rel)) {
+      if (isSecret(rel)) budget.secrets?.push(rel);
+      continue;
+    }
+    if (entry.isSymbolicLink()) budget.links?.push(abs);
+    else if (entry.isDirectory()) out.push(...(await listTree(abs, base, maxFiles, budget)));
     else if (entry.isFile()) {
       if (++budget.count > maxFiles) throw new Error('project exceeds 10000 file limit');
       out.push({ abs, rel });
@@ -442,6 +459,8 @@ async function importZip(abs, subdir) {
 
   if (zip.entries.length > MAX_FILES) throw new Error('archive exceeds 10000 entry limit');
   if (zip.entries.reduce((n, e) => n + e.size, 0) > MAX_BYTES) throw new Error('archive exceeds 95 MiB expanded limit');
+  const secrets = zip.entries.filter((e) => !e.dir && e.path && isSecret(e.path)).map((e) => e.path);
+  if (secrets.length) report.secrets.push({ from, files: secrets });
   const entries = zip.entries.filter((e) => !e.dir && e.path && !isJunk(e.path));
   if (isContainer(path.basename(abs), entries.map((e) => e.path))) return importContainer(zip, entries, subdir, from);
   const byPath = new Map(entries.map((e) => [e.path, e]));
@@ -540,8 +559,11 @@ const nameForDir = (abs) => {
 };
 
 async function importDirAsProject(abs, verdict, subdir) {
-  const all = await listTree(abs, abs, MAX_FILES);
+  const left = { count: 0, secrets: [], links: [] };
+  const all = await listTree(abs, abs, MAX_FILES, left);
   const from = shown(abs);
+  if (left.secrets.length) report.secrets.push({ from, files: left.secrets });
+  for (const link of left.links) await skipLink(link);
   const files = (root) =>
     all
       .filter((f) => !root || f.rel.startsWith(root + '/'))
@@ -617,7 +639,9 @@ async function importDir(abs, rootInput, under = '') {
   for (const entry of entries) {
     const child = path.join(abs, entry.name);
     try {
-    if (entry.isDirectory()) {
+    if (entry.isSymbolicLink()) {
+      await skipLink(child);
+    } else if (entry.isDirectory()) {
       await importDir(child, rootInput, under);
     } else if (HTML.test(entry.name)) {
       const info = await stat(child);
@@ -653,13 +677,14 @@ for (const input of inputs) {
   sourcePrefix = path.posix.dirname(label).replace(/^\.$/, '');
   let info;
   try {
-    info = await stat(input);
+    info = await lstat(input);
   } catch {
     report.failed.push({ from: home(input), why: 'not found' });
     continue;
   }
   try {
-  if (info.isDirectory()) await importDir(input, input);
+  if (info.isSymbolicLink()) await skipLink(input);
+  else if (info.isDirectory()) await importDir(input, input);
   else if (/\.zip$/i.test(input)) await importZip(input, '');
   else if (HTML.test(input)) {
     await importPage({ data: await boundedRead(input), name: path.basename(input), modified: info.mtime, from: shown(input), subdir: '', qualifier: path.basename(path.dirname(input)) });
@@ -733,9 +758,10 @@ function printReport() {
   );
   section('source archives left at input (not copied)', r.sources.map((s) => (s.rel ? `${s.rel}  ← ${s.from}` : `${s.from}  — ${s.why}`)));
   section(
-    'kept packages that contain what look like secrets — the repo is private, but rotate any live keys or delete them from the zip before committing',
-    r.secrets.map((x) => `${x.rel}  ${x.files.slice(0, 4).join(', ')}${x.files.length > 4 ? ', …' : ''}`)
+    'left out what look like secrets — never copied into games/, but rotate any live keys they hold',
+    r.secrets.map((x) => `${x.from}  ${x.files.slice(0, 4).join(', ')}${x.files.length > 4 ? ', …' : ''}`)
   );
+  section('symbolic links, never followed — import what belongs by its own path', r.links);
   section('could not import', r.failed.map((f) => `${f.from}  — ${f.why}`));
   if (r.ignored) console.log(`  ${r.ignored} other file${r.ignored === 1 ? '' : 's'} (not .html or .zip) left where they were.\n`);
 }

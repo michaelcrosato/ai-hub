@@ -79,7 +79,17 @@ test('secrets and clutter are never imported', () => {
   for (const p of ['.env', 'app/.env.local', 'node_modules/x/index.js', '__MACOSX/._a', '.git/HEAD', 'certs/server.key', 'id_rsa']) {
     assert.equal(isJunk(p), true, p);
   }
-  for (const p of ['index.html', 'src/environment.js', 'keyboard.png', 'assets/key.png']) {
+  // Credentials that once slipped through into games/: logins, deploy state, keys and cloud accounts.
+  for (const p of [
+    '.envrc', '.dev.vars', '.aws/credentials', 'tools/.ssh/config', '.vercel/project.json', '.docker/config.json',
+    '.kube/config', '.git-credentials', '.netrc', '_netrc', '.pypirc', '.pgpass', '.htpasswd', '.yarnrc.yml',
+    'id_ecdsa', 'id_dsa', 'deploy/server.ppk', 'android/release.jks', 'credentials.json', 'config/service-account.json',
+    'my-app-firebase-adminsdk-x1y2z-0a1b2c3d4e.json', 'client_secret_123.apps.googleusercontent.com.json',
+    'infra/terraform.tfstate', 'infra/terraform.tfstate.backup', 'prod.tfvars', '.env-local', '.env copy', '.env~',
+  ]) {
+    assert.equal(isJunk(p), true, p);
+  }
+  for (const p of ['index.html', 'src/environment.js', 'keyboard.png', 'assets/key.png', 'id_card.png', 'credits.json', 'levels/secrets.json', 'docs/env.md']) {
     assert.equal(isJunk(p), false, p);
   }
 });
@@ -106,8 +116,10 @@ test('root-absolute references are found and made relative, and only those that 
 
 test('secrets are flagged, harmless templates are not', async () => {
   const { isSecret } = await import('./lib/intake.mjs');
-  for (const p of ['.env', 'app/.env.production', 'deploy/server.pem', 'id_rsa', '.npmrc']) assert.equal(isSecret(p), true, p);
-  for (const p of ['.env.example', 'app/.env.sample', 'src/env.js', 'keys.png']) assert.equal(isSecret(p), false, p);
+  for (const p of ['.env', 'app/.env.production', 'deploy/server.pem', 'id_rsa', '.npmrc', '.aws/credentials', '.envrc', 'id_ecdsa']) assert.equal(isSecret(p), true, p);
+  for (const p of ['.env.example', 'app/.env.sample', 'src/env.js', 'keys.png', 'node_modules/x/index.js']) assert.equal(isSecret(p), false, p);
+  // A template is still clutter: never imported, just not worth a warning.
+  assert.equal(isJunk('.env.example'), true);
 });
 
 test('a Drive folder download or a zip of zips is a container, a package is not', async () => {
