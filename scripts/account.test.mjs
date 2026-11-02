@@ -104,8 +104,9 @@ test('every other address of the site sends you to the one your sign-in is kept 
   const canonical = redirects.find((r) => r.missing?.some((m) => m.type === 'host'));
   const host = canonical.missing.find((m) => m.type === 'host').value;
   assert.equal(host, 'crosato-arcade.vercel.app');
-  assert.equal(canonical.source, '/:path*');
-  assert.equal(canonical.destination, `https://${host}/:path*`);
+  // "/(.*)", not "/:path*": Vercel serves the bare root before a "/:path*" redirect sees it.
+  assert.equal(canonical.source, '/(.*)');
+  assert.equal(canonical.destination, `https://${host}/$1`);
 });
 
 test('play time reads plainly', () => {
