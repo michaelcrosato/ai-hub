@@ -47,6 +47,20 @@ export function sessionPool(library, examples, wanted = false) {
   return wanted || !any ? [...library, ...examples] : library;
 }
 
+/**
+ * The game a round deals, as this browser's own library has it, and the build
+ * to load. Round state arrives over the network, where any seat can pose as
+ * the host, so its path is never loaded: the slug picks the game, and the path
+ * only chooses among that game's own builds. Null when this library has no
+ * such game (an older copy of it, or one still loading).
+ */
+export function roundGame(cur, games) {
+  const game = games.find((g) => g.slug === cur?.slug);
+  if (!game) return null;
+  const builds = game.builds?.length ? game.builds : [{ path: game.path }];
+  return { game, build: builds.find((b) => b.path === cur.path) || builds[0] };
+}
+
 /** Side by side (each plays alone) or together (one course or one world): the two decks the deal alternates. */
 export const deckOf = (game) => (sessionOf(game)?.mode === 'parallel' ? 'side' : 'together');
 

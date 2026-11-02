@@ -36,7 +36,7 @@ import { createRound, limitFor, rankRace, SELF_REPORTED, SLOT_COLORS } from '/li
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
-import { pickNext, eligible, sessionPool } from './pick.js';
+import { pickNext, eligible, sessionPool, roundGame } from './pick.js';
 import { scoreRound, addRound, leaderboard, liveOrder, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, finalTable } from './score.js';
 
 const SEATS = 4;
@@ -467,9 +467,15 @@ async function saveRound(entry) {
 
 function openRound(cur) {
   closeRound();
-  const game = pool.find((g) => g.slug === cur.slug) || normalize({ slug: cur.slug, name: cur.name, path: cur.path, type: 'Game' });
+  // Only a game this browser's library knows is loaded, from the library's own path.
+  const found = roundGame(cur, [...pool, ...EXAMPLES]);
+  if (!found) {
+    // Still loading (the library opens it when it arrives) or not in this copy: the seat sits it out.
+    console.warn(`[session] round ${cur.round}: ${cur.slug} is not in this library`);
+    return;
+  }
   pendingRound = cur;
-  player.open(game, { path: cur.path });
+  player.open(found.game, found.build);
   renderStrip();
 }
 
@@ -1275,7 +1281,9 @@ async function main() {
   loadManifest().then(
     (d) => {
       pool = sessionPool(d.games, EXAMPLES, knobs.examples);
-      render();
+      // A round dealt while the library was loading could not open yet.
+      if (state) applyState();
+      else render();
     },
     () => {}
   );

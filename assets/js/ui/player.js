@@ -49,6 +49,20 @@ const FRAME_ALLOW = [
 const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 /**
+ * A game is a page of this site. Any other address (another origin, a
+ * javascript: or data: one) would run as the hub in this unsandboxed frame,
+ * where a signed-in player's session is kept, so it is never framed or linked.
+ */
+function onThisSite(address) {
+  try {
+    const url = new URL(address, location.href);
+    return url.origin === location.origin && /^https?:$/.test(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Options beyond the wall's: `src(build)` names the frame's address (a session
  * adds ?aihub=1), `onFrame(frame)` hands over each new frame before it loads,
  * `canRoll()` says whether the 🎲 shows (asked again on refresh()),
@@ -250,6 +264,14 @@ export function createPlayer(
     Object.entries(paletteVars(palette)).forEach(([k, v]) => root.style.setProperty(k, v));
     clear(root);
 
+    const address = src(build);
+    if (!onThisSite(build.path) || !onThisSite(address)) {
+      const { el: barEl } = exitBar();
+      root.append(barEl, h('div', { class: 'player__bail' }, h('h2', {}, `${game.name} cannot be opened`), h('p', {}, 'Its address is not a page of this site.')));
+      session = { game, build, unbind: [], idle: 0, hold: null, ask: null };
+      return;
+    }
+
     if (honorStandalone && (store.prefersStandalone(game.slug) || store.dev().alwaysStandalone)) {
       const { el: barEl } = exitBar();
       root.append(barEl, standalonePanel(game, build));
@@ -259,7 +281,7 @@ export function createPlayer(
 
     const frame = h('iframe', {
       class: 'player__frame',
-      src: src(build),
+      src: address,
       title: game.name,
       allow: FRAME_ALLOW,
       allowfullscreen: true,

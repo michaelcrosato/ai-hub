@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { nameChoices, isNickname, ADJECTIVES, ANIMALS } from '../assets/js/session/names.js';
-import { eligible, pickNext, sessionPool } from '../assets/js/session/pick.js';
+import { eligible, pickNext, sessionPool, roundGame } from '../assets/js/session/pick.js';
 import { placesOf, scoreRound, addRound, leaderboard, liveOrder, formatOver, formatProgress, sessionAwards, finalTable } from '../assets/js/session/score.js';
 import { createLocalNet } from '../assets/js/session/local.js';
 
@@ -48,6 +48,23 @@ test('the reference examples fill in while no library game supports sessions, or
   assert.deepEqual(sessionPool(plain, examples).map((g) => g.slug), ['no-session', 'example']);
   assert.deepEqual(sessionPool(ready, examples).map((g) => g.slug), ['fits']);
   assert.deepEqual(sessionPool(ready, examples, true).map((g) => g.slug), ['fits', 'example']);
+});
+
+test('a dealt round loads the library’s own path, never one that came over the network', () => {
+  const builds = [{ id: 'v2', path: '/games/orbit/v2.html' }, { id: 'v1', path: '/games/orbit/v1.html' }];
+  const library = [game('orbit', { path: builds[0].path, builds }), game('bare', { path: '/games/bare.html' })];
+  const deal = (slug, path) => roundGame({ round: 1, slug, path }, library);
+  assert.equal(deal('orbit', "javascript:alert(document.domain)//").build.path, '/games/orbit/v2.html');
+  assert.equal(deal('orbit', '/games/orbit/v2.html?level=<img src=x onerror=alert(1)>').build.path, '/games/orbit/v2.html');
+  assert.equal(deal('orbit', 'https://elsewhere.example/orbit.html').build.path, '/games/orbit/v2.html');
+  // The path still picks among the game's own builds, as the host dealt it.
+  assert.deepEqual(deal('orbit', '/games/orbit/v1.html').build, builds[1]);
+  assert.equal(deal('orbit', '/games/orbit/v1.html').game.slug, 'orbit');
+  // A game the manifest lists without builds keeps its own path.
+  assert.equal(deal('bare', 'javascript:alert(1)').build.path, '/games/bare.html');
+  // A slug this library does not hold is not played, whatever path comes with it.
+  assert.equal(deal('not-here', '/games/not-here.html'), null);
+  assert.equal(roundGame(undefined, library), null);
 });
 
 test('Random Mode plays every game once before any comes round again, in an order set by the seed', () => {
