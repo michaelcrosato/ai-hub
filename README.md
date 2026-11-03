@@ -17,8 +17,9 @@ Put the `.html` file in `games/`. That is the whole procedure.
 games/Whatever_You_Called_It.html
 ```
 
-Push it, and Vercel rebuilds the wall. No code to touch, no list to edit, no
-naming rules to remember — mixed case, spaces, underscores and hyphens are all
+Reload the wall on `pnpm dev` and it is there; the public site gets it with
+the next deploy. No code to touch, no list to edit, no naming rules to
+remember — mixed case, spaces, underscores and hyphens are all
 fine.
 
 ```bash
@@ -215,9 +216,12 @@ See `lib/vendor/README.md` for paths, import maps and verification commands.
 **Size.** GitHub refuses any single file over 100 MB and warns above 50 MB;
 the scan flags both. Inputs or expanded packages over 95 MiB are reported and skipped. For the whole wall,
 a library of ~400 games at ~2.5 MB each (~900 MB) packs to roughly 500 MB in
-git, under GitHub's 1 GB recommendation and 2 GB push limit. Deploy it by
-pushing: Vercel builds from the repo with room to spare, whereas `vercel
+git, under GitHub's 1 GB recommendation and 2 GB push limit. Deploy it from
+the repo: Vercel builds from GitHub with room to spare, whereas `vercel
 deploy` from the folder is capped at 100 MB of uploads on the Hobby plan.
+Pushes don't deploy, to keep Vercel's usage down (`"git": {
+"deploymentEnabled": false }` in `vercel.json`): to deploy, push with it set
+to `true`, then set it back to `false` in the next commit.
 Replaced builds stay in git history, so the repo grows with every update.
 
 ## Running it locally
