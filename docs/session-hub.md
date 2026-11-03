@@ -70,7 +70,18 @@ a WebGPU adapter (a real one, not a software fallback) and whether it has
 nothing but a touch screen. A game declaring `hub:webgpu` `required` is dealt
 only when every seat has WebGPU; when a seat is touch-only, the deal keeps to
 games tagged `touch` while any fit. The lobby's count of games uses the same
-rules.
+rules, and counts titles, as the deal does.
+
+The host can narrow the deal in the lobby, before the first round or back in
+the lobby between rounds, with three rows of filters: the mode; the round's
+length from `hub:session-minutes` (short is up to 3 minutes, medium 4 to 6,
+long 7 or more, and a game that does not say counts as long, since it gets
+the longest round limit); and the catalogue's `genre`. Values in one row are
+alternatives, the rows narrow together, and a row with nothing chosen keeps
+every game. Each value shows how many titles the deal would have with it
+alone chosen in its row; one that would leave none can't be chosen. The
+other players see the filters as one line. They travel in the session state,
+so a seat that takes over as host deals with them too.
 
 ### Between rounds
 

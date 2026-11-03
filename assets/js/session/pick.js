@@ -6,20 +6,94 @@
  * order fixed by the session's seed (the Deck's shuffle), and no game comes
  * round twice until every game in the pool has had its turn: then a new cycle
  * deals the pool again in a new order.
+ *
+ * The host can narrow the pool in the lobby: how the game is played together,
+ * how long a round runs, the genre.
  */
 
 import { sessionOf, sameKey } from '../manifest.js';
-import { SELF_REPORTED } from '../../../lib/hub/round.js';
+import { SELF_REPORTED, MODE_NAMES } from '../../../lib/hub/round.js';
 import { isVisible, shelfOf } from '../filter.js';
 import { shuffleDeck } from '../explore/deck.js';
+
+/**
+ * How long a round runs, from hub:session-minutes. A game that does not say
+ * gets the longest round limit there is, so it counts as long.
+ */
+export const LENGTHS = [
+  { value: 'short', label: 'Short', blurb: 'Up to 3 minutes a round', holds: (minutes) => minutes !== null && minutes <= 3 },
+  { value: 'medium', label: 'Medium', blurb: '4 to 6 minutes a round', holds: (minutes) => minutes !== null && minutes > 3 && minutes < 7 },
+  { value: 'long', label: 'Long', blurb: '7 minutes or more a round', holds: (minutes) => minutes === null || minutes >= 7 },
+];
+
+const MODE_BLURBS = {
+  parallel: 'Everyone plays their own copy, from the same start',
+  ghost: 'Your own copy, with the others shown in it as ghosts',
+  'shared-world': 'One world for everyone',
+};
+
+/**
+ * The host's filters on the deal, as groups: a group with values chosen keeps
+ * the games that have one of them, and a group with none chosen keeps them
+ * all. `fixed` lists a group's values in the order the lobby shows them; the
+ * genres are shown by how many games have them.
+ */
+export const FILTERS = [
+  {
+    key: 'modes',
+    label: 'Play',
+    read: (game) => sessionOf(game)?.mode ?? null,
+    fixed: Object.entries(MODE_NAMES).map(([value, label]) => ({ value, label, blurb: MODE_BLURBS[value] })),
+  },
+  {
+    key: 'lengths',
+    label: 'Length',
+    read: (game) => LENGTHS.find((length) => length.holds(sessionOf(game)?.minutes ?? null))?.value ?? null,
+    fixed: LENGTHS.map(({ value, label, blurb }) => ({ value, label, blurb })),
+  },
+  {
+    key: 'genres',
+    label: 'Genre',
+    read: (game) => (typeof game.genre === 'string' && game.genre.trim()) || null,
+  },
+];
+
+/** The values chosen in one group. Filters come over the network from the host, so anything else is none. */
+const chosenIn = (filters, key) => (Array.isArray(filters?.[key]) ? filters[key].filter((v) => typeof v === 'string') : []);
+
+/** Whether the host has narrowed the deal at all. */
+export const anyFilter = (filters) => FILTERS.some(({ key }) => chosenIn(filters, key).length > 0);
+
+/** Whether a game passes the host's filters. */
+export const passes = (game, filters) =>
+  FILTERS.every(({ key, read }) => {
+    const chosen = chosenIn(filters, key);
+    return !chosen.length || chosen.includes(read(game));
+  });
+
+/** The filters with one value chosen or taken back. */
+export function toggleFilter(filters, key, value, on) {
+  const rest = chosenIn(filters, key).filter((v) => v !== value);
+  return { ...filters, [key]: on ? [...rest, value] : rest };
+}
+
+/** The filters in words, one group after another: "Shared world · Short · Racing or Fighting". Null for none. */
+export function describeFilters(filters) {
+  const parts = FILTERS.map((group) => {
+    const labels = chosenIn(filters, group.key).map((v) => group.fixed?.find((o) => o.value === v)?.label ?? v);
+    return labels.length > 1 ? `${labels.slice(0, -1).join(', ')} or ${labels.at(-1)}` : labels[0];
+  }).filter(Boolean);
+  return parts.length ? parts.join(' · ') : null;
+}
 
 /**
  * The games a session of `n` players can play. The seats' browsers decide
  * too: a game that cannot play without WebGPU (hub:webgpu "required") only
  * when every seat has it (`webgpu`); and when a seat has nothing but a touch
- * screen (`touchOnly`), the games tagged touch, if any fit.
+ * screen (`touchOnly`), the games tagged touch, if any fit. Then the host's
+ * `filters`.
  */
-export function eligible(games, n, { webgpu = false, touchOnly = false } = {}) {
+export function eligible(games, n, { webgpu = false, touchOnly = false, filters = null } = {}) {
   const fit = games.filter((game) => {
     const session = sessionOf(game);
     return (
@@ -28,7 +102,8 @@ export function eligible(games, n, { webgpu = false, touchOnly = false } = {}) {
       n <= session.seats[1] &&
       (webgpu || game.webgpu !== 'required') &&
       isVisible(game, false) &&
-      shelfOf(game) === 'games'
+      shelfOf(game) === 'games' &&
+      passes(game, filters)
     );
   });
   const touch = touchOnly ? fit.filter((game) => Array.isArray(game.tags) && game.tags.includes('touch')) : [];
@@ -37,6 +112,35 @@ export function eligible(games, n, { webgpu = false, touchOnly = false } = {}) {
 
 /** One game, however many builds of it the library holds: the same source, or for an original the same name. */
 export const lineageKey = (game) => `${sameKey(game.lineage?.series ?? '')}\u0000${sameKey(game.lineage?.title ?? game.slug)}`;
+
+/** How many games a list holds, as the deal counts them: titles, not builds. */
+export const countGames = (games) => new Set(games.map(lineageKey)).size;
+
+/**
+ * What the lobby offers in each filter group: the values the games that seat
+ * the players have, each with how many games the deal would have if it alone
+ * were chosen in its group, the other groups as they are. A chosen value stays
+ * on offer when no game has it any more, so it can be taken back.
+ */
+export function filterChoices(games, n, { filters = null, ...seats } = {}) {
+  const fit = eligible(games, n, { webgpu: seats.webgpu });
+  return FILTERS.map((group) => {
+    const chosen = chosenIn(filters, group.key);
+    const seen = new Map();
+    for (const game of fit) {
+      const value = group.read(game);
+      if (value !== null) seen.set(value, (seen.get(value) || new Set()).add(lineageKey(game)));
+    }
+    const known = group.fixed ?? [...seen.keys()].sort((a, b) => seen.get(b).size - seen.get(a).size || a.localeCompare(b)).map((value) => ({ value, label: value }));
+    const offered = [...known.filter((o) => seen.has(o.value) || chosen.includes(o.value)), ...chosen.filter((v) => !known.some((o) => o.value === v)).map((value) => ({ value, label: value }))];
+    const options = offered.map((o) => ({
+      ...o,
+      chosen: chosen.includes(o.value),
+      count: countGames(eligible(fit, n, { ...seats, filters: { ...filters, [group.key]: [o.value] } })),
+    }));
+    return { key: group.key, label: group.label, options };
+  });
+}
 
 /**
  * The games a session deals from. The reference examples join the library when
@@ -76,8 +180,8 @@ export const deckOf = (game) => (SELF_REPORTED.includes(sessionOf(game)?.mode) ?
  * random, and no lineage comes round again until the deck is played through,
  * so a source with hundreds of runs is one game among the others.
  */
-export function pickNext(games, { seed, n, cycle = 0, played = [], webgpu = false, touchOnly = false }) {
-  const pool = eligible(games, n, { webgpu, touchOnly });
+export function pickNext(games, { seed, n, cycle = 0, played = [], webgpu = false, touchOnly = false, filters = null }) {
+  const pool = eligible(games, n, { webgpu, touchOnly, filters });
   if (!pool.length) return null;
   const decks = new Set(pool.map(deckOf));
   const last = played.length ? pool.find((game) => game.slug === played.at(-1)) : null;

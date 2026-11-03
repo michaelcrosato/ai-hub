@@ -36,7 +36,7 @@ import { createRound, limitFor, rankResults, seedsRandom, MODE_NAMES, SELF_REPOR
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
-import { pickNext, eligible, sessionPool, roundGame } from './pick.js';
+import { pickNext, eligible, sessionPool, roundGame, filterChoices, anyFilter, describeFilters, toggleFilter, countGames } from './pick.js';
 import { scoreRound, addRound, leaderboard, liveOrder, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, finalTable } from './score.js';
 
 const SEATS = 4;
@@ -204,6 +204,7 @@ function freshState() {
     reveal: null,
     notice: null,
     format: DEFAULT_FORMAT,
+    filters: {},
     final: null,
     knobs,
   };
@@ -272,9 +273,10 @@ function applyState() {
 function startRound({ under = false } = {}) {
   if (!isHost() || !state) return;
   const players = seated().map((m) => ({ key: m.key, slot: m.slot, name: m.name }));
-  const pick = pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played, ...seatsCan() });
+  const pick = pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played, ...seatsCan(), filters: state.filters });
   if (!pick) {
-    publish({ ...state, phase: 'lobby', notice: `No game in the library fits ${players.length} player${players.length === 1 ? '' : 's'} yet.` });
+    const n = `${players.length} player${players.length === 1 ? '' : 's'}`;
+    publish({ ...state, phase: 'lobby', notice: anyFilter(state.filters) ? `No game fits ${n} with these filters.` : `No game in the library fits ${n} yet.` });
     return;
   }
   const { game } = pick;
@@ -596,6 +598,8 @@ function render() {
     clock: net?.clock ? { offset: net.clock.offset, rtt: net.clock.rtt, following: net.clock.following } : null,
   };
   player.refresh();
+  // The lobby is drawn afresh on every change: keep the keyboard where it was.
+  const focused = app.contains(document.activeElement) && document.activeElement.id;
   clear(app);
   if (removed) app.append(h('section', { class: 'panel' }, h('h2', {}, 'You were removed from this session'), h('a', { class: 'primary', href: '/' }, 'Back to the wall')));
   else if (superseded)
@@ -613,6 +617,7 @@ function render() {
   else if (mine().status === 'full') app.append(h('section', { class: 'panel' }, h('h2', {}, 'This session is full'), h('p', {}, 'Four players are already in it.')));
   else if (state?.phase === 'ended') app.append(endScreen());
   else app.append(lobbyScreen());
+  if (focused) document.getElementById(focused)?.focus();
   renderStrip();
   renderResults();
   renderBoard();
@@ -708,7 +713,8 @@ function wire() {
 function lobbyScreen() {
   const seats = seated();
   const n = seats.length;
-  const fits = eligible(pool, n, seatsCan()).length;
+  const fits = countGames(eligible(pool, n, { ...seatsCan(), filters: state?.filters }));
+  const none = anyFilter(state?.filters) ? `No game fits ${n} player${n === 1 ? '' : 's'} with these filters` : `No game fits ${n} player${n === 1 ? '' : 's'} yet`;
   const cur = state?.current;
   const host = isHost();
   const inRound = state?.phase === 'round' && cur && !cur.players.some((p) => p.key === key);
@@ -742,12 +748,13 @@ function lobbyScreen() {
     state?.notice && h('p', { class: 'notice' }, state.notice),
     inRound && h('p', { class: 'notice' }, `${cur.name} is being played. You join from the next round.`),
     formatPicker(),
+    filterPicker(n),
     host && state?.phase === 'lobby'
       ? h(
           'div',
           { class: 'lobby__start' },
           h('button', { type: 'button', class: 'primary', id: 'start', disabled: !fits || undefined, onclick: () => startRound() }, 'Start Random Mode'),
-          h('span', { class: 'hint' }, fits ? `${fits} game${fits === 1 ? '' : 's'} fit ${n} player${n === 1 ? '' : 's'}` : `No game fits ${n} player${n === 1 ? '' : 's'} yet`)
+          h('span', { class: 'hint' }, fits ? `${fits} game${fits === 1 ? ' fits' : 's fit'} ${n} player${n === 1 ? '' : 's'}` : none)
         )
       : state?.phase === 'lobby' && h('p', { class: 'hint' }, `Waiting for ${nameOf(hostKey()) ?? 'the host'} to start.`),
     host && (state?.phase !== 'lobby' || state.history.length > 0) && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, 'End the session'),
@@ -769,10 +776,63 @@ function formatPicker() {
       h(
         'label',
         { class: `format${id === chosen ? ' is-chosen' : ''}` },
-        h('input', { type: 'radio', name: 'format', value: id, checked: id === chosen, onchange: () => publish({ ...state, format: id }) }),
+        h('input', { type: 'radio', name: 'format', id: `format-${id}`, value: id, checked: id === chosen, onchange: () => publish({ ...state, format: id }) }),
         h('span', { class: 'format__name' }, format.label),
         h('span', { class: 'format__blurb' }, format.blurb)
       )
+    )
+  );
+}
+
+/**
+ * Which games the deal draws from: the host narrows it in the lobby, between
+ * rounds too, and everyone else sees what was chosen. A group with nothing
+ * chosen keeps every game.
+ */
+function filterPicker(n) {
+  const filters = state?.filters ?? {};
+  if (!isHost() || state?.phase !== 'lobby') {
+    const chosen = describeFilters(filters);
+    return chosen && h('p', { class: 'hint format-line' }, `Games: ${chosen}.`);
+  }
+  const groups = filterChoices(pool, n, { ...seatsCan(), filters }).filter((g) => g.options.length > 1 || g.options.some((o) => o.chosen));
+  if (!groups.length) return null;
+  return h(
+    'fieldset',
+    { class: 'filters' },
+    h('legend', {}, 'Which games'),
+    groups.map((group) =>
+      h(
+        'div',
+        { class: 'filters__group', role: 'group', 'aria-label': group.label },
+        h('span', { class: 'filters__label', 'aria-hidden': 'true' }, group.label),
+        h(
+          'div',
+          { class: 'filters__options' },
+          group.options.map((o) =>
+            h(
+              'label',
+              { class: `filter${o.chosen ? ' is-chosen' : ''}${o.count ? '' : ' is-empty'}`, title: o.blurb },
+              h('input', {
+                type: 'checkbox',
+                id: `filter-${group.key}-${o.value.replace(/[^a-z0-9]+/gi, '-')}`,
+                checked: o.chosen,
+                disabled: !o.chosen && !o.count,
+                onchange: (e) => publish({ ...state, notice: null, filters: toggleFilter(filters, group.key, o.value, e.target.checked) }),
+              }),
+              h('span', { class: 'filter__name' }, o.label),
+              h('span', { class: 'filter__count' }, String(o.count))
+            )
+          )
+        )
+      )
+    ),
+    h(
+      'p',
+      { class: 'hint filters__note' },
+      anyFilter(filters)
+        ? h('button', { type: 'button', class: 'link', id: 'filters-clear', onclick: () => publish({ ...state, notice: null, filters: {} }) }, 'Show every game again')
+        : 'A row with nothing chosen keeps every game.'
     )
   );
 }
@@ -1081,7 +1141,7 @@ function splashCard(cur) {
   const game = pool.find((g) => g.slug === cur.slug);
   const info = game ? sessionOf(game) : null;
   // The spin passes the other games once each, starting somewhere new every round.
-  const others = [...new Set(eligible(pool, cur.players.length, seatsCan()).filter((g) => g.slug !== cur.slug).map((g) => g.name))];
+  const others = [...new Set(eligible(pool, cur.players.length, { ...seatsCan(), filters: state.filters }).filter((g) => g.slug !== cur.slug).map((g) => g.name))];
   const start = others.length ? cur.round % others.length : 0;
   const reel = [...others.slice(start), ...others.slice(0, start)].filter((n) => n !== cur.name).slice(0, 6);
   const playing = cur.players.some((p) => p.key === key);

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { nameChoices, isNickname, ADJECTIVES, ANIMALS } from '../assets/js/session/names.js';
-import { eligible, pickNext, sessionPool, roundGame } from '../assets/js/session/pick.js';
+import { eligible, pickNext, sessionPool, roundGame, filterChoices, countGames, anyFilter, describeFilters, toggleFilter } from '../assets/js/session/pick.js';
 import { placesOf, scoreRound, addRound, leaderboard, liveOrder, formatOver, formatProgress, sessionAwards, finalTable } from '../assets/js/session/score.js';
 import { createLocalNet } from '../assets/js/session/local.js';
 
@@ -309,6 +309,82 @@ test('a seat with nothing but a touch screen gets the games tagged touch, while 
   // With no touch game in the pool the session still deals, rather than nothing at all.
   assert.deepEqual(eligible([games[0]], 2, { touchOnly: true }).map((g) => g.slug), ['keys']);
   assert.equal(pickNext([games[0]], { seed: 's', n: 2, touchOnly: true })?.game.slug, 'keys');
+});
+
+test('the host’s filters narrow the deal by play, length and genre; a row with nothing chosen keeps every game', () => {
+  const games = [
+    game('arena', { sessionMode: 'shared-world', sessionMinutes: '3', genre: 'Fighting' }),
+    game('kart', { sessionMode: 'race', sessionMinutes: '4', genre: 'Racing' }),
+    game('rally', { sessionMode: 'parallel', sessionMinutes: '8', genre: 'Racing' }),
+    game('saga', { sessionMode: 'parallel', genre: 'RPG' }),
+  ];
+  const slugs = (filters) => eligible(games, 2, { filters }).map((g) => g.slug);
+  assert.deepEqual(slugs({}), ['arena', 'kart', 'rally', 'saga']);
+  assert.deepEqual(slugs({ modes: ['ghost'] }), ['kart'], 'an older tag plays, and filters, as its mode');
+  assert.deepEqual(slugs({ modes: ['parallel', 'shared-world'] }), ['arena', 'rally', 'saga'], 'values in one row: any of them');
+  assert.deepEqual(slugs({ lengths: ['short'] }), ['arena']);
+  assert.deepEqual(slugs({ lengths: ['long'] }), ['rally', 'saga'], 'a game with no length gets the longest round, so it is long');
+  assert.deepEqual(slugs({ genres: ['Racing'], lengths: ['medium'] }), ['kart'], 'rows: all of them');
+  assert.deepEqual(slugs({ genres: ['Puzzle'] }), []);
+  // Filters arrive over the network from the host: anything but a list of words is no filter.
+  assert.deepEqual(slugs({ genres: 'Racing', modes: [7], lengths: null }), ['arena', 'kart', 'rally', 'saga']);
+
+  const dealt = new Set();
+  let state = { seed: 5, n: 2, cycle: 0, played: [] };
+  for (let i = 0; i < 6; i++) {
+    const next = pickNext(games, { ...state, filters: { genres: ['Racing'] } });
+    dealt.add(next.game.slug);
+    state = { ...state, cycle: next.cycle, played: next.played };
+  }
+  assert.deepEqual([...dealt].sort(), ['kart', 'rally']);
+  assert.equal(pickNext(games, { seed: 5, n: 2, filters: { genres: ['Puzzle'] } }), null);
+});
+
+test('the lobby offers each filter value with how many games it alone would deal, counting titles', () => {
+  const lineage = (title) => ({ series: title, title, original: false });
+  const games = [
+    ...['a', 'b', 'c'].map((s) => game(`fox-${s}`, { sessionMode: 'parallel', sessionMinutes: '3', genre: 'Shooter', lineage: lineage('Star Fox') })),
+    game('kart', { sessionMode: 'shared-world', sessionMinutes: '4', genre: 'Racing', lineage: lineage('Kart') }),
+    game('rally', { sessionMode: 'parallel', sessionMinutes: '8', genre: 'Racing', lineage: lineage('Rally') }),
+    game('duel', { sessionMode: 'shared-world', sessionMinutes: '5', genre: 'Fighting', sessionPlayers: '2-2', lineage: lineage('Duel') }),
+  ];
+  assert.equal(countGames(eligible(games, 2)), 4, 'three builds of one source are one game');
+  // As [value, count, chosen], in the order the lobby shows them.
+  const row = (groups, key) => groups.find((g) => g.key === key).options.map((o) => [o.value, o.count, o.chosen]);
+
+  const open = filterChoices(games, 3);
+  assert.deepEqual(row(open, 'genres'), [['Racing', 2, false], ['Shooter', 1, false]], 'most games first, by titles not builds; nothing the seats rule out');
+  assert.deepEqual(row(open, 'modes'), [['parallel', 2, false], ['shared-world', 1, false]], 'in the order the hub names them; none no game has');
+  assert.deepEqual(row(open, 'lengths'), [['short', 1, false], ['medium', 1, false], ['long', 1, false]]);
+
+  const racing = filterChoices(games, 2, { filters: { genres: ['Racing'] } });
+  assert.deepEqual(row(racing, 'modes'), [['parallel', 1, false], ['shared-world', 1, false]], 'counted with the other rows as chosen');
+  assert.deepEqual(row(racing, 'genres'), [['Racing', 2, true], ['Fighting', 1, false], ['Shooter', 1, false]], 'a row counts each value on its own');
+  assert.deepEqual(row(racing, 'lengths'), [['short', 0, false], ['medium', 1, false], ['long', 1, false]]);
+
+  // A value chosen before a player left stays on offer, at nothing, so it can be taken back.
+  const gone = filterChoices(games, 3, { filters: { genres: ['Fighting'] } });
+  assert.deepEqual(row(gone, 'genres').at(-1), ['Fighting', 0, true]);
+});
+
+test('filters toggle one value at a time and read as one line', () => {
+  let filters = {};
+  assert.equal(anyFilter(filters), false);
+  assert.equal(describeFilters(filters), null);
+  filters = toggleFilter(filters, 'genres', 'Racing', true);
+  filters = toggleFilter(filters, 'genres', 'Fighting', true);
+  filters = toggleFilter(filters, 'genres', 'Racing', true);
+  assert.deepEqual(filters.genres, ['Fighting', 'Racing'], 'choosing a value twice keeps it once');
+  filters = toggleFilter(filters, 'modes', 'shared-world', true);
+  filters = toggleFilter(filters, 'lengths', 'short', true);
+  assert.equal(anyFilter(filters), true);
+  assert.equal(describeFilters(filters), 'Shared world · Short · Fighting or Racing');
+  filters = toggleFilter(filters, 'modes', 'shared-world', false);
+  filters = toggleFilter(filters, 'lengths', 'short', false);
+  filters = toggleFilter(filters, 'genres', 'Fighting', false);
+  assert.equal(describeFilters(filters), 'Racing');
+  assert.equal(describeFilters({ genres: ['A', 'B', 'C'] }), 'A, B or C');
+  assert.equal(anyFilter(toggleFilter(filters, 'genres', 'Racing', false)), false);
 });
 
 test('the live scoreboard orders players as the round will rank them', () => {

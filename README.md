@@ -535,7 +535,11 @@ the host picks how to win (**Party**: 8 rounds and three bonus awards worth 3
 points each; **Sprint**: 5 rounds; **First to 12**; **Endless**) and starts
 **Random Mode**. The hub deals every game that declares `hub:session` and
 seats everyone, in an order fixed by the session's seed, and none comes round
-twice until all have been played. Each round is played from the protocol's
+twice until all have been played. The host can narrow which games are dealt,
+in the lobby before the first round or between rounds: by mode (Parallel,
+Ghost, Shared world), by round length (Short, Medium, Long) and by genre. Each
+choice shows how many games it leaves, and a row with nothing chosen keeps
+every game. Each round is played from the protocol's
 start signal to its result. The moment it ends, the results land over it
 (places, points, the game's stats and awards, the table moving) while the next
 game is already loading underneath; a quick spin of the deck then shows the
