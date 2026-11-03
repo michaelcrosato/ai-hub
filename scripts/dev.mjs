@@ -6,7 +6,7 @@
  * every request for /data/games.json. Drop a file into games/, hit refresh,
  * and it is on the wall. No restart, no build step, no watcher.
  *
- * Usage:  pnpm dev  [--port 4173] [--open]
+ * Usage:  pnpm dev  [--port 7417] [--open]
  */
 
 import { createServer } from 'node:http';
@@ -24,7 +24,7 @@ const flag = (name, fallback) => {
   const at = argv.indexOf(`--${name}`);
   return at !== -1 && argv[at + 1] ? argv[at + 1] : fallback;
 };
-const START_PORT = Number(flag('port', process.env.PORT || 4173));
+const START_PORT = Number(flag('port', process.env.PORT || 7417));
 // Bound to loopback by default, and deliberately so: a wildcard bind on
 // Windows quietly *succeeds* while another server already holds
 // 127.0.0.1:<port>, and every request then goes to that other server instead.

@@ -7,7 +7,7 @@
 - Pushing does not deploy. Vercel usage costs too much to build every
   change, so Git deploys are off (`"git": { "deploymentEnabled": false }`
   in `vercel.json`) and the site runs locally: `pnpm dev`, then
-  http://127.0.0.1:4173. Deploy to Vercel only when Michael explicitly asks,
+  http://127.0.0.1:7417. Deploy to Vercel only when Michael explicitly asks,
   for a major update: push with `deploymentEnabled` set to `true` (that push
   deploys; check it reaches READY), then set it back to `false` in the next
   commit, which does not deploy.

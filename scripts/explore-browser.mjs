@@ -6,7 +6,7 @@ import { mkdir } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 
 const { chromium } = createRequire(import.meta.url)('playwright');
-const base = (process.argv[2] || 'http://127.0.0.1:4173').replace(/\/$/, '');
+const base = (process.argv[2] || 'http://127.0.0.1:7417').replace(/\/$/, '');
 const output = '.cache/selection-checks';
 await mkdir(output, { recursive: true });
 const views = ['atlas', 'timeline', 'deck'];

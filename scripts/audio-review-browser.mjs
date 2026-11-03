@@ -4,7 +4,7 @@
 import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
 const { chromium } = createRequire(import.meta.url)('playwright');
-const base = process.argv[2] || 'http://127.0.0.1:4173';
+const base = process.argv[2] || 'http://127.0.0.1:7417';
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH, args: ['--no-sandbox'] });
 try {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });

@@ -227,7 +227,7 @@ Replaced builds stay in git history, so the repo grows with every update.
 ## Running it locally
 
 ```bash
-pnpm dev          # http://localhost:4173
+pnpm dev          # http://localhost:7417
 ```
 
 There is no build step and no `node_modules` — `pnpm install` has nothing to
@@ -468,7 +468,7 @@ next to each other on a simulated network:
 
 ```
 pnpm dev
-http://localhost:4173/lib/hub/harness.html?game=/games/mygame.html&players=4&latency=150&jitter=50&loss=5
+http://localhost:7417/lib/hub/harness.html?game=/games/mygame.html&players=4&latency=150&jitter=50&loss=5
 ```
 
 `node scripts/hub-check.mjs games/mygame.html` runs the automatic conformance
@@ -592,7 +592,7 @@ machine:
 
 ```
 pnpm dev
-http://localhost:4173/session?transport=local&examples=1#try      (open it in up to four tabs)
+http://localhost:7417/session?transport=local&examples=1#try      (open it in up to four tabs)
 ```
 
 - `examples=1` adds the two reference games to the deal.
