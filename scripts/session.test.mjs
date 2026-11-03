@@ -387,6 +387,30 @@ test('filters toggle one value at a time and read as one line', () => {
   assert.equal(anyFilter(toggleFilter(filters, 'genres', 'Racing', false)), false);
 });
 
+test('the host can deal by what made a game: the model, how hard it thought, the month it came in', () => {
+  const games = [
+    game('opus', { model: 'Claude Opus 5.5', effort: 'max', added: '2026-11-01T00:30:00.000Z' }),
+    game('sol', { model: 'GPT-6.1 Sol', effort: 'xhigh', added: '2026-10-31T23:59:59.000Z' }),
+    game('pair', { model: ['GPT-6.1 Sol', ' Claude Opus 5.5 '], effort: 'ultra', added: '2026-09-24T03:36:47.000Z' }),
+    game('bare', { effort: 'turbo' }),
+  ];
+  const slugs = (filters) => eligible(games, 2, { filters }).map((g) => g.slug);
+  assert.deepEqual(slugs({ models: ['Claude Opus 5.5'] }), ['opus', 'pair'], 'a game that names two models has both');
+  assert.deepEqual(slugs({ efforts: ['xhigh', 'ultra'] }), ['sol', 'pair']);
+  assert.deepEqual(slugs({ months: ['2026-10'] }), ['sol'], 'a month is a UTC month');
+  assert.deepEqual(slugs({ models: ['GPT-6.1 Sol'], months: ['2026-09', '2026-11'] }), ['pair']);
+
+  const row = (key) => filterChoices(games, 2).find((g) => g.key === key).options.map((o) => [o.value, o.label, o.count]);
+  assert.deepEqual(row('models'), [['Claude Opus 5.5', 'Claude Opus 5.5', 2], ['GPT-6.1 Sol', 'GPT-6.1 Sol', 2]], 'none for a game that names no model');
+  assert.deepEqual(row('efforts'), [['xhigh', 'Extra high', 1], ['max', 'Max', 1], ['ultra', 'Ultra', 1], ['turbo', 'Turbo', 1]], 'least effort first, then any the scale does not know');
+  assert.deepEqual(row('months'), [['2026-11', 'November 2026', 1], ['2026-10', 'October 2026', 1], ['2026-09', 'September 2026', 1]], 'newest first');
+
+  assert.equal(describeFilters({ models: ['GPT-6.1 Sol'], efforts: ['max', 'xhigh'], months: ['2026-10'] }), 'GPT-6.1 Sol · Max or Extra high effort · Added in October 2026');
+  // A month that is not one only comes over the network: it reads as it is, and deals nothing.
+  assert.equal(describeFilters({ months: ['2026-13'] }), 'Added in 2026-13');
+  assert.deepEqual(slugs({ months: ['2026-13'] }), []);
+});
+
 test('the live scoreboard orders players as the round will rank them', () => {
   const rows = [
     { id: 0, progress: { score: 300, label: 'Floor 3' } },

@@ -73,15 +73,20 @@ games tagged `touch` while any fit. The lobby's count of games uses the same
 rules, and counts titles, as the deal does.
 
 The host can narrow the deal in the lobby, before the first round or back in
-the lobby between rounds, with three rows of filters: the mode; the round's
+the lobby between rounds, with six rows of filters: the mode; the round's
 length from `hub:session-minutes` (short is up to 3 minutes, medium 4 to 6,
 long 7 or more, and a game that does not say counts as long, since it gets
-the longest round limit); and the catalogue's `genre`. Values in one row are
-alternatives, the rows narrow together, and a row with nothing chosen keeps
-every game. Each value shows how many titles the deal would have with it
-alone chosen in its row; one that would leave none can't be chosen. The
-other players see the filters as one line. They travel in the session state,
-so a seat that takes over as host deals with them too.
+the longest round limit); the catalogue's `genre`; its `model` (a game that
+names two has both); its `effort`, least first (low, medium, high, xhigh,
+max, ultra, then any other, A to Z); and the month it was `added` to the
+library, newest first, a UTC month as the Explore timeline files arrivals.
+Values in one row are alternatives, the rows narrow together, and a row with
+nothing chosen keeps every game; a game the catalogue says nothing about in a
+row (no model, say) is left out once that row has a choice. Each value shows
+how many titles the deal would have with it alone chosen in its row; one that
+would leave none can't be chosen. The other players see the filters as one
+line. They travel in the session state, so a seat that takes over as host
+deals with them too.
 
 ### Between rounds
 

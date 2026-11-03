@@ -8,7 +8,8 @@
  * deals the pool again in a new order.
  *
  * The host can narrow the pool in the lobby: how the game is played together,
- * how long a round runs, the genre.
+ * how long a round runs, the genre, and what made it: the model, how hard the
+ * model was asked to think, and when it came into the library.
  */
 
 import { sessionOf, sameKey } from '../manifest.js';
@@ -33,30 +34,69 @@ const MODE_BLURBS = {
 };
 
 /**
+ * How hard the model was asked to think, as the catalogue records it, least
+ * first. An effort not listed here follows them, A to Z.
+ */
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const effortAt = (value) => (EFFORTS.includes(value) ? EFFORTS.indexOf(value) : EFFORTS.length);
+const effortName = (value) => (value === 'xhigh' ? 'Extra high' : value.charAt(0).toUpperCase() + value.slice(1));
+
+/** The month a game came into the library, "2026-10": a UTC month, as the Explore timeline files arrivals. */
+const monthOf = (game) => {
+  const at = Date.parse(game.added);
+  return Number.isFinite(at) ? new Date(at).toISOString().slice(0, 7) : null;
+};
+const MONTH = new Intl.DateTimeFormat('en', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+/** "2026-10" reads "October 2026". Anything else came over the network, and reads as it is. */
+const monthName = (value) => (/^\d{4}-(0[1-9]|1[0-2])$/.test(value) ? MONTH.format(new Date(`${value}-01T12:00:00Z`)) : value);
+
+/**
  * The host's filters on the deal, as groups: a group with values chosen keeps
  * the games that have one of them, and a group with none chosen keeps them
  * all. `fixed` lists a group's values in the order the lobby shows them; the
- * genres are shown by how many games have them.
+ * others are found on the games, in `rank` order or most games first. `name`
+ * is what the lobby calls a value, and `say` puts a group's choice in words.
  */
 export const FILTERS = [
   {
     key: 'modes',
     label: 'Play',
-    read: (game) => sessionOf(game)?.mode ?? null,
+    read: (game) => sessionOf(game)?.mode,
     fixed: Object.entries(MODE_NAMES).map(([value, label]) => ({ value, label, blurb: MODE_BLURBS[value] })),
   },
   {
     key: 'lengths',
     label: 'Length',
-    read: (game) => LENGTHS.find((length) => length.holds(sessionOf(game)?.minutes ?? null))?.value ?? null,
+    read: (game) => LENGTHS.find((length) => length.holds(sessionOf(game)?.minutes ?? null))?.value,
     fixed: LENGTHS.map(({ value, label, blurb }) => ({ value, label, blurb })),
   },
+  { key: 'genres', label: 'Genre', read: (game) => game.genre },
+  { key: 'models', label: 'Model', read: (game) => game.model },
   {
-    key: 'genres',
-    label: 'Genre',
-    read: (game) => (typeof game.genre === 'string' && game.genre.trim()) || null,
+    key: 'efforts',
+    label: 'Effort',
+    read: (game) => game.effort,
+    rank: (a, b) => effortAt(a) - effortAt(b) || a.localeCompare(b),
+    name: effortName,
+    blurb: (value) => `Made at ${value} effort`,
+    say: (text) => `${text} effort`,
+  },
+  {
+    key: 'months',
+    label: 'Added',
+    read: monthOf,
+    rank: (a, b) => b.localeCompare(a),
+    name: monthName,
+    say: (text) => `Added in ${text}`,
   },
 ];
+
+/** What a game has in a group, as trimmed words: one, several (a game may name two models) or none. */
+const valuesOf = (value) =>
+  (Array.isArray(value) ? value : [value]).filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim());
+
+/** What the lobby calls a value. */
+const labelOf = (group, value) => group.fixed?.find((o) => o.value === value)?.label ?? group.name?.(value) ?? value;
 
 /** The values chosen in one group. Filters come over the network from the host, so anything else is none. */
 const chosenIn = (filters, key) => (Array.isArray(filters?.[key]) ? filters[key].filter((v) => typeof v === 'string') : []);
@@ -68,7 +108,7 @@ export const anyFilter = (filters) => FILTERS.some(({ key }) => chosenIn(filters
 export const passes = (game, filters) =>
   FILTERS.every(({ key, read }) => {
     const chosen = chosenIn(filters, key);
-    return !chosen.length || chosen.includes(read(game));
+    return !chosen.length || valuesOf(read(game)).some((value) => chosen.includes(value));
   });
 
 /** The filters with one value chosen or taken back. */
@@ -77,11 +117,13 @@ export function toggleFilter(filters, key, value, on) {
   return { ...filters, [key]: on ? [...rest, value] : rest };
 }
 
-/** The filters in words, one group after another: "Shared world · Short · Racing or Fighting". Null for none. */
+/** The filters in words, one group after another: "Shared world · Short · Racing or Fighting · Max effort". Null for none. */
 export function describeFilters(filters) {
   const parts = FILTERS.map((group) => {
-    const labels = chosenIn(filters, group.key).map((v) => group.fixed?.find((o) => o.value === v)?.label ?? v);
-    return labels.length > 1 ? `${labels.slice(0, -1).join(', ')} or ${labels.at(-1)}` : labels[0];
+    const labels = chosenIn(filters, group.key).map((v) => labelOf(group, v));
+    if (!labels.length) return null;
+    const text = labels.length > 1 ? `${labels.slice(0, -1).join(', ')} or ${labels.at(-1)}` : labels[0];
+    return group.say ? group.say(text) : text;
   }).filter(Boolean);
   return parts.length ? parts.join(' · ') : null;
 }
@@ -128,11 +170,12 @@ export function filterChoices(games, n, { filters = null, ...seats } = {}) {
     const chosen = chosenIn(filters, group.key);
     const seen = new Map();
     for (const game of fit) {
-      const value = group.read(game);
-      if (value !== null) seen.set(value, (seen.get(value) || new Set()).add(lineageKey(game)));
+      for (const value of valuesOf(group.read(game))) seen.set(value, (seen.get(value) || new Set()).add(lineageKey(game)));
     }
-    const known = group.fixed ?? [...seen.keys()].sort((a, b) => seen.get(b).size - seen.get(a).size || a.localeCompare(b)).map((value) => ({ value, label: value }));
-    const offered = [...known.filter((o) => seen.has(o.value) || chosen.includes(o.value)), ...chosen.filter((v) => !known.some((o) => o.value === v)).map((value) => ({ value, label: value }))];
+    const option = (value) => ({ value, label: labelOf(group, value), ...(group.blurb && { blurb: group.blurb(value) }) });
+    const mostFirst = (a, b) => seen.get(b).size - seen.get(a).size || a.localeCompare(b);
+    const known = group.fixed ?? [...seen.keys()].sort(group.rank ?? mostFirst).map(option);
+    const offered = [...known.filter((o) => seen.has(o.value) || chosen.includes(o.value)), ...chosen.filter((v) => !known.some((o) => o.value === v)).map(option)];
     const options = offered.map((o) => ({
       ...o,
       chosen: chosen.includes(o.value),
