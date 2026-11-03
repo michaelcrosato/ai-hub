@@ -80,18 +80,41 @@ async function waitFor(page, test, arg, timeout = 30_000) {
   await page.waitForFunction(test, arg, { timeout, polling: 200 });
 }
 
-/** The splash is up for a round on this tab. */
+/** A card is up for a round on this tab: the hub's splash, or the game's own (Starfall shows its own). */
 const onSplash = (page, round) =>
-  waitFor(page, (r) => window.__session?.state?.current?.round === r && document.querySelector('.splash__ready') && !document.querySelector('#results').hidden, round, 30_000);
+  waitFor(
+    page,
+    (r) => window.__session?.state?.current?.round === r && ((document.querySelector('.splash__ready') && !document.querySelector('#results').hidden) || window.__session.card === 'own'),
+    round,
+    30_000
+  );
 
-/** Press the splash's Ready: a click, the keyboard or the controller, and see it taken. */
+const ownCard = (page) => page.evaluate(() => window.__session.card === 'own');
+
+/** Press a key in the game's frame, which has the keyboard while the game shows its own card. */
+async function gameKey(page, key) {
+  await page.locator('#player iframe').focus();
+  await page.keyboard.press(key);
+}
+
+/** Press Ready: a click, the keyboard or the controller, on the hub's card or the game's own, and see it taken. */
 async function ready(page, how = 'click') {
-  if (how === 'click') await page.click('.splash__ready');
+  if (await ownCard(page)) {
+    // The game reads the controller itself: press Cross on the frame's own pad.
+    if (how === 'pad') await padPress(await (await page.$('#player iframe')).contentFrame(), 0);
+    else await gameKey(page, 'Enter');
+  } else if (how === 'click') await page.click('.splash__ready');
   else if (how === 'enter') {
     await page.focus('.splash__ready');
     await page.keyboard.press('Enter');
   } else await padPress(page, 0);
-  await waitFor(page, () => document.querySelector('.splash__ready')?.textContent.startsWith('Ready ✓') || document.querySelector('#results').hidden, null, 3_000);
+  await waitFor(page, () => window.__session.state.current?.splash?.ready.includes(window.__session.key) || window.__session.state.current?.splash?.released, null, 3_000);
+}
+
+/** Ask for more time, or take it back: on the hub's card, or with T on Starfall's own. */
+async function more(page) {
+  if (await ownCard(page)) await gameKey(page, 't');
+  else await page.click('.splash__more');
 }
 
 /** A press long enough to be seen by a page drawing slowly: four tabs of games share this machine. */
@@ -146,7 +169,7 @@ try {
   await pages[4].route('**/lib/hub/examples/*', (route) => route.abort());
   await pages[1].click('#start');
   for (const seat of [1, 2, 3, 4]) await onSplash(pages[seat], 1);
-  for (const seat of [1, 2, 3]) await pages[seat].click('.splash__more');
+  for (const seat of [1, 2, 3]) await more(pages[seat]);
   await waitFor(pages[1], () => window.__session.state.current.splash.paused !== null, null, 5_000);
   await waitFor(pages[4], () => document.querySelector('.splash__count')?.textContent.startsWith('Paused'), null, 5_000);
   assert.match(await pages[4].textContent('.splash__note'), /asking for more time|A player needs more time/);
@@ -154,7 +177,7 @@ try {
   log('three of four asked for more time: the countdown holds');
   await pages[1].waitForTimeout(SPLASH_S * 1000 + 1_000);
   assert.equal(splashOf(await session(pages[1])).released, false, 'still held');
-  for (const seat of [1, 2]) await pages[seat].click('.splash__more');
+  for (const seat of [1, 2]) await more(pages[seat]);
   await waitFor(pages[1], () => window.__session.state.current.splash.paused === null, null, 5_000);
   for (const seat of [1, 2, 3]) await ready(pages[seat]);
   log('two took it back: the countdown runs on, and runs out with seat 4 not ready');

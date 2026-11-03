@@ -18,6 +18,7 @@ export const RELEASES = Object.freeze({
   '1.1.0': '6625a3a55ed0380baf268d593dd24e85f6c49fcd00d524fc308ae0fd4b484272',
   '1.2.0': '2d6e9bd677210500e7683deaa88dace3f70b28295f85b0525a1811b2bc9bd088',
   '1.3.0': '32ed0ff62e4e0880bc78db850a0cff8dd7c9277d34ef76cafc60d535d41761db',
+  '1.4.0': '529eac78c54cfff0e60d375a9c63f66d1a594327ddcc262a2bdf9b1f2fb6582a',
 });
 
 const BANNER = '/*! aihub-session ';

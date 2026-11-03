@@ -107,6 +107,14 @@ countdown takes about 25 seconds, less when everyone presses Ready:
      *A player needs more time* without saying who. While more than half the
      players are asking, the countdown holds until fewer than half are.
      Pressing it again, or Ready, takes it back.
+   - **The game's own card**: a game that connects with `card: true` shows
+     the card itself, in its own style (lib/hub/README.md, *The card*). The
+     hub's card stays up until that game calls `ready()`, then steps aside:
+     each seat's page sends its game `card` (the time left, who is ready,
+     whether the countdown holds) whenever it changes, and every second
+     while the countdown runs, and passes the game's `answer` on as that seat's press. The hub
+     reads no controller meanwhile, since the game does. A seat whose game
+     has not loaded yet, or does not show its own card, keeps the hub's.
 3. **Start**: the card lifts and the 3-2-1 begins as soon as every game has
    loaded; a game still loading gets up to 20 seconds more, then its player
    sits the round out.
@@ -149,9 +157,11 @@ to the welcome's origin.
 
 | From | type | Fields | Rule |
 |---|---|---|---|
-| game | `hello` | `v: 1, client, mode, seats` | every 500 ms until welcomed; after 10 s the game plays alone |
-| hub | `welcome` | `me, host, players, mode, seed, limitMs, round, splash?, limits, server?` | once; a 1.3.0 client keeps any field the hub adds |
+| game | `hello` | `v: 1, client, mode, seats, card` | every 500 ms until welcomed; after 10 s the game plays alone |
+| hub | `welcome` | `me, host, players, mode, seed, limitMs, round, splash?, limits, server?` | once; a client of 1.3.0 or later keeps any field the hub adds |
 | game | `ready` | | once, when loaded: the hub's card collects the players' ready (`splash`) |
+| hub | `card` | `left, paused, starting, ready, asking, asked` | to a game that connected with `card: true`, after its `ready`, until `start` |
+| game | `answer` | `answer`: `ready` or `more` | on its own card, after the welcome, until `start` |
 | hub | `start` | `in` | milliseconds until play begins |
 | game | `send` | `data, to?, reliable` | after welcome, until end; within `limits` |
 | hub | `message` | `from, data` | |

@@ -19,10 +19,12 @@
  * /session#<code>; friends open it and join as guests, no account needed.
  *
  * Between rounds every seat sees the results, then the next game's splash: a
- * countdown the host sets (10, 20 or 30 seconds) that starts the round by itself, Ready (every seat
- * ready starts it at once) and I need more time (+10 s; while most seats ask,
- * the countdown holds). The games load underneath and ready up by themselves
- * (lib/hub/README.md, "Ready, start and the clock"); the host's round
+ * countdown the host sets (10, 20 or 30 seconds) that starts the round by
+ * itself, Ready (every seat ready starts it at once) and I need more time
+ * (+10 s; while most seats ask, the countdown holds). A game can show its own
+ * card instead: once it has loaded, the hub's steps aside, and the game gets
+ * the countdown and sends the answers (lib/hub/README.md, "The card"). The
+ * games load underneath and ready up by themselves; the host's round
  * coordinator starts the round when the splash is over and every game has
  * loaded.
  */
@@ -506,6 +508,7 @@ function attachRound(frame) {
     onIssue: (i) => console.warn(`[session] ${i.problem}`),
     onProgress: (id, p) => noteProgress(cur.round, id, p),
     onFullscreen: fullscreen,
+    onAnswer: (what) => press(what),
   });
   detach = attachFrame(frame, (msg) => bridge.fromGame(msg));
   for (const [from, env] of early.splice(0)) if (env.r === cur.round) bridge.fromNet(from, env);
@@ -604,6 +607,10 @@ function render() {
       return boardRound === state?.current?.round ? Object.fromEntries(progressById) : {};
     },
     clock: net?.clock ? { offset: net.clock.offset, rtt: net.clock.rtt, following: net.clock.following } : null,
+    /** Which card is up: the hub's ('splash'), the game's own ('own'), the results, or none. */
+    get card() {
+      return revealStage();
+    },
   };
   player.refresh();
   // The lobby is drawn afresh on every change: keep the keyboard where it was.
@@ -1080,8 +1087,35 @@ function revealStage() {
   // The 3-2-1 has begun: lift the card for it.
   if (status && cur && status.round === cur.round && status.phase !== 'loading') return 'none';
   if (state.reveal?.results && state.history.length && hostNow() < state.reveal.resultsUntil) return 'results';
-  if (cur && state.phase === 'round' && cur.splash) return cur.splash.released && waitsForMyKey() ? 'none' : 'splash';
+  if (cur && state.phase === 'round' && cur.splash) {
+    if (bridge?.round === cur.round && bridge.showsCard) return 'own';
+    return cur.splash.released && waitsForMyKey() ? 'none' : 'splash';
+  }
   return 'none';
+}
+
+/** The game's own card: what it needs to show the countdown and who is ready, sent when any of it changes. */
+let cardSent = '';
+function sendCard(cur) {
+  const sp = cur.splash;
+  const seats = splashSeats(cur);
+  const ids = status?.round === cur.round ? new Map(status.players.map((p) => [p.key, p.id])) : new Map([...cur.players].sort((a, b) => a.slot - b.slot).map((p, id) => [p.key, id]));
+  if (myAnswer.round !== cur.round) myAnswer = { round: cur.round, ready: false, more: false, moreAt: 0 };
+  const paused = sp.paused !== null && !sp.released;
+  const left = sp.released || paused ? null : Math.max(0, sp.until - hostNow());
+  const card = {
+    left,
+    paused,
+    starting: sp.released,
+    ready: sp.ready.filter((k) => seats.includes(k) && ids.has(k)).map((k) => ids.get(k)).sort((a, b) => a - b),
+    asking: sp.marked,
+    asked: myAnswer.more,
+  };
+  // Once a second at least, as the countdown ticks, and at once when anything else changes.
+  const id = JSON.stringify({ ...card, left: left === null ? null : Math.ceil(left / 1000), round: cur.round });
+  if (id === cardSent) return;
+  cardSent = id;
+  bridge.card(card);
 }
 
 function renderResults() {
@@ -1090,7 +1124,7 @@ function renderResults() {
   if (id !== shown) {
     shown = id;
     clear(overlay);
-    overlay.hidden = stage === 'none';
+    overlay.hidden = stage === 'none' || stage === 'own';
     if (stage === 'results') overlay.append(resultsCard(state.history.at(-1)));
     if (stage === 'splash') {
       overlay.append(splashCard(state.current));
@@ -1100,9 +1134,11 @@ function renderResults() {
   const count = overlay.querySelector('.results__count');
   if (count && stage === 'results') count.textContent = `Next game in ${Math.max(0, Math.ceil((state.reveal.resultsUntil - hostNow()) / 1000))} s`;
   if (stage === 'splash') updateSplash(state.current);
-  // The card lifted: hand the keyboard to the game.
-  if (stage === 'none' && !lifted) document.querySelector('#player iframe')?.focus();
-  lifted = stage === 'none';
+  if (stage === 'own') sendCard(state.current);
+  // The card lifted, or the game shows its own: hand the keyboard to the game.
+  const toGameNow = stage === 'none' || stage === 'own';
+  if (toGameNow && !lifted) document.querySelector('#player iframe')?.focus();
+  lifted = toGameNow;
 }
 
 const MEDALS = ['🥇', '🥈', '🥉'];

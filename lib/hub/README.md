@@ -48,9 +48,10 @@ Games tagged with the older modes keep working: `race` is played as ghost,
 
 ## A round
 
-1. The hub shows its card for the game (its name, its goal and its controls,
-   from the game's tags) with a countdown of 10 to 30 seconds, and loads the
-   game under it on every player's device.
+1. The hub loads the game on every player's device, and the players get 10
+   to 30 seconds with the game's card: what the game is, how to win, the
+   controls. The card is the hub's, from the game's tags, or the game's own
+   (*The card*).
 2. The game connects and calls `ready()`.
 3. The round starts on the hub's clock, on every device at once.
 4. The game reports how it goes.
@@ -106,13 +107,12 @@ edited copy is not replaced.
 
 - `AIHub.active` is `true` from the first line when the hub opened the page.
 - In a session, the game opens straight into the round: no title screen,
-  menus or prompts before it.
+  menus or prompts before it, other than its own card (*The card*).
 - `AIHub.connect({ mode, seats: [min, max] })` returns a promise of the
   round's `info`, or of `null` when there is no hub after all; with `null`
   the game runs as it does on its own.
 - `AIHub.ready()` is called once, when the game has loaded and the round can
-  start. The players answer the hub's card; the game shows no ready prompt of
-  its own.
+  start, with no key press: the players answer the card.
 - The round starts when the card's countdown ends or every player pressed
   Ready, and every game has called `ready()`. A game still loading then gets
   20 more seconds; after that its player sits the round out.
@@ -130,6 +130,53 @@ edited copy is not replaced.
 
 Names come from the hub and are never inserted into the page as HTML. Colours
 follow the seat: `#e8443a`, `#3b82f6`, `#22c55e`, `#f5b700`.
+
+### The card
+
+Before every round the players get 10 to 30 seconds to learn what comes
+next and say when they are ready. By default the hub shows its own card over
+the game. A game can make the card its own, as part of the game:
+
+```js
+AIHub.connect({ mode, seats, card: true });
+```
+
+The hub's card then steps aside when the game calls `ready()`, and the game's
+screen is the card until `start`. How it looks and sounds is the game's: its
+title, its music, its world, the players lining up. Introduce the game the way
+it deserves.
+
+While it is on, the card shows:
+
+- the game's name;
+- the players, each in their colour, and which of them are ready;
+- how to win the round;
+- the controls this player will use;
+- the time left, from the `card` event.
+
+And it takes two answers, from the keyboard, a controller, or a tap or click
+on the card:
+
+- **Ready**: Enter, Cross (button 0), or a tap on Ready:
+  `AIHub.answer('ready')`.
+- **More time**: Triangle (button 3), a key the card names, or a tap on More
+  time: `AIHub.answer('more')`. Answering `more` again takes it back.
+
+Nothing done on the card changes the round. It has no menus, settings or
+choices, and play begins only at `start`. In parallel and ghost it draws no
+numbers from `Math.random`, which would change the round's start: use
+`AIHub.rng('card')`.
+
+`card` arrives whenever it changes, and every second while the countdown runs:
+
+| Field | |
+|---|---|
+| `left` | milliseconds until the round starts by itself; `null` while paused or starting |
+| `paused` | `true` while most players asked for more time |
+| `starting` | `true` once the countdown is over or everyone is ready: `start` follows when every game has loaded |
+| `ready` | the ids of the players who are ready |
+| `asking` | how many players asked for more time (never who) |
+| `asked` | `true` when this player asked for more time |
 
 ### The start
 
@@ -288,6 +335,7 @@ The checklist fills in as it runs. **A game passes when
 `"true"` at the end. It checks:
 
 - the tags, `connect()`, `ready()` with no key press, and the start;
+- with the game's own card, that Enter answers Ready;
 - parallel and ghost: `Math.random` the same on every copy, and progress from
   every copy; parallel sends nothing, ghost sends;
 - shared world: traffic both ways, and a round hosted by a copy with no
@@ -326,8 +374,9 @@ runs there.
 | | |
 |---|---|
 | `AIHub.active` | `true` in a session, from the first line |
-| `AIHub.connect({ mode, seats })` | → `Promise<info \| null>`; `null`: no hub |
+| `AIHub.connect({ mode, seats, card? })` | → `Promise<info \| null>`; `null`: no hub. `card: true`: the game shows its own card |
 | `AIHub.ready()` | once, when the round can start |
+| `AIHub.answer('ready' \| 'more')` | on the game's own card, before `start` |
 | `AIHub.time()` | milliseconds since play began: negative in the countdown, `-Infinity` before `start` |
 | `AIHub.on(event, fn)` | returns a function that removes the handler |
 | `AIHub.progress({ score, label })` | parallel and ghost |
@@ -343,6 +392,7 @@ read them.
 
 | Event | Arguments |
 |---|---|
+| `card` | `{ left, paused, starting, ready, asking, asked }`, with the game's own card |
 | `start` | `{ in }`: milliseconds until play begins |
 | `message` | `data, from` |
 | `leave` | `{ id, reason }` |
@@ -355,6 +405,6 @@ reach the game through the client unchanged.
 
 ### Versions
 
-This is protocol **1**, client **1.3.0**. Changes within version 1 only add:
+This is protocol **1**, client **1.4.0**. Changes within version 1 only add:
 games on older clients keep working. A change that would break a game becomes
 protocol 2, with its own `hub:session` value.

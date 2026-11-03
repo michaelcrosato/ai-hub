@@ -544,7 +544,8 @@ chosen keeps every game. Each round is played from the protocol's
 start signal to its result. The moment it ends, the results land over it
 (places, points, the game's stats and awards, the table moving) while the next
 game is already loading underneath; a quick spin of the deck then shows the
-next game, how to win it and its controls, and lifts on its ready prompt:
+next game, how to win it and its controls (or the game shows its own card, in
+its own style), and lifts on its ready prompt:
 about half a minute from one game to the next, less when everyone is ready
 (the host sets the card's countdown in the lobby: 10, 20 or 30 seconds). The table: one point for every
 player beaten, then wins, then average place. When the format says so, a final

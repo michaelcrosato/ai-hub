@@ -178,7 +178,7 @@ async function newRound() {
   grid.style.gridTemplateColumns = copies > 1 ? '1fr 1fr' : '1fr';
   grid.style.gridTemplateRows = `repeat(${Math.ceil(copies / (copies > 1 ? 2 : 1))}, 1fr)`;
 
-  const state = { round, n, metas, mode, limitMs, seed, players, cells: [], hubEnd, status: null, record: null, hidden: false, splashUntil: performance.now() + SPLASH_MS };
+  const state = { round, n, metas, mode, limitMs, seed, players, cells: [], hubEnd, status: null, record: null, hidden: false, splashUntil: performance.now() + SPLASH_MS, answers: { ready: new Set(), more: new Set() } };
   current = state;
   log(`round ${round}: ${n} player${n > 1 ? 's' : ''}, seed ${seed}, limit ${Math.round(limitMs / 1000)} s, mode ${mode || '(from hello)'}`);
 
@@ -221,7 +221,7 @@ async function newRound() {
     grid.append(el);
 
     const endpoint = net.endpoint(p.key);
-    const cell = { ...p, el, label, frame, endpoint, violations: [], instrumented: true, gone: false, progress: [] };
+    const cell = { ...p, el, label, frame, endpoint, violations: [], instrumented: true, gone: false, progress: [], cardSent: '' };
     const post = postTo(frame);
     cell.bridge = createBridge({
       key: p.key,
@@ -234,6 +234,7 @@ async function newRound() {
       net: endpoint,
       onIssue: (i) => log(`${p.key} ✗ ${i.problem}`),
       onFullscreen: (on) => log(`${p.key} asked for fullscreen ${on ? 'on' : 'off'}: the hub's page takes it`),
+      onAnswer: (what) => answerCard(state, cell, what),
       // The scoreboard's feed: this cell's own progress, as its bridge passes it on.
       onProgress: (id, report) => {
         if (id !== cell.bridge?.me) return;
@@ -250,16 +251,56 @@ async function newRound() {
   }
   renderWho(state);
   render(state);
-  // By hand, the splash lifts by itself after ten seconds, as in a session; the conformance run releases it itself.
-  if (!auto) setTimeout(() => releaseRound(state), SPLASH_MS);
+  // By hand, the card lifts by itself after ten seconds (more when a player asks), as in a session;
+  // the conformance run releases it itself.
+  const ticker = setInterval(() => {
+    if (state !== current || state.coordinator.released) return clearInterval(ticker);
+    if (!auto && performance.now() >= state.splashUntil) return releaseRound(state);
+    tickCard(state);
+  }, 250);
   return state;
 }
 
 function releaseRound(state = current) {
   if (!state || state !== current || state.coordinator.released) return;
   state.splashUntil = null;
+  tickCard(state);
   log('splash over: the round starts once every game has loaded');
   state.coordinator.release();
+}
+
+/** A game's own card, as the hub drives it: the countdown and who is ready, to every copy that shows one. */
+function tickCard(state) {
+  const left = state.splashUntil === null ? null : Math.max(0, state.splashUntil - performance.now());
+  const ready = state.cells.filter((c) => state.answers.ready.has(c.key)).map((c) => c.bridge.me);
+  for (const cell of state.cells) {
+    if (cell.gone || !cell.bridge.showsCard) continue;
+    const card = { left, paused: false, starting: left === null, ready, asking: state.answers.more.size, asked: state.answers.more.has(cell.key) };
+    const id = JSON.stringify({ ...card, left: left === null ? null : Math.ceil(left / 1000) });
+    if (cell.cardSent === id) continue;
+    cell.cardSent = id;
+    cell.bridge.card(card);
+  }
+}
+
+/** A player answered on the game's own card: Ready, or more time (+10 s; again takes it back). */
+function answerCard(state, cell, what) {
+  if (state !== current || state.coordinator.released || cell.server) return;
+  const { ready, more } = state.answers;
+  if (what === 'ready') {
+    ready.add(cell.key);
+    more.delete(cell.key);
+  } else if (more.has(cell.key)) {
+    more.delete(cell.key);
+  } else {
+    more.add(cell.key);
+    ready.delete(cell.key);
+    state.splashUntil += 10_000;
+  }
+  log(`${cell.key} answers ${what} on the game's card`);
+  const players = state.cells.filter((c) => !c.server && !c.gone);
+  if (!auto && players.every((c) => ready.has(c.key))) return releaseRound(state);
+  tickCard(state);
 }
 
 function endCurrent() {
@@ -306,7 +347,7 @@ function render(state) {
     cell.el.classList.toggle('is-out', !!p.out || cell.gone);
   }
   const lines = [`Round ${s.round} · ${s.mode || 'mode unknown'} · phase ${s.phase}`, `Host: ${s.server ? 'the server, no player' : `player ${s.host}`} · seed ${state.seed}`];
-  if (s.gate && !s.released) lines.push(`Splash: ${state.splashUntil ? `${Math.max(0, Math.ceil((state.splashUntil - performance.now()) / 1000))} s left` : 'held'} (Start now ends it)`);
+  if (s.gate && !s.released) lines.push(`Card: ${state.cells.some((c) => c.bridge.showsCard) ? 'the game’s own, ' : ''}${state.splashUntil ? `${Math.max(0, Math.ceil((state.splashUntil - performance.now()) / 1000))} s left` : 'held'} (Start now ends it)`);
   if (state.record) {
     const name = (id) => s.players[id]?.name ?? `#${id}`;
     lines.push(`Ended ${state.record.status} (${state.record.reason})`);
@@ -398,7 +439,15 @@ async function conformance() {
 
     // The card collects ready: every game readies up by itself once loaded, with no prompt and no key.
     const loaded = await until(() => copies().every((p) => p.ready), 20_000);
-    check('ready without a key press (the hub’s card asks the players)', loaded, copies().filter((p) => !p.ready).map((p) => p.key).join(', '));
+    check('ready without a key press (the card asks the players)', loaded, copies().filter((p) => !p.ready).map((p) => p.key).join(', '));
+    // A game that shows its own card takes the players' answers on it: Enter is Ready.
+    if (caps.some((c) => c?.card)) {
+      const players = state.cells.filter((c) => !c.server);
+      const sent = await until(() => players.every((c) => c.cardSent), 2000);
+      for (const cell of players) poke(cell, 'Enter');
+      const answered = await until(() => players.every((c) => state.answers.ready.has(c.key)), 3000);
+      check('its own card: Enter answers Ready', sent && answered, players.filter((c) => !state.answers.ready.has(c.key)).map((c) => `${c.key}${c.cardSent ? '' : ' (no card yet)'}`).join(', '));
+    }
     releaseRound(state);
     const started = await until(() => state.status?.phase !== 'loading', 15_000);
     check('the round starts when the card ends', started && copies().every((p) => p.ready), copies().filter((p) => !p.ready).map((p) => p.key).join(', ') || state.status?.phase);

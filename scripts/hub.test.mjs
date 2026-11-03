@@ -87,7 +87,7 @@ test('the client is inactive without ?aihub=1 in a frame, and connect() answers 
 test('the client says hello until welcomed, then resolves with the round', async () => {
   const { hub, posted, fromHub, clock } = await loadClient();
   const info = hub.connect({ mode: 'versus', seats: [2, 4] });
-  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.3.0', mode: 'versus', seats: [2, 4] });
+  assert.deepEqual(posted[0].msg, { aihub: 1, type: 'hello', v: 1, client: '1.4.0', mode: 'versus', seats: [2, 4], card: false });
   assert.equal(posted[0].origin, '*');
   clock.advance(1_000);
   assert.equal(posted.length, 3);
@@ -103,6 +103,28 @@ test('the client says hello until welcomed, then resolves with the round', async
   hub.ready();
   hub.ready();
   assert.deepEqual(posted.slice(3).map((p) => [p.msg.type, p.origin]), [['ready', 'https://hub.test']]);
+});
+
+test('a game with its own card says so, hears the card, and answers on it until the start', async () => {
+  const { hub, posted, fromHub, flush, warnings } = await loadClient();
+  hub.connect({ mode: 'parallel', seats: [1, 4], card: true });
+  assert.equal(posted[0].msg.card, true);
+  hub.answer('ready');
+  assert.equal(posted.length, 1, 'no answer before the welcome');
+  fromHub({ ...WELCOME, splash: true });
+  const cards = [];
+  hub.on('card', (c) => cards.push(c));
+  fromHub({ aihub: 1, type: 'card', left: 12_000, paused: false, starting: false, ready: [0], asking: 1, asked: false });
+  await flush();
+  assert.deepEqual(JSON.parse(JSON.stringify(cards)), [{ left: 12_000, paused: false, starting: false, ready: [0], asking: 1, asked: false }]);
+  hub.answer('more');
+  hub.answer('ready');
+  hub.answer('later');
+  assert.deepEqual(posted.slice(1).map((p) => p.msg), [{ aihub: 1, type: 'answer', answer: 'more' }, { aihub: 1, type: 'answer', answer: 'ready' }]);
+  assert.match(warnings.at(-1), /ready or more/);
+  fromHub({ aihub: 1, type: 'start', in: 3_000 });
+  hub.answer('ready');
+  assert.equal(posted.length, 3, 'the card is over at the start');
 });
 
 test('the client gives up after ten seconds with no hub, and plays solo with its own Math.random', async () => {
@@ -764,6 +786,46 @@ test('the bridge turns the start time into a countdown and stops after the end',
   assert.equal(posted.at(-1).type, 'end');
 });
 
+test('the bridge sends the card to a game that shows its own, and hands its answers to the page until the start', () => {
+  const clock = fakeClock(10_000);
+  const posted = [];
+  const issues = [];
+  const answers = [];
+  const make = (card) => {
+    const bridge = createBridge({ key: 'b', round: 4, coordinator: 'hub', post: (msg) => posted.push(msg), net: { send: () => {} }, clock, onIssue: (i) => issues.push(i.problem), onAnswer: (what) => answers.push(what) });
+    bridge.fromGame({ aihub: 1, type: 'hello', v: 1, client: '1.4.0', mode: 'parallel', seats: [1, 4], card });
+    bridge.fromNet('hub', { k: 'h', r: 4, m: { round: 4, type: 'welcome', me: 1, host: 0, players: [], keys: ['a', 'b'], mode: 'parallel', seed: 1, limitMs: 9, splash: true } });
+    return bridge;
+  };
+  const plain = make(undefined);
+  plain.fromGame({ aihub: 1, type: 'ready' });
+  plain.card({ left: 5_000 });
+  plain.fromGame({ aihub: 1, type: 'answer', answer: 'ready' });
+  assert.equal(plain.showsCard, false);
+  assert.deepEqual(answers, []);
+  assert.match(issues.join('|'), /answer without its own card/);
+  assert.ok(!posted.some((m) => m.type === 'card'), 'a game without its own card never hears one');
+
+  posted.length = 0;
+  const own = make(true);
+  assert.equal(own.showsCard, false, 'the hub keeps its own card up until the game has loaded');
+  own.fromGame({ aihub: 1, type: 'ready' });
+  assert.equal(own.showsCard, true);
+  own.card({ left: 5_000, paused: false, starting: false, ready: [], asking: 0, asked: false });
+  assert.deepEqual(posted.at(-1), { aihub: 1, type: 'card', left: 5_000, paused: false, starting: false, ready: [], asking: 0, asked: false });
+  own.fromGame({ aihub: 1, type: 'answer', answer: 'more' });
+  own.fromGame({ aihub: 1, type: 'answer', answer: 'sure' });
+  own.fromGame({ aihub: 1, type: 'answer', answer: 'ready' });
+  assert.deepEqual(answers, ['more', 'ready']);
+  assert.match(issues.at(-1), /"sure" is not ready or more/);
+  own.fromNet('hub', { k: 'h', r: 4, m: { type: 'start', at: clock.now() + 3_000 } });
+  const sent = posted.length;
+  own.card({ left: 0 });
+  own.fromGame({ aihub: 1, type: 'answer', answer: 'ready' });
+  assert.equal(posted.length, sent, 'no card after the start');
+  assert.deepEqual(answers, ['more', 'ready'], 'no answer after the start');
+});
+
 test('the simulated network keeps reliable messages in order and only loses unreliable ones', async () => {
   const net = createLocalNetwork({ latency: 5, jitter: 5, loss: 1 });
   const a = net.endpoint('a');
@@ -800,7 +862,7 @@ test('the client reports the splash, and hands the harness whatever the game pro
 
 test('the three examples carry the client byte for byte, and the spec links to it', async () => {
   const client = await read('lib/hub/session.js');
-  assert.match(client, /^\/\*! aihub-session 1\.3\.0 /);
+  assert.match(client, /^\/\*! aihub-session 1\.4\.0 /);
   assert.match(await read('lib/hub/README.md'), /raw\.githubusercontent\.com\/michaelcrosato\/ai-hub\/main\/lib\/hub\/session\.js/);
   for (const file of ['lib/hub/examples/arena.html', 'lib/hub/examples/ghost.html', 'lib/hub/examples/parallel.html']) {
     assert.ok((await read(file)).includes(client), `${file} must contain lib/hub/session.js unchanged`);
