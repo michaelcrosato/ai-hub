@@ -768,11 +768,13 @@ assets/js/        native ES modules, no bundler
   session/        seats, names, Random Mode, scoring; local, Realtime and WebRTC transports
   account/        sign-in, votes, play time, the account menu
 assets/vendor/    supabase-js, pinned and checked
+cloudflare/       Worker and Wrangler config for `pnpm release`
 supabase/         migrations, RLS tests, the turn Edge Function (not deployed to the site)
 scripts/
   scan.mjs        the build; walks games/, writes games.json
   ingest.mjs      bulk import of pages, folders and zips
   dev.mjs         local server, re-scans on every request
+  release.mjs     publish to Cloudflare: only what the site serves, shelf trimmed to what games load
   shots.mjs       optional screenshots
   lib/layout.mjs  what a path is: game, build, project, collection
   lib/intake.mjs  what a package holds, and what never to import
@@ -805,6 +807,14 @@ through `lib/vendor/`. Those packages do not replace the patched shared stack.
 
 Vercel runs `node scripts/scan.mjs` as the build command and serves the
 repository. There is no framework and nothing is compiled.
+
+`pnpm release` publishes the same site to Cloudflare Workers instead (not live
+yet): it stages only what the site serves into `.cache/release/site`, with the
+library shelf cut to the files games actually load (about 14,700 files in all,
+under the free plan's 20,000), splits any file over Cloudflare's 25 MiB limit
+into parts that `cloudflare/worker.js` streams back whole, and deploys with
+Wrangler. `--dry-run` stages and reports; `--local` serves the staged site with
+Cloudflare's runtime on port 8787.
 
 ### A note on colour
 
