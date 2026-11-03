@@ -91,15 +91,16 @@ deals with them too.
 ### Between rounds
 
 Fast is the point. From one round's last whistle to the next round's
-countdown takes about fifteen seconds, less when everyone presses Ready:
+countdown takes about 25 seconds, less when everyone presses Ready:
 
 1. **Results**, the moment a round ends, over the game: places, points, stats
    and awards, and the table moving (about 5 seconds).
 2. **The card** (the splash): a quick spin through the deck lands on the next
    game and shows its name, its mode, `hub:session-goal` and
-   `hub:session-howto`, with a 10-second countdown that starts the round by
-   itself. The next game has been loading underneath since the results
-   appeared.
+   `hub:session-howto`, with a countdown that starts the round by itself: 10,
+   20 (the default) or 30 seconds, as the host sets it in the lobby, before
+   the first round or between rounds. The next game has been loading
+   underneath since the results appeared.
    - **Ready** (Enter, or Cross on a controller): when every player has
      pressed it, the round starts at once.
    - **I need more time** (Triangle): adds 10 seconds, and tells the others

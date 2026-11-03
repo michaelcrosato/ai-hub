@@ -49,8 +49,8 @@ Games tagged with the older modes keep working: `race` is played as ghost,
 ## A round
 
 1. The hub shows its card for the game (its name, its goal and its controls,
-   from the game's tags) with a 10-second countdown, and loads the game under
-   it on every player's device.
+   from the game's tags) with a countdown of 10 to 30 seconds, and loads the
+   game under it on every player's device.
 2. The game connects and calls `ready()`.
 3. The round starts on the hub's clock, on every device at once.
 4. The game reports how it goes.

@@ -19,7 +19,7 @@
  * /session#<code>; friends open it and join as guests, no account needed.
  *
  * Between rounds every seat sees the results, then the next game's splash: a
- * 10-second countdown that starts the round by itself, Ready (every seat
+ * countdown the host sets (10, 20 or 30 seconds) that starts the round by itself, Ready (every seat
  * ready starts it at once) and I need more time (+10 s; while most seats ask,
  * the countdown holds). The games load underneath and ready up by themselves
  * (lib/hub/README.md, "Ready, start and the clock"); the host's round
@@ -44,6 +44,9 @@ const STATE_EVERY_MS = 2_000;
 const DISCOVER_MS = 700;
 /** "I need more time" adds this much to the splash's countdown. */
 const MORE_MS = 10_000;
+/** How long the splash counts down, in seconds: the host picks in the lobby. */
+const CARD_SECONDS = [10, 20, 30];
+const DEFAULT_CARD_SECONDS = 20;
 const RELAY_KEY = 'ai-hub:relay-only';
 /** The controller on the splash: Cross is Ready, Triangle asks for more time. */
 const PAD = { cross: 0, triangle: 3 };
@@ -54,7 +57,7 @@ const seconds = (name) => (Number(params.get(name)) > 0 ? Number(params.get(name
 const knobs = {
   limitMs: seconds('limit'),
   resultsMs: seconds('results') ?? 5_000,
-  splashMs: seconds('splash') ?? 10_000,
+  splashMs: seconds('splash'),
   graceMs: seconds('grace'),
   examples: params.get('examples') === '1',
 };
@@ -205,6 +208,7 @@ function freshState() {
     notice: null,
     format: DEFAULT_FORMAT,
     filters: {},
+    cardSeconds: DEFAULT_CARD_SECONDS,
     final: null,
     knobs,
   };
@@ -324,9 +328,13 @@ function startRound({ under = false } = {}) {
   marks = new Set();
   const reveal = under && state.reveal ? state.reveal : { at: hostNow(), resultsUntil: hostNow(), results: false };
   // The splash's countdown runs from the moment the results make way for it.
-  current.splash = { until: Math.max(reveal.resultsUntil, hostNow()) + (limits.splashMs ?? knobs.splashMs), paused: null, ready: [], marked: 0, notice: 0, released: false };
+  current.splash = { until: Math.max(reveal.resultsUntil, hostNow()) + splashMsOf(state), paused: null, ready: [], marked: 0, notice: 0, released: false };
   publish({ ...state, round, cycle: pick.cycle, played: pick.played, phase: 'round', current, reveal, notice: null });
 }
+
+/** The splash's countdown: the host's address can set it for trying games, else the lobby's choice. State comes over the network, so anything else is the default. */
+const cardSecondsOf = (s) => (CARD_SECONDS.includes(s?.cardSeconds) ? s.cardSeconds : DEFAULT_CARD_SECONDS);
+const splashMsOf = (s) => s?.knobs?.splashMs ?? cardSecondsOf(s) * 1000;
 
 /** After a round: its results for `resultsMs`, then the next game's splash. */
 function revealFor(s) {
@@ -748,6 +756,7 @@ function lobbyScreen() {
     state?.notice && h('p', { class: 'notice' }, state.notice),
     inRound && h('p', { class: 'notice' }, `${cur.name} is being played. You join from the next round.`),
     formatPicker(),
+    cardPicker(),
     filterPicker(n),
     host && state?.phase === 'lobby'
       ? h(
@@ -779,6 +788,35 @@ function formatPicker() {
         h('input', { type: 'radio', name: 'format', id: `format-${id}`, value: id, checked: id === chosen, onchange: () => publish({ ...state, format: id }) }),
         h('span', { class: 'format__name' }, format.label),
         h('span', { class: 'format__blurb' }, format.blurb)
+      )
+    )
+  );
+}
+
+/** How long the next game's card counts down: the host picks in the lobby, between rounds too; everyone sees it. */
+function cardPicker() {
+  const chosen = cardSecondsOf(state);
+  if (state?.knobs?.splashMs) return null;
+  if (!isHost() || state?.phase !== 'lobby') return h('p', { class: 'hint format-line' }, `Each game's card counts down ${chosen} seconds.`);
+  return h(
+    'fieldset',
+    { class: 'filters' },
+    h('legend', {}, 'Before each game'),
+    h(
+      'div',
+      { class: 'filters__group', role: 'radiogroup', 'aria-label': 'Timer' },
+      h('span', { class: 'filters__label', 'aria-hidden': 'true' }, 'Timer'),
+      h(
+        'div',
+        { class: 'filters__options' },
+        CARD_SECONDS.map((sec) =>
+          h(
+            'label',
+            { class: `filter${sec === chosen ? ' is-chosen' : ''}`, title: `${sec} seconds to read the card and get ready` },
+            h('input', { type: 'radio', name: 'card-seconds', id: `card-${sec}`, value: sec, checked: sec === chosen, onchange: () => publish({ ...state, cardSeconds: sec }) }),
+            h('span', { class: 'filter__name' }, `${sec}s`)
+          )
+        )
       )
     )
   );
@@ -1132,7 +1170,7 @@ function resultsCard(entry) {
 /** Host: skip the rest of the results; the splash starts its countdown now. */
 function nextGameNow() {
   const cur = state.current;
-  const splash = cur?.splash && !cur.splash.released && cur.splash.paused === null ? { ...cur.splash, until: hostNow() + (state.knobs?.splashMs ?? knobs.splashMs) } : cur?.splash;
+  const splash = cur?.splash && !cur.splash.released && cur.splash.paused === null ? { ...cur.splash, until: hostNow() + splashMsOf(state) } : cur?.splash;
   publish({ ...state, reveal: { ...state.reveal, resultsUntil: hostNow() }, current: cur ? { ...cur, splash } : cur });
 }
 
