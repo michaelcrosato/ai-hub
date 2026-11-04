@@ -1,10 +1,12 @@
 /**
- * ui/views.js — six ways into the same library, and the switch between
+ * ui/views.js — seven ways into the same library, and the switch between
  * them that every one of them carries.
  *
  *   Wall       the arcade: cabinets on a wall, picked by shelf and filter
+ *   Friends    game night: host or join a session, and the games that play together
  *   Couch      the big screen: a hero and rails, driven by arrows or a gamepad
  *   Catalogue  the reading room: every game a row, narrowed by query and chart
+ *   Atlas, Timeline and Deck: by genre district, by date added, one card at a time
  *
  * A game that is open travels with you: the switch links to the same game in
  * the other view, and a search carries over as the other view's search, as
@@ -15,6 +17,13 @@ import { h, icon } from '../dom.js';
 
 export const VIEWS = [
   { key: 'wall', label: 'Wall', href: '/', hint: 'Cabinets on a wall', glyph: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z' },
+  {
+    key: 'friends',
+    label: 'Friends',
+    href: '/friends',
+    hint: 'Play with friends: host or join a session, and every game that plays together',
+    glyph: 'M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20a6.5 6.5 0 0 1 13 0M16 4.3a3.5 3.5 0 0 1 0 6.4M18 14.4a6.5 6.5 0 0 1 3.5 5.6',
+  },
   { key: 'couch', label: 'Couch', href: '/couch', hint: 'Big screen, for a controller or the arrow keys', glyph: 'M3 5h18v11H3zM8 20h8M12 16v4' },
   {
     key: 'catalogue',

@@ -48,7 +48,19 @@ Ties go to more wins, then the better average place, and otherwise stay ties.
 
 ### The deal
 
-Random Mode deals every game that declares `hub:session`, seats the players
+The host's own picks come first: **Up next** in the lobby, the games the host
+chose (`state.queue`, at most twelve slugs), played in their order before
+Random Mode deals. The host picks from every game that seats the players
+present and that every seat's browser can run; the deal's filters and the
+touch-screen rule narrow only Random Mode. A pick that does not seat the
+players yet keeps its place for a later round. A session hosted from a game's
+page in the Friends view (`/session?first=<slug>`) starts with that game in
+the list, and the address drops it once the session has it. The round's
+state says `picked: true`, and its card reads *The host's pick*. A pick is
+added to the played list, so Random Mode does not deal it again in the same
+cycle.
+
+Then Random Mode deals every game that declares `hub:session`, seats the players
 present and sits on the Games shelf (`assets/js/session/pick.js`). A game
 whose `data/overrides.json` entry says `"session": "0"` is never dealt:
 `scripts/hub-check.mjs --record` writes that, with a `sessionNote`, for a game

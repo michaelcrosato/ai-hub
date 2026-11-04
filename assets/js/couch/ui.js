@@ -59,6 +59,8 @@ const PROMPTS = {
   play: ['Enter', 'A'],
   info: ['I', 'Y'],
   fave: ['F', 'X'],
+  // No pad button is free: a pad reaches With friends with the arrows.
+  friends: ['P', null],
   back: ['Esc', 'B'],
   surprise: ['R', PAD_GLYPHS.menu],
 };
@@ -74,7 +76,7 @@ export function prompt(action) {
     'span',
     { class: 'prompt', 'aria-hidden': 'true' },
     h('kbd', { class: 'prompt__key' }, key),
-    button.length === 1 ? h('span', { class: 'prompt__pad' }, button) : icon(button, { class: 'prompt__pad' })
+    !button ? null : button.length === 1 ? h('span', { class: 'prompt__pad' }, button) : icon(button, { class: 'prompt__pad' })
   );
 }
 

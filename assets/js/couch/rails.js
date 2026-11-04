@@ -1,8 +1,9 @@
 /**
  * couch/rails.js — the Couch's home screen as rows of games, the way a
- * console lays out a library: what you played and starred, what is new, then
- * the library by genre with its series and models woven between, then the
- * originals, the games for more than one, and the other shelf last.
+ * console lays out a library: what you played and starred, what is new, the
+ * games to play with friends, then the library by genre with its series and
+ * models woven between, then the originals, couch co-op on this screen, and
+ * the other shelf last.
  *
  * No DOM, so node --test can pin the order down. `stats` is the same small
  * read-only view of this device the wall's sorts use:
@@ -12,6 +13,7 @@
 import { sameKey, playersOf, MULTI } from '../manifest.js';
 import { shelfOf, SHELVES } from '../filter.js';
 import { fnv1a } from '../color.js';
+import { playsOnline } from '../friends/together.js';
 
 /** The most tiles a rail holds. Past this a row stops being browsable. */
 export const CAP = { recent: 20, fresh: 24, library: 40 };
@@ -107,10 +109,11 @@ export function weave(genres, others, cadence = CADENCE) {
 }
 
 /**
- * The rows, in order: Jump back in, Your favourites, Fresh on the wall, the
- * genres (biggest first) with series and models between them, Originals, Play
- * together, and Tech demos & tools. A row that comes out shorter than it needs
- * to be is left out. `seed` (today, by default) settles the order of series
+ * The rows, in order: Jump back in, Your favourites, Fresh on the wall, Play
+ * with friends (the games that play in a session, each on their own device),
+ * the genres (biggest first) with series and models between them, Originals,
+ * Couch co-op (several players on this screen), and Tech demos & tools. A row
+ * that comes out shorter than it needs to be is left out. `seed` (today, by default) settles the order of series
  * and model rails of the same size, so the lineup turns over day by day but
  * never between two visits on the same day.
  */
@@ -152,6 +155,7 @@ export function buildRails(games, stats, { now = Date.now(), seed = dayKey(now) 
       return rail(`series:${group.key}`, title, group.games);
     });
 
+  const friends = shelf.filter((game) => playsOnline(game, { showAll: true }));
   const together = shelf.filter((game) => playersOf(game).includes(MULTI));
   const worth = (fewest, row) => (row.games.length >= fewest ? row : null);
 
@@ -159,9 +163,10 @@ export function buildRails(games, stats, { now = Date.now(), seed = dayKey(now) 
     worth(FEWEST.personal, { key: 'recent', title: 'Jump back in', games: recent }),
     worth(FEWEST.personal, { key: 'faves', title: 'Your favourites', games: faves }),
     worth(FEWEST.library, rail('fresh', 'Fresh on the wall', games, CAP.fresh)),
+    worth(FEWEST.together, rail('friends', 'Play with friends', friends)),
     ...weave(genres, others),
     worth(FEWEST.library, rail('originals', 'Originals', shelf.filter((game) => game.lineage.original))),
-    worth(FEWEST.together, rail('together', 'Play together', together)),
+    worth(FEWEST.together, rail('together', 'Couch co-op', together)),
     worth(1, rail('unsure', 'Unsure', unsure)),
     worth(FEWEST.library, rail('tools', 'Tech demos & tools', tools)),
   ].filter(Boolean);

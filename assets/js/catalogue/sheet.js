@@ -20,6 +20,7 @@ import { byName } from './order.js';
 import { playersText } from './ledger.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
 import { sessionOf } from '../manifest.js';
+import { friendsLink } from '../ui/friends.js';
 
 const GLYPHS = {
   external: 'M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
@@ -296,6 +297,7 @@ export function createSheet(
             h('span', { class: 'btn__text' }, 'Play'),
             h('kbd', { class: 'btn__key' }, 'Enter')
           ),
+          friendsLink(entry, { className: 'record__friends' }),
           faveButton,
           markButton,
           rateButtons(entry.slug, { className: 'record__thumbs' })

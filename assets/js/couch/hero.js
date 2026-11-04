@@ -1,10 +1,12 @@
 /**
  * couch/hero.js — the focused game, large, top left: what it is, where it
- * comes from, a few facts, and the three things you can do with it.
+ * comes from, a few facts, and the things you can do with it: play it, play
+ * it with friends (a game that plays in a session), read more, star it.
  *
  * The words change with every move; the buttons never do. They are built
  * once and only relabelled, so focus resting on one is never lost when the
- * game behind it changes.
+ * game behind it changes. With friends hides for a game that plays alone,
+ * and hands its focus to Play.
  */
 
 import { h, icon, append, clear, ICONS } from '../dom.js';
@@ -12,6 +14,8 @@ import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
 import { eyebrow, heroChips } from './facts.js';
 import { keyRun, prompt, reducedMotion } from './ui.js';
+import { emblem } from '../ui/friends.js';
+import { friendsHref, playsOnline } from '../friends/together.js';
 
 const INFO = 'M12 8h.01M11 12h1v5h1M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z';
 
@@ -34,6 +38,7 @@ export function createHero(root, { onPlay, onInfo, onFave }) {
   const star = icon(ICONS.star);
   const buttons = {
     play: button('play', 'Play', icon(ICONS.play, { fill: 'currentColor', stroke: 'none' }), () => game && onPlay(game)),
+    friends: button('friends', 'With friends', emblem({ size: 22, className: 'friends-emblem btn__emblem' }), () => game && playsOnline(game) && location.assign(friendsHref(game))),
     info: button('info', 'More info', icon(INFO), () => game && onInfo(game)),
     fave: button('fave', 'Favourite', star, () => game && onFave(game), { 'aria-pressed': 'false' }),
   };
@@ -72,6 +77,9 @@ export function createHero(root, { onPlay, onInfo, onFave }) {
           )
         ),
     ]);
+    const together = playsOnline(next);
+    if (!together && document.activeElement === buttons.friends) buttons.play.focus({ preventScroll: true });
+    buttons.friends.hidden = !together;
     for (const [key, value] of Object.entries(paletteVars(cabinetPalette(next)))) root.style.setProperty(key, value);
     if (!quick && !still && !reducedMotion()) {
       body.classList.remove('is-new');
@@ -85,7 +93,7 @@ export function createHero(root, { onPlay, onInfo, onFave }) {
 
   return {
     show,
-    buttons: () => Object.values(buttons),
+    buttons: () => Object.values(buttons).filter((b) => !b.hidden),
     button: (action) => buttons[action],
   };
 }

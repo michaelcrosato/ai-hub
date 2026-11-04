@@ -1,15 +1,18 @@
 /**
  * ui/shelves.js — the big buttons under the sign.
  *
- * Games has a row to itself: it is the wall people come for. Under it, five
- * equal buttons: the Source of what is showing (All, Original, Inspired), the
- * other shelf (Tech demos & tools), and Surprise me. Each is drawn as an arcade
+ * Games and Play with friends share the first row: the wall people come for,
+ * and the way to play it together (the Friends view). Under them, five equal
+ * buttons: the Source of what is showing (All, Original, Inspired), the other
+ * shelf (Tech demos & tools), and Surprise me. Each is drawn as an arcade
  * push-button: dark plastic when up, lit and sunk when chosen, so the state of
  * the wall reads at a glance from across the room.
  */
 
 import { h } from '../dom.js';
 import { SHELVES } from '../filter.js';
+import { SLOT_COLORS } from '../../../lib/hub/round.js';
+import { FRIENDS_PATH } from '../friends/together.js';
 
 const line = { fill: 'none', stroke: 'currentColor', 'stroke-width': 2.4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
 const dot = (cx, cy, r = 2.3) => h('circle', { cx, cy, r, fill: 'currentColor' });
@@ -55,6 +58,16 @@ const ART = {
     h('rect', { ...line, x: 24, y: 10, width: 30, height: 36, rx: 4 }),
     h('path', { ...line, d: 'M31 22h16M31 30h12' }),
   ],
+  // Four players round a table, one in each seat's colour.
+  friends: () => [
+    h('circle', { ...line, cx: 32, cy: 32, r: 11, 'stroke-dasharray': '3 4' }),
+    ...[
+      [32, 10],
+      [54, 32],
+      [32, 54],
+      [10, 32],
+    ].map(([cx, cy], i) => h('circle', { cx, cy, r: 7.5, fill: SLOT_COLORS[i] })),
+  ],
   // A die, five showing.
   surprise: () => [
     h('rect', { ...line, x: 10, y: 10, width: 44, height: 44, rx: 8 }),
@@ -99,9 +112,17 @@ export function createShelves(root, { onSelect, onSource, onSurprise }) {
     title: 'Play a random game from the ones showing',
     'aria-pressed': null,
   });
+  // Not a shelf of this wall: the way to the Friends view, so it is a link.
+  const friendsNote = h('span', { class: 'shelf__count' }, 'Host or join a session');
+  const friends = h(
+    'a',
+    { class: 'shelf shelf--friends', href: FRIENDS_PATH, title: 'Up to four players, each on their own device: host a session or join one' },
+    art('friends'),
+    h('span', { class: 'shelf__text' }, h('span', { class: 'shelf__label' }, 'Play with friends'), friendsNote)
+  );
 
   root.append(
-    h('div', { class: 'shelves__row shelves__row--lead' }, games.el),
+    h('div', { class: 'shelves__row shelves__row--lead' }, games.el, friends),
     h('div', { class: 'shelves__row' }, ...sources.map((s) => s.el), tools.el, unsure.el, surprise.el)
   );
 
@@ -109,8 +130,10 @@ export function createShelves(root, { onSelect, onSource, onSurprise }) {
     /**
      * @param counts   Map of shelf key → how many are on that shelf right now
      * @param origins  Original and Inspired with how many the other filters leave
+     * @param together how many games play in a session
      */
-    render(current, counts, { origin = '', origins = [], canSurprise = true } = {}) {
+    render(current, counts, { origin = '', origins = [], canSurprise = true, together = 0 } = {}) {
+      friendsNote.textContent = together ? `${together} games · host or join a session` : 'Host or join a session';
       for (const { shelf, el, note } of [games, tools, unsure]) {
         el.setAttribute('aria-pressed', String(shelf.key === current));
         note.textContent = String(counts.get(shelf.key) || 0);

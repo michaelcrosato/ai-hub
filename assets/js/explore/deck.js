@@ -2,6 +2,8 @@
 import { h, ICONS, icon } from '../dom.js';
 import { store } from '../store.js';
 import { gameImage, gameMeta } from './common.js';
+import { emblem } from '../ui/friends.js';
+import { friendsHref, playsOnline } from '../friends/together.js';
 
 export const DEFAULT_SEED = 'first-deal';
 
@@ -180,10 +182,18 @@ export function createView(root, actions) {
       }),
   });
   const filter = h('label', { class: 'deck-filter' }, unplayed, h('span', {}, 'Only unplayed'));
+  // The card's game with friends, when it plays in a session.
+  const friends = h(
+    'a',
+    { class: 'deck-button deck-button--friends', href: '/friends', hidden: true },
+    emblem({ size: 16 }),
+    'With friends',
+  );
   const actionsRow = h(
     'div',
     { class: 'deck-actions', 'aria-label': 'Current card actions' },
     play,
+    friends,
     details,
     favourite,
   );
@@ -250,6 +260,12 @@ export function createView(root, actions) {
   function advance(delta) {
     if (!state.cards.length || (delta > 0 && state.exhausted) || (delta < 0 && state.index === 0)) return;
     actions.setQuery(moveCard(state, delta));
+  }
+
+  function syncFriends() {
+    const together = Boolean(state.current && playsOnline(state.current));
+    friends.hidden = !together;
+    if (together) friends.href = friendsHref(state.current);
   }
 
   function syncFavourite() {
@@ -423,6 +439,7 @@ export function createView(root, actions) {
       currentSeed = seed;
       wasExhausted = state.exhausted;
       syncFavourite();
+      syncFriends();
       if (
         ownedFocus &&
         !root.closest('[inert]') &&

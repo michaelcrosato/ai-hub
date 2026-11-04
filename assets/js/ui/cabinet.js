@@ -14,6 +14,8 @@ import { frameAt, FRAME_MS } from '../frames.js';
 import { bytes, plural } from '../format.js';
 import { store } from '../store.js';
 import { plainNameOf } from '../manifest.js';
+import { emblem } from './friends.js';
+import { friendsHref, playsOnline, togetherLine } from '../friends/together.js';
 
 function faveButton(game) {
   const on = store.isFave(game.slug);
@@ -199,6 +201,14 @@ export function cabinet(game, index = 0, caption = null) {
             { class: 'cab__info', href: `#/g/${game.slug}` },
             infoLabel
           ),
+          // A game that plays in a session: straight to playing it with friends.
+          playsOnline(game) &&
+            h(
+              'a',
+              { class: 'cab__friends', href: friendsHref(game), title: `Play with friends: ${togetherLine(game)}` },
+              emblem({ size: 12 }),
+              'With friends'
+            ),
           // Genre when the catalogue has one; size is the fallback fact. Dev
           // settings can swap in the slug, the key everything else hangs off.
           store.dev().showSlugs

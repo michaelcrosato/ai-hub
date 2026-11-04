@@ -10,6 +10,7 @@ import { currentUser, onUser, signInWithGoogle, signOut, deleteAccount, savedNic
 import { hasSession } from './cloud.js';
 import { syncPlays } from './sync.js';
 import { toast } from './toast.js';
+import { friendsButton } from '../ui/friends.js';
 
 /** "3 h 5 min", "12 min", "under a minute". */
 export function duration(seconds) {
@@ -42,7 +43,7 @@ export function accountButton({ className = '' } = {}) {
       { class: 'account__menu', role: 'menu' },
       h('p', { class: 'account__who' }, name || 'Signed in', user.email && h('span', {}, user.email)),
       h('p', { class: 'account__stat' }, `Played ${totals.games} game${totals.games === 1 ? '' : 's'} · ${duration(totals.seconds)} in all`),
-      h('a', { class: 'account__item', role: 'menuitem', href: '/session' }, 'Play with friends'),
+      h('a', { class: 'account__item', role: 'menuitem', href: '/friends' }, 'Play with friends'),
       h('a', { class: 'account__item', role: 'menuitem', href: '/privacy/' }, 'Privacy'),
       h('button', { type: 'button', class: 'account__item', role: 'menuitem', onclick: () => signOut().then(close) }, 'Sign out'),
       h('button', { type: 'button', class: 'account__item account__danger', role: 'menuitem', onclick: () => confirmDelete() }, 'Delete my data')
@@ -66,7 +67,8 @@ export function accountButton({ className = '' } = {}) {
 
   async function render(user) {
     clear(root);
-    if (location.pathname !== '/session') root.append(h('a', { class: 'account__friends', href: '/session' }, 'Play with friends'));
+    // Everywhere but where friends already are: the Friends view and the session itself.
+    if (!/^\/(friends|session)\/?$/.test(location.pathname)) root.append(friendsButton({ className: 'account__friends' }));
     if (!user) {
       root.append(
         h('button', { type: 'button', class: 'account__signin', onclick: () => signInWithGoogle().catch(() => toast('Sign-in is unavailable right now.')) }, 'Sign in')

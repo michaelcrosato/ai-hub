@@ -264,8 +264,9 @@ belongs to the game.
 If a game misbehaves in a frame, *Open on its own page* in its Details drawer
 runs it in a plain tab.
 
-Under the sign, the big buttons. **Games** (the default) has a row to itself.
-Under it, five across: **All**, **Original** and **Inspired** (every game is
+Under the sign, the big buttons. **Games** (the default) leads the first row,
+with **Play with friends** beside it, the way into the Friends view (see
+*Friends* below). Under them, five across: **All**, **Original** and **Inspired** (every game is
 one or the other: an original has no `source`, an inspired one riffs on a
 classic; from the other shelf they go back to Games), **Tech demos & tools**
 (demos, tools and websites, the other shelf),
@@ -305,14 +306,49 @@ or not at all. View also sets the size: *One per row* (the default: a wide
 cabinet with its whole blurb beside the screen) or *Three per row*. A phone
 shows one per row either way.
 
-## Six ways into the library
+## Seven ways into the library
 
 The wall is one way into the library. The switch in the corner of every view
-(**Wall · Couch · Catalogue · Atlas · Timeline · Deck**) leads to five more, built over the same games
+(**Wall · Friends · Couch · Catalogue · Atlas · Timeline · Deck**) leads to six more, built over the same games
 and the same memory of this device: a game starred in one is starred in all,
 and a game played anywhere counts everywhere. An open game travels with you
 when you switch, and so does a search, as far as it is plain words. Hidden
-games stay hidden in all six.
+games stay hidden in all seven.
+
+Playing with friends is never more than a glance away. Beside the account
+control in every view's corner sits the one light button, **Play with
+friends**, to the Friends view. Every game that plays in a session says so
+where you would play it: *With friends* on its cabinet, *Play with friends*
+under Play in its details (the wall, the Atlas, the Timeline, the Catalogue's
+record), on the Couch's hero and game page, and on the Deck's card. Each of
+them opens the game's page in the Friends view.
+
+### Friends — `/friends`
+
+The hub as a game-night console, for playing with other people:
+
+- **The party.** *Host a game night* (Google sign-in, then the session's
+  lobby with an invite link), *Got an invite?* (paste the link, the code, or
+  a message with the link in it; it finds the ten-character code), and *Try a
+  session on this computer*, in up to four tabs with the hub's practice games.
+- **Made for game night**: the games built for sessions by hand (Blaze Cup,
+  Merry-Go-Kart 64, Grand Theft Motto III, Arwingdings, Brine Line 64,
+  Urethane, Slick & Skid; `SPOTLIGHT` in `assets/js/friends/together.js`),
+  else the newest shared worlds.
+- **How a session works**, in three steps, and the **ways to win**.
+- **Games to play together**: every game that plays in a session, filed by
+  how it plays — *One world for everyone* (shared world), *Race each other's
+  ghosts* (ghost), *Same start, side by side* (parallel) — and *Couch co-op*,
+  the games that seat several players on one screen by themselves (their
+  `players`). The toolbar narrows them by the party's size (2, 3, 4), the way
+  it plays, a session round's length and a search; each choice shows how
+  many games it leaves. A browser with no WebGPU is told how many of them need
+  it, and those cards say so.
+- **A game's page** (`/friends#/g/<slug>`): how it plays together, its goal,
+  controls, seats and round length, and the ways to start it: *Host with this
+  game* (a session that opens with it, then deals the rest), *Try it on this
+  computer*, and *Practise alone* in the hub's player. A couch co-op game has
+  *Play on this screen*.
 
 ### The Couch — `/couch`
 
@@ -320,9 +356,10 @@ The hub as a console's home screen, for a TV and a controller. One game at a
 time fills the screen: its stills cross-fade behind everything, tinted with
 its own colours, and its name, blurb, facts and keys sit over them. Under it
 run the rails: *Jump back in*, *Your favourites*, *Fresh on the wall*, one per
-genre, one for each series with three or more games (*Inspired by Final
-Fantasy*) and each model that made three or more, *Originals*, *Play together*
-and *Tech demos & tools*. Until you touch anything, the hero is *Today's
+*Play with friends* (the games that play in a session), one per genre, one for
+each series with three or more games (*Inspired by Final Fantasy*) and each
+model that made three or more, *Originals*, *Couch co-op* (several players on
+this screen) and *Tech demos & tools*. Until you touch anything, the hero is *Today's
 spotlight*, a pick that changes with the date.
 
 | | Keyboard | Controller |
@@ -331,6 +368,7 @@ spotlight*, a pick that changes with the date.
 | Play | Enter | A |
 | More info | I | Y |
 | Favourite | F | X |
+| With friends (a game that plays in a session) | P | the hero's button |
 | Back | Esc or Backspace | B |
 | Previous / next rail | ↑ / ↓ | LB / RB |
 | Search | / or S | View |
@@ -536,8 +574,19 @@ for you: commit what passed in batches of about fifty.
 
 The session itself: players pick a generated name, take one of four seats,
 the host picks how to win (**Party**: 8 rounds and three bonus awards worth 3
-points each; **Sprint**: 5 rounds; **First to 12**; **Endless**) and starts
-**Random Mode**. The hub deals every game that declares `hub:session` and
+points each; **Sprint**: 5 rounds; **First to 12**; **Endless**) and starts.
+
+**Up next** holds the host's own picks: *Pick the games* opens every game the
+players present can play (it seats them, and every seat's browser can run
+it), searchable and by mode, and each tap adds one to the end of the list or
+takes it off, up to twelve. They play first, in that order, whatever the
+filters say; a pick that does not seat the players yet keeps its place until
+it does. A session hosted from a game's page in the Friends view
+(`/session?first=<slug>`) opens with that game on the list; the address drops
+it once the session has it. Everyone sees the list, and the next game's card
+says *The host's pick*.
+
+After the picks, **Random Mode** deals. The hub deals every game that declares `hub:session` and
 seats everyone, in an order fixed by the session's seed, and none comes round
 twice until all have been played. The host can narrow which games are dealt,
 in the lobby before the first round or between rounds: by mode (Parallel,
@@ -615,7 +664,7 @@ Google, and is only for:
 - hosting a session.
 
 The hub asks Google for nothing but who you are, and shows nobody your
-Google name or photo. The account menu has *Play with friends*, *Privacy*,
+Google name or photo. The account menu has *Play with friends* (the Friends view), *Privacy*,
 *Sign out* and *Delete my data*. What is stored is on
 [`/privacy/`](https://crosato-arcade.vercel.app/privacy/).
 
@@ -750,7 +799,8 @@ catalogue/        the Catalogue, likewise
 atlas/            the Atlas: genre districts and departure boards
 timeline/         the Timeline: a journal of arrivals
 deck/             the Deck: one shuffled discovery at a time
-session/          a session: friends, Random Mode and the table
+friends/          the Friends view: host or join, and every game that plays together
+session/          a session: friends, the host's picks, Random Mode and the table
 auth/             where Google sends you back after signing in
 privacy/          what is stored, and how to delete it
 assets/js/        native ES modules, no bundler
@@ -761,11 +811,13 @@ assets/js/        native ES modules, no bundler
   similar.js      other attempts, and "more like this" (pure, tested)
   ui/grid.js      the wall, rendered in batches as you scroll
   ui/player.js    the framed player and the ways out of it, for every view
-  ui/views.js     the switch between all six selection interfaces
+  ui/views.js     the switch between all seven selection interfaces
+  ui/friends.js   Play with friends: the four-seat emblem, the corner button, a game's link
+  friends/        the Friends view; together.js is what plays together, and how (pure, tested)
   explore/        Atlas, Timeline, Deck and their shared search/player shell
   couch/          rails, pad and keys, the game page, search (logic tested)
   catalogue/      the query language, tallies, table, record card, compare
-  session/        seats, names, Random Mode, scoring; local, Realtime and WebRTC transports
+  session/        seats, names, the host's picks (chooser.js), Random Mode, scoring; local, Realtime and WebRTC transports
   account/        sign-in, votes, play time, the account menu
 assets/vendor/    supabase-js, pinned and checked
 cloudflare/       Worker and Wrangler config for `pnpm release`

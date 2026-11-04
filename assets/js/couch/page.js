@@ -19,6 +19,8 @@ import { nearest } from './nav.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
 import { tile, keyRun, keycap, prompt, glide, reducedMotion } from './ui.js';
 import { viewSwitch } from '../ui/views.js';
+import { emblem } from '../ui/friends.js';
+import { friendsHref, playsOnline } from '../friends/together.js';
 
 /** Each still holds this long before the gallery moves on by itself. */
 const ADVANCE_MS = 5000;
@@ -234,6 +236,13 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
                 h('span', { class: 'btn__label' }, 'Play'),
                 prompt('play')
               ),
+              playsOnline(next) &&
+                h(
+                  'a',
+                  { class: 'btn btn--friends', href: friendsHref(next), dataset: { nav: 'page', action: 'friends' } },
+                  emblem({ size: 22, className: 'friends-emblem btn__emblem' }),
+                  h('span', { class: 'btn__label' }, 'Play with friends')
+                ),
               fave.button,
               rateButtons(next.slug, { className: 'page__thumbs' }),
               current &&

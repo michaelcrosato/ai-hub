@@ -27,9 +27,9 @@ test('new views share wall shelf, text search, favourites and visibility rules',
   assert.deepEqual(pick('shelf=invalid'), ['kart']);
 });
 
-test('all six switch destinations exist, with each new renderer wired to its page', async () => {
-  assert.equal(VIEWS.length, 6);
-  assert.equal(new Set(VIEWS.map((view) => view.href)).size, 6);
+test('all seven switch destinations exist, with each new renderer wired to its page', async () => {
+  assert.equal(VIEWS.length, 7);
+  assert.equal(new Set(VIEWS.map((view) => view.href)).size, 7);
   for (const view of VIEWS) {
     const page = await readFile(
       new URL(`..${view.href === '/' ? '' : view.href}/index.html`, import.meta.url),
@@ -39,6 +39,11 @@ test('all six switch destinations exist, with each new renderer wired to its pag
       assert.ok(page.includes(`data-view="${view.key}"`));
       assert.ok(page.includes('/assets/js/explore/app.js'));
       assert.ok(page.includes(`/assets/css/${view.key}.css`));
+    }
+    if (view.key === 'friends') {
+      assert.ok(page.includes('data-view="friends"'));
+      assert.ok(page.includes('/assets/js/friends/app.js'));
+      assert.ok(page.includes('/assets/css/friends.css'));
     }
   }
 });

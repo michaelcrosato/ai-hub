@@ -31,14 +31,17 @@
 
 import { h, clear } from '../dom.js';
 import { loadManifest, normalize, sessionOf } from '../manifest.js';
-import { fnv1a } from '../color.js';
+import { fnv1a, cabinetPalette, paletteVars } from '../color.js';
 import { createPlayer } from '../ui/player.js';
 import { createBridge, attachFrame, postTo, cleanProgress } from '/lib/hub/bridge.js';
 import { createRound, limitFor, rankResults, seedsRandom, MODE_NAMES, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay } from './net.js';
 import { nameChoices } from './names.js';
-import { pickNext, eligible, sessionPool, roundGame, filterChoices, anyFilter, describeFilters, toggleFilter, countGames } from './pick.js';
+import { pickNext, eligible, sessionPool, roundGame, filterChoices, anyFilter, describeFilters, toggleFilter, countGames, cleanQueue, takeQueued, pickable, MOST_PICKS } from './pick.js';
+import { createChooser } from './chooser.js';
+import { FRIENDS_PATH, inviteCode, joinHref, togetherLine } from '../friends/together.js';
+import { emblem } from '../ui/friends.js';
 import { scoreRound, addRound, leaderboard, liveOrder, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, finalTable } from './score.js';
 
 const SEATS = 4;
@@ -63,6 +66,8 @@ const knobs = {
   graceMs: seconds('grace'),
   examples: params.get('examples') === '1',
 };
+/** The game a session was hosted with (from a game's page in the Friends view): first in the host's picks. */
+const firstPick = params.get('first');
 const asSeat = Number(params.get('as')) >= 1 && Number(params.get('as')) <= SEATS ? Number(params.get('as')) - 1 : null;
 const transport =
   params.get('transport') === 'local' ? 'local' : params.get('transport') === 'relay' && window.__sessionRelay ? 'relay' : 'online';
@@ -79,6 +84,27 @@ let superseded = false;
 const app = document.getElementById('session');
 const strip = document.getElementById('strip');
 const overlay = document.getElementById('results');
+
+/**
+ * The host's game picker, over the lobby: what it adds plays first
+ * (state.queue). It offers the games that seat the players here now, and the
+ * ones that will once more sit down: a pick waits for them.
+ */
+const chooser = createChooser(document.getElementById('chooser'), {
+  games: () => {
+    const all = new Map();
+    for (let n = Math.max(1, seated().length); n <= SEATS; n++) for (const game of pickable(pool, n, { webgpu: seatsCan().webgpu })) all.set(game.slug, game);
+    return [...all.values()];
+  },
+  fitsNow: (game) => pickable([game], seated().length, { webgpu: seatsCan().webgpu }).length > 0,
+  picked: () => cleanQueue(state?.queue),
+  most: MOST_PICKS,
+  onToggle(slug, on) {
+    if (!isHost() || !state) return;
+    const queue = cleanQueue(state.queue);
+    publish({ ...state, notice: null, queue: on ? cleanQueue([...queue, slug]) : queue.filter((s) => s !== slug) });
+  },
+});
 
 /** The reference games, one per kind of round, for a session with nothing else to play. */
 const EXAMPLES = [
@@ -210,10 +236,21 @@ function freshState() {
     notice: null,
     format: DEFAULT_FORMAT,
     filters: {},
+    queue: [],
     cardSeconds: DEFAULT_CARD_SECONDS,
     final: null,
     knobs,
   };
+}
+
+/** The game a fresh session opens with, then off the address, so a reload or a shared link never brings it back. */
+function withFirstPick(next) {
+  if (!firstPick) return next;
+  const query = new URLSearchParams(location.search);
+  query.delete('first');
+  const text = query.toString();
+  history.replaceState(null, '', `${location.pathname}${text ? `?${text}` : ''}${location.hash}`);
+  return { ...next, queue: cleanQueue([firstPick]) };
 }
 
 function publish(next) {
@@ -224,7 +261,7 @@ function publish(next) {
 
 /** This tab became the host: carry on from the last state it saw. */
 function takeOver() {
-  let next = state ? { ...state } : freshState();
+  let next = state ? { ...state } : withFirstPick(freshState());
   if (!state) next.knobs = knobs;
   if (next.phase === 'round' && next.current && next.current.coordinator !== key) {
     next = withRoundRecorded(next, scoreLeftRound(next.current) ?? { status: 'void', reason: 'host-left', standings: null, players: [] });
@@ -279,7 +316,11 @@ function applyState() {
 function startRound({ under = false } = {}) {
   if (!isHost() || !state) return;
   const players = seated().map((m) => ({ key: m.key, slot: m.slot, name: m.name }));
-  const pick = pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played, ...seatsCan(), filters: state.filters });
+  // The host's own picks first, in their order; then Random Mode deals.
+  const queued = takeQueued(pool, state.queue, { n: players.length, webgpu: seatsCan().webgpu });
+  const pick = queued
+    ? { game: queued.game, cycle: state.cycle, played: [...state.played, queued.game.slug], queue: queued.queue, picked: true }
+    : pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played, ...seatsCan(), filters: state.filters });
   if (!pick) {
     const n = `${players.length} player${players.length === 1 ? '' : 's'}`;
     publish({ ...state, phase: 'lobby', notice: anyFilter(state.filters) ? `No game fits ${n} with these filters.` : `No game in the library fits ${n} yet.` });
@@ -300,6 +341,7 @@ function startRound({ under = false } = {}) {
     seed: fnv1a(`${state.seed}:${round}`),
     players,
     coordinator: key,
+    picked: pick.picked === true,
   };
   const handle = createRound({
     round,
@@ -331,7 +373,7 @@ function startRound({ under = false } = {}) {
   const reveal = under && state.reveal ? state.reveal : { at: hostNow(), resultsUntil: hostNow(), results: false };
   // The splash's countdown runs from the moment the results make way for it.
   current.splash = { until: Math.max(reveal.resultsUntil, hostNow()) + splashMsOf(state), paused: null, ready: [], marked: 0, notice: 0, released: false };
-  publish({ ...state, round, cycle: pick.cycle, played: pick.played, phase: 'round', current, reveal, notice: null });
+  publish({ ...state, round, cycle: pick.cycle, played: pick.played, queue: pick.queue ?? cleanQueue(state.queue), phase: 'round', current, reveal, notice: null });
 }
 
 /** The splash's countdown: the host's address can set it for trying games, else the lobby's choice. State comes over the network, so anything else is the default. */
@@ -570,7 +612,7 @@ async function leaveSession() {
   closeRound();
   if (online) await online.sb.rpc('leave_session', { p_session: online.sessionId }).then(() => {}, () => {});
   net?.close();
-  location.href = '/';
+  location.href = FRIENDS_PATH;
 }
 
 /** The host removes a player for the rest of the session (online: the database bars them). */
@@ -616,12 +658,12 @@ function render() {
   // The lobby is drawn afresh on every change: keep the keyboard where it was.
   const focused = app.contains(document.activeElement) && document.activeElement.id;
   clear(app);
-  if (removed) app.append(h('section', { class: 'panel' }, h('h2', {}, 'You were removed from this session'), h('a', { class: 'primary', href: '/' }, 'Back to the wall')));
+  if (removed) app.append(h('section', { class: 'panel panel--note' }, h('h2', {}, 'You were removed from this session'), h('a', { class: 'primary', href: FRIENDS_PATH }, 'Back to Friends')));
   else if (superseded)
     app.append(
       h(
         'section',
-        { class: 'panel' },
+        { class: 'panel panel--note' },
         h('h2', {}, 'This session is open in another tab'),
         h('p', {}, 'You joined it again somewhere else with the same account, so this tab stepped aside. To play with a second account, use a private window.'),
         h('button', { type: 'button', class: 'primary', onclick: () => location.reload() }, 'Play here instead')
@@ -629,36 +671,98 @@ function render() {
     );
   else if (!name && transport === 'online' && !code && !(user && !user.guest)) app.append(hostIntro());
   else if (!name) app.append(joinScreen());
-  else if (mine().status === 'full') app.append(h('section', { class: 'panel' }, h('h2', {}, 'This session is full'), h('p', {}, 'Four players are already in it.')));
+  else if (mine().status === 'full')
+    app.append(h('section', { class: 'panel panel--note' }, h('h2', {}, 'This session is full'), h('p', {}, 'Four players are already in it.'), h('a', { class: 'primary', href: FRIENDS_PATH }, 'Back to Friends')));
   else if (state?.phase === 'ended') app.append(endScreen());
   else app.append(lobbyScreen());
   if (focused) document.getElementById(focused)?.focus();
+  // Only the host picks, and only in the lobby.
+  if (isHost() && name && state?.phase === 'lobby') chooser.refresh();
+  else chooser.close();
   renderStrip();
   renderResults();
   renderBoard();
 }
 
+/** The game this session opens with, as a card: on the way in, before the lobby. */
+function firstCard() {
+  const game = firstPick && pool.find((g) => g.slug === firstPick);
+  if (!game) return null;
+  return h(
+    'div',
+    { class: 'first-pick', style: paletteVars(cabinetPalette(game)) },
+    game.cover && h('img', { class: 'first-pick__shot', src: game.cover, alt: '', loading: 'eager', decoding: 'async', onerror: (e) => e.currentTarget.remove() }),
+    h('span', { class: 'first-pick__text' }, h('span', { class: 'first-pick__label' }, 'Opening with'), h('span', { class: 'first-pick__name' }, game.name), h('span', { class: 'first-pick__meta' }, togetherLine(game)))
+  );
+}
+
+/** Paste an invite: the code, the link, or a message with the link in it. */
+function joinBox() {
+  const input = h('input', { type: 'text', id: 'invite-paste', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', placeholder: 'Paste the invite link or code' });
+  const note = h('span', { class: 'hint join-box__note' }, 'No account needed to join.');
+  return h(
+    'form',
+    {
+      class: 'join-box',
+      onsubmit(event) {
+        event.preventDefault();
+        const found = inviteCode(input.value);
+        if (!found) {
+          note.textContent = 'That has no invite code in it: the ten letters and digits after the # in the link.';
+          input.focus();
+          return;
+        }
+        // This page reads its session from the address once: a new hash on the same page needs a reload.
+        const target = new URL(joinHref(found), location.href);
+        if (target.pathname === location.pathname && target.search === location.search) {
+          location.hash = target.hash;
+          location.reload();
+        } else location.href = target.href;
+      },
+    },
+    h('label', { class: 'join-box__label', for: 'invite-paste' }, 'Got an invite?'),
+    h('span', { class: 'join-box__field' }, input, h('button', { type: 'submit' }, 'Join')),
+    note
+  );
+}
+
 function hostIntro() {
+  const tryHref = `${location.pathname}?transport=local${firstPick ? `&first=${encodeURIComponent(firstPick)}` : '&examples=1'}#try`;
   return h(
     'section',
-    { class: 'panel' },
-    h('h2', {}, 'Play together'),
-    h('p', {}, 'Host a session and send your friends the invite link. They join from it without an account. The hub deals the games, keeps time and keeps score. There is no chat, so talk in an app of your own.'),
-    h('button', { type: 'button', class: 'primary', onclick: () => import('../account/auth.js').then((a) => a.signInWithGoogle()).catch(() => alert('Sign-in is unavailable right now.')) }, 'Sign in with Google to host'),
-    h('p', { class: 'hint' }, 'Got an invite link? Open it to join. ', h('a', { href: `${location.pathname}?transport=local&examples=1#try` }, 'Or try a session in this browser.'))
+    { class: 'panel intro' },
+    emblem({ size: 44, className: 'intro__emblem' }),
+    h('h2', {}, 'Host a game night'),
+    h('p', { class: 'intro__blurb' }, 'Sign in with Google to host. You get an invite link to send; friends open it, pick a name and play, with no account. The hub deals the games, keeps time and keeps score. There is no chat, so talk in an app of your own.'),
+    firstCard(),
+    h(
+      'button',
+      { type: 'button', class: 'primary primary--big', onclick: () => import('../account/auth.js').then((a) => a.signInWithGoogle()).catch(() => alert('Sign-in is unavailable right now.')) },
+      'Sign in with Google to host'
+    ),
+    joinBox(),
+    h('p', { class: 'hint' }, 'Or ', h('a', { href: tryHref }, 'try a session in this browser'), ': open it in up to four tabs, one seat each.')
   );
 }
 
 function joinScreen() {
   const taken = net ? net.members().map((m) => m.name).filter(Boolean) : [];
   const choices = nameChoices(`${code}:${key}:${reroll}`, 6, taken);
+  const hosting = transport === 'online' && !code;
+  const free = net ? [...Array(SEATS).keys()].find((slot) => !net.members().some((m) => m.slot === slot && m.name)) : 0;
   return h(
     'section',
     { class: 'panel join' },
-    h('h2', {}, transport === 'online' && !code ? 'Pick your name to host' : 'Pick your name'),
+    h('p', { class: 'eyebrow' }, hosting ? 'Hosting' : code && code !== 'local' && code !== 'try' ? 'Joining a session' : 'Taking a seat'),
+    h('h2', {}, hosting ? 'Pick your name to host' : 'Pick your name'),
     problem && h('p', { class: 'notice' }, problem),
     h('p', { class: 'hint' }, 'Everyone in the session sees it. Names come from the hub: there is no chat, so talk in an app of your own.'),
-    h('div', { class: 'join__names' }, choices.map((choice) => h('button', { type: 'button', class: 'join__name', onclick: () => join(choice) }, choice))),
+    (hosting || !net?.members().some((m) => m.name)) && firstCard(),
+    h(
+      'div',
+      { class: 'join__names', style: { '--seat': SLOT_COLORS[free ?? 0] ?? SLOT_COLORS[0] } },
+      choices.map((choice) => h('button', { type: 'button', class: 'join__name', onclick: () => join(choice) }, choice))
+    ),
     h('button', { type: 'button', class: 'link', onclick: () => { reroll++; render(); } }, 'Other names')
   );
 }
@@ -733,49 +837,122 @@ function lobbyScreen() {
   const cur = state?.current;
   const host = isHost();
   const inRound = state?.phase === 'round' && cur && !cur.players.some((p) => p.key === key);
+  const next = takeQueued(pool, state?.queue, { n, webgpu: seatsCan().webgpu });
   return h(
     'section',
     { class: 'panel lobby' },
-    h('h2', {}, 'Players'),
     h(
-      'ol',
-      { class: 'seats' },
-      [...Array(SEATS).keys()].map((slot) => {
-        const m = seats.find((s) => s.slot === slot);
-        return h(
-          'li',
-          { class: `seat${m ? '' : ' is-empty'}` },
-          swatch(slot),
-          h('span', { class: 'seat__name' }, m ? m.name : 'Open seat'),
-          m?.key === key && h('span', { class: 'seat__tag' }, 'You'),
-          m && m.key === hostKey() && h('span', { class: 'seat__tag' }, 'Host'),
-          m && m.key !== key && net.link?.(m.key) === 'failed' && h('span', { class: 'seat__tag' }, 'No connection'),
-          m && m.key !== key && isHost() && transport !== 'local' && h('button', { type: 'button', class: 'link seat__kick', onclick: () => kick(m) }, 'Remove')
-        );
-      })
+      'div',
+      { class: 'lobby__main' },
+      h(
+        'header',
+        { class: 'lobby__head' },
+        h('h2', {}, 'The table'),
+        h('span', { class: 'lobby__count' }, `${n} of ${SEATS} seats taken`)
+      ),
+      h(
+        'ol',
+        { class: 'seats' },
+        [...Array(SEATS).keys()].map((slot) => {
+          const m = seats.find((s) => s.slot === slot);
+          return h(
+            'li',
+            { class: `seat${m ? '' : ' is-empty'}${m?.key === key ? ' is-me' : ''}`, style: { '--seat': SLOT_COLORS[slot] } },
+            h('span', { class: 'seat__puck', 'aria-hidden': 'true' }, String(slot + 1)),
+            h('span', { class: 'seat__name' }, m ? m.name : 'Open seat'),
+            h(
+              'span',
+              { class: 'seat__tags' },
+              m?.key === key && h('span', { class: 'seat__tag' }, 'You'),
+              m && m.key === hostKey() && h('span', { class: 'seat__tag' }, 'Host'),
+              m && m.key !== key && net.link?.(m.key) === 'failed' && h('span', { class: 'seat__tag is-bad' }, 'No connection'),
+              !m && h('span', { class: 'seat__tag is-quiet' }, transport === 'online' ? 'Waiting for a friend' : 'Open in another tab')
+            ),
+            m && m.key !== key && isHost() && transport !== 'local' && h('button', { type: 'button', class: 'link seat__kick', onclick: () => kick(m) }, 'Remove')
+          );
+        })
+      ),
+      transport === 'online'
+        ? inviteLine()
+        : h(
+            'p',
+            { class: 'invite invite--local' },
+            h('span', { class: 'invite__label' }, 'More players'),
+            h('span', {}, 'Open this page again in another tab of this browser: '),
+            h('a', { href: `${location.pathname}?transport=local${knobs.examples ? '&examples=1' : ''}#${encodeURIComponent(code)}`, target: '_blank' }, 'new seat')
+          ),
+      state?.notice && h('p', { class: 'notice' }, state.notice),
+      inRound && h('p', { class: 'notice' }, `${cur.name} is being played. You join from the next round.`),
+      upNext(n),
+      host && state?.phase === 'lobby'
+        ? h(
+            'div',
+            { class: 'lobby__start' },
+            h(
+              'button',
+              { type: 'button', class: 'primary primary--big', id: 'start', disabled: !fits && !next ? true : undefined, onclick: () => startRound() },
+              next ? `Start with ${next.game.name}` : 'Start Random Mode'
+            ),
+            h('span', { class: 'hint' }, next ? (fits ? `Then the hub deals from ${fits} game${fits === 1 ? '' : 's'}` : 'Then the hub deals') : fits ? `${fits} game${fits === 1 ? ' fits' : 's fit'} ${n} player${n === 1 ? '' : 's'}` : none)
+          )
+        : state?.phase === 'lobby' && h('p', { class: 'hint lobby__wait' }, `Waiting for ${nameOf(hostKey()) ?? 'the host'} to start.`),
+      host && (state?.phase !== 'lobby' || state.history.length > 0) && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, 'End the session')
     ),
-    transport === 'online' ? inviteLine() : h(
-      'p',
-      { class: 'hint' },
-      'To add a player on this computer, open this page again in another tab: ',
-      h('a', { href: `${location.pathname}?transport=local${knobs.examples ? '&examples=1' : ''}#${encodeURIComponent(code)}`, target: '_blank' }, 'new seat')
+    h(
+      'aside',
+      { class: 'lobby__side', 'aria-label': 'Session settings' },
+      formatPicker(),
+      cardPicker(),
+      filterPicker(n),
+      transport === 'online' && relaySwitch()
     ),
-    state?.notice && h('p', { class: 'notice' }, state.notice),
-    inRound && h('p', { class: 'notice' }, `${cur.name} is being played. You join from the next round.`),
-    formatPicker(),
-    cardPicker(),
-    filterPicker(n),
-    host && state?.phase === 'lobby'
-      ? h(
-          'div',
-          { class: 'lobby__start' },
-          h('button', { type: 'button', class: 'primary', id: 'start', disabled: !fits || undefined, onclick: () => startRound() }, 'Start Random Mode'),
-          h('span', { class: 'hint' }, fits ? `${fits} game${fits === 1 ? ' fits' : 's fit'} ${n} player${n === 1 ? '' : 's'}` : none)
-        )
-      : state?.phase === 'lobby' && h('p', { class: 'hint' }, `Waiting for ${nameOf(hostKey()) ?? 'the host'} to start.`),
-    host && (state?.phase !== 'lobby' || state.history.length > 0) && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, 'End the session'),
-    transport === 'online' && relaySwitch(),
     standingsTable()
+  );
+}
+
+/**
+ * The host's picks: the games the session plays first, in order, before the
+ * hub deals the rest. The host adds and removes them in the lobby; everyone
+ * sees them.
+ */
+function upNext(n) {
+  const host = isHost() && state?.phase === 'lobby';
+  const queue = cleanQueue(state?.queue);
+  const can = new Set(pickable(pool, n, { webgpu: seatsCan().webgpu }).map((g) => g.slug));
+  const items = queue.map((slug) => ({ slug, game: pool.find((g) => g.slug === slug) })).filter((item) => item.game);
+  if (!host && !items.length) return null;
+  const remove = (slug) => publish({ ...state, notice: null, queue: queue.filter((s) => s !== slug) });
+  return h(
+    'section',
+    { class: 'upnext', 'aria-labelledby': 'upnext-title' },
+    h(
+      'header',
+      { class: 'upnext__head' },
+      h('h3', { id: 'upnext-title' }, 'Up next'),
+      host && items.length < MOST_PICKS && h('button', { type: 'button', class: 'upnext__add', id: 'choose', onclick: () => chooser.open() }, items.length ? 'Pick more games' : 'Pick the games')
+    ),
+    items.length
+      ? h(
+          'ol',
+          { class: 'upnext__list' },
+          items.map(({ slug, game }, i) =>
+            h(
+              'li',
+              { class: `upnext__item${can.has(slug) ? '' : ' is-waiting'}`, style: paletteVars(cabinetPalette(game)) },
+              h('span', { class: 'upnext__n' }, String(i + 1)),
+              game.cover ? h('img', { class: 'upnext__shot', src: game.cover, alt: '', loading: 'lazy', decoding: 'async', onerror: (e) => e.currentTarget.remove() }) : h('span', { class: 'upnext__shot' }),
+              h(
+                'span',
+                { class: 'upnext__text' },
+                h('span', { class: 'upnext__name' }, game.name),
+                h('span', { class: 'upnext__meta' }, can.has(slug) ? togetherLine(game) : `Waits for ${sessionOf(game)?.seats?.[0] > n ? `${sessionOf(game).seats[0]} players` : 'every player to have WebGPU'}`)
+              ),
+              host && h('button', { type: 'button', class: 'upnext__remove', 'aria-label': `Take ${game.name} off the list`, onclick: () => remove(slug) }, '✕')
+            )
+          )
+        )
+      : h('p', { class: 'hint upnext__empty' }, 'Nothing picked: the hub deals every game at random. Pick games to play them first, in your order.'),
+    items.length > 0 && h('p', { class: 'hint upnext__then' }, 'Then the hub deals the rest at random.')
   );
 }
 
@@ -913,13 +1090,25 @@ function relaySwitch() {
 
 function inviteLine() {
   const link = `${location.origin}/session#${code}`;
+  const copy = h(
+    'button',
+    { type: 'button', class: 'invite__copy', onclick: () => navigator.clipboard?.writeText(link).then(() => (copy.textContent = 'Copied'), () => (copy.textContent = 'Select the link to copy it')) },
+    'Copy link'
+  );
+  const share =
+    typeof navigator.share === 'function' &&
+    h(
+      'button',
+      { type: 'button', class: 'invite__share', onclick: () => navigator.share({ title: 'Play with me on the AI Hub', text: 'Join my game night: pick a name and play, no account needed.', url: link }).catch(() => {}) },
+      'Share'
+    );
   return h(
-    'p',
+    'div',
     { class: 'invite' },
-    h('span', { class: 'hint' }, 'Invite link: '),
-    h('code', {}, link),
-    ' ',
-    h('button', { type: 'button', onclick: (e) => navigator.clipboard?.writeText(link).then(() => (e.target.textContent = 'Copied')) }, 'Copy')
+    h('span', { class: 'invite__label' }, 'Invite friends'),
+    h('code', { class: 'invite__link' }, link),
+    h('span', { class: 'invite__buttons' }, copy, share),
+    h('span', { class: 'hint invite__note' }, 'Friends open the link, pick a name and take a seat. No account needed.')
   );
 }
 
@@ -1222,7 +1411,7 @@ function splashCard(cur) {
   return h(
     'div',
     { class: 'results__card is-next' },
-    h('p', { class: 'eyebrow' }, `Next up · ${formatProgress(state.format, state.history, state.totals)}`),
+    h('p', { class: 'eyebrow' }, `${cur.picked ? 'The host’s pick' : 'Next up'} · ${formatProgress(state.format, state.history, state.totals)}`),
     reel.length > 0 && h('div', { class: 'reel', 'aria-hidden': 'true' }, h('div', { class: 'reel__strip', style: { '--n': reel.length } }, reel.map((n) => h('span', {}, n)), h('span', { class: 'is-it' }, cur.name))),
     h('h2', { class: 'next__name' }, cur.name),
     h(
@@ -1380,7 +1569,7 @@ function endScreen() {
         )
       )
     ),
-    h('a', { class: 'primary', href: '/' }, 'Back to the wall')
+    h('div', { class: 'finale__out' }, h('a', { class: 'primary', href: FRIENDS_PATH }, 'Back to Friends'), h('a', { class: 'link', href: '/' }, 'To the wall'))
   );
 }
 

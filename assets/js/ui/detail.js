@@ -17,6 +17,7 @@ import { cabinetPalette, paletteVars } from '../color.js';
 import { NOT_A_FACET, sessionOf } from '../manifest.js';
 import { bytes, date, plural } from '../format.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
+import { friendsLink } from './friends.js';
 
 const prettyLabel = (key) =>
   key
@@ -125,10 +126,15 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
             { class: 'detail__body' },
             game.description && h('p', { class: 'detail__blurb' }, game.description),
             h(
-              'button',
-              { class: 'detail__play', type: 'button', onclick: () => onPlay(game, current) },
-              icon(ICONS.play, { fill: 'currentColor', stroke: 'none', width: 15, height: 15 }),
-              'Play'
+              'div',
+              { class: 'detail__go' },
+              h(
+                'button',
+                { class: 'detail__play', type: 'button', onclick: () => onPlay(game, current) },
+                icon(ICONS.play, { fill: 'currentColor', stroke: 'none', width: 15, height: 15 }),
+                'Play'
+              ),
+              friendsLink(game, { className: 'detail__friends' })
             ),
             rateButtons(game.slug, { className: 'detail__thumbs' }),
             h(

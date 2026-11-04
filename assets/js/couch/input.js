@@ -24,6 +24,7 @@ const KEYS = new Map([
   ['/', 'search'],
   ['i', 'info'],
   ['f', 'fave'],
+  ['p', 'friends'],
   ['s', 'search'],
   ['r', 'surprise'],
 ]);

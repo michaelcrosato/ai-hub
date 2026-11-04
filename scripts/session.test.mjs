@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { nameChoices, isNickname, ADJECTIVES, ANIMALS } from '../assets/js/session/names.js';
-import { eligible, pickNext, sessionPool, roundGame, filterChoices, countGames, anyFilter, describeFilters, toggleFilter } from '../assets/js/session/pick.js';
+import { eligible, pickNext, sessionPool, roundGame, filterChoices, countGames, anyFilter, describeFilters, toggleFilter, cleanQueue, takeQueued, pickable, MOST_PICKS } from '../assets/js/session/pick.js';
 import { placesOf, scoreRound, addRound, leaderboard, liveOrder, formatOver, formatProgress, sessionAwards, finalTable } from '../assets/js/session/score.js';
 import { createLocalNet } from '../assets/js/session/local.js';
 
@@ -422,4 +422,38 @@ test('the live scoreboard orders players as the round will rank them', () => {
     { id: 6, result: { time: 59_500 } },
   ];
   assert.deepEqual(liveOrder(rows).map((r) => r.id), [6, 4, 1, 0, 5, 3, 2]);
+});
+
+test('the host’s picks arrive over the network: only slugs, each once, at most MOST_PICKS', () => {
+  assert.deepEqual(cleanQueue(['a', 'b', 'a', 7, null, '', { slug: 'c' }, 'c']), ['a', 'b', 'c']);
+  assert.deepEqual(cleanQueue('a'), []);
+  assert.deepEqual(cleanQueue(undefined), []);
+  assert.equal(cleanQueue(Array.from({ length: 40 }, (_, i) => `g${i}`)).length, MOST_PICKS);
+  assert.deepEqual(cleanQueue(['x'.repeat(201), 'ok']), ['ok'], 'no slug is that long');
+});
+
+test('picks play first, in order; one that does not seat the players yet keeps its place', () => {
+  const games = [
+    game('duo', { sessionPlayers: '2-2' }),
+    game('crowd', { sessionPlayers: '3-4' }),
+    game('gpu', { webgpu: 'required' }),
+    game('any', { sessionPlayers: '1-4' }),
+  ];
+  const queue = ['crowd', 'gone', 'duo', 'any'];
+  const two = takeQueued(games, queue, { n: 2 });
+  assert.equal(two.game.slug, 'duo', 'the crowd game waits for a third player; a game this library lacks is passed over');
+  assert.deepEqual(two.queue, ['crowd', 'gone', 'any']);
+  assert.equal(takeQueued(games, ['crowd'], { n: 2 }), null);
+  assert.equal(takeQueued(games, ['crowd'], { n: 3 }).game.slug, 'crowd');
+  assert.equal(takeQueued(games, ['gpu'], { n: 2 }), null, 'a game every seat cannot run is never dealt');
+  assert.equal(takeQueued(games, ['gpu'], { n: 2, webgpu: true }).game.slug, 'gpu');
+  assert.equal(takeQueued(games, [], { n: 2 }), null);
+});
+
+test('the host picks from every game that seats the players, the deal’s filters aside', () => {
+  const games = [game('a', { genre: 'Racing' }), game('b', { genre: 'Puzzle', tags: ['touch'] }), game('c', { sessionPlayers: '3-4' })];
+  assert.deepEqual(pickable(games, 2).map((g) => g.slug), ['a', 'b']);
+  assert.deepEqual(eligible(games, 2, { filters: { genres: ['Puzzle'] } }).map((g) => g.slug), ['b'], 'the filters narrow the deal');
+  assert.deepEqual(eligible(games, 2, { touchOnly: true }).map((g) => g.slug), ['b'], 'and a touch screen narrows the deal');
+  assert.equal(takeQueued(games, ['a'], { n: 2 }).game.slug, 'a', 'but not what the host picked');
 });

@@ -44,6 +44,7 @@ import { createPlayer } from './ui/player.js';
 import { createDev } from './ui/dev.js';
 import { viewSwitch } from './ui/views.js';
 import { accountButton } from './account/button.js';
+import { playsOnline } from './friends/together.js';
 
 const wallEl = document.getElementById('wall');
 document.querySelector('.sign__side')?.prepend(viewSwitch('wall'), accountButton({ className: 'sign__account' }));
@@ -319,6 +320,7 @@ function renderWall(state) {
     origin: state.origin,
     origins: sources.origins,
     canSurprise: visible.length > 0,
+    together: games.filter((g) => playsOnline(g, { showAll: state.showAll })).length,
   });
   controls.render(state, {
     facets,

@@ -21,6 +21,7 @@ import { createStage } from './stage.js';
 import { createHero } from './hero.js';
 import { createShelf } from './shelf.js';
 import { reducedMotion } from './ui.js';
+import { friendsHref, playsOnline } from '../friends/together.js';
 
 /** A tile rests this long before it plays its own stills. */
 const PREVIEW_MS = 1200;
@@ -182,7 +183,8 @@ export function createHome({ couch, stageEl, heroEl, railsEl, bar, games, stats,
     if (next) focus(next);
   }
 
-  const heroEntry = () => lastHero || hero.button('play');
+  // The hero button last used, unless the game now in the hero hides it (With friends).
+  const heroEntry = () => (lastHero && !lastHero.hidden ? lastHero : hero.button('play'));
   const barEntry = () => lastBar || bar.items().find((el) => el.getAttribute('aria-label') === 'Search') || bar.items()[0];
 
   function move(dir) {
@@ -389,6 +391,10 @@ export function createHome({ couch, stageEl, heroEl, railsEl, bar, games, stats,
         return true;
       case 'fave':
         if (current) onFave(current);
+        return true;
+      case 'friends':
+        // P: the hero's game, with friends, when it plays in a session.
+        if (current && playsOnline(current)) location.assign(friendsHref(current));
         return true;
       case 'surprise':
         surprise();

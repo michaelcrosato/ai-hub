@@ -264,7 +264,7 @@ try {
   await hold(pages[4], '.player__close');
   await pages[4].waitForSelector('.player__ask');
   assert.match(await pages[4].textContent('.player__ask'), /Leave the session/);
-  await Promise.all([pages[4].waitForURL(`${base}/`), pages[4].click('.player__ask-go')]);
+  await Promise.all([pages[4].waitForURL(`${base}/friends`), pages[4].click('.player__ask-go')]);
   log('round 5: a guest held ✕ and left the session');
   await waitFor(pages[2], () => !Object.keys(window.__session.links).includes('seat4'), null, 10_000);
   // Rounds here last twelve seconds: if this one ended meanwhile, hold ✕ in the next.

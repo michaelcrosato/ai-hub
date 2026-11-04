@@ -56,7 +56,7 @@ test('the home screen opens with what is yours and what is new, and ends with th
   const rails = buildRails(games, stats, { now: NOW });
   const titles = rails.map((r) => r.title);
   assert.deepEqual(titles.slice(0, 3), ['Jump back in', 'Your favourites', 'Fresh on the wall']);
-  assert.deepEqual(titles.slice(-3), ['Originals', 'Play together', 'Tech demos & tools']);
+  assert.deepEqual(titles.slice(-3), ['Originals', 'Couch co-op', 'Tech demos & tools']);
 
   const [recent, faves, fresh] = rails;
   assert.deepEqual(slugs(recent.games), ['shooter-1', 'demo-2', 'rpg-3'], 'most recently played first');
@@ -122,11 +122,28 @@ test('weave puts one other row after every two genres and the rest at the end', 
   assert.deepEqual(weave(['g1'], []), ['g1']);
 });
 
-test('Originals and Play together come from the Games shelf', () => {
+test('Originals and Couch co-op come from the Games shelf', () => {
   const rails = buildRails(library(), quiet, { now: NOW });
   const originals = rails.find((r) => r.key === 'originals');
   assert.ok(originals.games.every((g) => g.lineage.original && (g.type || 'Game') === 'Game'));
   assert.deepEqual(slugs(rails.find((r) => r.key === 'together').games), ['racing-1', 'racing-0']);
+});
+
+test('Play with friends follows what is new: the games that play in a session, newest first', () => {
+  const session = { session: '1', sessionPlayers: '1-4', sessionMode: 'parallel' };
+  const games = [
+    ...library(),
+    game('party-0', { ...session, added: '2026-09-20', genre: 'Action' }),
+    game('party-1', { ...session, added: '2026-09-25', genre: 'Action' }),
+    game('party-demo', { ...session, type: 'Tech demo' }),
+    game('party-future', { ...session, session: '9' }),
+  ];
+  const rails = buildRails(games, quiet, { now: NOW });
+  const at = rails.findIndex((r) => r.key === 'friends');
+  assert.equal(rails[at - 1].key, 'fresh');
+  assert.equal(rails[at].title, 'Play with friends');
+  assert.deepEqual(slugs(rails[at].games), ['party-1', 'party-0'], 'not the other shelf, nor a protocol this hub cannot run');
+  assert.ok(!buildRails(library(), quiet, { now: NOW }).some((r) => r.key === 'friends'), 'no session games, no row');
 });
 
 test('the same day and library give the same rows; the seed only settles ties', () => {

@@ -1,5 +1,9 @@
 /**
- * session/pick.js — Random Mode: which game the session plays next.
+ * session/pick.js — which game the session plays next.
+ *
+ * The host's own picks come first, in the order they were picked (the queue:
+ * "Up next" in the lobby, and the game a session was hosted with). Then
+ * Random Mode deals.
  *
  * Every game that declares a supported session protocol, seats the players
  * present, and sits on the Games shelf is in the pool. The pool is dealt in an
@@ -250,4 +254,40 @@ export function pickNext(games, { seed, n, cycle = 0, played = [], webgpu = fals
   }
   const game = shuffleDeck(next.builds, `${seed}:${cycle}:${next.slug}`)[0];
   return { game, cycle, played: [...played, game.slug] };
+}
+
+/** The host's picks wait in the queue, this many at most. */
+export const MOST_PICKS = 12;
+
+/**
+ * The queue as the host published it: slugs, each once, at most MOST_PICKS.
+ * It comes over the network, so anything else is dropped.
+ */
+export function cleanQueue(queue) {
+  const out = [];
+  for (const slug of Array.isArray(queue) ? queue : []) {
+    if (typeof slug === 'string' && slug && slug.length <= 200 && !out.includes(slug) && out.length < MOST_PICKS) out.push(slug);
+  }
+  return out;
+}
+
+/**
+ * The games the host can pick by hand for `n` players: every game that seats
+ * them and every seat's browser can run. The host's filters narrow only the
+ * deal, and the touch rule only what the deal reaches for: a pick is the
+ * host's own choice.
+ */
+export const pickable = (games, n, { webgpu = false } = {}) => eligible(games, n, { webgpu });
+
+/**
+ * The first of the host's picks that seats the players now, and the queue
+ * without it: a pick that does not fit yet keeps its place for later. Null
+ * when none fits.
+ */
+export function takeQueued(games, queue, { n, webgpu = false }) {
+  const can = new Map(pickable(games, n, { webgpu }).map((game) => [game.slug, game]));
+  const list = cleanQueue(queue);
+  const at = list.findIndex((slug) => can.has(slug));
+  if (at === -1) return null;
+  return { game: can.get(list[at]), queue: [...list.slice(0, at), ...list.slice(at + 1)] };
 }
