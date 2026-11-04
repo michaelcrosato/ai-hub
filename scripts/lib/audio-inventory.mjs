@@ -9,12 +9,36 @@ const hash = text => createHash('sha256').update(text).digest('hex');
 const mimeFormat = mime => /^(?:audio\/(?:mpeg|x-mpeg|mp3|x-mp3|mpeg3|x-mpeg-3))$/i.test(mime) ? 'mp3'
   : /^(?:audio\/(?:wav|wave|x-wav|x-pn-wav|vnd.wave))$/i.test(mime) ? 'wav' : null;
 const cache = new Map();
-async function read(abs) {
-  const s = await stat(abs), stamp = `${s.size}:${s.mtimeMs}`;
+async function read(abs, s) {
+  const stamp = `${s.size}:${s.mtimeMs}`;
   if (cache.get(abs)?.stamp === stamp) return cache.get(abs).text;
   const text = await readFile(abs, 'utf8');
   if (s.size < 256 * 1024) cache.set(abs, { stamp, text });
   return text;
+}
+
+/** A path as it is now: missing, or its kind, inode, size and times. Any change to a file, or to a folder's entries, changes it. */
+async function look(abs) {
+  try {
+    const s = await stat(abs);
+    return { s, sig: `${s.isFile() ? 'f' : s.isDirectory() ? 'd' : 'o'}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}` };
+  } catch {
+    return { s: null, sig: 'missing' };
+  }
+}
+
+/**
+ * Inventories already taken, each with every path it looked at: the files it
+ * read, the folders it listed and the references it looked for, found or not.
+ * The dev server scans on every request; an inventory is taken again only
+ * when one of those paths has changed, so adding the file a game names is
+ * seen as surely as editing the game.
+ */
+const taken = new Map();
+
+async function unchanged(seen) {
+  for (const [abs, sig] of seen) if ((await look(abs)).sig !== sig) return false;
+  return true;
 }
 
 export function placeholderEvidence(text, file) {
@@ -41,6 +65,15 @@ export function placeholderEvidence(text, file) {
 }
 
 export async function scanAudio(entry, root) {
+  const key = `${root}\u0000${entry.rel}\u0000${entry.project ? 'project' : 'page'}`;
+  const before = taken.get(key);
+  if (before && (await unchanged(before.seen))) return structuredClone(before.result);
+  const seen = new Map();
+  const observe = async (abs) => {
+    const { s, sig } = await look(abs);
+    seen.set(abs, sig);
+    return s;
+  };
   const assets = new Map(), evidence = [], visited = new Set();
   const projectDir = entry.project ? path.posix.dirname(entry.rel) : null;
   const inside = rel => rel !== '..' && !rel.startsWith('../') && !path.isAbsolute(rel);
@@ -51,7 +84,7 @@ export async function scanAudio(entry, root) {
       : [path.posix.join(path.posix.dirname(source), clean), ...(projectDir ? [path.posix.join(projectDir, clean)] : [])];
     for (const rel of candidates.map(x => path.posix.normalize(x))) {
       if (!inside(rel)) continue;
-      try { if ((await stat(path.join(root, rel))).isFile()) return rel; } catch { /* unresolved literal */ }
+      if ((await observe(path.join(root, rel)))?.isFile()) return rel; // else an unresolved literal
     }
     return null;
   }
@@ -64,7 +97,10 @@ export async function scanAudio(entry, root) {
     const format = formatOf(rel);
     if (format) { add(`games/${rel}`, format, 'local', rel); return; }
     if (!TEXT.test(rel)) return;
-    const text = await read(path.join(root, rel));
+    const abs = path.join(root, rel);
+    const s = await observe(abs);
+    // A file that went missing mid-scan fails the build, as it always has.
+    const text = s ? await read(abs, s) : await readFile(abs, 'utf8');
     evidence.push(...placeholderEvidence(text, rel));
     for (const m of text.replace(/\\\//g, '/').matchAll(/data:(audio\/[\w.+-]+)((?:;[\w=.+-]+)*),([a-z0-9+/=%\s.-]+)/gi)) {
       const f = mimeFormat(m[1]);
@@ -131,6 +167,7 @@ export async function scanAudio(entry, root) {
     }
   }
   async function walk(dir) {
+    await observe(path.join(root, dir));
     for (const e of (await readdir(path.join(root, dir), { withFileTypes: true })).sort((a,b) => a.name.localeCompare(b.name, 'en'))) {
       if (e.name.startsWith('.') || e.name === 'node_modules') continue;
       const rel = path.posix.join(dir, e.name);
@@ -139,7 +176,9 @@ export async function scanAudio(entry, root) {
     }
   }
   if (projectDir) await walk(projectDir); else await inspect(entry.rel);
-  return mergeAudio([{ assets: [...assets.values()], evidence }]);
+  const result = mergeAudio([{ assets: [...assets.values()], evidence }]);
+  taken.set(key, { seen, result: structuredClone(result) });
+  return result;
 }
 
 export function mergeAudio(inventories) {

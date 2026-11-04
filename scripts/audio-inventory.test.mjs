@@ -124,3 +124,41 @@ test('Shellshift manifest yields all 17 ID3 assets; Brick Blast keeps Music evid
   assert.ok(evidence.some(e => e.line === 107 && /Music\s*: placeholders/.test(e.excerpt)));
   assert.ok(!evidence.some(e => e.line === 110));
 });
+
+test('an inventory is taken again whenever anything it looked at changes, found or not', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'audio-again-'));
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 15));
+  const ids = (inventory) => inventory.assets.map((a) => a.id);
+  try {
+    await mkdir(path.join(root, 'kit/sfx'), { recursive: true });
+    await writeFile(path.join(root, 'page.html'), `<audio src="theme.mp3"></audio>`);
+    const page = { rel: 'page.html', project: false };
+    const first = await scanAudio(page, root);
+    assert.deepEqual(ids(first), [], 'theme.mp3 is not there yet');
+    assert.deepEqual(await scanAudio(page, root), first, 'nothing changed: the same inventory');
+
+    // The file the game names arrives: nothing the game itself says changed.
+    await writeFile(path.join(root, 'theme.mp3'), '');
+    assert.deepEqual(ids(await scanAudio(page, root)), ['games/theme.mp3']);
+
+    // The game is edited.
+    await tick();
+    await writeFile(path.join(root, 'page.html'), `<audio src="theme.mp3"></audio><p>Placeholder music for now.</p>`);
+    const edited = await scanAudio(page, root);
+    assert.equal(edited.evidence.length, 1);
+
+    // A project gains a file in a folder it listed.
+    await writeFile(path.join(root, 'kit/index.html'), '<title>Kit</title>');
+    const kit = { rel: 'kit/index.html', project: true };
+    assert.deepEqual(ids(await scanAudio(kit, root)), []);
+    await writeFile(path.join(root, 'kit/sfx/hit.wav'), '');
+    assert.deepEqual(ids(await scanAudio(kit, root)), ['games/kit/sfx/hit.wav']);
+
+    // What comes back is a copy: changing it changes nothing the next scan returns.
+    const copy = await scanAudio(kit, root);
+    copy.assets.length = 0;
+    assert.deepEqual(ids(await scanAudio(kit, root)), ['games/kit/sfx/hit.wav']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

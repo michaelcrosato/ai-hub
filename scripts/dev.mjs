@@ -33,7 +33,19 @@ const HOST = flag('host', '127.0.0.1');
 const OPEN = argv.includes('--open');
 
 // Always-fresh manifest: this is what makes "drop a file in, refresh" work.
-const server = createServer(staticHandler(ROOT, { manifest: () => scan({ quiet: true }) }));
+// The first scan reads every game in full (about half a minute at 2,000
+// games); later ones reuse what has not changed and take under a second. So
+// the first starts now, while the browser opens, and a request that arrives
+// before it ends waits for it, then scans again: every answer is fresh.
+const warm = scan({ quiet: true }).catch(() => {});
+const server = createServer(
+  staticHandler(ROOT, {
+    manifest: async () => {
+      await warm;
+      return scan({ quiet: true });
+    },
+  })
+);
 
 function listen(port, attempt = 0) {
   server.once('error', (err) => {

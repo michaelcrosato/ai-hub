@@ -232,8 +232,11 @@ pnpm dev          # http://localhost:7417
 
 There is no build step and no `node_modules` — `pnpm install` has nothing to
 install. The dev server re-scans `games/` on every refresh, so dropping a file
-in and hitting reload is the whole loop. (It remembers each file's parsed head
-until the file changes, so that stays instant at four hundred games.)
+in and hitting reload is the whole loop. It remembers what it read from each
+game (its head, and the audio inventory with every path that inventory looked
+at) until any of that changes, so a scan after the first takes under a second.
+The first reads every game in full, about half a minute at two thousand games;
+it starts with the server, and a page opened sooner waits for it.
 
 ```bash
 pnpm test         # parsers, layout rules, zip reading, search and filters, Couch and Catalogue logic
