@@ -399,7 +399,12 @@ in by batches of about fifty.
   game when it joins the library. `ingest.mjs` parses every new page (a page
   whose scripts cannot parse is listed), but it does not run `hub-check`: a
   new session game is dealt untested until `hub-check --record` runs on it.
-  Next: run it at import.
+  On 2026-11-05 every session game was checked once, at two players and with
+  the host leaving, on a machine without a GPU: 28 failing in ways that hold
+  anywhere (a WebRTC connection of their own, malformed metas, an edited or
+  missing client, a wrong result) are kept out; a dozen that failed only in
+  ways slow software rendering can cause were left in. Next: run it at
+  import.
 - **A sleeping database.** The free Supabase project pauses after a quiet week.
   Hosting or joining then tells the player the server cannot be reached
   (`plainProblem` in `session/net.js`) until the owner resumes the project

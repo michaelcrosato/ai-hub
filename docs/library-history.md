@@ -83,8 +83,9 @@ catalogue.
   Wands of Lore, which had none, got one from a real GPU.
   The same day every pristine copy of the session client went to 1.4.0 (344
   games; a sample, all five hand-built game-night games among them, passed
-  `hub-check`), Soulflare Soldier was kept out of sessions for opening a
-  WebRTC connection of its own, and three games stopped asking for files that
+  `hub-check`). A `hub-check` sweep of all 345 session games kept 28 out of
+  sessions for failures that hold on any machine, 17 of them for opening a
+  WebRTC connection of their own. Three games stopped asking for files that
   were never there: Smash TV's player-records config, Crownfall Tactics'
   ripped placeholder music (its manifest keeps the intended sources), and
   AFTERGLOW OVERDRIVE's font stylesheet, now inline.

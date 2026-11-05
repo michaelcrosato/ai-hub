@@ -46,6 +46,15 @@ history, so they were left for you.
 
 ## Left as they are, for you to decide
 
+- **Session games to check on a GPU.** A `hub-check` sweep of every session
+  game ran on this machine, which has no GPU (software rendering, under
+  load). Failures that hold anywhere are recorded (28 games kept out). These
+  still failed when checked on their own, but only in ways slow rendering can
+  cause, so they were left in the deal; run `node scripts/hub-check.mjs
+  <game> --record` on a machine with a GPU to settle them: drive-stillwake,
+  drive-lumenwake-1, Street Fighter Axiom, Street Thunder Alpha, Clockwork
+  Fright, The Last High Mage, Waddle Trouble, Synthpunk 2084, MopeyDick,
+  Waku Waku Lucky and Lands of Yore.
 - **Sessions.** Checking the docs against the code turned up limits worth
   fixing, among them that the database's host never follows a host handover:
   the page hosts from the lowest seat, but `game_sessions.host_id` moves only
