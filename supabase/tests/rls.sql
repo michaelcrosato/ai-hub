@@ -2,7 +2,8 @@
 -- the migrations after them (0007 moved the SECURITY DEFINER bodies to the
 -- schema `private`; the last checks fail until it is applied; 0009 decides in
 -- every policy what a guest may read, and 0010 keeps those reads fast; two of
--- the three checks for 0009 fail without it).
+-- the three checks for 0009 fail without it; 0011 lets a seated player claim
+-- the host, and two of its four checks fail without it).
 --
 -- Run in the Supabase SQL editor (or execute_sql). It makes throwaway users,
 -- acts as each one the way the hub's pages would, checks every rule, and then
@@ -167,6 +168,36 @@ begin
     perform public.join_session(scode, 'Witty Yak');
     failed := failed + 1; report := report || E'\nFAIL: a fifth player got a seat';
   exception when others then passed := passed + 1;
+  end;
+
+  -- ---- the host follows the page (0011) -----------------------------------------
+  perform set_config('request.jwt.claims', json_build_object('sub', extra2, 'role', 'authenticated', 'is_anonymous', false)::text, true);
+  begin
+    perform public.claim_session_host(sid);
+    failed := failed + 1; report := report || E'\nFAIL: an outsider claimed the host';
+  exception when others then passed := passed + 1;
+  end;
+  perform set_config('request.jwt.claims', json_build_object('sub', guest, 'role', 'authenticated', 'is_anonymous', true)::text, true);
+  begin
+    perform public.claim_session_host(sid);
+    failed := failed + 1; report := report || E'\nFAIL: a removed player claimed the host';
+  exception when others then passed := passed + 1;
+  end;
+  perform set_config('request.jwt.claims', json_build_object('sub', friend, 'role', 'authenticated', 'is_anonymous', false)::text, true);
+  begin
+    perform public.claim_session_host(sid);
+    select count(*) into n from public.game_sessions where id = sid and host_id = friend;
+    if n = 1 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a seated player could not claim the host'; end if;
+  exception when others then
+    failed := failed + 1; report := report || E'\nFAIL: a seated player could not claim the host: ' || sqlerrm;
+  end;
+  perform set_config('request.jwt.claims', json_build_object('sub', host, 'role', 'authenticated', 'is_anonymous', false)::text, true);
+  begin
+    perform public.claim_session_host(sid);
+    select count(*) into n from public.game_sessions where id = sid and host_id = host;
+    if n = 1 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: the first host could not take it back'; end if;
+  exception when others then
+    failed := failed + 1; report := report || E'\nFAIL: the first host could not take it back: ' || sqlerrm;
   end;
 
   -- ---- recording rounds ---------------------------------------------------------

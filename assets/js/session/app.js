@@ -262,6 +262,8 @@ function publish(next) {
 
 /** This tab became the host: carry on from the last state it saw. */
 function takeOver() {
+  // Online, the database's host follows this page's (migration 0011), so removing a player and ending the session work after a handover.
+  if (online) online.sb.rpc('claim_session_host', { p_session: online.sessionId }).then(() => {}, () => {});
   let next = state ? { ...state } : withFirstPick(freshState());
   if (!state) next.knobs = knobs;
   if (next.phase === 'round' && next.current && next.current.coordinator !== key) {

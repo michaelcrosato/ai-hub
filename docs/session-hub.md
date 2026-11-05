@@ -105,6 +105,9 @@ game](../lib/hub/README.md#modes)). On the hub's side:
   each round's coordinator (`round.js`), and broadcasts the whole state on
   every change and every second, so a tab that joins late, or takes over when
   the host leaves, knows everything. In a shared world its copy runs the world.
+  Online, a tab that takes over also takes the host's place in the database
+  (`claim_session_host`, migration 0011), so it can remove a player and end
+  the session.
 - **Relay only**, in the lobby, sends all of a device's connections through
   the TURN relay, so the others never see its IP address.
 
@@ -380,17 +383,15 @@ in by batches of about fifty.
   drops for a moment (a phone screen, a Wi-Fi change) is marked out at once,
   and their healthy mesh links are torn down. Next: about 15 seconds' grace,
   with an explicit goodbye from a player who really leaves.
-- **The page's host and the database's can differ.** `game_sessions.host_id`
-  stays with the session's creator (the page calls `leave_session` only for a
-  guest). Once the creator's tab closes, the next host's *Remove* fails, and
-  its *End the session* leaves the session open until the hourly job.
 - **Seats trust each other.** A Realtime envelope carries a sender key the
   sender writes, presence carries the seat each tab claims, and `record_round`
   checks only that the caller is seated (not that it is the host, that rounds
-  come in order or that the session is open; `scores` has no size cap). A
-  seated player's modified page could pose as the host. One defence is in
-  place: a dealt round names its game by slug, and each seat loads that game
-  from its own library, never a path from the network.
+  come in order or that the session is open; `scores` has no size cap). Any
+  seated player may also claim the host's place in the database, as the page
+  does at a handover. A seated player's modified page could pose as the host,
+  and as the database's host remove the others or end the session. One
+  defence is in place: a dealt round names its game by slug, and each seat
+  loads that game from its own library, never a path from the network.
 - **TURN credentials for anyone signed in.** The `turn` function serves any
   caller Supabase lets through, guests included, with no check that the caller
   sits in a live session and no rate limit; relayed traffic past the free
