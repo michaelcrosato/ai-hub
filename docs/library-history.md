@@ -85,10 +85,12 @@ catalogue.
   games; a sample, all five hand-built game-night games among them, passed
   `hub-check`). A `hub-check` sweep of all 345 session games kept 28 out of
   sessions for failures that hold on any machine, 18 of them for opening a
-  WebRTC connection of their own. Three games stopped asking for files that
-  were never there: Smash TV's player-records config, Crownfall Tactics'
-  ripped placeholder music (its manifest keeps the intended sources), and
-  AFTERGLOW OVERDRIVE's font stylesheet, now inline.
+  WebRTC connection of their own. Eleven more had failed only in ways slow
+  software rendering can cause; checked again on a machine with a GPU, seven
+  still failed and are out too (35 in all). Three games stopped asking for
+  files that were never there: Smash TV's player-records config, Crownfall
+  Tactics' ripped placeholder music (its manifest keeps the intended
+  sources), and AFTERGLOW OVERDRIVE's font stylesheet, now inline.
 
 ## How games were told apart
 
