@@ -200,9 +200,9 @@ game.
 Look at anything the report lists as unable to start, then check each game's
 genre, shelf (`Game`, `Tech demo` or `Tool`) and any claimed source against
 the game actually running. Capture a real screenshot strip at
-`covers/<slug>/0.jpg`, `1.jpg` and `2.jpg`: a title or opening view, then two
-useful game or tool views, each 640×480 JPEG at quality 58. Loading, blank and
-error screens do not count. Leave details you are unsure of unset; when a
+`covers/<slug>/0.jpg`, `1.jpg` and `2.jpg` (`pnpm shots` makes candidates): a
+title or opening view, then two useful game or tool views, each 640×480 JPEG at
+quality 58. Loading, blank and error screens do not count. Leave details you are unsure of unset; when a
 package does not say which version made it, Gemini means Gemini 4 Argon and
 Muse means Muse Wonder 1.
 
@@ -696,14 +696,17 @@ None of this is needed. All of it is ignored if absent.
 Slugs are listed in `data/games.json`. A strip, `covers/<slug>/0.jpg` to
 `2.jpg`, always wins.
 
-**Real screenshots.** `pnpm shots` opens each game without a cover, waits for
-its title screen and saves one. It needs Playwright (see [Checks](#checks)):
+**Screenshot strips.** `pnpm shots` writes a candidate strip for every game
+without one: it opens the game in a 960×720 window, takes the title once it
+settles, presses Enter for the second frame and plays a few keys for the
+third, and saves them as `covers/<slug>/0.jpg` to `2.jpg` in the strip
+format. Games differ, so look at the frames before committing and replace any
+that show loading, blank or error screens. A game that needs WebGPU draws
+nothing without a GPU. It needs Playwright (see [Checks](#checks)):
 
 ```bash
-pnpm shots                # four at a time; --jobs 8 for more, --only <slug> for one
+pnpm shots                # four at a time; --jobs 8 for more, --only <slug> for one, --all to redo every strip
 ```
-
-A project with its own `og:image` already has a cover and is skipped.
 
 ### Extra metadata
 
@@ -847,7 +850,7 @@ scripts/
   ingest.mjs      bulk import of pages, folders and zips
   dev.mjs         local server, re-scans on every request
   release.mjs     publish to Cloudflare: only what the site serves, shelf trimmed to what games load
-  shots.mjs       optional cover screenshots
+  shots.mjs       candidate screenshot strips for games without one
   lib/layout.mjs  what a path is: game, build, project, collection
   lib/intake.mjs  what a package holds, and what never to import
   lib/zip.mjs     a small zip reader, so the project stays dependency-free
