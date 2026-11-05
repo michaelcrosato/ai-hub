@@ -576,15 +576,18 @@ node scripts/retrofit.mjs run $(cat .cache/pilot.txt) --jobs 2 \
   machine without a GPU, `--browser-args` with SwiftShader's flags (in
   `scripts/hub-check.mjs`) gives such games a software adapter.
 - A tool step puts the client and the metas first in its head (`prepare`).
-- A model, cheapest first, wires the score, the end and the session steps from
-  the prompt in [`lib/hub/retrofit.md`](lib/hub/retrofit.md), which quotes the
-  protocol from *Modes* to *Rules*, word for word. It works on a copy of the game in
-  a folder of its own, so it can change nothing else and two jobs never meet.
+- A model, cheapest first, wires the score, the end, up to six stats the game
+  already keeps and the session steps from the prompt in
+  [`lib/hub/retrofit.md`](lib/hub/retrofit.md), which quotes the protocol from
+  *Modes* to *Rules*, word for word. It works on a copy of the game in a folder
+  of its own, so it can change nothing else and two jobs never meet.
 - The static check (`check`), a budget of 150 changed lines, and
   `hub-check --retrofit` judge it: two players with one leaving, then the game
   on its own compared with the original.
 - Each model gets a second try with what failed, then the next one does, up to
-  `--max-cost` dollars a game.
+  `--max-cost` dollars a game. The cheapest model's try that changed nothing
+  gets no second one: the next model takes over. Past `--timeout` minutes
+  (20) an agent is stopped, with everything it started.
 - A game that passes keeps its changes for you to review. Any other is put back
   exactly as it was, with a `sessionNote` in `data/overrides.json` saying why,
   so later runs skip it (`--again` retries).
