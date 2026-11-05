@@ -22,7 +22,8 @@
  *      its stdin (or as a file, in place of {prompt-file}). It works on a copy
  *      of the game in a folder of its own, outside the repository, so it can
  *      touch nothing else and two jobs never meet; what it changed is copied
- *      back for the checks. For example
+ *      back for the checks. An agent still running after --timeout minutes
+ *      is stopped, with everything it started. For example
  *        --agent "claude -p --model claude-haiku-5-5 --max-turns 30 --permission-mode acceptEdits --output-format json"
  *   3. The static check, a diff budget, then hub-check --retrofit against the
  *      original. Each tier gets two tries, the second told what the first's
@@ -39,13 +40,13 @@
  * Nothing is committed: commit what passed in batches of about fifty.
  */
 
-import { spawn } from 'node:child_process';
 import { appendFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { checkRetrofit, prepareParallel, changedLines } from './lib/retrofit.mjs';
+import { run as runCommand, stopAll } from './lib/run.mjs';
 import { normalize, sessionOf } from '../assets/js/manifest.js';
 import { lineageKey } from '../assets/js/session/pick.js';
 
@@ -65,27 +66,8 @@ const flag = (name) => argv.includes(`--${name}`);
 const named = new Set(['--agent', '--jobs', '--minutes', '--timeout', '--budget', '--max-cost', '--wave', '--limit', '--browser-args']);
 const targets = argv.filter((a, i) => !a.startsWith('--') && !named.has(argv[i - 1]));
 
-const run = (cmd, args, { input, timeoutMs = 0, shell = false, cwd = ROOT } = {}) =>
-  new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, shell, stdio: ['pipe', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    const timer = timeoutMs ? setTimeout(() => child.kill('SIGTERM'), timeoutMs) : null;
-    const done = (code) => {
-      if (timer) clearTimeout(timer);
-      resolve({ code, out, err });
-    };
-    child.stdout.on('data', (d) => (out += d));
-    child.stderr.on('data', (d) => (err += d));
-    // A command that exits without reading its input, or never starts, is a failed try, not a crash.
-    child.stdin.on('error', () => {});
-    child.on('error', (e) => {
-      err += e.message;
-      done(-1);
-    });
-    child.on('close', done);
-    child.stdin.end(input ?? '');
-  });
+/** A command from the repository's root; a timeout stops it and all it started (lib/run.mjs). */
+const run = (cmd, args, options = {}) => runCommand(cmd, args, { cwd: ROOT, ...options });
 
 const rel = (file) => path.relative(ROOT, file);
 const isProject = (page) => path.basename(page) === 'index.html';
@@ -192,14 +174,21 @@ async function noted(page) {
 
 /* --- one game ---------------------------------------------------------------- */
 
-/** What to undo if the run is stopped (Ctrl-C, a kill): each game in hand puts itself back. */
+/**
+ * What to undo if the run is stopped (Ctrl-C, a kill, a closed terminal): the
+ * agents and checks still running are stopped, since each runs in a process
+ * group of its own that the terminal's signal misses, and each game in hand
+ * puts itself back.
+ */
 const inHand = new Set();
 let stopping = false;
-for (const signal of ['SIGINT', 'SIGTERM']) {
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.once(signal, async () => {
     stopping = true;
+    stopAll('SIGTERM');
     console.log(`\n${signal}: putting back the ${inHand.size} game${inHand.size === 1 ? '' : 's'} in hand`);
     await Promise.all([...inHand].map((undo) => undo().catch(() => {})));
+    stopAll('SIGKILL');
     process.exit(130);
   });
 }
@@ -339,7 +328,9 @@ async function retrofitOne(arg, agents, prompt) {
         const down = reply.code !== 0 && !changed;
         if (down) {
           agentDown++;
-          agentError = `the agent exited with ${reply.code} and changed nothing${reply.err.trim() ? `: ${reply.err.trim().slice(-200)}` : ''}`;
+          agentError = reply.timedOut
+            ? `the agent ran past --timeout (${timeoutMs / 60_000} min), was stopped and changed nothing`
+            : `the agent exited with ${reply.code} and changed nothing${reply.err.trim() ? `: ${reply.err.trim().slice(-200)}` : ''}`;
         }
         const problems = [
           ...(down ? [agentError] : []),
