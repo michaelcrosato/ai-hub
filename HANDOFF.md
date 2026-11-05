@@ -41,12 +41,11 @@ for good.
 
 ## Left as they are, for you to decide
 
-- **Ashlar Wake** (a Grok roundup game) renders and plays on a real GPU, but
-  while walking its engine sometimes stops on `PHYSICS_BAD_ARGUMENT:
-  stepCharacter(body) got 16`. It is a 6.8 MB minified bundle; the fix belongs
-  in its source. It carries `"status": "Needs a fix"` in `data/overrides.json`.
 - **Sessions.** Checking the docs against the code turned up limits worth
-  fixing, among them that the database's host never follows a host handover,
-  so a new host can neither remove a player nor end the session. They are in
-  `docs/session-hub.md`, *Known limits*. Fixing that one needs a migration,
-  which is the Supabase dashboard again.
+  fixing, among them that the database's host never follows a host handover:
+  the page hosts from the lowest seat, but `game_sessions.host_id` moves only
+  when the host calls `leave_session`, which closing a tab never does, so a new
+  host can neither remove a player nor end the session. The page cannot hand
+  over for someone who is gone; it needs a database function (a seated player
+  claiming the host when the recorded one has left), so a migration in the
+  Supabase dashboard. The rest are in `docs/session-hub.md`, *Known limits*.
