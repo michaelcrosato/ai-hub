@@ -107,6 +107,11 @@ test('root-absolute references are found and made relative, and only those that 
     '/assets/index-a1b2.js',
   ]);
   assert.deepEqual(rootAbsoluteRefs('<link rel="modulepreload" href="/lib/three/three.webgpu.js">'), [], 'the shared stack is meant to load from the root');
+  assert.deepEqual(
+    rootAbsoluteRefs('<script>window.__ASSETS={"/my-engine.js":"data:text/javascript;base64,AA=="}</script><script src="/my-engine.js"></script><img src="/real.png">'),
+    ['/real.png'],
+    'a path the page maps to inline data never reaches the server',
+  );
   const have = new Set(['assets/index-a1b2.js']);
   const out = relativizeRefs(VITE_BUILT + '<link href="/missing.css">', (p) => have.has(p));
   assert.match(out, /src="\.\/assets\/index-a1b2\.js"/);

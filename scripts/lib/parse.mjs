@@ -299,16 +299,23 @@ export function compareVersions(a, b) {
 // src="/assets/x.js", href='/style.css' — but not "//cdn…" or a bare "/".
 const ROOT_REF = /(\b(?:src|href|poster)\s*=\s*)(["'])\/(?![/"'])([^"'?#]*)([^"']*)\2/gi;
 
+// "/my-engine.js":"data:…": a bundle that carries its files inline and resolves
+// these paths itself, from a map like window.__ASSETS, never asks the server.
+const INLINE_ASSET = /["'](\/[^"'\\]+)["']\s*:\s*["']data:/g;
+
 /**
  * Root-absolute references in a page (`/assets/index-3f2a.js`). A bundler
  * configured for its own domain writes these, and inside the hub they resolve
  * against the hub rather than the game's folder, so the game loads blank.
- * `/lib/` is the exception: the shared 3D stack lives there on purpose.
+ * `/lib/` is the exception: the shared 3D stack lives there on purpose. So is
+ * a path the page maps to inline data of its own.
  */
 export function rootAbsoluteRefs(html) {
+  const text = String(html || '');
+  const inline = new Set([...text.matchAll(INLINE_ASSET)].map((m) => m[1]));
   const found = new Set();
-  for (const m of String(html || '').matchAll(ROOT_REF)) {
-    if (m[3] && !m[3].startsWith('lib/')) found.add('/' + m[3]);
+  for (const m of text.matchAll(ROOT_REF)) {
+    if (m[3] && !m[3].startsWith('lib/') && !inline.has('/' + m[3])) found.add('/' + m[3]);
   }
   return [...found];
 }

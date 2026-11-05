@@ -135,7 +135,7 @@ async function inspect(abs, project) {
   const value = { info: parseHead(text), rootRefs: [] };
   if (project) {
     // Only projects load files of their own; a single-file game has nothing to lose.
-    const whole = stats.size <= 2 * MB ? await readFile(abs, 'utf8') : text;
+    const whole = await readFile(abs, 'utf8');
     value.rootRefs = rootAbsoluteRefs(whole);
   }
   headCache.set(abs, { stamp, value });
