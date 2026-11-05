@@ -4,8 +4,10 @@ An arcade wall for games built by AI models. Games can be single HTML pages
 or project folders with their own code and assets; the hub finds them, dresses
 them, and gets out of the way. Shared engines live in `lib/`.
 
-**Live:** <https://crosato-arcade.vercel.app> — public, no sign-in. This repo
-stays private; only the built site is reachable.
+**Live:** <https://crosato-arcade.michael-crosato.workers.dev> — public, no
+sign-in. Every push to `main` republishes it on Cloudflare Workers. This repo
+stays private; only the built site is reachable. The older Vercel copy,
+<https://crosato-arcade.vercel.app>, changes only when deployed by hand.
 
 ---
 
@@ -669,7 +671,7 @@ Google, and is only for:
 The hub asks Google for nothing but who you are, and shows nobody your
 Google name or photo. The account menu has *Play with friends* (the Friends view), *Privacy*,
 *Sign out* and *Delete my data*. What is stored is on
-[`/privacy/`](https://crosato-arcade.vercel.app/privacy/).
+[`/privacy/`](https://crosato-arcade.michael-crosato.workers.dev/privacy/).
 
 How it's built:
 - The accounts live in the Supabase project `ai-hub` (ref
@@ -860,16 +862,30 @@ upgrading three.js and Rapier and the local patches to re-apply.
 Imported games can instead keep their original engine version and renderer
 through `lib/vendor/`. Those packages do not replace the patched shared stack.
 
-Vercel runs `node scripts/scan.mjs` as the build command and serves the
-repository. There is no framework and nothing is compiled.
+The site is hosted on Cloudflare Workers as `crosato-arcade`
+(<https://crosato-arcade.michael-crosato.workers.dev>). There is no framework
+and nothing is compiled.
 
-`pnpm release` publishes the same site to Cloudflare Workers instead (not live
-yet): it stages only what the site serves into `.cache/release/site`, with the
-library shelf cut to the files games actually load (about 14,700 files in all,
-under the free plan's 20,000), splits any file over Cloudflare's 25 MiB limit
-into parts that `cloudflare/worker.js` streams back whole, and deploys with
-Wrangler. `--dry-run` stages and reports; `--local` serves the staged site with
-Cloudflare's runtime on port 8787.
+**Every push to `main` republishes it.** Workers Builds, Cloudflare's Git
+integration, is connected to this repository (Cloudflare dashboard → Workers &
+Pages → `crosato-arcade` → Settings → Build). On each push to `main` it clones
+the repo and runs `node scripts/release.mjs` as the deploy command, and GitHub
+shows the result as a check on the commit. The build command is empty and
+other branches do not build. The free plan includes 3,000 build minutes a
+month.
+
+`pnpm release` is that same deploy, run from your own machine (after
+`npx wrangler login`). It stages only what the site serves into
+`.cache/release/site`, with the library shelf cut to the files games actually
+load (about 14,700 files in all, under the free plan's 20,000). It splits any
+file over Cloudflare's 25 MiB limit into parts that `cloudflare/worker.js`
+streams back whole, and deploys with Wrangler, which uploads only files
+Cloudflare does not already have. `--dry-run` stages and reports; `--local`
+serves the staged site with Cloudflare's runtime on port 8787.
+
+Vercel can still serve the repository (`vercel.json`, build command
+`node scripts/scan.mjs`), but Git deploys are off there; it deploys only when
+asked.
 
 ### A note on colour
 
