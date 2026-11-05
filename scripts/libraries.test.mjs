@@ -87,6 +87,19 @@ test("shelf addons resolve three to the page's own entry files, so .min pages lo
   assert.equal(scope["three/webgpu"], "/lib/vendor/three/0.180.0/build/three.webgpu.min.js");
 });
 
+test("an older release without a WebGPU build gets no three/webgpu or three/tsl mapping", () => {
+  const html =
+    '<head><script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script></head><script type="module">import * as THREE from "three";</script>';
+  const map = mapOf(localizeGameLibraries(new Map([["game.html", html]]), manifest).files.get("game.html"));
+  const scope = map.scopes["/lib/vendor/three/0.160.0/"];
+  assert.equal(map.imports.three, "/lib/vendor/three/0.160.0/build/three.module.js");
+  assert.equal(map.imports["three/addons/"], "/lib/vendor/three/0.160.0/examples/jsm/");
+  for (const imports of [map.imports, scope]) {
+    assert.equal(imports["three/webgpu"], undefined, "r160 has no build/three.webgpu.js");
+    assert.equal(imports["three/tsl"], undefined, "nor build/three.tsl.js");
+  }
+});
+
 test("bare modules get defaults before preloads; existing shared-kit mappings stay intact", () => {
   const html =
     '<head><link rel="modulepreload" href="main.js"></head><script type="module">import { Scene } from "three"; import R from "@dimforge/rapier2d-deterministic";</script>';

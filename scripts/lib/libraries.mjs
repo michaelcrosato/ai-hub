@@ -93,10 +93,12 @@ export function resolveLibraryReference(reference, manifest) {
 }
 
 export function threeImports(record, main = record.base + record.entry, externalImports = {}) {
+  // Releases before the WebGPU build (r160 on the shelf) get no mapping that points at nothing.
+  const has = (file) => !record.files || file in record.files;
   return {
     three: main,
-    "three/webgpu": `${record.base}build/three.webgpu.js`,
-    "three/tsl": `${record.base}build/three.tsl.js`,
+    ...(has("build/three.webgpu.js") ? { "three/webgpu": `${record.base}build/three.webgpu.js` } : {}),
+    ...(has("build/three.tsl.js") ? { "three/tsl": `${record.base}build/three.tsl.js` } : {}),
     "three/addons/": `${record.base}examples/jsm/`,
     "three/examples/jsm/": `${record.base}examples/jsm/`,
     "three/src/": `${record.base}src/`,
