@@ -1,6 +1,6 @@
 /* Shared deterministic contracts. No DOM or persistent storage in the simulation. */
 (() => {
-const G = globalThis.Drive = { E: My3D2dge, VERSION: '1.0.0', STEP: 1 / 120 };
+const G = globalThis.Drive = { E: My3D2dge, VERSION: '1.1.0', STEP: 1 / 120 };
 G.clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 G.dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 G.angle = a => Math.atan2(Math.sin(a), Math.cos(a));
@@ -52,7 +52,7 @@ G.MemoryStore = class { constructor() { this.data = {}; this.writes = 0; } getIt
 G.Save = class {
   constructor(store, key='five-finger-sd-v1') { this.store=store; this.key=key; this.error=null; this.generation=0; }
   valid(raw) { try { const v=JSON.parse(raw); if(v.schema!==1 || !Number.isSafeInteger(v.generation) || v.check!==G.hash(v.payload) || !this.payloadValid(v.payload)) return null; return v; } catch { return null; } }
-  payloadValid(p) {return !!p&&(p.contentVersion===undefined||p.contentVersion===1)&&(p.gameVersion===undefined||p.gameVersion===G.VERSION)&&!!G.content.missions[p.mission]&&Number.isFinite(p.seed)&&Number.isInteger(p.progress)&&p.progress>=0&&p.progress<=G.content.missions[p.mission].stages.length&&Array.isArray(p.cars)&&p.cars.every(c=>G.content.vehicles[c.type]&&Number.isFinite(c.x)&&Number.isFinite(c.y)&&Array.isArray(c.occupants))&&Array.isArray(p.crew)&&p.crew.length===3&&p.crew.every(a=>G.content.crew.some(d=>d.id===a.id)&&['city','records','gantry'].includes(a.zone)&&Number.isFinite(a.x)&&Number.isFinite(a.y)&&Number.isFinite(a.hp));}
+  payloadValid(p) {return !!p&&(p.contentVersion===undefined||p.contentVersion===1)&&(p.gameVersion===undefined||p.gameVersion==='1.0.0'||p.gameVersion===G.VERSION)&&!!G.content.missions[p.mission]&&Number.isFinite(p.seed)&&Number.isInteger(p.progress)&&p.progress>=0&&p.progress<=G.content.missions[p.mission].stages.length&&Array.isArray(p.cars)&&p.cars.every(c=>G.content.vehicles[c.type]&&Number.isFinite(c.x)&&Number.isFinite(c.y)&&Array.isArray(c.occupants))&&Array.isArray(p.crew)&&p.crew.length===3&&p.crew.every(a=>G.content.crew.some(d=>d.id===a.id)&&['city','records','gantry'].includes(a.zone)&&Number.isFinite(a.x)&&Number.isFinite(a.y)&&Number.isFinite(a.hp));}
   load() { try { const slots=[0,1].map(n=>this.valid(this.store.getItem(this.key+':'+n))).filter(Boolean).sort((a,b)=>b.generation-a.generation); if(!slots.length) return null; this.generation=slots[0].generation; return G.copy(slots[0].payload); } catch(e) { this.error='Storage unavailable. This run can continue.'; return null; } }
   write(payload) { this.load();const generation=this.generation+1, value={schema:1,generation,payload:G.copy(payload)}; value.check=G.hash(value.payload); try { this.store.setItem(this.key+':'+generation%2,JSON.stringify(value));const verified=this.valid(this.store.getItem(this.key+':'+generation%2));if(!verified||verified.generation!==generation)throw Error('Save verification failed'); this.store.setItem(this.key+':head',String(generation)); this.generation=generation; return true; } catch(e) { this.error='Save unavailable. Keep this tab open.'; return false; } }
 };

@@ -99,6 +99,7 @@ G.drawWorld=(app,r)=>{
  if(s.yard)for(const p of s.yardStations)r.queue(p.x,p.y,0,g=>{const[x,y]=r.w(p.x,p.y,25);G.text(g,p.label.toUpperCase(),x,y,'#fff1c9',{align:'center',font:'tiny'});});
  if(s.time>20)r.overlay(g=>{g.save();g.fillStyle='rgba(62,46,91,'+Math.min(.10,(s.time-20)/1800)+')';g.fillRect(0,0,r.W,r.H);g.restore();});
  if(app.mode==='play'||app.mode==='demo')G.drawHUD(app,r);
+ app.hub?.draw(r);app.party?.draw(r);
 };
 G.drawHUD=(app,r)=>{
  if(app.mobile&&app.mode==='demo')return;

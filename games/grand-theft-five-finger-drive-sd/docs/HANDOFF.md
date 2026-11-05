@@ -2,7 +2,7 @@
 
 Published release: the game systems, level, expansion fixture and automated checks are implemented. The four-hour soak passes, and production delivery is verified. The original plan's human/hardware/performance gates are not silently marked passed; see QA.md for exact limits. Those open gates prevent an unqualified claim that every acceptance criterion is complete.
 
-## Verified delivery
+## Original 1.0.0 delivery
 
 - Code commit on `main`: `c5c5016462f38daa654de4b3c9a9572792d72d9b`.
 - Tested and published Git tree: `5c7903b2a9441426e99e82748fbb6df0a93da24a`. A later documentation-only commit records this evidence.
@@ -62,8 +62,18 @@ Open `index.html` through HTTP. From ai-hub, run `node scripts/dev.mjs`. The gam
 
 Run content validation, game contracts, 20 seeded missions plus the seed-552 regression, expansion and replay. Compare native/isolated runners before the long soak. Run the four-hour simulation after gameplay changes, and browser contracts plus the half-hour foreground observation after lifecycle changes. Preserve any failing seed. Run the repository tests and scanner before delivery. Large generated evidence remains outside committed source.
 
-The repository's authorized workflow is `main` → commit → push `origin/main` → Vercel production READY → direct game and hub iframe smoke test. Recheck remote state before pushing and preserve unrelated work. No root dependency or generated catalogue is required.
+The current repository workflow is `main` → verify → commit → push `origin/main`. Git deployments are disabled. Deploy to Vercel only when Michael explicitly requests it. The earlier production release above is historical. Recheck remote state before pushing and preserve unrelated work. No root dependency or generated catalogue is required.
 
 ## Remaining verification blockers
 
 No physical DualSense is attached. Only cloud Chrome is available; its roughly 1 FPS animation cadence prevents a normal manual playthrough, listening/animation review and sustained 60 Hz certification. Local browsers cannot launch under the managed socket restrictions. Do not bypass those restrictions or present emulation as hardware evidence. The exact unmet plan items and measured results are in QA.md.
+
+## Version 1.1.0: multiplayer and portable export
+
+`src/multiplayer.js` owns hub rounds, ghost validation/rendering, race results and local controller turns. `tools/bundle.mjs` exports the exact runtime into one HTML file. It does not replace the source project or add a second catalogue entry. See MULTIPLAYER.md for integration details and QA.md for this update's checks.
+
+The required integration reference is: **Follow https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub for multiplayer integration into ai-hub as well as for the game on its own.**
+
+Hub races support 1–4 players. Standalone races support 2–4 local turns. Neither mode writes a solo checkpoint. The pinned engine and existing three-view mission remain unchanged.
+
+Verification: 66 game tests, 382 repository tests, five mission regressions, two expansion paths and the browser hub cases pass. The final export is 888,016 bytes. Its filename, SHA-256 and exact browser limits are recorded in QA.md. No generated export or catalogue is committed. The active effort level is unexposed, so the export uses `unknown` in that filename field.

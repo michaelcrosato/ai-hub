@@ -16,7 +16,7 @@ These are live dependencies, not an unused vendor file. The contract suite check
 
 ## What the game did not use
 
-The agent edition, 3D first/third-person camera, WebGPU lighting, networking, mocap and unrelated starter scenes are not part of the game. No alternate renderer or game framework is installed.
+The agent edition, 3D first/third-person camera, WebGPU lighting, engine networking, mocap and unrelated starter scenes are not part of the game. No alternate renderer or game framework is installed.
 
 The game does not use FlowField as its navigation service. A shared heap-based A* query handles different foot/car clearances, car obstacles and road preference. It does not use the engine Store directly for checkpoints; a game-specific two-slot checksummed envelope provides corruption recovery and demo isolation. The custom action-stream replay is separate from the engine's page-recording session tool. Police dispatch, seats, vehicle dynamics, crime reports, economy and mission graphs are game systems added above the engine.
 
@@ -35,3 +35,7 @@ The initial wall pass scanned every map cell. A small local viewport-culling pat
 **A public input-frame API with explicit physical-source ownership.** A kiosk game needs to see an unmapped physical key, a secondary pad's stick or an analog trigger before menus and paused scenes consume input. It must also distinguish those observations from AI/replay actions. The local extension retains analog button values, returns a copied action frame, and adds pre-input and unscaled-frame hooks. A supported upstream contract for those operations would remove the most fragile integration point.
 
 Keep that change narrow. The city game's missions, police and car handling should remain content/game modules, not a compulsory engine rewrite. Exact patches and checks are in `ENGINE-PATCHES.md`.
+
+## Multiplayer update
+
+The game uses the official AI Hub client for transport and round control. A separate game adapter sends bounded ghost positions and race results. It uses the existing unscaled input/frame hooks to hold the simulation before the common start and stop it at the end. No engine file changed in this update. The engine pin and local engine hash remain unchanged. Standalone local turns use the same mission and save-isolation contract.

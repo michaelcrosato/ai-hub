@@ -766,3 +766,16 @@ Keep the same selected model. Set effort to **xhigh**. Make this plan available 
 ```text
 /goal Read Grand-Theft-Five-Finger-Drive-SD-PLAN.md and execute it in michaelcrosato/ai-hub. Use the pinned my-3D2dge v0.46.1 handoff. Complete every implementation stage, the polished Palm Quay level, controller-first UI, autonomous attract loop, expansion proof, tests, and handoff documents. Use the same model at xhigh effort. Continue through verification and the repository's authorized delivery workflow. Report only verified results and exact remaining blockers.
 ```
+
+## Addendum: multiplayer and portable HTML — 2026-11-04
+
+User instruction: **Follow https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub for multiplayer integration into ai-hub as well as for the game on its own.**
+
+- Add AI Hub Protocol v1 ghost races for 1–4 players through the unmodified client.
+- Keep one common seed, a hub-owned countdown and clock, progress, one result, departure handling and end cleanup.
+- Keep ghosts outside the simulation, collision and persistent saves.
+- Add standalone local races for 2–4 players through controller-first menus.
+- Export the exact runtime as `[GameTitle-SOURCE-model-effort-stamp].html`, with all runtime assets included. Record unknown model/effort fields honestly.
+- Test the protocol, poor network conditions, departures, local turns, saves, original missions and the exported file. Publish source through the current repository workflow.
+
+Implementation and verification records: MULTIPLAYER.md, QA.md and HANDOFF.md. Original physical-device acceptance limits remain open; this addendum does not erase them.

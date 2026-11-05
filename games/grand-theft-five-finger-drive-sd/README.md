@@ -12,6 +12,24 @@ The crew keeps its health, ammunition, tasks, position and seat when control cha
 
 The title enters a real autonomous demo after **10 seconds without physical input**, including from title Settings and Controls. Any physical input returns to the title before another AI action. Release the interrupting control, then press a fresh confirm to play. Live-game pause never enters the demo. Demo saves and rewards stay in memory.
 
+## Multiplayer and the single-file game
+
+Integration follows the [AI Hub multiplayer guide](https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub) for the hub and standalone game.
+
+**AI Hub:** 1–4 players race through The Meter Job from the same seeded start. Other players appear as coloured, non-colliding ghosts. Each player controls their own three-person crew and city. Deliver the ledger first. Finished runs rank by elapsed time; unfinished runs rank by completed objectives. The hub owns the countdown, time limit, results and exit controls.
+
+**On its own:** choose **Play → Local race · 2–4 players**. Pass one controller between turns. Each player gets the same city and crew, with an 18-minute limit per turn. Pause menus do not stop the race clock. Race saves stay in memory. Solo play, saves, expansion jobs and the 10-second attract loop remain available.
+
+The standalone multiplayer mode uses local turns. Online races run through AI Hub. No separate account or network server is included in the exported file. See [MULTIPLAYER.md](docs/MULTIPLAYER.md) for the protocol, limits and tests.
+
+To export one HTML file, run this command from the game folder. The output must be outside that folder:
+
+```sh
+node tools/bundle.mjs /absolute/output/Grand-Theft-Five-Finger-Drive-SD-Grand-Theft-Auto-V-gpt-6-astra-unknown-STAMP.html
+```
+
+The file includes the pinned engine, game scripts, styles, icon, generated art and sound, the unmodified hub client, source information and the MIT license. Open it in a browser. No build service or external asset is required. The effort field is `unknown` because the active reasoning level is not exposed.
+
 ## Controls
 
 The browser must expose the controller through the standard Gamepad API. A DualSense-style layout is the default. Buttons can be rebound in Controls. This is browser controller support, not a PlayStation console build.
@@ -48,7 +66,7 @@ The **developer test yard** has eight stations: movement, six vehicle types, com
 
 ```sh
 node tools/validate.mjs
-node --test tests/contracts.test.mjs
+node --test tests/contracts.test.mjs tests/multiplayer.test.mjs
 node tests/mission.mjs 20
 node tests/expansion.mjs
 node tests/replay.mjs
@@ -75,8 +93,8 @@ This reference is separate from the engine evaluation.
 | SOURCE | Grand Theft Auto V / Grand Theft Auto 5; spiritual inspiration only |
 | GAME ENGINE | my-3D2dge 0.46.1, pinned commit `cfa866aa45474868350cad1a7fc015e612f9305f`; full handoff, with documented local extensions |
 | Handoff URL | https://github.com/michaelcrosato/my-3d2dge/tree/main/dist/handoff |
-| Environment | ChatGPT Work Mode / Codex; Linux x86_64, Bash, Node.js 24.19.0, Python 3.12, Git 2.51; HTML Canvas; cloud Chrome for browser checks |
-| Model | OpenAI / Codex based on GPT. The exact model identifier is not exposed. |
+| Environment | ChatGPT Work Mode / Codex; Linux x86_64, Bash, Node.js 24.22.1; HTML Canvas; cloud Chrome for browser checks |
+| Model | Update: OpenAI / gpt-6-astra. The original release did not expose its exact model. |
 | Effort | xhigh was requested. The actual active effort level is not exposed. |
 
 Engine evaluation: [ENGINE-EVALUATION.md](docs/ENGINE-EVALUATION.md). License and asset sources: [ASSET-LICENSES.md](docs/ASSET-LICENSES.md). No Rockstar art, audio, dialogue, map, code, or characters are included.

@@ -13,3 +13,17 @@ This reference is separate from the engine evaluation.
 | Reasoning effort | User requested xhigh. The actual active level is not exposed and is not guessed. |
 
 Repository: `michaelcrosato/ai-hub`. Game path: `games/grand-theft-five-finger-drive-sd/`. Canonical title: **Grand Theft Five-Finger Drive-SD**. The original naming candidates and recorded selection remain in PLAN.md.
+
+## Multiplayer and portable-file update
+
+| Field | Value |
+| --- | --- |
+| Update date | 2026-11-04 America/Vancouver; 2026-11-05 UTC |
+| Model | OpenAI / gpt-6-astra |
+| Active reasoning effort | Not exposed; the export filename uses `unknown` |
+| Environment | ChatGPT Work Mode / Codex; Linux; Bash; Node.js 24.22.1; cloud Chrome |
+| Multiplayer guide | https://github.com/michaelcrosato/ai-hub/tree/main/lib/hub |
+| Protocol and client | AI Hub Session Protocol v1; unmodified client 1.4.0 |
+| Game version | 1.1.0; existing 1.0.0 checkpoints remain readable |
+
+The initial date, source inspiration and engine pin above still apply. Engine feedback is in ENGINE-EVALUATION.md.

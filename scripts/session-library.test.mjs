@@ -23,7 +23,10 @@ test('every session game is catalogued for 1–4 players and tagged with how it 
     assert.ok(entry, `${game.slug} has a data/overrides.json entry`);
     assert.equal(entry.players, '1–4', `${game.slug} seats "1–4"`);
     const tags = (entry.tags || []).filter((tag) => MODE_TAGS.includes(tag));
-    assert.ok(tags.includes(game.sessionMode), `${game.slug} is tagged ${game.sessionMode}, its session mode`);
+    // Protocol v1 names the simulation contract. Wall tags name how friends play.
+    const mode = sessionOf(game).mode;
+    const expected = mode === 'ghost' ? ['race'] : mode === 'shared-world' ? ['versus', 'co-op'] : [game.sessionMode];
+    assert.ok(tags.some(tag => expected.includes(tag)), `${game.slug} has a play tag for ${mode}`);
   }
 });
 

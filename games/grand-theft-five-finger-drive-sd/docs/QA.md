@@ -94,3 +94,39 @@ No runtime service, paid asset, account, key, server or physical controller is r
 The initial long run reached a legal watchdog restart at delivery in seed 552. Mara had reached Broadcast Pier while two following companions remained in combat roughly 700 units away. Their combat branch had suppressed movement indefinitely. The fix combines legal navigation and fire for distant followers and recognizes crew approach as useful watchdog progress. The reproduced seed now succeeds in isolated Node, native Node and rendered Chrome. The earlier failure report is preserved; it is not counted as a passing endurance run.
 
 Watch Demo now consumes the selection event and waits for its release, preventing the title's own confirm from immediately cancelling the requested demo. Three input-family regression cases cover that handoff.
+
+## Multiplayer and portable export — 2026-11-04
+
+These are new checks for version 1.1.0. The earlier results above remain historical.
+
+| Check | Verified result |
+| --- | --- |
+| Game tests: `node --test tests/*.test.mjs` | 66 passed, 0 failed. Includes 52 original contracts, 13 multiplayer contracts and 1 bundle test. |
+| Full hub mission | The test supplied normal director actions to a live hub session. All 12 objectives and all three views completed. One timed result; no persistent save writes or engine errors. |
+| Mission regression: `node tests/mission.mjs 4` | Five wins: seeds 700–703 and 552, with both approaches and both escape routes. No engine errors. |
+| Expansion: `node tests/expansion.mjs` | Spare Key with compact and a newly registered content-only job with van both completed after checkpoint restore. |
+| Content validation | Two missions, six vehicles, three weapons; valid spawns and targets. |
+| Repository: `node --test --test-concurrency=2 "scripts/**/*.test.mjs"` | 382 passed, 0 failed. The earlier fully parallel run lost one catalogue-test worker; the complete two-worker rerun passed. |
+| Engine integrity | SHA-256 remains `e90bb09b103394e65c7e141c6432b62aef9426540facf661adf1b351c020a588`. No engine file changed. |
+| Export | 888,016 bytes; 15 executable inline scripts, including one unmodified hub client. The bundle boots in an isolated VM. No external runtime script, style or icon remains. |
+
+The official hub browser harness passed these cases. Each case completed with all 15 conformance checks passing:
+
+| Runtime | Players | Network and departure |
+| --- | --- | --- |
+| Source project | 2 | Default latency and jitter |
+| Source project | 4 | 150 ms latency, 50 ms jitter, 5% loss; a peer leaves |
+| Source project | 3 | 150 ms latency, 50 ms jitter, 5% loss; the host leaves |
+| Export | 1 | Default latency and jitter |
+| Export | 3 | Default latency and jitter; a peer leaves |
+| Final export | 4 | 150 ms latency, 50 ms jitter, 5% loss; the host leaves |
+
+In the final exported file, the browser also checked Play → Local race → two players → start/end turn one → player-two handoff → start/end turn two → results → Escape to title. Keyboard confirm, pause and back worked. The idle title entered a visible LIVE DEMO, and an unmapped F9 input returned to the title. No game error was observed. Browser-extension metadata errors were outside the game.
+
+The export test found and fixed a JavaScript replacement-string issue before delivery. The bundler now uses callback replacements so engine text containing dollar-sign replacement patterns remains intact. Local race Back/Close handling and old-checkpoint compatibility have regression tests.
+
+Export filename: `Grand-Theft-Five-Finger-Drive-SD-Grand-Theft-Auto-V-gpt-6-astra-unknown-20261104-190414.html`.
+
+Export SHA-256: `e4bd1c067b15c91af31f48402522d10cd8a3e41e39da22e869619e9d62e3faf0`.
+
+Remaining checks: a physical DualSense; multiplayer across separate real devices; the earlier normal-rate play, audio and reference-device performance checks. The cloud browser's URL policy blocks `file://`, so direct file opening could not be tested there. The same self-contained bytes passed browser tests over HTTP and executed without external assets in the isolated bundle test. No Vercel deployment was requested or made; the repository keeps Git deployments disabled.
