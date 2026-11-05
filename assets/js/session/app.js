@@ -5,9 +5,10 @@
  * Every tab is one seat. The seated tab with the lowest seat is the host: it
  * holds the session's state (round, seed, what has been played, the table),
  * picks the next game, and runs each round's coordinator (lib/hub/round.js).
- * It sends the whole state to the others whenever it changes and every couple
- * of seconds, so a tab that joins late, or takes over when the host leaves,
- * knows everything. A round whose host leaves dies with it and is void.
+ * It sends the whole state to the others whenever it changes and every second,
+ * so a tab that joins late, or takes over when the host leaves, knows
+ * everything. A shared world whose host leaves dies with it and is void; a
+ * parallel or ghost round is scored from what the others played.
  *
  * Three transports with one shape: across devices (session/net.js: Supabase
  * Realtime for presence and control, a WebRTC mesh for game traffic, rounds
@@ -1007,9 +1008,9 @@ function cardPicker() {
 }
 
 /**
- * Which games the deal draws from: the host narrows it in the lobby, between
- * rounds too, and everyone else sees what was chosen. A group with nothing
- * chosen keeps every game.
+ * Which games the deal draws from: the host narrows it in the lobby (before the
+ * first round, or after going back to it), and everyone else sees what was
+ * chosen. A group with nothing chosen keeps every game.
  */
 function filterPicker(n) {
   const filters = state?.filters ?? {};

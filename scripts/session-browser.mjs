@@ -53,7 +53,7 @@ const browser = await chromium.launch({
   args: ['--no-sandbox', '--disable-features=WebRtcHideLocalIpsWithMdns'],
 });
 const context = await browser.newContext({ viewport: { width: 1000, height: 700 }, reducedMotion: 'reduce' });
-// Only the two reference games.
+// No library: only the reference games are dealt.
 await context.route('**/data/games.json', (route) => route.fulfill({ json: { games: [] } }));
 // A standard gamepad each page can press (window.__pad), connected on its first press.
 await context.addInitScript(() => {

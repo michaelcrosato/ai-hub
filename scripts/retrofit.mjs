@@ -386,7 +386,7 @@ const scored = (text) => /\bscore\b|\blives\b|game ?over|gameOver|you win|victor
 async function pick() {
   const overrides = JSON.parse(await readFile(OVERRIDES, 'utf8'));
   const note = (g) => String(overrides[g.slug]?.sessionNote || '');
-  const games = (await catalogue()).map(normalize).filter((g) => (g.type ?? 'Game') === 'Game' && !overrides[g.slug]?.hidden && !overrides[g.slug]?.restricted);
+  const games = (await catalogue()).map(normalize).filter((g) => (g.type ?? 'Game') === 'Game' && !overrides[g.slug]?.restricted);
   // Titles first, as the deal counts them (lineageKey): a title with a build in sessions is
   // done, and one found unfit (no score, no finish) stays so, whichever build was tried.
   const lineages = new Map();
