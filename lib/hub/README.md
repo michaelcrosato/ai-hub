@@ -49,9 +49,9 @@ Games tagged with the older modes keep working: `race` is played as ghost,
 ## A round
 
 1. The hub loads the game on every player's device, and the players get 10
-   to 30 seconds with the game's card: what the game is, how to win, the
-   controls. The card is the hub's, from the game's tags, or the game's own
-   (*The card*).
+   to 30 seconds with the game's card, longer if one asks for more time: what
+   the game is, how to win, the controls. The card is the hub's, from the
+   game's tags, or the game's own (*The card*).
 2. The game connects and calls `ready()`.
 3. The round starts on the hub's clock, on every device at once.
 4. The game reports how it goes.
@@ -134,8 +134,10 @@ follow the seat: `#e8443a`, `#3b82f6`, `#22c55e`, `#f5b700`.
 ### The card
 
 Before every round the players get 10 to 30 seconds to learn what comes
-next and say when they are ready. By default the hub shows its own card over
-the game. A game can make the card its own, as part of the game:
+next and say when they are ready. A player can ask for more time, which adds
+ten seconds; while more than half of them are asking, the countdown holds.
+By default the hub shows its own card over the game. A game can make the
+card its own, as part of the game:
 
 ```js
 AIHub.connect({ mode, seats, card: true });

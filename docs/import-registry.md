@@ -67,19 +67,18 @@ content comparison; explicitly distinct identities are kept even with identical
 bytes. Registry data is only rewritten when records change. There is no persistent
 mtime-based cache. Changing transformations requires a pipeline-version migration.
 
-The committed seed contains 203 audit-backed source/destination records from
-`docs/imports/2026-10-13-remainder-audit.json`, verified against installed entry
-hashes. These are records, not 203 additional games. Raw hashes are explicitly
-marked as audited source-artifact hashes, not reconstructed raw bundle hashes.
-Unsupported game identity or revision lineage is left unset. Audit reasons,
-replacement references, and evidence remain available; project IDs are hints,
-not inferred identity. `node scripts/seed-import-registry.mjs --dry-run` regenerates
-the seed plan only in an uninitialized checkout; it refuses to overwrite a registry.
+The registry was seeded on 2026-10-13 with audit-backed source/destination
+records from that day's import, verified against the installed entry hashes;
+202 of them remain. They cite `docs/imports/2026-10-13-remainder-audit.json`,
+which was removed on 2026-11-05 and is in git history. These are records, not
+additional games. Their raw hashes are marked as audited source-artifact hashes,
+not reconstructed raw bundle hashes, and game identity or revision lineage the
+audit could not support is left unset. Project IDs are hints, not identity.
 
 Limits: 10,000 files and 95 MiB per project/archive (including expanded ZIP size).
 Malformed/oversized input and recognizable save/database files are reported;
-healthy sibling inputs continue. Opaque leftover archives are no longer copied
-into `sources/`. Inspect exports and supply runtime-only content: filename
+healthy sibling inputs continue. Opaque leftover archives are never copied into
+the repository; they stay where they were. Inspect exports and supply runtime-only content: filename
 checks cannot establish that arbitrary JSON contains no private data.
 No source deletion, network publication, game execution, screenshot admission
 check, or numerical token-savings claim is part of this phase.
