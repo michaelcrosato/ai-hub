@@ -16,7 +16,8 @@
   it (locally and on GitHub) in the same session. Never leave a local
   branch, an unpushed commit, a stash, or an open PR behind.
 - Before starting work, run `git fetch --prune` and look at
-  `gh pr list`. Anything open gets resolved first.
+  `gh pr list`. Anything open gets resolved first, and so does
+  `HANDOFF.md` when there is one: it lists steps left for later.
 
 ## Pull requests from others
 

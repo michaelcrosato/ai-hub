@@ -24,11 +24,10 @@ const WRANGLER = 'wrangler@4.151.2';
 const OUT = path.join(ROOT, '.cache/release/site');
 // Cloudflare's per-deploy file limits: Workers Free, Workers Paid.
 const LIMITS = [[20_000, 'Workers Free'], [100_000, 'Workers Paid']];
-// Top-level entries that are the repo's, not the site's.
-const PRIVATE = new Set([
-  'cloudflare', 'docs', 'node_modules', 'scripts', 'supabase',
-  'CLAUDE.md', 'README.md', 'package.json', 'pnpm-workspace.yaml',
-]);
+// Top-level entries that are the repo's, not the site's, and so is any
+// top-level Markdown file (README.md, CLAUDE.md, a handoff note).
+const PRIVATE = new Set(['cloudflare', 'docs', 'node_modules', 'scripts', 'supabase', 'package.json', 'pnpm-workspace.yaml']);
+const isPrivate = (name) => PRIVATE.has(name) || /\.md$/i.test(name);
 const TEXT = /\.(html?|m?js|css|json)$/i;
 
 const argv = process.argv.slice(2);
@@ -39,7 +38,7 @@ function walk(rel, out = []) {
   for (const entry of readdirSync(path.join(ROOT, rel), { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
     const child = rel ? `${rel}/${entry.name}` : entry.name;
-    if (!rel && PRIVATE.has(child)) continue;
+    if (!rel && isPrivate(child)) continue;
     if (entry.isDirectory()) walk(child, out);
     else if (entry.isFile()) out.push(child);
   }
