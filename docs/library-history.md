@@ -29,11 +29,11 @@ catalogue.
 | 2026-10-15 | A Google Drive folder of 39 pages by Grok 4.7 Build | 37 | 672 | Bean Napped and Cloverhollow updated in place. Astral Crest's boot repaired. Five games still carry `Needs WebGPU review` and Meridian — Semantic World Compiler `Needs visual review`. |
 | 2026-10-15 | The desktop folder `New AI Stuff`, second pass | 18 | 690 | Three more files were already on the wall. |
 | 2026-10-16 | Added by hand | 11 | 701 | Ten games in one change (Dented Destiny to FROSTLINE) and the Grand Theft Five-Finger Drive vertical slice. |
-| 2026-10-19 | Root HTML pages of `cc-hub`, `gemini-hub`, `gpt-hub`, `grok-hub` and `muse-hub` | 172 | 873 | 170 games and 2 tools, the first entries with title-first filenames. Four same-title variants went to the Unsure shelf. IgniteBike 64, Myth of Zela and WreckWarrior 3050 threw errors during the screenshot pass. |
-| 2026-10-21 | gpt-matrix: one Star Fox 64 prompt, GPT-6.1 Sol and GPT-6 Astra at six effort levels | 639 | 1,512 | 669 runs; 30 left no page. 34 went to the Unsure shelf. StarHop 64 and MeteorFox 64 stop at load (no `THREE` global) and came in unmodified. |
+| 2026-10-19 | Root HTML pages of `cc-hub`, `gemini-hub`, `gpt-hub`, `grok-hub` and `muse-hub` | 172 | 873 | 170 games and 2 tools, the first entries with title-first filenames. Four same-title variants went to the Unsure shelf. IgniteBike 64, Myth of Zela and WreckWarrior 3050 threw errors during the screenshot pass; all three were repaired on 2026-11-05. |
+| 2026-10-21 | gpt-matrix: one Star Fox 64 prompt, GPT-6.1 Sol and GPT-6 Astra at six effort levels | 639 | 1,512 | 669 runs; 30 left no page. 34 went to the Unsure shelf. StarHop 64 and MeteorFox 64 stopped at load (no `THREE` global) and came in unmodified; both were repaired on 2026-11-05, with eleven more from this batch. |
 | 2026-10-22 | `cc-hub` and `gpt-hub` pages not yet on the wall | 80 | 1,592 | 126 candidates: 45 were already on the wall and one was a copy from a build folder. |
 | 2026-10-27 | gpt-matrix runs of 24–27 Oct, about 40 classics | 239 | 1,831 | 259 runs; 20 left no page. 22 went to the Unsure shelf. |
-| 2026-10-29 | cc-matrix: a GPT-6 matrix (3 models, 3 efforts, 10 sources) and earlier Star Fox 64 and Mario Kart 64 runs | 103 | 1,934 | 102 of 115 runs; 13 failed or delivered nothing. Wands of Lore was added by hand that morning. BumbleBlock Cabaret throws on Play. |
+| 2026-10-29 | cc-matrix: a GPT-6 matrix (3 models, 3 efforts, 10 sources) and earlier Star Fox 64 and Mario Kart 64 runs | 103 | 1,934 | 102 of 115 runs; 13 failed or delivered nothing. Wands of Lore was added by hand that morning. BumbleBlock Cabaret threw on Play until 2026-11-05. |
 | 2026-10-30 | cc-matrix: 20 sources (Alien Soldier to Waku Waku 7) across Claude, Gemini, GPT and Muse models, and 11 Rocket League runs | 226 | 2,160 | 316 runs; 90 skipped: failed builds, 26 already on the wall, and Talons & Seeds Primeval, which never starts. Strange Soldier and Amber Wrath hit a WebGPU error in their attract demo. |
 | 2026-11-01 | cc-matrix: Cyberpunk 2077 and Zelda: Breath of the Wild riffs on the my-3D2dge engine | 6 | 2,166 | 406 of 412 runs were already on the wall or decided. Moth of the Wild throws after about 50 s. Cybershrunk 2077 loads Rapier from jsDelivr. |
 | 2026-11-02 | cc-matrix: riffs on 14 books, films and TV shows (Moby-Dick to The Office) | 24 | 2,190 | 12 interrupted runs left out. The importer's three.js shelf scopes were fixed in the same change. |
@@ -56,6 +56,30 @@ catalogue.
   City After Dark, Golden Hour Courtyard, KEYFORGE typing tutor, Police Quest
   City Beat 96, Mega Man II Titanium Circuit and the old TIDELINE surface
   build. So was `sources/`, which held zipped projects that never ran here.
+  A browser pass over every game, and a parse of every inline script, found
+  eighteen that never started, all broken since they were imported; each got
+  the smallest repair that restores what its author wrote:
+  - Seven Star Fox 64 runs that inline the my-3D2dge engine (Nova Foxfire,
+    Nova Paws, Nova Vixen, Solar Vixen, Star Ruff 64, StarScamper, Stellar
+    Vixen): the engine's own header shows `<script src=…></script>`, which
+    ended the inline script early. Escaped as `<\/script>`; in Nova Paws and
+    StarScamper the game's code had also been pasted twice into the engine,
+    which got its clean copy back.
+  - Starlit Fox 64: a licence block had been inserted inside that same header;
+    it moved to the end of the page.
+  - MeteorFox 64 (the `!` in front of three.js r160's wrapper was lost),
+    Comet Kitsune (two apostrophes in single-quoted dialogue), Moonfox 64 (a
+    function missing its closing brace) and StarHop 64 (a damaged copy of
+    three.js r180, replaced by the shelf's).
+  - Ripshift and Starlance imported a WebGPU renderer path three.js r180 does
+    not have (now `three/webgpu`); Ripshift's menus then read a field its input
+    never returns, and Starlance hung its asteroid outlines on a missing
+    parent.
+  - IgniteBike 64 used `div` without importing it; Myth of Zela and
+    WreckWarrior 3050 loaded `three.min.js` builds that were never published
+    (now r160's, from the shelf); BumbleBlock Cabaret called a Rapier method
+    on a body description that only a body has.
+  The six whose screenshot strips showed only their menus got new strips.
 
 ## How games were told apart
 
