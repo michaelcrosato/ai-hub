@@ -202,9 +202,9 @@ genre, shelf (`Game`, `Tech demo` or `Tool`) and any claimed source against
 the game actually running. Capture a real screenshot strip at
 `covers/<slug>/0.jpg`, `1.jpg` and `2.jpg` (`pnpm shots` makes candidates): a
 title or opening view, then two useful game or tool views, each 640×480 JPEG at
-quality 58. Loading, blank and error screens do not count. Leave details you are unsure of unset; when a
-package does not say which version made it, Gemini means Gemini 4 Argon and
-Muse means Muse Wonder 1.
+quality 58. Loading, blank and error screens do not count. Leave details you
+are unsure of unset; when a package does not say which version made it,
+Gemini means Gemini 4 Argon and Muse means Muse Wonder 1.
 
 Only when it is unclear whether an import is a game at all, or which game it
 is, set `"unsure": true` and a `reviewNote` in its `data/overrides.json` entry.
@@ -257,9 +257,11 @@ project folders whose extra pages might really be separate games.
 page, the way a browser splits it, in about twenty seconds: a page that fails
 it never starts (a library pasted inline whose comments show `</script>`, an
 apostrophe in single-quoted text, a missing brace). Give it file names to
-check just those. The browser checks need Playwright, which the hub does not install: add it for the
-session (`pnpm add -D playwright && pnpm exec playwright install chromium`)
-and leave `package.json` as it was.
+check just those.
+
+The browser checks need Playwright, which the hub does not install: add it
+for the session (`pnpm add -D playwright && pnpm exec playwright install
+chromium`) and leave `package.json` as it was.
 
 ```bash
 node scripts/explore-browser.mjs              # Atlas, Timeline and Deck, on pnpm dev or a site URL
