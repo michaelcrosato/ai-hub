@@ -27,7 +27,8 @@
  *        --agent "claude -p --model claude-haiku-5-5 --max-turns 30 --permission-mode acceptEdits --output-format json"
  *   3. The static check, a diff budget, then hub-check --retrofit against the
  *      original. Each tier gets two tries, the second told what the first's
- *      checks found; past --max-cost dollars for one game it stops.
+ *      checks found, except that a first tier whose try changed nothing hands
+ *      over to the next at once; past --max-cost dollars for one game it stops.
  *   4. A game that passes keeps its changes, for review. Every other game is
  *      put back exactly as it was, so it never declares a session it cannot
  *      play, and gets a sessionNote in data/overrides.json saying why (unfit,
@@ -347,6 +348,8 @@ async function retrofitOne(arg, agents, prompt) {
         }
         lastFailed = checked.failed;
         notes = checked.failed.slice(0, 12).map((f) => `- ${f}`).join('\n');
+        // The cheapest agent, having changed nothing, would change nothing again: the next tier takes over.
+        if (!changed && tier === 0 && agents.length > 1) break;
       }
     }
     // An agent that never ran (not installed, signed out, rate-limited) says nothing about the game: no note.

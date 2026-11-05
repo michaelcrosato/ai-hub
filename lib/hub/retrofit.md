@@ -44,9 +44,12 @@ Do only this:
    `AIHub.progress({ score: <number>, label: <short text> })`, where a higher
    score is further ahead and `label` is short text for the scoreboard.
 5. When the run ends (finished, died, out of lives), call
-   `AIHub.result({ time })` or `AIHub.result({ score })` once. In
-   `AIHub.on('time-up', …)`, report the current score at once if the run is
-   still going.
+   `AIHub.result({ time, stats })` or `AIHub.result({ score, stats })` once.
+   `stats` holds up to six numbers the game already keeps that say how the
+   run went, each under a name of at most 16 characters, for example
+   `{ Coins: 42, 'Best combo': 7 }`; add no counting for it, and leave it out
+   if the game keeps none. In `AIHub.on('time-up', …)`, report the current
+   score and stats at once if the run is still going.
 6. In `AIHub.on('end', …)`, stop input and sound.
 7. If the game deals its pieces, cards, board or level layout from one
    function using `Math.random`, make that function draw from

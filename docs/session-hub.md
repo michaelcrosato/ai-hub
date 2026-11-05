@@ -316,16 +316,18 @@ runs on the owner's machine with any agent CLI and Playwright (commands in
    script, after `<meta charset>` when it comes first (the charset must sit in
    the first 1,024 bytes; the client is about 17 KB).
 4. **Model**: the prompt in [`lib/hub/retrofit.md`](../lib/hub/retrofit.md),
-   which quotes the protocol from *Modes* to *Rules*, wires the score, the end
-   and the session calls in a copy of the game outside the repository. A game
-   with no score and no finish is declared unfit.
+   which quotes the protocol from *Modes* to *Rules*, wires the score, the end,
+   up to six stats the game already keeps and the session calls in a copy of
+   the game outside the repository. A game with no score and no finish is
+   declared unfit.
 5. **Check**: the static check (`check`), at most 150 changed lines, then
    `hub-check --retrofit` against the original.
 6. **Retry and escalate**: a second try told what failed, then the next agent,
-   until `--max-cost` dollars (default 1). A pass keeps its changes for review;
-   any other game is put back byte for byte, with a `sessionNote` in
-   `data/overrides.json` that later runs skip unless `--again`. Each try is a
-   line in `.cache/retrofit.jsonl`.
+   until `--max-cost` dollars (default 1). When the cheapest agent's try
+   changed nothing, the next agent takes over at once. A pass keeps its
+   changes for review; any other game is put back byte for byte, with a
+   `sessionNote` in `data/overrides.json` that later runs skip unless
+   `--again`. Each try is a line in `.cache/retrofit.jsonl`.
 
 **What it costs.** The pilot (every seventh game of `pick --wave 1`; Claude
 Haiku 5.5, then Sonnet 5.5; `--max-cost 1`) passed 26 of 32 games, 24 of them
@@ -437,10 +439,10 @@ in by batches of about fifty.
   waits. No game changes; it comes before the rest of wave 1 is dealt.
 - **Hub awards for parallel rounds** (a personal best, the most attempts, a
   win on the first try), so no retrofit has to make any.
-- **The rest of wave 1**, in batches of about fifty, after two fixes from the
-  pilot: end a game's cheapest tier when its agent exits having changed
-  nothing, and have the prompt ask for up to six stats (the pilot's games
-  report none, so their rounds have no highlights).
+- **The rest of wave 1**, in batches of about fifty. The pilot's two fixes are
+  in: the cheapest tier hands over when its agent changed nothing, and the
+  prompt asks for up to six stats (the pilot's games report none, so their
+  rounds have no highlights).
 
 ### Later
 
