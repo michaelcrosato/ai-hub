@@ -120,13 +120,6 @@ export async function savedNickname() {
   return rows[0]?.nickname ?? null;
 }
 
-export async function saveNickname(nickname) {
-  const user = await currentUser();
-  if (!user) return false;
-  const saved = await attempt((sb) => sb.from('profiles').upsert({ user_id: user.id, nickname }).select('nickname'), null);
-  return Boolean(saved);
-}
-
 /**
  * Delete the account and everything stored with it. The database asks for a
  * sign-in in the last ten minutes; when that is missing, sign in again and
