@@ -9,6 +9,7 @@
  * APPNOTE.TXT is the reference: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
  */
 
+import { constants as bufferConstants } from 'node:buffer';
 import { inflateRawSync } from 'node:zlib';
 import * as zlib from 'node:zlib';
 
@@ -27,6 +28,20 @@ const u64 = (buf, at) => {
   if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('zip entry too large');
   return Number(value);
 };
+
+/**
+ * Inflate no further than the size the entry declares. A zip bomb declares a
+ * small size and expands without end, and the importer limits only the sizes
+ * entries declare (MAX_BYTES in ingest.mjs).
+ */
+function inflate(name, raw, size) {
+  try {
+    return inflateRawSync(raw, { maxOutputLength: Math.min(Math.max(1, size), bufferConstants.MAX_LENGTH) });
+  } catch (error) {
+    if (error.code === 'ERR_BUFFER_TOO_LARGE') throw new Error(`${name}: expands past its declared size`);
+    throw error;
+  }
+}
 
 function findEndOfCentralDirectory(buf) {
   const stop = Math.max(0, buf.length - 22 - MAX_COMMENT);
@@ -141,7 +156,7 @@ export function openZip(buf) {
 
     let data;
     if (method === 0) data = raw;
-    else if (method === 8) data = inflateRawSync(raw);
+    else if (method === 8) data = inflate(entry.name, raw, entry.size);
     else throw new Error(`${entry.name}: compression method ${method} is not supported`);
 
     if (data.length !== entry.size) throw new Error(`${entry.name}: size mismatch`);

@@ -10,9 +10,10 @@ function makeZip(files, { comment = '' } = {}) {
   const locals = [];
   const centrals = [];
   let offset = 0;
-  for (const { name, data, deflate = true } of files) {
+  for (const { name, data, deflate = true, declare } of files) {
     const raw = Buffer.from(data);
     const body = deflate ? deflateRawSync(raw) : raw;
+    const size = declare ?? raw.length;
     const nameBuf = Buffer.from(name, 'utf8');
     const crc = typeof zlib.crc32 === 'function' ? zlib.crc32(raw) >>> 0 : 0;
 
@@ -25,7 +26,7 @@ function makeZip(files, { comment = '' } = {}) {
     local.writeUInt16LE((2024 - 1980) << 9 | 5 << 5 | 17, 12);
     local.writeUInt32LE(crc, 14);
     local.writeUInt32LE(body.length, 18);
-    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt32LE(size, 22);
     local.writeUInt16LE(nameBuf.length, 26);
     locals.push(local, nameBuf, body);
 
@@ -39,7 +40,7 @@ function makeZip(files, { comment = '' } = {}) {
     central.writeUInt16LE((2024 - 1980) << 9 | 5 << 5 | 17, 14);
     central.writeUInt32LE(crc, 16);
     central.writeUInt32LE(body.length, 20);
-    central.writeUInt32LE(raw.length, 24);
+    central.writeUInt32LE(size, 24);
     central.writeUInt16LE(nameBuf.length, 28);
     central.writeUInt32LE(offset, 42);
     centrals.push(central, nameBuf);
@@ -87,6 +88,17 @@ test('a corrupted entry is refused rather than half-read', () => {
   buf[30 + 'a.html'.length] ^= 0xff; // flip a byte of the stored body
   const zip = openZip(buf);
   if (typeof zlib.crc32 === 'function') assert.throws(() => zip.read(zip.entries[0]), /checksum/);
+});
+
+test('an entry that expands past its declared size is refused before it is all inflated', () => {
+  // 64 MiB of zeros deflate to about 64 KiB; the entry claims 100 bytes.
+  const zip = openZip(makeZip([{ name: 'bomb.html', data: Buffer.alloc(64 * 1024 * 1024), declare: 100 }]));
+  assert.equal(zip.entries[0].size, 100);
+  assert.throws(() => zip.read(zip.entries[0]), /bomb\.html: expands past its declared size/);
+  // An honest entry of exactly its declared size still reads, an empty one too.
+  const ok = openZip(makeZip([{ name: 'a.txt', data: 'x'.repeat(4096) }, { name: 'empty.txt', data: '' }]));
+  assert.equal(ok.read(ok.entries[0]).length, 4096);
+  assert.equal(ok.read(ok.entries[1]).length, 0);
 });
 
 test('not a zip is a clear error', () => {
