@@ -35,9 +35,14 @@ address; nothing is broken in the meantime.
 
 The Vercel project `crosato-arcade` is paused, and on 2026-11-05 it was
 disconnected from this repository, so no push builds there, and nothing in
-the repository refers to Vercel any more. Deleting the project in the Vercel
-dashboard retires `crosato-arcade.vercel.app` and `ai-hub-five-mu.vercel.app`
-for good.
+the repository refers to Vercel any more (the repository's website link now
+points at the Cloudflare site). Deleting the project in the Vercel dashboard
+retires `crosato-arcade.vercel.app` and `ai-hub-five-mu.vercel.app` for good.
+
+GitHub still shows Vercel's two deployment environments, Production and
+Preview, with their old deployments, on the repository page. Delete them under
+the repository's Settings → Environments if you want them gone; they are
+history, so they were left for you.
 
 ## Left as they are, for you to decide
 
