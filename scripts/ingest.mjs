@@ -22,7 +22,7 @@
  *   --dry-run         show what would happen, write nothing
  */
 
-import { readdir, stat, lstat, readlink, readFile, writeFile, mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
+import { readdir, stat, lstat, readlink, readFile, writeFile, mkdir, mkdtemp, rm, rmdir, utimes } from 'node:fs/promises';
 import { readFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -232,6 +232,15 @@ async function put(rel, data, modified) {
   if (modified) await utimes(abs, modified, modified).catch(() => {});
 }
 
+/** Take back what a project that failed halfway wrote: its files, then each of its folders left empty. */
+async function takeBack(dir, rels) {
+  if (opts.dryRun) return;
+  await Promise.all(rels.map((rel) => rm(path.join(GAMES_DIR, rel), { force: true }).catch(() => {})));
+  const folders = new Set([dir]);
+  for (const rel of rels) for (let d = path.posix.dirname(rel); d.startsWith(`${dir}/`); d = path.posix.dirname(d)) folders.add(d);
+  for (const d of [...folders].sort((a, b) => b.length - a.length)) await rmdir(path.join(GAMES_DIR, d)).catch(() => {});
+}
+
 const titleOf = (buf) => parseHead(buf.subarray(0, 256 * 1024).toString('utf8')).title;
 
 /* --- what is already on the wall ----------------------------------------- */
@@ -426,15 +435,24 @@ async function performProject({ name, files, from, subdir, entry = null }) {
 
   let bytes = 0;
   const leftovers = [];
-  for (const f of files) {
-    const data = pages.get(f.rel) ?? (await f.read());
-    bytes += data.length;
-    const rel = target(f.rel);
-    // Bundles that build URLs at runtime cannot be fixed by rewriting a page.
-    if (/\.(m?js|css)$/i.test(rel) && /["'`(]\/(assets|static|build|_app)\//.test(data.toString('latin1'))) {
-      leftovers.push(rel);
+  // A project lands whole or not at all: a write that fails (a name the disk
+  // refuses, a full disk) takes back the ones before it.
+  const tried = [];
+  try {
+    for (const f of files) {
+      const data = pages.get(f.rel) ?? (await f.read());
+      bytes += data.length;
+      const rel = target(f.rel);
+      // Bundles that build URLs at runtime cannot be fixed by rewriting a page.
+      if (/\.(m?js|css)$/i.test(rel) && /["'`(]\/(assets|static|build|_app)\//.test(data.toString('latin1'))) {
+        leftovers.push(rel);
+      }
+      tried.push(posix(dir, rel));
+      await put(posix(dir, rel), data, f.modified);
     }
-    await put(posix(dir, rel), data, f.modified);
+  } catch (error) {
+    await takeBack(dir, tried);
+    throw error;
   }
   const entryModified = prepared.candidate.provenance.sourceDate ? new Date(prepared.candidate.provenance.sourceDate) : files.find((f) => f.rel === entryKey)?.modified;
   remember(prepared, dir, `${dir}/index.html`);

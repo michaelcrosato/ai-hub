@@ -162,7 +162,9 @@ What it does, so you do not have to:
   `dist/`/`build/` folder next to its source) is unpacked into a project
   folder. A zip of several single-file games becomes a collection. A package
   that is only source (a `package.json`, an `index.html` pointing at
-  `/src/main.ts`) is reported as needing a build, not half-imported.
+  `/src/main.ts`) is reported as needing a build, not half-imported. A
+  project that fails partway through being written (a name the disk refuses,
+  a full disk) is taken back and reported as failed.
 - **Root paths.** Bundlers write `src="/assets/index-3f2a.js"`, which inside the
   hub would point at the hub, not the game. Unpacked pages get those rewritten
   to relative paths. Anything it cannot fix (a bundle that builds URLs at

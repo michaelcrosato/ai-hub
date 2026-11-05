@@ -192,6 +192,17 @@ test('multiple projects inside one ZIP have independent metadata and decisions',
   assert.equal(run('input/games.zip', '--metadata', 'meta.json').counts.unchanged, 2);
 });
 
+test('a project that fails halfway is taken back whole', async t => {
+  const { root, run } = await fixture(t);
+  // index.html is written, then the disk refuses a name past 255 bytes.
+  await writeFile(path.join(root, 'input/broken.zip'), projectZip({ 'index.html': html, [`assets/${'a'.repeat(300)}.js`]: 'let a=1' }));
+  await writeFile(path.join(root, 'input/good.html'), html + '<!-- good -->');
+  const result = run('input/broken.zip', 'input/good.html');
+  assert.equal(result.counts.failed, 1);
+  assert.equal(result.counts.pages, 1);
+  assert.deepEqual(await readdir(path.join(root, 'games')), ['good.html']);
+});
+
 test('explicit identity never collapses into an anonymous seeded exact match', async t => {
   const { root, run } = await fixture(t);
   await writeFile(path.join(root, 'input/anonymous.html'), html);
