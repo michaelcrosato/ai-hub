@@ -3,7 +3,8 @@
 -- schema `private`; the last checks fail until it is applied; 0009 decides in
 -- every policy what a guest may read, and 0010 keeps those reads fast; two of
 -- the three checks for 0009 fail without it; 0011 lets a seated player claim
--- the host, and two of its four checks fail without it).
+-- the host, and two of its four checks fail without it; 0012 gives the relay
+-- only to live seats, and without it the run stops at its first check).
 --
 -- Run in the Supabase SQL editor (or execute_sql). It makes throwaway users,
 -- acts as each one the way the hub's pages would, checks every rule, and then
@@ -127,6 +128,8 @@ begin
   else failed := failed + 1; report := report || E'\nFAIL: an outsider may use the session''s Realtime channel'; end if;
   if not public.may_use_session_topic('session:not-a-uuid') then passed := passed + 1;
   else failed := failed + 1; report := report || E'\nFAIL: a malformed topic was allowed'; end if;
+  if not public.has_live_seat() then passed := passed + 1;
+  else failed := failed + 1; report := report || E'\nFAIL: an outsider gets the relay (0012)'; end if;
   begin
     perform public.record_round(sid, 1, 'snake', 'race', 'played', 'finished', null, '[]'::jsonb);
     failed := failed + 1; report := report || E'\nFAIL: an outsider could record a round';
@@ -140,6 +143,8 @@ begin
   if n = 3 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: a member sees ' || n || ' seats, not 3'; end if;
   if public.may_use_session_topic('session:' || sid) then passed := passed + 1;
   else failed := failed + 1; report := report || E'\nFAIL: a member may not use the session''s Realtime channel'; end if;
+  if public.has_live_seat() then passed := passed + 1;
+  else failed := failed + 1; report := report || E'\nFAIL: a seated player does not get the relay (0012)'; end if;
 
   -- ---- removing a player ------------------------------------------------------
   begin
@@ -157,6 +162,8 @@ begin
   end;
   if not public.may_use_session_topic('session:' || sid) then passed := passed + 1;
   else failed := failed + 1; report := report || E'\nFAIL: a removed player may still use the Realtime channel'; end if;
+  if not public.has_live_seat() then passed := passed + 1;
+  else failed := failed + 1; report := report || E'\nFAIL: a removed player still gets the relay (0012)'; end if;
 
   -- ---- four seats and no more ---------------------------------------------------
   perform set_config('request.jwt.claims', json_build_object('sub', other, 'role', 'authenticated', 'is_anonymous', false)::text, true);
@@ -228,6 +235,8 @@ begin
   perform public.end_session(sid);
   select count(*) into n from public.game_sessions where id = sid and status = 'ended';
   if n = 1 then passed := passed + 1; else failed := failed + 1; report := report || E'\nFAIL: the host could not end the session'; end if;
+  if not public.has_live_seat() then passed := passed + 1;
+  else failed := failed + 1; report := report || E'\nFAIL: a seat in an ended session still gets the relay (0012)'; end if;
 
   -- ---- what a guest may read (0009) -----------------------------------------
   perform set_config('request.jwt.claims', json_build_object('sub', other, 'role', 'authenticated', 'is_anonymous', false)::text, true);

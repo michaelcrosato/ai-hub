@@ -286,9 +286,11 @@ browser (`?transport=local`) the same envelopes go over a BroadcastChannel
   after 12 seconds, is retried up to three times through the TURN relay only.
   A pair that never connects trades no game traffic; the round goes on.
 - **TURN**: Cloudflare's relay, for browsers that can't connect directly. The
-  `turn` Edge Function hands out four-hour credentials (STUN only, without its
-  secrets). The first 1,000 GB a month are free, shared with Cloudflare's SFU,
-  then $0.05 a GB.
+  `turn` Edge Function hands out four-hour credentials to a caller seated in
+  an open session (`has_live_seat`, migration 0012, asked with the caller's
+  own token); anyone else gets STUN only, as does every caller when the
+  function lacks its secrets. The first 1,000 GB a month are free, shared
+  with Cloudflare's SFU, then $0.05 a GB (only what the relay sends is billed).
 - **The clock** (`clock.js`): each player takes five samples of the host's
   time over the mesh and keeps the offset from the shortest round trip, again
   every 30 seconds. Rounds start and are timed on the host's clock.
@@ -394,10 +396,11 @@ in by batches of about fifty.
   and as the database's host remove the others or end the session. One
   defence is in place: a dealt round names its game by slug, and each seat
   loads that game from its own library, never a path from the network.
-- **TURN credentials for anyone signed in.** The `turn` function serves any
-  caller Supabase lets through, guests included, with no check that the caller
-  sits in a live session and no rate limit; relayed traffic past the free
-  allowance is billed. Next: credentials only for seated players.
+- **TURN credentials for any seated player.** The `turn` function serves only
+  a caller seated in an open session, but with no rate limit, so someone who
+  signs in with Google and hosts a session of their own can still take
+  credentials; relayed traffic past the free allowance is billed. Until
+  2026-11-05 it served anyone, even a call with no sign-in.
 - **The check at the door is by hand.** The protocol says the hub tests every
   game when it joins the library. `ingest.mjs` parses every new page (a page
   whose scripts cannot parse is listed), but it does not run `hub-check`: a

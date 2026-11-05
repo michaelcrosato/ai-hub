@@ -671,10 +671,11 @@ How it's built:
   write goes through a function that checks who is asking.
   `supabase/tests/rls.sql` checks all of it in one self-cleaning run of the
   SQL editor.
-- The `turn` Edge Function (`supabase/functions/turn/`) hands signed-in players
-  short-lived Cloudflare TURN credentials. It answers the live site and local
-  dev only. Supabase is changed from its dashboard: migrations in the SQL
-  editor, the function in the Edge Functions editor.
+- The `turn` Edge Function (`supabase/functions/turn/`) hands players seated
+  in a session short-lived Cloudflare TURN credentials; anyone else gets STUN
+  only. It answers the live site and local dev only. Supabase is changed from
+  its dashboard: migrations in the SQL editor, the function in the Edge
+  Functions editor.
 - The page code is in `assets/js/account/`. It loads the vendored supabase-js
   only for a signed-in device.
 - Google sends you back to `/auth/` on the address you signed in from, which
