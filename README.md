@@ -194,8 +194,9 @@ game.
 
 ### Before publishing an import
 
-Check each game's genre, shelf (`Game`, `Tech demo` or `Tool`) and any claimed
-source against the game actually running. Capture a real screenshot strip at
+Run `node scripts/check-pages.mjs` on the new pages, then check each game's
+genre, shelf (`Game`, `Tech demo` or `Tool`) and any claimed source against
+the game actually running. Capture a real screenshot strip at
 `covers/<slug>/0.jpg`, `1.jpg` and `2.jpg`: a title or opening view, then two
 useful game or tool views, each 640×480 JPEG at quality 58. Loading, blank and
 error screens do not count. Leave details you are unsure of unset; when a
@@ -248,8 +249,12 @@ project folders whose extra pages might really be separate games.
 
 ### Checks
 
-`pnpm test` runs in about half a minute; run it before every commit. The
-browser checks need Playwright, which the hub does not install: add it for the
+`pnpm test` runs in about half a minute; run it before every commit.
+`node scripts/check-pages.mjs` parses the inline JavaScript of every game
+page, the way a browser splits it, in about twenty seconds: a page that fails
+it never starts (a library pasted inline whose comments show `</script>`, an
+apostrophe in single-quoted text, a missing brace). Give it file names to
+check just those. The browser checks need Playwright, which the hub does not install: add it for the
 session (`pnpm add -D playwright && pnpm exec playwright install chromium`)
 and leave `package.json` as it was.
 
@@ -842,6 +847,7 @@ scripts/
   lib/layout.mjs  what a path is: game, build, project, collection
   lib/intake.mjs  what a package holds, and what never to import
   lib/zip.mjs     a small zip reader, so the project stays dependency-free
+  check-pages.mjs every game page's inline JavaScript parses (seconds)
   audit3d.mjs     static rules every 3D game must pass (seconds)
   hub-check.mjs   a game against the session protocol, for its mode; --record keeps the verdict
   hub-client.mjs  every game's pasted session client, upgraded by script
