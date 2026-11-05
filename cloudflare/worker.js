@@ -3,7 +3,7 @@
  * without running this. It runs only for a path with no file behind it:
  *
  * - a folder (/, /session, /catalogue/): its index.html, at that address,
- *   the way the dev server and Vercel answer it;
+ *   the way the dev server answers it;
  * - a file over Cloudflare's 25 MiB limit, published as numbered parts
  *   (game.html.part0, game.html.part1, …; see scripts/release.mjs): the parts
  *   streamed back as the one file the path names.

@@ -183,7 +183,8 @@ export function partSizes(bytes, { limit = MAX_ASSET_BYTES, part = PART_BYTES } 
   return sizes;
 }
 
-/** Cache rules for Cloudflare's _headers file, the same ones vercel.json gave Vercel. */
+/** Cache rules for Cloudflare's _headers file: the catalogue and the hub's own code always revalidate,
+ *  shared engines and games may be a little stale while the fresh copy loads. */
 export const HEADERS = `/data/games.json
   Cache-Control: public, max-age=0, must-revalidate
 /assets/*

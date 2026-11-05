@@ -456,7 +456,7 @@ test('sizes are written and said the way people write them', () => {
 /* --- a library shaped like the real one ------------------------------------ */
 
 const catalogue = Object.entries(JSON.parse(readFileSync(new URL('../data/overrides.json', import.meta.url), 'utf8')))
-  .filter(([slug, entry]) => !slug.startsWith('_') && !entry.hidden && !entry.restricted)
+  .filter(([slug, entry]) => !slug.startsWith('_') && !entry.restricted)
   .map(([slug, entry], i) =>
     normalize({
       slug,

@@ -87,7 +87,7 @@ test('the links: a game’s page in the Friends view, a session hosted with it, 
 test('an invite code is found in the code, the link, or a message with the link in it', () => {
   assert.equal(inviteCode('abcdefgh23'), 'abcdefgh23');
   assert.equal(inviteCode('  ABCDEFGH23 '), 'abcdefgh23');
-  assert.equal(inviteCode('https://crosato-arcade.vercel.app/session#abcdefgh23'), 'abcdefgh23');
+  assert.equal(inviteCode('https://crosato-arcade.michael-crosato.workers.dev/session#abcdefgh23'), 'abcdefgh23');
   assert.equal(inviteCode('Join me! https://example.workers.dev/session#k2m3n4p5q6 see you'), 'k2m3n4p5q6');
   assert.equal(inviteCode('the code is k2m3n4p5q6'), 'k2m3n4p5q6');
   assert.equal(inviteCode('abcde-fgh23'), 'abcdefgh23');

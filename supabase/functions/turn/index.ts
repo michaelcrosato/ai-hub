@@ -8,15 +8,12 @@
 // Secrets: CF_TURN_KEY_ID, CF_TURN_API_TOKEN (Cloudflare Realtime → TURN keys).
 
 const STUN = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
-const ALLOWED = [
-  /^https:\/\/crosato-arcade\.michael-crosato\.workers\.dev$/,
-  /^https:\/\/crosato-arcade\.vercel\.app$/,
-  /^http:\/\/(localhost|127\.0\.0\.1):\d+$/,
-];
+const SITE = 'https://crosato-arcade.michael-crosato.workers.dev';
+const LOCAL = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/;
 const TTL_SECONDS = 4 * 60 * 60;
 
 function cors(origin: string | null) {
-  const allow = origin && ALLOWED.some((re) => re.test(origin)) ? origin : 'https://crosato-arcade.vercel.app';
+  const allow = origin && (origin === SITE || LOCAL.test(origin)) ? origin : SITE;
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-client-info',

@@ -89,24 +89,13 @@ test('starting another game ends the one before it', () => {
 });
 
 test('sign-in only ever returns to a page on this site, never to /auth/ itself', () => {
-  const origin = 'https://crosato-arcade.vercel.app';
-  assert.equal(safeReturn('https://crosato-arcade.vercel.app/couch#/g/snake?q=a', origin), '/couch#/g/snake?q=a');
+  const origin = 'https://crosato-arcade.michael-crosato.workers.dev';
+  assert.equal(safeReturn('https://crosato-arcade.michael-crosato.workers.dev/couch#/g/snake?q=a', origin), '/couch#/g/snake?q=a');
   assert.equal(safeReturn('/catalogue?x=1', origin), '/catalogue?x=1');
   assert.equal(safeReturn('https://evil.example/', origin), '/');
   assert.equal(safeReturn('//evil.example/x', origin), '/');
   assert.equal(safeReturn('/auth/?code=1', origin), '/');
   assert.equal(safeReturn('javascript:alert(1)', origin), '/');
-});
-
-test('every other address of the site sends you to the one your sign-in is kept on', async () => {
-  // A sign-in lives in one origin's storage: a deployment URL or an old alias would always be signed out.
-  const { redirects } = JSON.parse(await readFile(new URL('../vercel.json', import.meta.url), 'utf8'));
-  const canonical = redirects.find((r) => r.missing?.some((m) => m.type === 'host'));
-  const host = canonical.missing.find((m) => m.type === 'host').value;
-  assert.equal(host, 'crosato-arcade.vercel.app');
-  // "/(.*)", not "/:path*": Vercel serves the bare root before a "/:path*" redirect sees it.
-  assert.equal(canonical.source, '/(.*)');
-  assert.equal(canonical.destination, `https://${host}/$1`);
 });
 
 test('play time reads plainly', () => {

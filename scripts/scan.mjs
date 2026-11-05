@@ -3,8 +3,9 @@
  * scan.mjs — the one thing that makes this hub dynamic.
  *
  * Walks games/, reads game heads plus static audio evidence, and writes
- * data/games.json. This runs as the Vercel build command, so adding game #401
- * is `git add` and nothing else. It never writes to a game file.
+ * data/games.json. Every deploy runs it (scripts/release.mjs), and so does the
+ * dev server, so adding game #401 is `git add` and nothing else. It never
+ * writes to a game file.
  *
  * What counts as a game, a build or a collection is decided in lib/layout.mjs.
  *
@@ -334,7 +335,6 @@ export async function scan({ quiet = false, list = false } = {}) {
     builds.sort((a, b) => compareVersions(b.version, a.version) || Date.parse(b.sourceDate) - Date.parse(a.sourceDate));
 
     const override = overrides[slug] || {};
-    if (override.hidden === true) continue;
 
     const current = builds[0];
     const head = current.head;
@@ -372,7 +372,6 @@ export async function scan({ quiet = false, list = false } = {}) {
     game.audioReview = mergeAudio(builds.map(b => b.audio));
     for (const build of builds) delete build.audio;
     game.audioTags = [...game.audioReview.formats.map(f => f.toUpperCase()), ...(game.audioReview.evidence.length ? ['placeholder music'] : [])];
-    delete game.hidden;
     for (const [field, value] of Object.entries(game)) {
       if (value === undefined || value === null || value === '') delete game[field];
     }

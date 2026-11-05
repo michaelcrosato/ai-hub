@@ -26,8 +26,8 @@ const OUT = path.join(ROOT, '.cache/release/site');
 const LIMITS = [[20_000, 'Workers Free'], [100_000, 'Workers Paid']];
 // Top-level entries that are the repo's, not the site's.
 const PRIVATE = new Set([
-  'cloudflare', 'docs', 'node_modules', 'scripts', 'sources', 'supabase',
-  'CLAUDE.md', 'README.md', 'package.json', 'pnpm-workspace.yaml', 'vercel.json',
+  'cloudflare', 'docs', 'node_modules', 'scripts', 'supabase',
+  'CLAUDE.md', 'README.md', 'package.json', 'pnpm-workspace.yaml',
 ]);
 const TEXT = /\.(html?|m?js|css|json)$/i;
 
