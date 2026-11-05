@@ -281,12 +281,13 @@ them. Nothing is written into a game file to make that work: the hub only
 attaches listeners to the game's document, which it is allowed to do because
 the games are served from the same origin.
 
-The bar in the corner has three buttons: **←** back to the wall, **🎲** roll
-another random game from what the wall was showing, and **✕**. A tap of ✕
-folds the bar down to just the ✕ (tap again to bring it back); holding it
-removes the bar entirely until the hub is reloaded. The browser's Back button
-always works too. The hub claims no keys while a game runs, so every key
-belongs to the game.
+The bar in the corner has three buttons. Hold **✕** until its ring fills and
+the hub asks whether to close the game (*Close the game* or *Keep playing*).
+**🎲** rolls another random game from what the wall was showing. A tap of
+**←** folds the bar away (tap again to bring it back); holding it removes the
+bar until the hub is reloaded. Left alone, the bar slides out of the way and
+comes back when the mouse moves. The browser's Back button always works too.
+The hub claims no keys while a game runs, so every key belongs to the game.
 
 If a game misbehaves in a frame, *Open on its own page* in its Details drawer
 runs it in a plain tab.

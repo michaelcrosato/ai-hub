@@ -44,6 +44,14 @@ const count = async (page, n) => {
 };
 const noOverflow = async (page) =>
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+// The corner bar's ✕ closes a game: held until its ring fills, then confirmed.
+const closeGame = async (page) => {
+  await page.locator('.player__close').focus();
+  await page.keyboard.down('Enter');
+  await page.waitForTimeout(900);
+  await page.keyboard.up('Enter');
+  await page.getByRole('button', { name: 'Close the game', exact: true }).click();
+};
 
 try {
   for (const view of views) {
@@ -62,7 +70,7 @@ try {
     );
     await page.goto(`${base}/${view}`);
     await count(page, 4);
-    assert.equal(await page.locator('.views__link').count(), 6);
+    assert.equal(await page.locator('.views__link').count(), 7);
     await noOverflow(page);
     const content = page.locator('#explore-content');
     await page.getByLabel('Search the library').fill('Alpha');
@@ -92,7 +100,7 @@ try {
     await page.keyboard.press('/');
     assert.equal(await frame.locator('body').getAttribute('data-key'), '/');
     assert.match(await page.locator('.player__frame').getAttribute('src'), /alpha-old$/);
-    await page.getByRole('button', { name: `Back to the ${view}` }).click();
+    await closeGame(page);
     await page.getByRole('dialog').waitFor();
     assert.equal(await page.locator('.player__frame').count(), 0);
     await page.keyboard.press('Escape');
@@ -159,7 +167,7 @@ try {
       await count(page, 1);
       await content.getByRole('button', { name: 'Play this', exact: true }).click();
       await page.frameLocator('.player__frame').getByRole('button', { name: 'Start game' }).waitFor();
-      await page.getByRole('button', { name: 'Back to the deck' }).click();
+      await closeGame(page);
       await page.getByText('All caught up.').waitFor();
       assert.equal(await content.evaluate((node) => document.activeElement === node), true);
     }
