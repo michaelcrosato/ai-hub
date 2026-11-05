@@ -35,23 +35,18 @@ export function parseAddedHistory(history) {
   );
 }
 
-/** Persisted dates always win during scans: a shallow deployment checkout
- * cannot recover historical import dates. Full history is required only for
- * the explicit migration of legacy source timestamps. */
-export async function gitAddedDates(root, { requireFullHistory = false } = {}) {
+/** First-commit dates of the games, from git history. Persisted dates always
+ * win during scans: a shallow deployment checkout cannot recover historical
+ * import dates, and then this is empty rather than wrong. */
+export async function gitAddedDates(root) {
   try {
-    if (requireFullHistory) {
-      const { stdout } = await run('git', ['rev-parse', '--is-shallow-repository'], { cwd: root });
-      if (stdout.trim() !== 'false') throw new Error('Date migration requires a full Git history');
-    }
     const { stdout } = await run(
       'git',
       ['log', '--reverse', '--name-status', '-z', '--find-renames', '--format=%x00%cI', '--', 'games'],
       { cwd: root, maxBuffer: 64 * 1024 * 1024, timeout: 20_000 },
     );
     return parseAddedHistory(stdout);
-  } catch (error) {
-    if (requireFullHistory) throw error;
+  } catch {
     return new Map();
   }
 }
