@@ -433,8 +433,6 @@ in by batches of about fifty.
   pilot: end a game's cheapest tier when its agent exits having changed
   nothing, and have the prompt ask for up to six stats (the pilot's games
   report none, so their rounds have no highlights).
-- **Pasted clients to 1.4.0** (`hub-client.mjs --write`), as the protocol
-  promises. Most games still carry 1.3.0, which needs nothing newer.
 
 ### Later
 

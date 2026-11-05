@@ -41,20 +41,12 @@ for good.
 
 ## Left as they are, for you to decide
 
-- **Session clients.** 339 games carry session client 1.3.0, five 1.2.0 and
-  five the current 1.4.0 (Splinter Signal's copy is edited, so it is left
-  alone). The protocol says unmodified copies get each new version;
-  `node scripts/hub-client.mjs --write` does it, a batch at a time (README,
-  *Bringing the library to sessions*).
-- **Wands of Lore** has no screenshot strip: it draws its world only with
-  WebGPU on a real GPU, which the headless browser here does not have.
-- **Small 404s** in three games that otherwise play: AFTERGLOW OVERDRIVE (a
-  second request for its inline font stylesheet), Smash TV (an optional
-  `/cloud-config.json`) and Crownfall Tactics (its title music was never
-  imported).
-- **Moth of the Wild** was recorded at import as throwing about 50 seconds
-  into play; 75 seconds on its title screen showed nothing.
+- **Ashlar Wake** (a Grok roundup game) renders and plays on a real GPU, but
+  while walking its engine sometimes stops on `PHYSICS_BAD_ARGUMENT:
+  stepCharacter(body) got 16`. It is a 6.8 MB minified bundle; the fix belongs
+  in its source. It carries `"status": "Needs a fix"` in `data/overrides.json`.
 - **Sessions.** Checking the docs against the code turned up limits worth
   fixing, among them that the database's host never follows a host handover,
   so a new host can neither remove a player nor end the session. They are in
-  `docs/session-hub.md`, *Known limits*.
+  `docs/session-hub.md`, *Known limits*. Fixing that one needs a migration,
+  which is the Supabase dashboard again.

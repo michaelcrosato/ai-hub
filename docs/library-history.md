@@ -26,7 +26,7 @@ catalogue.
 | 2026-10-13 | Five GitHub repositories | 5 | 617 | `rdr2-gpt6a`, `policegame-2`, `policegame`, `agent-engine` and `90spcrpg`, from their static builds, with licences and player documentation. |
 | 2026-10-14 | The desktop folder `New AI Stuff`, one game per change | 16 | 633 | Four Meltdown Mile and Meltdown Express attempts, Demolition Duty, Citrus Rush and KRIEG (built from source with sign-in removed), The False Dawn (an SVG fix), Wreck Route and others. |
 | 2026-10-14 | Two GitHub repositories | 2 | 635 | Vesper Lane and Ochre Veil. Cinder Valley (`rdr2-gpt6a`) was updated in place the same day. |
-| 2026-10-15 | A Google Drive folder of 39 pages by Grok 4.7 Build | 37 | 672 | Bean Napped and Cloverhollow updated in place. Astral Crest's boot repaired. Five games still carry `Needs WebGPU review` and Meridian — Semantic World Compiler `Needs visual review`. |
+| 2026-10-15 | A Google Drive folder of 39 pages by Grok 4.7 Build | 37 | 672 | Bean Napped and Cloverhollow updated in place. Astral Crest's boot repaired. Five games were marked `Needs WebGPU review` and Meridian — Semantic World Compiler `Needs visual review` until a real GPU showed them rendering on 2026-11-05; Ashlar Wake is marked for a physics error while walking instead. |
 | 2026-10-15 | The desktop folder `New AI Stuff`, second pass | 18 | 690 | Three more files were already on the wall. |
 | 2026-10-16 | Added by hand | 11 | 701 | Ten games in one change (Dented Destiny to FROSTLINE) and the Grand Theft Five-Finger Drive vertical slice. |
 | 2026-10-19 | Root HTML pages of `cc-hub`, `gemini-hub`, `gpt-hub`, `grok-hub` and `muse-hub` | 172 | 873 | 170 games and 2 tools, the first entries with title-first filenames. Four same-title variants went to the Unsure shelf. IgniteBike 64, Myth of Zela and WreckWarrior 3050 threw errors during the screenshot pass; all three were repaired on 2026-11-05. |
@@ -34,8 +34,8 @@ catalogue.
 | 2026-10-22 | `cc-hub` and `gpt-hub` pages not yet on the wall | 80 | 1,592 | 126 candidates: 45 were already on the wall and one was a copy from a build folder. |
 | 2026-10-27 | gpt-matrix runs of 24–27 Oct, about 40 classics | 239 | 1,831 | 259 runs; 20 left no page. 22 went to the Unsure shelf. |
 | 2026-10-29 | cc-matrix: a GPT-6 matrix (3 models, 3 efforts, 10 sources) and earlier Star Fox 64 and Mario Kart 64 runs | 103 | 1,934 | 102 of 115 runs; 13 failed or delivered nothing. Wands of Lore was added by hand that morning. BumbleBlock Cabaret threw on Play until 2026-11-05. |
-| 2026-10-30 | cc-matrix: 20 sources (Alien Soldier to Waku Waku 7) across Claude, Gemini, GPT and Muse models, and 11 Rocket League runs | 226 | 2,160 | 316 runs; 90 skipped: failed builds, 26 already on the wall, and Talons & Seeds Primeval, which never starts. Strange Soldier and Amber Wrath hit a WebGPU error in their attract demo. |
-| 2026-11-01 | cc-matrix: Cyberpunk 2077 and Zelda: Breath of the Wild riffs on the my-3D2dge engine | 6 | 2,166 | 406 of 412 runs were already on the wall or decided. Moth of the Wild throws after about 50 s. Cybershrunk 2077 loads Rapier from jsDelivr. |
+| 2026-10-30 | cc-matrix: 20 sources (Alien Soldier to Waku Waku 7) across Claude, Gemini, GPT and Muse models, and 11 Rocket League runs | 226 | 2,160 | 316 runs; 90 skipped: failed builds, 26 already on the wall, and Talons & Seeds Primeval, which never starts. Strange Soldier and Amber Wrath hit a WebGPU error in their attract demo; on a real GPU on 2026-11-05 both ran it cleanly. |
+| 2026-11-01 | cc-matrix: Cyberpunk 2077 and Zelda: Breath of the Wild riffs on the my-3D2dge engine | 6 | 2,166 | 406 of 412 runs were already on the wall or decided. Moth of the Wild threw about 50 s into play at import; 80 s of play on 2026-11-05 showed no error. Cybershrunk 2077 loads Rapier from jsDelivr. |
 | 2026-11-02 | cc-matrix: riffs on 14 books, films and TV shows (Moby-Dick to The Office) | 24 | 2,190 | 12 interrupted runs left out. The importer's three.js shelf scopes were fixed in the same change. |
 
 ## Other passes over the library
@@ -79,7 +79,15 @@ catalogue.
     WreckWarrior 3050 loaded `three.min.js` builds that were never published
     (now r160's, from the shelf); BumbleBlock Cabaret called a Rapier method
     on a body description that only a body has.
-  The six whose screenshot strips showed only their menus got new strips.
+  The six whose screenshot strips showed only their menus got new strips, and
+  Wands of Lore, which had none, got one from a real GPU.
+  The same day every pristine copy of the session client went to 1.4.0 (344
+  games; a sample, all five hand-built game-night games among them, passed
+  `hub-check`), Soulflare Soldier was kept out of sessions for opening a
+  WebRTC connection of its own, and three games stopped asking for files that
+  were never there: Smash TV's player-records config, Crownfall Tactics'
+  ripped placeholder music (its manifest keeps the intended sources), and
+  AFTERGLOW OVERDRIVE's font stylesheet, now inline.
 
 ## How games were told apart
 
