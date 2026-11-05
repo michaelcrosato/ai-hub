@@ -24,6 +24,7 @@
 
 import { readdir, stat, lstat, readlink, readFile, writeFile, mkdir, mkdtemp, rm, utimes } from 'node:fs/promises';
 import { readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -710,7 +711,8 @@ if (!opts.dryRun && JSON.stringify(registry) !== originalRegistry) {
   await writeFile(REGISTRY_FILE, JSON.stringify(registry, null, 2) + '\n');
 }
 report.unusedMetadata = Object.keys(metadata.sources || {}).filter(key => !usedMetadata.has(key)).sort();
-report.counts = Object.fromEntries(['pages','projects','duplicates','failed','needsBuild'].map(k => [k, report[k].length]));
+report.unparsable = opts.dryRun ? [] : unparsablePages();
+report.counts = Object.fromEntries(['pages','projects','duplicates','failed','needsBuild','unparsable'].map(k => [k, report[k].length]));
 for (const row of report.decisions) report.counts[row.action] = (report.counts[row.action] || 0) + 1;
 if (opts.json) console.log(JSON.stringify(report, null, 2));
 else printReport();
@@ -763,7 +765,16 @@ function printReport() {
   );
   section('symbolic links, never followed — import what belongs by its own path', r.links);
   section('could not import', r.failed.map((f) => `${f.from}  — ${f.why}`));
+  section('will not start: an inline script does not parse (node scripts/check-pages.mjs <page> shows where)', r.unparsable);
   if (r.ignored) console.log(`  ${r.ignored} other file${r.ignored === 1 ? '' : 's'} (not .html or .zip) left where they were.\n`);
+}
+
+/** Pages just imported whose inline JavaScript cannot parse: they would never start (scripts/check-pages.mjs). */
+function unparsablePages() {
+  const pages = [...report.pages.map((p) => `games/${p.rel}`), ...report.projects.map((p) => `games/${p.rel}index.html`)];
+  if (!pages.length) return [];
+  const run = spawnSync(process.execPath, [path.join(ROOT, 'scripts/check-pages.mjs'), ...pages], { cwd: ROOT, encoding: 'utf8' });
+  return (run.stdout || '').split('\n').filter((line) => line.startsWith('games/'));
 }
 
 /** Separate tiles that share a title are often builds of one game under

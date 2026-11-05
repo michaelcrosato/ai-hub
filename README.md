@@ -186,6 +186,9 @@ What it does, so you do not have to:
 - **Originals.** Archives and source that hold no runnable game stay where
   they were; nothing is copied into the repository for safekeeping. Keep your
   originals: an import is not a backup.
+- **Pages that cannot start.** Every page it brings in has its inline
+  JavaScript parsed, as `scripts/check-pages.mjs` does, and one that does not
+  parse is listed (`unparsable` in `--json`): it would never start.
 
 Afterwards it rescans and lists titles shared by more than one tile, often the
 same game saved under different filenames. Those are never merged for you;
@@ -194,7 +197,7 @@ game.
 
 ### Before publishing an import
 
-Run `node scripts/check-pages.mjs` on the new pages, then check each game's
+Look at anything the report lists as unable to start, then check each game's
 genre, shelf (`Game`, `Tech demo` or `Tool`) and any claimed source against
 the game actually running. Capture a real screenshot strip at
 `covers/<slug>/0.jpg`, `1.jpg` and `2.jpg`: a title or opening view, then two
