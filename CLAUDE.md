@@ -33,6 +33,11 @@ it, and land a better version on main that says which PR it replaces).
   committing code.
 - Delete what is no longer used instead of leaving it around. A game that
   should not be on the wall is deleted, not hidden; git history keeps it.
+- Improve the hub, not the games. Change a game file only when a hub change
+  needs it (the pasted session client, a link back to the hub). Note a
+  broken game in its `data/overrides.json` entry instead, and
+  `node scripts/hub-check.mjs <game> --record` keeps one that breaks the
+  session protocol out of sessions.
 - The repository is public: never commit keys, tokens or personal data.
 
 ## Outside the repository
