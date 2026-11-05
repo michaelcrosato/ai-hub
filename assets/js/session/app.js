@@ -37,7 +37,7 @@ import { createPlayer } from '../ui/player.js';
 import { createBridge, attachFrame, postTo, cleanProgress } from '/lib/hub/bridge.js';
 import { createRound, limitFor, rankResults, seedsRandom, MODE_NAMES, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
-import { createRelayNet, supabaseRelay } from './net.js';
+import { createRelayNet, supabaseRelay, plainProblem } from './net.js';
 import { nameChoices } from './names.js';
 import { pickNext, eligible, sessionPool, roundGame, filterChoices, anyFilter, describeFilters, toggleFilter, countGames, cleanQueue, takeQueued, pickable, MOST_PICKS } from './pick.js';
 import { createChooser } from './chooser.js';
@@ -774,7 +774,7 @@ async function join(choice) {
     try {
       await joinOnline(choice);
     } catch (error) {
-      problem = error.message || String(error);
+      problem = plainProblem(error);
       render();
       return;
     }

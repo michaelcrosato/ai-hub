@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createRelayNet, supabaseRelay } from '../assets/js/session/net.js';
+import { createRelayNet, supabaseRelay, plainProblem } from '../assets/js/session/net.js';
 
 /** A stand-in for the session's Realtime channel: presence is pushed by the test. */
 function fakeRelay() {
@@ -88,3 +88,14 @@ test('after a dropped connection rejoins the channel, this tab is tracked again'
   subscribed('SUBSCRIBED');
   assert.deepEqual(tracks, [{ name: 'Jolly Walrus', slot: 1 }, { name: 'Jolly Walrus', slot: 1 }]);
 });
+
+test('a failed host or join says why in plain words', () => {
+  const unreachable = 'Game night cannot reach its server right now. Check your connection and try again in a minute.';
+  assert.equal(plainProblem(new TypeError('Failed to fetch')), unreachable, 'offline, or the project is paused');
+  assert.equal(plainProblem({ message: 'TypeError: NetworkError when attempting to fetch resource.' }), unreachable);
+  assert.equal(plainProblem({ message: 'Service Unavailable', status: 503 }), unreachable);
+  assert.equal(plainProblem({ message: 'this session is full', code: 'P0001' }), 'this session is full', "the database's own refusal passes through");
+  assert.equal(plainProblem(new Error('Sign in with Google to host a session.')), 'Sign in with Google to host a session.');
+  assert.equal(plainProblem(null), 'Something went wrong. Try again in a minute.');
+});
+

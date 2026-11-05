@@ -16,6 +16,22 @@ import { createClock } from './clock.js';
 const ASK_TIMEOUT_MS = 2_000;
 
 /**
+ * What a player is told when hosting or joining fails. The database's own
+ * refusals ("this session is full") are already written for people and pass
+ * through. A server that cannot be reached (offline, or the free Supabase
+ * project paused after a quiet week) only says "Failed to fetch" or a gateway
+ * status, so that becomes plain words.
+ */
+export function plainProblem(error) {
+  const text = String(error?.message ?? error ?? '').trim();
+  const status = Number(error?.status ?? error?.statusCode ?? 0);
+  if (status >= 500 || /failed to fetch|fetch failed|networkerror|load failed|network request failed|timed? ?out|upstream|paused|^5\d\d\b/i.test(text)) {
+    return 'Game night cannot reach its server right now. Check your connection and try again in a minute.';
+  }
+  return text || 'Something went wrong. Try again in a minute.';
+}
+
+/**
  * @param relay  { track(meta), onPresence(fn(list)), send(event, payload), on(event, fn), close() }
  */
 export function createRelayNet({ key, relay, iceServers = [], relayOnly = false }) {

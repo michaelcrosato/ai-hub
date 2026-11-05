@@ -399,9 +399,10 @@ in by batches of about fifty.
   game when it joins the library, but `ingest.mjs` does not run `hub-check`:
   a new session game is dealt untested until `hub-check --record` runs on it.
   Next: run it at import.
-- **A sleeping database.** The free Supabase project pauses after a quiet week,
-  and a session then fails with a raw error. Next: a plain message, and perhaps
-  a daily keep-alive.
+- **A sleeping database.** The free Supabase project pauses after a quiet week.
+  Hosting or joining then tells the player the server cannot be reached
+  (`plainProblem` in `session/net.js`) until the owner resumes the project
+  from the dashboard. Next: perhaps a daily keep-alive.
 - **A dropped peer link freezes that player's row** on the scoreboard. Next:
   mark the player instead.
 - **No server yet, by choice.** The host's copy runs every shared world. The
