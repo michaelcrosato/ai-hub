@@ -114,7 +114,7 @@ script can't pull them out reliably.
 - **Width, for `max`:** count whole letters, with a Chinese, Japanese or Korean
   character counting as two. Tags count nothing. `width()` in the example does
   this.
-- **Writing a block:** in both blocks, write `<` as `<`. A line containing
+- **Writing a block:** in both blocks, write `<` as `\u003c`. A line containing
   `</script>` would otherwise end the block early and spill into the page.
   `JSON.stringify(data).replace(/</g, '\\u003c')` does it.
 - **What goes in:** menus, labels, help, dialogue, item names and
@@ -516,9 +516,9 @@ function t(id, values = {}) {
   line = line.replace(/\{key:(\w+)\}/g, (tag, action) => controlLabel(action)).replace(/\{(\w+)\}/g, (tag, name) => {
     if (!Object.prototype.hasOwnProperty.call(values, name)) return tag;
     const v = values[name], text = typeof v === 'number' ? new Intl.NumberFormat(textLang).format(v) : String(v);
-    return dir === 'rtl' ? '⁨' + text + '⁩' : text;   // isolated, so a Latin name or a number can't scramble the line
+    return dir === 'rtl' ? '\u2068' + text + '\u2069' : text;   // isolated, so a Latin name or a number can't scramble the line
   });
-  if (!translated && !FAKE.includes(lang) && RTL.test(SOURCE.language) !== (dir === 'rtl')) line = '⁨' + line + '⁩';
+  if (!translated && !FAKE.includes(lang) && RTL.test(SOURCE.language) !== (dir === 'rtl')) line = '\u2068' + line + '\u2069';
   return line;
 }
 
@@ -537,7 +537,7 @@ function pieces(line) {
 function width(line) {
   const text = line.replace(/\{[^{}]*\}/g, '');
   const letters = typeof Intl.Segmenter === 'function' ? [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment(text)].map((s) => s.segment) : Array.from(text);
-  return letters.reduce((n, g) => n + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}　-〿＀-￯]/u.test(g) ? 2 : 1), 0);
+  return letters.reduce((n, g) => n + (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3000-\u303f\uff00-\uffef]/u.test(g) ? 2 : 1), 0);
 }
 
 /** A test language made from a line before its blanks are filled: accented and longer (en-XA), Chinese characters (zh-XC), right-to-left letters (ar-XB). */
@@ -643,7 +643,7 @@ Translate the way a novel or an indie film is translated:
 ```
 
 - **Where:** in the page's `<head>`, right after the `game-lines` block, with
-  one entry per language code. Write `<` as `<`, as in `game-lines`.
+  one entry per language code. Write `<` as `\u003c`, as in `game-lines`.
 - **Each entry has:**
   - `by`;
   - `names`, for languages in other alphabets;
