@@ -11,6 +11,7 @@
 
 import { h, icon, append, clear, ICONS } from '../dom.js';
 import { t } from '../lang.js';
+import { shown } from '../manifest.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
 import { eyebrow, heroChips } from './facts.js';
@@ -66,7 +67,7 @@ export function createHero(root, { onPlay, onInfo, onFave }) {
       h('p', { class: 'hero__eyebrow' }, eyebrow(next).join(' · ')),
       h('h2', { class: 'hero__name', 'data-fit': fit(next.name) }, next.name),
       next.tagline && h('p', { class: 'hero__tagline' }, next.tagline),
-      !quick && next.description && h('p', { class: 'hero__blurb' }, next.description),
+      !quick && next.description && h('p', { class: 'hero__blurb' }, shown(next, 'description')),
       facts.length > 0 &&
         h(
           'ul',

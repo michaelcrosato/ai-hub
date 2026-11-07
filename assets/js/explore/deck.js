@@ -4,6 +4,7 @@ import { store } from '../store.js';
 import { gameImage, gameMeta } from './common.js';
 import { emblem } from '../ui/friends.js';
 import { friendsHref, playsOnline } from '../friends/together.js';
+import { shown } from '../manifest.js';
 import { t, tx } from '../lang.js';
 
 export const DEFAULT_SEED = 'first-deal';
@@ -373,7 +374,7 @@ export function createView(root, actions) {
               h(
                 'p',
                 { class: 'deck-tagline' },
-                game.tagline || game.description || t('explore.deck.tagline_fallback'),
+                game.tagline || shown(game, 'description') || t('explore.deck.tagline_fallback'),
               ),
             ),
           );

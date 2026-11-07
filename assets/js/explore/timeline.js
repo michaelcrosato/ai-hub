@@ -2,6 +2,7 @@
 
 import { h, ICONS, icon } from '../dom.js';
 import { gameImage, gameMeta } from './common.js';
+import { shown } from '../manifest.js';
 import { t, tx, number, date, compare as collate } from '../lang.js';
 
 const BATCH_SIZE = 24;
@@ -125,7 +126,7 @@ export function createView(root, actions) {
         h(
           'span',
           { class: 'timeline-card__description' },
-          game.tagline || game.description || t('explore.timeline.card_fallback'),
+          game.tagline || shown(game, 'description') || t('explore.timeline.card_fallback'),
         ),
         h(
           'span',

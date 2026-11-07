@@ -19,7 +19,7 @@ import { keycaps } from './keycaps.js';
 import { byName } from './order.js';
 import { playersText } from './ledger.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
-import { sessionOf } from '../manifest.js';
+import { sessionOf, shown, termName } from '../manifest.js';
 import { friendsLink } from '../ui/friends.js';
 
 const GLYPHS = {
@@ -55,7 +55,7 @@ export function createSheet(
   root.append(bar, body);
 
   /** A value that searches for itself. */
-  const query = (field, value) =>
+  const query = (field, value, kind) =>
     h(
       'button',
       {
@@ -64,7 +64,7 @@ export function createSheet(
         title: t('catalogue.sheet.add_term', { term: `${field}:${value.toLowerCase()}` }),
         onclick: () => onQuery(termFor(field, value)),
       },
-      value
+      kind ? termName(kind, value) : value
     );
 
   const fact = (label, value) =>
@@ -211,7 +211,7 @@ export function createSheet(
             h(
               'span',
               { class: 'likeness__meta' },
-              [valuesOf(other.genre).join(', '), sizeText(other.bytes)].filter(Boolean).join(' · ')
+              [valuesOf(other.genre).map((v) => termName('genre', v)).join(', '), sizeText(other.bytes)].filter(Boolean).join(' · ')
             )
           )
         )
@@ -284,7 +284,7 @@ export function createSheet(
           { class: 'record__eyebrow' },
           h('span', { class: 'label' }, t('catalogue.sheet.record')),
           h('span', { class: 'record__no' }, t('catalogue.sheet.number', { number: String(accession.get(entry.slug) ?? '').padStart(4, '0') })),
-          h('span', { class: 'record__kind' }, [entry.type || t('catalogue.sheet.game'), ...genre].join(' · '))
+          h('span', { class: 'record__kind' }, [entry.type ? termName('type', entry.type) : t('catalogue.sheet.game'), ...genre.map((v) => termName('genre', v))].join(' · '))
         ),
         plate(entry),
         h('h2', { class: 'record__name', id: 'record-name' }, entry.name),
@@ -322,15 +322,15 @@ export function createSheet(
         )
       ),
       entry.description &&
-        h('section', { class: 'record__section' }, h('p', { class: 'record__desc' }, entry.description)),
+        h('section', { class: 'record__section' }, h('p', { class: 'record__desc' }, shown(entry, 'description'))),
       section(
         t('catalogue.sheet.record'),
         h(
           'dl',
           { class: 'facts' },
           fact(t('catalogue.sheet.fact_slug'), h('code', {}, entry.slug)),
-          fact(t('catalogue.sheet.fact_type'), entry.type || t('catalogue.sheet.game')),
-          fact(t('catalogue.sheet.fact_genre'), genre.length && genre.map((value) => query('genre', value))),
+          fact(t('catalogue.sheet.fact_type'), entry.type ? termName('type', entry.type) : t('catalogue.sheet.game')),
+          fact(t('catalogue.sheet.fact_genre'), genre.length && genre.map((value) => query('genre', value, 'genre'))),
           fact(t('catalogue.sheet.fact_origin'), entry.lineage.original ? t('catalogue.sheet.original') : t('catalogue.sheet.inspired')),
           fact(t('catalogue.sheet.fact_source'), entry.source && query('source', entry.source)),
           fact(
@@ -359,7 +359,7 @@ export function createSheet(
                       title: t('catalogue.sheet.add_term', { term: `tag:${tag}` }),
                       onclick: () => onQuery(termFor('tag', tag)),
                     },
-                    tag
+                    termName('tag', tag)
                   )
                 )
               )

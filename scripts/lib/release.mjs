@@ -187,6 +187,8 @@ export function partSizes(bytes, { limit = MAX_ASSET_BYTES, part = PART_BYTES } 
  *  shared engines and games may be a little stale while the fresh copy loads. */
 export const HEADERS = `/data/games.json
   Cache-Control: public, max-age=0, must-revalidate
+/data/lang/*
+  Cache-Control: public, max-age=0, must-revalidate
 /assets/*
   Cache-Control: public, max-age=0, must-revalidate
 /lib/kit/*

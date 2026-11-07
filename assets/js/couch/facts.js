@@ -4,7 +4,7 @@
  * The hero and the page draw these; node --test reads them directly.
  */
 
-import { playersOf, MULTI, sessionOf } from '../manifest.js';
+import { playersOf, MULTI, sessionOf, termName } from '../manifest.js';
 import { t, bytes, date, ago as relative, list } from '../lang.js';
 import { parseControls, keysSummary } from './howto.js';
 
@@ -45,7 +45,7 @@ export function playersText(game) {
 }
 
 /** The line over the name: genre · origin · model, each when known. */
-export const eyebrow = (game) => [game.genre, originOf(game), modelsOf(game)].filter(Boolean);
+export const eyebrow = (game) => [termName('genre', game.genre), originOf(game), modelsOf(game)].filter(Boolean);
 
 /**
  * The chips under the hero's blurb: who it is for, its size, its builds when
@@ -72,7 +72,7 @@ export function pageFacts(game, now = Date.now()) {
   const series = !lineage.original && lineage.series !== lineage.title ? t('couch.facts.series', { series: lineage.series }) : '';
   const updated = game.updatedAt && dateText(game.updated) !== dateText(game.added);
   return [
-    game.genre && { label: t('couch.facts.label_genre'), value: game.genre },
+    game.genre && { label: t('couch.facts.label_genre'), value: termName('genre', game.genre) },
     { label: t('couch.facts.label_origin'), value: originOf(game), note: series },
     modelsOf(game) && { label: t('couch.facts.label_model'), value: modelsOf(game) },
     playersText(game) && { label: t('couch.facts.label_players'), value: playersText(game) },
@@ -81,6 +81,6 @@ export function pageFacts(game, now = Date.now()) {
     game.addedAt > 0 && { label: t('couch.facts.label_added'), value: dateText(game.added), note: ago(game.addedAt, now) },
     updated && { label: t('couch.facts.label_updated'), value: dateText(game.updated), note: ago(game.updatedAt, now) },
     game.builds.length > 1 && { label: t('couch.facts.label_builds'), value: String(game.builds.length) },
-    { label: t('couch.facts.label_type'), value: game.type || t('couch.facts.type_game') },
+    { label: t('couch.facts.label_type'), value: game.type ? termName('type', game.type) : t('couch.facts.type_game') },
   ].filter(Boolean);
 }

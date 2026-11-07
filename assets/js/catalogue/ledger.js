@@ -19,7 +19,7 @@
 
 import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette } from '../color.js';
-import { playersOf } from '../manifest.js';
+import { playersOf, shown, termName } from '../manifest.js';
 import { buildsOf, dayText, dayToken, sizeText, valuesOf } from './query.js';
 import { lang, number, t, tx } from '../lang.js';
 
@@ -149,9 +149,9 @@ export function createLedger(root, { onSort, onPlay, onFave, onMark, onOpen }) {
         { class: 'c-name', scope: 'row' },
         name,
         game.tagline && h('span', { class: 'ledger__tagline' }, game.tagline),
-        h('span', { class: 'ledger__blurb' }, game.description)
+        h('span', { class: 'ledger__blurb' }, shown(game, 'description'))
       ),
-      h('td', { class: 'c-genre' }, valuesOf(game.genre).join(', ') || DASH()),
+      h('td', { class: 'c-genre' }, valuesOf(game.genre).map((v) => termName('genre', v)).join(', ') || DASH()),
       h('td', { class: 'c-lineage' }, lineageCell(game)),
       h('td', { class: 'c-model' }, valuesOf(game.model).join(', ') || DASH()),
       h('td', { class: 'c-players num' }, playersText(game)),

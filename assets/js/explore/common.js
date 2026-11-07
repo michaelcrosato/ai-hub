@@ -2,6 +2,7 @@ import { h } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { selectGames } from '../filter.js';
 import { t, upper } from '../lang.js';
+import { termName } from '../manifest.js';
 
 /** Shared scope, with the same search and visibility rules as the wall. */
 export function selection(games, query, stats, showAll = false) {
@@ -20,7 +21,7 @@ export function selection(games, query, stats, showAll = false) {
 }
 
 export function gameMeta(game) {
-  return [Array.isArray(game.genre) ? game.genre.join(' / ') : game.genre, game.source || t('explore.common.original')]
+  return [Array.isArray(game.genre) ? game.genre.map((g) => termName('genre', g)).join(' / ') : termName('genre', game.genre), game.source || t('explore.common.original')]
     .filter(Boolean)
     .join(' · ');
 }

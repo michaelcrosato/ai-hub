@@ -13,6 +13,7 @@ import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
 import { t, bytes, withLanguage, dir as textDir } from '../lang.js';
 import { attemptsAt, similarGames } from '../similar.js';
+import { shown as translated, termName } from '../manifest.js';
 import { parseControls, proseParts } from './howto.js';
 import { eyebrow, pageFacts, dateText } from './facts.js';
 import { nearest } from './nav.js';
@@ -227,7 +228,7 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
             h('p', { class: 'page__eyebrow' }, eyebrow(next).join(' · ')),
             h('h2', { class: 'page__name', id: 'page-name' }, next.name),
             next.tagline && h('p', { class: 'page__tagline' }, next.tagline),
-            next.description && h('p', { class: 'page__blurb' }, next.description),
+            next.description && h('p', { class: 'page__blurb' }, translated(next, 'description')),
             h(
               'div',
               { class: 'page__actions' },
@@ -257,7 +258,7 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
             ),
             howTo(next),
             facts(next),
-            next.tags.length > 0 && h('ul', { class: 'tags', 'aria-label': t('couch.page.tags') }, next.tags.map((tag) => h('li', { class: 'tag' }, tag))),
+            next.tags.length > 0 && h('ul', { class: 'tags', 'aria-label': t('couch.page.tags') }, next.tags.map((tag) => h('li', { class: 'tag' }, termName('tag', tag)))),
             builds(next)
           )
         ),

@@ -21,6 +21,7 @@ import { h, clear, append, icon, ICONS } from '../dom.js';
 import { t, tx, fillPage, number } from '../lang.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { loadLibrary } from '../library.js';
+import { shown as translated } from '../manifest.js';
 import { router } from '../router.js';
 import { createPlayer } from '../ui/player.js';
 import { viewSwitch } from '../ui/views.js';
@@ -526,7 +527,7 @@ function openSheet(game) {
         how.online && how.screen && fact(t('friends.sheet.also'), t('friends.sheet.seats_screen', { seats: seatsText(how.screen) })),
         how.webgpu && fact(t('friends.sheet.needs'), webgpu === false ? t('friends.sheet.needs_no_webgpu') : t('friends.sheet.needs_webgpu'))
       ),
-      game.description && h('p', { class: 'sheet__blurb' }, game.description),
+      game.description && h('p', { class: 'sheet__blurb' }, translated(game, 'description')),
       h('a', { class: 'sheet__wall', href: `/#/g/${encodeURIComponent(game.slug)}` }, t('friends.sheet.wall'))
     )
   );

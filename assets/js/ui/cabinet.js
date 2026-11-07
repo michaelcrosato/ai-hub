@@ -14,7 +14,7 @@ import { frameAt, FRAME_MS } from '../frames.js';
 import { bytes } from '../format.js';
 import { t } from '../lang.js';
 import { store } from '../store.js';
-import { plainNameOf, valueLabel } from '../manifest.js';
+import { plainNameOf, shown, termName, valueLabel } from '../manifest.js';
 import { emblem } from './friends.js';
 import { friendsHref, playsOnline, togetherLine } from '../friends/together.js';
 
@@ -122,7 +122,7 @@ export function stackCabinet(stack, index = 0, href = '#/') {
       : stack.level === 'facet'
         ? t('game.cabinet.stack_games', { count })
         : t('game.cabinet.stack_attempts', { count });
-  // A genre or model is shown as it is; "Multiplayer" and the like are the hub's words.
+  // A model is shown as it is; "Multiplayer" and the like are the hub's words.
   const name = stack.level === 'facet' ? valueLabel(stack.facet, stack.label) : stack.label;
 
   return h(
@@ -160,7 +160,7 @@ export function stackCabinet(stack, index = 0, href = '#/') {
           // a stack would otherwise hide.
           h('span', { class: 'cab__open' }, t('game.cabinet.more')),
           h('a', { class: 'cab__info', href: `#/g/${front.slug}` }, t('game.cabinet.details')),
-          h('span', {}, front.genre || bytes(front.bytes))
+          h('span', {}, termName('genre', front.genre) || bytes(front.bytes))
         )
       )
     ),
@@ -196,9 +196,9 @@ export function cabinet(game, index = 0, caption = null) {
       h(
         'div',
         { class: 'cab__panel' },
-        h('p', { class: 'cab__tagline' }, game.tagline || game.description || t('game.cabinet.no_blurb')),
+        h('p', { class: 'cab__tagline' }, game.tagline || shown(game, 'description') || t('game.cabinet.no_blurb')),
         // Only shown one to a row, where there is room to say more.
-        game.tagline && game.description && h('p', { class: 'cab__about' }, game.description),
+        game.tagline && game.description && h('p', { class: 'cab__about' }, shown(game, 'description')),
         h(
           'div',
           { class: 'cab__meta' },
@@ -219,7 +219,7 @@ export function cabinet(game, index = 0, caption = null) {
           // settings can swap in the slug, the key everything else hangs off.
           store.dev().showSlugs
             ? h('code', { class: 'cab__slug' }, `${game.slug} · ${bytes(game.bytes)}`)
-            : h('span', {}, caption || game.genre || bytes(game.bytes))
+            : h('span', {}, caption || termName('genre', game.genre) || bytes(game.bytes))
         )
       ),
       faveButton(game)

@@ -14,13 +14,14 @@ import { buildsOf, dayText, sizeText, valuesOf } from './query.js';
 import { keycaps } from './keycaps.js';
 import { playersText } from './ledger.js';
 import { number, t } from '../lang.js';
+import { shown, termName } from '../manifest.js';
 
 const listed = (value) => valuesOf(value).join(', ');
 
 /** Each row: a label, what it compares, and how it is drawn. */
 const ROWS = [
-  { label: t('catalogue.compare.row_type'), value: (g) => g.type || t('catalogue.compare.game') },
-  { label: t('catalogue.compare.row_genre'), value: (g) => listed(g.genre) },
+  { label: t('catalogue.compare.row_type'), value: (g) => g.type || t('catalogue.compare.game'), text: (g) => (g.type ? termName('type', g.type) : t('catalogue.compare.game')) },
+  { label: t('catalogue.compare.row_genre'), value: (g) => listed(g.genre), text: (g) => valuesOf(g.genre).map((v) => termName('genre', v)).join(', ') },
   {
     label: t('catalogue.compare.row_origin'),
     value: (g) => (g.lineage.original ? t('catalogue.compare.original') : t('catalogue.compare.inspired')),
@@ -66,7 +67,7 @@ function cell(row, game, { max, from, to }) {
       return h(
         'span',
         { class: 'tags' },
-        valuesOf(game.tags).map((tag) => h('span', { class: 'tag is-static' }, tag))
+        valuesOf(game.tags).map((tag) => h('span', { class: 'tag is-static' }, termName('tag', tag)))
       );
     case 'keys':
       return h(
@@ -75,11 +76,11 @@ function cell(row, game, { max, from, to }) {
         keycaps(game.controls).map((run) => (run.key ? h('kbd', {}, run.key) : run.text))
       );
     case 'prose':
-      return h('span', { class: 'prose' }, value);
+      return h('span', { class: 'prose' }, shown(game, 'description'));
     case 'code':
       return h('code', {}, value);
     default:
-      return String(value);
+      return String(row.text ? row.text(game) : value);
   }
 }
 

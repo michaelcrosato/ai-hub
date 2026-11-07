@@ -12,7 +12,7 @@
  * as well) would give, which is what makes the facets usable as a chart.
  */
 
-import { playersOf, sameKey, valueLabel, MULTI, SINGLE } from '../manifest.js';
+import { playersOf, sameKey, termName, valueLabel, MULTI, SINGLE } from '../manifest.js';
 import { t, lang } from '../lang.js';
 import { DAY, buildsOf, formatTerm, parse, select, sizeText, sizeToken, startsWord, valuesOf } from './query.js';
 
@@ -46,7 +46,7 @@ export const FACETS = [
     field: 'type',
     label: t('catalogue.tally.facet_type'),
     values: (g) => [g.type || 'Game'],
-    show: (value) => (value === 'Game' ? t('catalogue.tally.type_game') : value),
+    show: (value) => (value === 'Game' ? t('catalogue.tally.type_game') : termName('type', value)),
   },
   {
     field: 'origin',
@@ -56,7 +56,7 @@ export const FACETS = [
     show: (value) => (value === 'Original' ? t('catalogue.tally.origin_original') : t('catalogue.tally.origin_inspired')),
     term: (value) => `origin:${value.toLowerCase()}`,
   },
-  { field: 'genre', label: t('catalogue.tally.facet_genre'), values: (g) => valuesOf(g.genre) },
+  { field: 'genre', label: t('catalogue.tally.facet_genre'), values: (g) => valuesOf(g.genre), show: (value) => termName('genre', value) },
   {
     field: 'players',
     label: t('catalogue.tally.facet_players'),
@@ -67,7 +67,7 @@ export const FACETS = [
   },
   { field: 'model', label: t('catalogue.tally.facet_model'), values: (g) => valuesOf(g.model) },
   { field: 'series', label: t('catalogue.tally.facet_series'), values: (g) => (g.lineage.original ? [] : [g.lineage.series]) },
-  { field: 'tag', label: t('catalogue.tally.facet_tags'), values: (g) => valuesOf(g.tags), limit: 24 },
+  { field: 'tag', label: t('catalogue.tally.facet_tags'), values: (g) => valuesOf(g.tags), limit: 24, show: (value) => termName('tag', value) },
   {
     field: 'size',
     label: t('catalogue.tally.facet_size'),

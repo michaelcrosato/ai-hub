@@ -16,7 +16,7 @@
  * model was asked to think, and when it came into the library.
  */
 
-import { sessionOf, sameKey } from '../manifest.js';
+import { sessionOf, sameKey, termName } from '../manifest.js';
 import { SELF_REPORTED } from '../../../lib/hub/round.js';
 import { t, date, list, compare } from '../lang.js';
 import { isVisible, shelfOf } from '../filter.js';
@@ -85,7 +85,7 @@ export const FILTERS = [
     read: (game) => LENGTHS.find((length) => length.holds(sessionOf(game)?.minutes ?? null))?.value,
     fixed: LENGTHS.map(({ value, label, blurb }) => ({ value, label, blurb })),
   },
-  { key: 'genres', label: t('session.filter.genre'), read: (game) => game.genre },
+  { key: 'genres', label: t('session.filter.genre'), read: (game) => game.genre, name: (value) => termName('genre', value) },
   { key: 'models', label: t('session.filter.model'), read: (game) => game.model },
   {
     key: 'efforts',

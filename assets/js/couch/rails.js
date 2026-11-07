@@ -10,7 +10,7 @@
  * { isFave(slug), lastPlayed(slug) }.
  */
 
-import { sameKey, playersOf, MULTI } from '../manifest.js';
+import { sameKey, playersOf, termName, MULTI } from '../manifest.js';
 import { shelfOf, SHELVES } from '../filter.js';
 import { fnv1a } from '../color.js';
 import { playsOnline } from '../friends/together.js';
@@ -53,6 +53,8 @@ export function genreTitle(genre) {
   const known = GENRE_TITLES.get(sameKey(genre));
   if (known) return known;
   const text = String(genre).trim();
+  const named = termName('genre', text);
+  if (named !== text) return t('couch.rails.genre_other', { genre: named });
   return t('couch.rails.genre_other', { genre: `${upper(text.charAt(0))}${text.slice(1).toLowerCase()}` });
 }
 

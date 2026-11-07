@@ -8,7 +8,7 @@
  * so one query always lists one way.
  */
 
-import { playersOf, sameKey, SINGLE } from '../manifest.js';
+import { playersOf, sameKey, termName, SINGLE } from '../manifest.js';
 import { t, lang } from '../lang.js';
 import { DAY, buildsOf, dayText, valuesOf } from './query.js';
 
@@ -89,7 +89,7 @@ export function weekOf(ms) {
  * single row, so those share one bucket at the end.
  */
 const GROUPERS = {
-  genre: () => ({ of: (g) => (first(g.genre) ? [sameKey(first(g.genre)), first(g.genre)] : null), rest: t('catalogue.order.rest_genre') }),
+  genre: () => ({ of: (g) => (first(g.genre) ? [sameKey(first(g.genre)), termName('genre', first(g.genre))] : null), rest: t('catalogue.order.rest_genre') }),
   model: () => ({
     of: (g) => (first(g.model) ? [sameKey(first(g.model)), first(g.model)] : null),
     rest: t('catalogue.order.rest_model'),

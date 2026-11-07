@@ -101,12 +101,22 @@ export function sourceProblems(source) {
 /** The plural forms a language uses, as Intl.PluralRules names them. */
 export const pluralForms = (code) => new Intl.PluralRules(code).resolvedOptions().pluralCategories;
 
-/** Forms that only ever mean one number (English "one" is 1, Arabic "two" is 2), so they may leave out {count}. */
-export function singleNumberForms(code) {
+/** The small numbers each plural form covers in a language: French one is 0 and 1, Russian one is 1, 21, 31… */
+export function formNumbers(code, upTo = 1000) {
   const rules = new Intl.PluralRules(code);
   const numbers = {};
-  for (let n = 0; n <= 1000; n++) (numbers[rules.select(n)] ??= new Set()).add(n);
-  return new Set(Object.entries(numbers).filter(([, set]) => set.size === 1).map(([form]) => form));
+  for (let n = 0; n <= upTo; n++) (numbers[rules.select(n)] ??= []).push(n);
+  return numbers;
+}
+
+/**
+ * Forms that only ever mean one number (English "one" is 1, Arabic "two" is
+ * 2), so they may leave out {count}. With a "zero" form, which t() picks for
+ * none, 0 no longer counts: French "one" then means only 1.
+ */
+export function singleNumberForms(code, { zero = false } = {}) {
+  const numbers = formNumbers(code);
+  return new Set(Object.entries(numbers).filter(([, list]) => list.filter((n) => !(zero && n === 0)).length === 1).map(([form]) => form));
 }
 
 const SCRIPTS = { Latn: 'Latin', Cyrl: 'Cyrillic', Arab: 'Arabic', Deva: 'Devanagari', Beng: 'Bengali', Hans: 'Han', Hant: 'Han', Jpan: 'Han|Hiragana|Katakana', Kore: 'Hangul', Ethi: 'Ethiopic', Grek: 'Greek', Hebr: 'Hebrew', Thai: 'Thai' };
@@ -147,13 +157,13 @@ export function checkTranslation(source, code, lines) {
   const block = (id, text) => { bad.add(id); blocking.push(text); };
   if (!lines || typeof lines !== 'object' || Array.isArray(lines)) return { blocking: ['lines: not an object of lines'], flags, bad };
   const forms = pluralForms(code);
-  const single = singleNumberForms(code);
   const letters = scriptTest(code);
   const names = source.names || [];
   for (const [id, value] of Object.entries(lines)) {
     const original = own(source.lines, id);
     if (original === undefined || id.startsWith('dev.')) { block(id, `${id}: not a line in the original`); continue; }
     const pairs = [];   // [form, translated text, original text]
+    const single = singleNumberForms(code, { zero: !!value && typeof value === 'object' && typeof value.zero === 'string' });
     if (typeof original === 'string') {
       if (typeof value !== 'string' || !value.trim()) { block(id, `${id}: should be text`); continue; }
       pairs.push(['', value, original]);

@@ -14,7 +14,7 @@
 
 import { h, clear, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
-import { NOT_A_FACET, sessionOf } from '../manifest.js';
+import { NOT_A_FACET, sessionOf, shown, termName } from '../manifest.js';
 import { bytes, date } from '../format.js';
 import { t, withLanguage } from '../lang.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
@@ -25,6 +25,9 @@ const prettyLabel = (key) =>
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .replace(/[-_]+/g, ' ')
     .replace(/^./, (c) => c.toUpperCase());
+
+/** Fields of prose that have a translation. */
+const TEXTS = ['controls', 'howto', 'goal'];
 
 /** The fields games carry most; any other field is named after its key. */
 const FIELDS = {
@@ -51,7 +54,9 @@ function facts(game) {
 
   for (const [key, value] of Object.entries(game)) {
     if (NOT_A_FACET.has(key)) continue;
-    const text = Array.isArray(value) ? value.join(', ') : value;
+    const kind = { genre: 'genre', tags: 'tag' }[key];
+    const text = Array.isArray(value) ? value.map((v) => (kind ? termName(kind, v) : v)).join(', ')
+      : kind ? termName(kind, value) : TEXTS.includes(key) ? shown(game, key) : value;
     if (typeof text !== 'string' || !text.trim()) continue;
     rows.push([fieldLabel(key), text]);
   }
@@ -140,7 +145,7 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
           h(
             'div',
             { class: 'detail__body' },
-            game.description && h('p', { class: 'detail__blurb' }, game.description),
+            game.description && h('p', { class: 'detail__blurb' }, shown(game, 'description')),
             h(
               'div',
               { class: 'detail__go' },

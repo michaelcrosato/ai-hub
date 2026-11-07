@@ -2,13 +2,16 @@
 
 import { hashInt } from '../color.js';
 import { h, ICONS, icon } from '../dom.js';
-import { sameKey } from '../manifest.js';
+import { sameKey, shown, termName } from '../manifest.js';
 import { gameImage, gameMeta } from './common.js';
 import { t, compare } from '../lang.js';
 
 const LINES = ['#265e9b', '#a23b38', '#497044', '#8b5425', '#72568f', '#25716c'];
 const MAP_SIZE = 8;
 const PAGE_SIZE = 8;
+
+/** A district's name for players: a genre in their language, the label as it is for Uncharted. */
+const districtName = (district) => (district.key === 'unmapped' ? district.label : termName('genre', district.label));
 
 /** A game may belong to several districts, but never twice to the same one.
  * Untagged entries get a district too, so the map never loses an entry. */
@@ -112,7 +115,7 @@ export function createView(root, actions) {
           { class: 'atlas-station-dot', 'aria-hidden': 'true' },
           twoDigits(shown.page * MAP_SIZE + index + 1),
         ),
-        h('span', { class: 'atlas-station-name' }, district.label),
+        h('span', { class: 'atlas-station-name' }, districtName(district)),
         h(
           'span',
           { class: 'atlas-station-count' },
@@ -273,7 +276,7 @@ export function createView(root, actions) {
           h(
             'p',
             { class: 'atlas-stop-description' },
-            game.tagline || game.description || t('explore.atlas.stop_fallback'),
+            game.tagline || shown(game, 'description') || t('explore.atlas.stop_fallback'),
           ),
           h(
             'div',
@@ -327,7 +330,7 @@ export function createView(root, actions) {
     const page = pageStops(games, gamePage);
     gamePage = page.page;
     const color = selectedKey ? lineColor(selectedKey) : '#265e9b';
-    const heading = selectedKey ? district?.label || t('explore.atlas.district_unavailable') : t('explore.atlas.all_districts_heading');
+    const heading = selectedKey ? district ? districtName(district) : t('explore.atlas.district_unavailable') : t('explore.atlas.all_districts_heading');
     return h(
       'section',
       {

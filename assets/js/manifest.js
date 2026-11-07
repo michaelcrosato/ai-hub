@@ -9,7 +9,7 @@
  */
 
 import { modeOf } from '../../lib/hub/round.js';
-import { t, lang, compare } from './lang.js';
+import { t, lang, compare, fake, FAKE } from './lang.js';
 
 /** Fields that describe a specific game rather than classify it. Never a rail.
  *  The drawer reuses this to decide which fields are worth listing as facts. */
@@ -98,8 +98,8 @@ export function sessionOf(game) {
     seats,
     mode,
     minutes,
-    goal: line(game.sessionGoal, 60),
-    howto: line(game.sessionHowto, 80),
+    goal: line(shown(game, 'sessionGoal'), 60),
+    howto: line(shown(game, 'sessionHowto'), 80),
     supported: SESSION_PROTOCOLS.includes(version),
     label: parts.join(' · '),
   };
@@ -112,7 +112,8 @@ export const sizeOf = (bytes) => SIZES.find((size) => bytes < size.under).label;
  * What a rail's value reads as on screen. Values stay as they are in the data
  * (the address, the stacks and the filters compare them); only the words the
  * hub writes itself are translated: single player, multiplayer, a head count
- * and a size bracket. A genre or a model shows as it is.
+ * and a size bracket; a genre and a tag read in the player's language when
+ * the catalogue has a translation. A model shows as it is.
  */
 export function valueLabel(key, value) {
   if (key === 'players') {
@@ -120,6 +121,8 @@ export function valueLabel(key, value) {
     if (value === MULTI) return t('filter.players.multi');
     if (SEATS.test(value)) return t('filter.players.seats', { count: Number.parseInt(value, 10) });
   }
+  if (key === 'genre') return termName('genre', value);
+  if (key === 'tags') return termName('tag', value);
   if (key === 'fileSize') return SIZES.find((size) => size.label === value)?.shown() ?? value;
   return value;
 }
@@ -167,8 +170,41 @@ export const fold = (text) =>
     .toLowerCase();
 
 /**
+ * The translation of the catalogue's own texts and terms for the chosen
+ * language: data/lang/<code>.json. Game fields stay English data; only
+ * display goes through shown() and termName(). Any part may be missing.
+ */
+let words = {};
+const own = (o, k) => (o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined);
+const usable = (v) => (typeof v === 'string' && v.trim() !== '' ? v : null);
+
+/** Sets the translation (anything that is not an object means none). */
+export function setWords(data) {
+  words = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+}
+
+/**
+ * A game's description, controls, goal or how-to as players read it: the
+ * translation when there is a usable one, else the game's own text. Test
+ * languages show the English made fake, so raw data stands out.
+ */
+export function shown(game, field) {
+  const own_ = game?.[field];
+  if (FAKE.includes(lang)) return typeof own_ === 'string' && own_ ? fake(own_) : own_;
+  return usable(own(own(own(words, 'games'), game?.slug), field)) ?? own_;
+}
+
+/** A genre, type or tag as players read it ('genre' | 'type' | 'tag'); filters and URLs keep the value. */
+export function termName(kind, value) {
+  if (typeof value !== 'string' || !value) return value;
+  if (FAKE.includes(lang)) return fake(value);
+  return usable(own(own(own(words, 'terms'), kind), value)) ?? value;
+}
+
+/**
  * Everything a search should reach: the name and blurb, plus every field that
- * classifies the game — model, collection, tags, or any field invented later.
+ * classifies the game — model, collection, tags, or any field invented later —
+ * and the translated texts and terms, so players can search in their language.
  */
 function haystack(game) {
   const parts = [game.name, game.tagline, game.description, game.slug];
@@ -178,11 +214,27 @@ function haystack(game) {
       if (typeof v === 'string') parts.push(v);
     }
   }
+  const mine = own(own(words, 'games'), game.slug);
+  for (const field of ['description', 'controls', 'sessionGoal', 'sessionHowto', 'howto', 'goal']) parts.push(usable(own(mine, field)));
+  for (const [kind, key] of [['genre', 'genre'], ['type', 'type'], ['tag', 'tags']]) {
+    for (const v of [].concat(game[key] ?? [])) parts.push(usable(own(own(own(words, 'terms'), kind), v)));
+  }
   return fold(parts.filter(Boolean).join(' '));
 }
 
+/** The translation file for the chosen language, next to the games file; none on any trouble. */
+async function loadWords(url) {
+  if (lang === 'en' || FAKE.includes(lang)) return {};
+  try {
+    const res = await fetch(new URL(`lang/${lang}.json`, new URL(url, globalThis.location?.href || 'http://localhost/')).href);
+    return res.ok ? await res.json() : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function loadManifest(url = '/data/games.json') {
-  const response = await fetch(url, { cache: 'no-cache' });
+  const [response, translation] = await Promise.all([fetch(url, { cache: 'no-cache' }), loadWords(url)]);
   if (!response.ok) {
     throw new Error(t('filter.manifest.status', { status: response.status }));
   }
@@ -190,6 +242,7 @@ export async function loadManifest(url = '/data/games.json') {
   if (!data || !Array.isArray(data.games)) {
     throw new Error(t('filter.manifest.no_games'));
   }
+  setWords(translation);
   return {
     ...data,
     games: data.games.map(normalize),

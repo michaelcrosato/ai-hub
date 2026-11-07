@@ -6,7 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { englishLines, usedLines, sourceProblems } from './lib/languages.mjs';
+import { englishLines, usedLines, sourceProblems, checkTranslation } from './lib/languages.mjs';
+import { readdirSync } from 'node:fs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const LANG = new URL('../assets/js/lang.js', import.meta.url).href;
@@ -162,4 +163,47 @@ test('every line the code uses is in en.js, and every line in en.js is used', as
   assert.deepEqual(missing, [], 'lines the code uses that en.js lacks');
   const unused = Object.keys(source.lines).filter((id) => !used.has(id));
   assert.deepEqual(unused, [], 'lines in en.js nothing uses');
+});
+
+test('the checks block a changed tag, missing plural forms and a lost {count}, and flag the rest', () => {
+  const source = {
+    names: ['AI Hub'],
+    lines: {
+      'a.open': 'Open {game}',
+      'a.count': { one: '{count} game', other: '{count} games' },
+      'a.none': { zero: 'No games', one: '{count} game', other: '{count} games' },
+      'a.hub': 'Welcome to AI Hub',
+    },
+    max: { 'a.open': 10 },
+  };
+  const ru = checkTranslation(source, 'ru', {
+    'a.open': 'Открыть {gam}',
+    'a.count': { one: 'Одна игра', few: '{count} игры', many: '{count} игр', other: '{count} игры' },
+    'a.none': { one: '{count} игра', few: '{count} игры', many: '{count} игр', other: '{count} игры' },
+    'a.hub': 'Добро пожаловать в Эй-Ай Хаб',
+  });
+  assert.deepEqual([...ru.bad].sort(), ['a.count', 'a.none', 'a.open'], 'a changed tag; Russian "one" is also 21, so it keeps {count}; the original has "zero"');
+  assert.ok(ru.flags.some((f) => f.startsWith('a.hub: AI Hub')), 'a name not as written is flagged');
+  const ar = checkTranslation(source, 'ar', {
+    'a.count': { zero: 'لا ألعاب', one: 'لعبة واحدة', two: 'لعبتان', few: '{count} ألعاب', many: '{count} لعبة', other: '{count} لعبة' },
+  });
+  assert.deepEqual([...ar.bad], [], 'Arabic zero, one and two only ever mean one number');
+  assert.ok(ar.flags.some((f) => f.startsWith('a.open: missing')), 'a missing line is flagged, not blocked');
+  const fr = checkTranslation(source, 'fr', { 'a.open': 'Ouvrir le jeu {game}', 'a.hub': 'Bienvenue sur AI Hub', 'a.count': { one: '{count} jeu', many: '{count} de jeux', other: '{count} jeux' } });
+  assert.deepEqual([...fr.bad], []);
+  assert.ok(fr.flags.some((f) => f.includes('max 10')), 'a label wider than its max is flagged');
+});
+
+test('each translation in assets/lang passes the checks, and LANGUAGES lists exactly those', async () => {
+  const source = await englishLines(ROOT);
+  const files = readdirSync(new URL('../assets/lang', import.meta.url)).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)).sort();
+  const listed = JSON.parse(original.match(/export const LANGUAGES = (\[[^\]]*\]);/)[1].replace(/'/g, '"'));
+  assert.deepEqual(listed.slice(1).sort(), files, 'LANGUAGES in lang.js lists English and each assets/lang/<code>.json');
+  for (const code of files) {
+    const data = JSON.parse(readFileSync(new URL(`../assets/lang/${code}.json`, import.meta.url), 'utf8'));
+    assert.equal(typeof data.by, 'string', `${code}: "by" says who translated it`);
+    const { blocking, flags } = checkTranslation(source, code, data.lines);
+    assert.deepEqual(blocking, [], `${code}: lines that fail the checks`);
+    if (flags.length) console.log(`${code}: ${flags.length} lines to look at, such as ${flags.slice(0, 3).join('; ')}`);
+  }
 });
