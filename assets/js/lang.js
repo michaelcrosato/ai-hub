@@ -15,7 +15,7 @@
 import SOURCE from '../lang/en.js';
 
 /** The languages the hub has, English first: one for each assets/lang/<code>.json. */
-export const LANGUAGES = ['en'];
+export const LANGUAGES = ['en', 'zh-Hans', 'hi', 'es-419', 'ar', 'fr', 'bn', 'pt-BR', 'ru', 'id'];
 /** The test languages, chosen only by ?lang=. */
 export const FAKE = ['en-XA', 'zh-XC', 'ar-XB'];
 const RTL = /^(ar|fa|ur|he|ps|sd|ug|yi|ckb|dv)\b/i;

@@ -3,7 +3,7 @@
  * languages with the `claude` CLI, following "Translating" in
  * lib/hub/languages.md.
  *
- *   node scripts/translate.mjs [--catalogue] [--model claude-haiku-5-5] [--effort medium]
+ *   node scripts/translate.mjs [--catalogue [--sample N]] [--model claude-haiku-5-5] [--effort medium]
  *        [--langs fr,ru] [--jobs 4] [--force] [--dry-run]
  *        [--out assets/lang] [--sources scripts/lang-sources]
  *
@@ -42,12 +42,14 @@ const flag = (name, fallback) => {
   return i === -1 ? fallback : args[i + 1];
 };
 const has = (name) => args.includes(`--${name}`);
-const MODEL = flag('model', 'claude-haiku-5-5');
+const MODEL_FLAG = flag('model', null);   // otherwise each language keeps the model it was last translated with
+const DEFAULT_MODEL = 'claude-haiku-5-5';
 const EFFORT = flag('effort', 'medium');
 const LANGS = flag('langs', SET1.join(',')).split(',').filter(Boolean);
 const JOBS = Number(flag('jobs', 4));
 const CHUNK = Number(flag('chunk', 6000));   // characters of English per call
 const CATALOGUE = has('catalogue');
+const SAMPLE = Number(flag('sample', 0));   // with --catalogue: only every so many games, to compare models cheaply
 const OUT = join(ROOT, flag('out', CATALOGUE ? 'data/lang' : 'assets/lang'));
 const SOURCES = join(ROOT, flag('sources', 'scripts/lang-sources'));
 const LOG = join(ROOT, '.cache/translate/runs.jsonl');
@@ -68,8 +70,8 @@ const TERMS = ['Wall', 'Couch', 'Catalogue', 'Atlas', 'Timeline', 'Deck', 'Frien
 
 /** One call to the claude CLI: the reply's text, usage, cost and time. */
 const WORK = mkdtempSync(join(tmpdir(), 'translate-'));
-function ask(prompt) {
-  const cli = ['-p', '--model', MODEL, '--effort', EFFORT, '--output-format', 'json', '--tools', '', '--system-prompt', SYSTEM,
+function ask(prompt, model) {
+  const cli = ['-p', '--model', model, '--effort', EFFORT, '--output-format', 'json', '--tools', '', '--system-prompt', SYSTEM,
     '--no-session-persistence', '--strict-mcp-config', '--disable-slash-commands', '--setting-sources', ''];
   return new Promise((resolve) => {
     const started = Date.now();
@@ -95,10 +97,10 @@ function parseObject(text) {
   try { return JSON.parse(text.slice(start, end + 1)); } catch { return null; }
 }
 
-function record(kind, code, lines, res) {
+function record(kind, code, lines, res, model) {
   const u = res.reply?.usage || {};
   const entry = {
-    at: new Date().toISOString(), kind, model: MODEL, effort: EFFORT, code, lines,
+    at: new Date().toISOString(), kind, model, effort: EFFORT, code, lines,
     input: u.input_tokens || 0, cacheWrite: u.cache_creation_input_tokens || 0, cacheRead: u.cache_read_input_tokens || 0, output: u.output_tokens || 0,
     cost: res.reply?.total_cost_usd || 0, ms: res.reply?.duration_ms || res.wall, apiMs: res.reply?.duration_api_ms || 0, ok: res.ok,
   };
@@ -123,15 +125,15 @@ function formsText(code) {
 }
 
 /** The terms for a language, chosen once and kept, so a word means one thing everywhere. */
-async function chooseTerms(code, state) {
+async function chooseTerms(code, state, model) {
   if (state.terms && state.you) return [];
   const prompt = `You will translate this website into ${english(code)} (${code}). First choose how to say its key terms, so each always has the same name, and which form of "you" to use for the player (see the brief).
 
 Terms: ${TERMS.map((t) => JSON.stringify(t)).join(', ')}
 
 Reply with one JSON object: {"you": "<the form of you, as a word in ${english(code)}>", "terms": {"<term>": "<translation>", ...}}`;
-  const res = await ask(prompt);
-  const entry = record('terms', code, TERMS.length, res);
+  const res = await ask(prompt, model);
+  const entry = record('terms', code, TERMS.length, res, model);
   const reply = parseObject(res.text);
   if (reply && typeof reply.you === 'string' && reply.terms && typeof reply.terms === 'object') {
     state.you = reply.you;
@@ -181,14 +183,14 @@ function chunks(ids) {
   return out;
 }
 
-async function translateChunk(code, state, ids) {
+async function translateChunk(code, state, ids, model) {
   const entries = [];
   const good = {};
   let todo = ids;
   let problems = null;
   for (let attempt = 0; attempt < 2 && todo.length; attempt++) {
-    const res = await ask(linesPrompt(code, state, todo, problems));
-    entries.push(record(attempt ? 'retry' : 'lines', code, todo.length, res));
+    const res = await ask(linesPrompt(code, state, todo, problems), model);
+    entries.push(record(attempt ? 'retry' : 'lines', code, todo.length, res, model));
     const reply = parseObject(res.text);
     const lines = reply && reply.lines && typeof reply.lines === 'object' ? reply.lines : {};
     const asked = Object.fromEntries(todo.filter((id) => id in lines).map((id) => [id, lines[id]]));
@@ -223,16 +225,16 @@ async function translateLines() {
     const current = readJson(file, { lines: {} });
     const usable = (id) => id in (current.lines || {}) && checkTranslation(source, code, { [id]: current.lines[id] }).blocking.length === 0;
     const todo = ids.filter((id) => has('force') || state.lines?.[id] !== fingerprint(id) || !usable(id));
-    return { code, file, state, current, todo };
+    return { code, file, state, current, todo, model: MODEL_FLAG || state.model || DEFAULT_MODEL };
   });
 
-  for (const p of plan) console.log(`${p.code}: ${p.todo.length} of ${ids.length} lines to translate, ${chunks(p.todo).length} calls`);
+  for (const p of plan) console.log(`${p.code}: ${p.todo.length} of ${ids.length} lines to translate with ${p.model}, ${chunks(p.todo).length} calls`);
   if (has('dry-run')) return;
 
   await pool(plan.map((p) => async () => {
     if (!p.todo.length) return;
-    log.push(...(await chooseTerms(p.code, p.state)));
-    const results = await pool(chunks(p.todo).map((part) => () => translateChunk(p.code, p.state, part)), 3);
+    log.push(...(await chooseTerms(p.code, p.state, p.model)));
+    const results = await pool(chunks(p.todo).map((part) => () => translateChunk(p.code, p.state, part, p.model)), 3);
     const lines = { ...(p.current.lines || {}) };
     for (const id of Object.keys(lines)) if (!(id in source.lines)) delete lines[id];
     const sources = { ...(p.state.lines || {}) };
@@ -244,11 +246,11 @@ async function translateLines() {
       failed.push(...r.failed);
     }
     const ordered = Object.fromEntries(ids.filter((id) => id in lines).map((id) => [id, lines[id]]));
-    const by = [...new Set([...(String(p.current.by || '').split(', ').filter(Boolean)), MODEL])];
+    const by = [...new Set([...(String(p.current.by || '').split(', ').filter(Boolean)), p.model])];
     mkdirSync(OUT, { recursive: true });
     mkdirSync(SOURCES, { recursive: true });
     writeFileSync(p.file, JSON.stringify({ by: by.join(', '), lines: ordered }, null, 1) + '\n');
-    writeFileSync(join(SOURCES, `${p.code}.json`), JSON.stringify({ model: MODEL, you: p.state.you, terms: p.state.terms, lines: sources }, null, 1) + '\n');
+    writeFileSync(join(SOURCES, `${p.code}.json`), JSON.stringify({ model: p.model, you: p.state.you, terms: p.state.terms, lines: sources }, null, 1) + '\n');
     const { flags } = checkTranslation(source, p.code, ordered);
     console.log(`${p.code}: ${Object.keys(ordered).length}/${ids.length} lines${failed.length ? `, ${failed.length} left in English: ${failed.slice(0, 8).join(', ')}` : ''}${flags.length ? `, ${flags.length} flags` : ''}`);
   }), JOBS);
@@ -285,7 +287,7 @@ function usableText(english, text) {
   return typeof text === 'string' && text.trim() !== '' && (english.length < 40 || text.trim() !== english.trim());
 }
 
-async function translateGames(code, items) {
+async function translateGames(code, items, model) {
   const entries = [];
   const good = {};
   let todo = items;
@@ -299,8 +301,8 @@ Entries:
 ${JSON.stringify(asked, null, 1)}
 
 Reply with one JSON object: {"games": {"<slug>": {"<text name>": "<translation>", ...}, ...}} with every entry and every text above, and no title.`;
-    const res = await ask(prompt);
-    entries.push(record(attempt ? 'retry' : 'games', code, todo.length, res));
+    const res = await ask(prompt, model);
+    entries.push(record(attempt ? 'retry' : 'games', code, todo.length, res, model));
     const reply = parseObject(res.text);
     const games = reply && reply.games && typeof reply.games === 'object' ? reply.games : {};
     for (const item of todo) {
@@ -318,14 +320,14 @@ Reply with one JSON object: {"games": {"<slug>": {"<text name>": "<translation>"
   return { good, failed: todo.flatMap((item) => Object.keys(item.texts).map((f) => `${item.slug}.${f}`)), entries };
 }
 
-async function translateTerms(code, terms) {
+async function translateTerms(code, terms, model) {
   const prompt = `Translate these names used to sort the arcade's games into ${english(code)} (${code}): genres, types of entry, and tags. Keep each one short, as a label; give each its usual name in ${english(code)}, and keep a name that players of ${english(code)} use as it is (such as "RPG" or "3d" where that is usual). The same word in two lists gets the same translation.
 
 ${JSON.stringify(terms, null, 1)}
 
 Reply with one JSON object of the same shape: {"genre": {"<English>": "<translation>"}, "type": {...}, "tag": {...}}.`;
-  const res = await ask(prompt);
-  const entry = record('terms', code, Object.values(terms).reduce((n, list) => n + list.length, 0), res);
+  const res = await ask(prompt, model);
+  const entry = record('terms', code, Object.values(terms).reduce((n, list) => n + list.length, 0), res, model);
   const reply = parseObject(res.text) || {};
   const out = {};
   for (const [kind, list] of Object.entries(terms)) {
@@ -343,7 +345,8 @@ async function translateCatalogue() {
   const games = JSON.parse(readFileSync(join(ROOT, 'data/games.json'), 'utf8')).games;
   const items = games
     .map((g) => ({ slug: g.slug, title: g.name, texts: Object.fromEntries(FIELDS.filter((f) => typeof g[f] === 'string' && g[f].trim()).map((f) => [f, g[f].trim()])) }))
-    .filter((item) => Object.keys(item.texts).length);
+    .filter((item) => Object.keys(item.texts).length)
+    .filter((item, i, all) => !SAMPLE || i % Math.ceil(all.length / SAMPLE) === 0);
   const vocabulary = Object.fromEntries(Object.entries(KINDS).map(([kind, read]) => [kind, [...new Set(games.flatMap((g) => (read(g) || []).filter((v) => typeof v === 'string' && v.trim())))].sort()]));
   const print = (n) => (n / 1000).toFixed(0) + 'k';
   const plan = LANGS.map((code) => {
@@ -356,17 +359,17 @@ async function translateCatalogue() {
       .map((item) => ({ ...item, texts: Object.fromEntries(Object.entries(item.texts).filter(([field, text]) => has('force') || state.games?.[item.slug]?.[field] !== fp(text) || !current.games?.[item.slug]?.[field])) }))
       .filter((item) => Object.keys(item.texts).length);
     const terms = Object.fromEntries(Object.entries(vocabulary).map(([kind, list]) => [kind, list.filter((v) => has('force') || !current.terms?.[kind]?.[v])]));
-    return { code, file, stateFile, state, current, todo, terms, fp };
+    return { code, file, stateFile, state, current, todo, terms, fp, model: MODEL_FLAG || state.model || DEFAULT_MODEL };
   });
   for (const p of plan) {
     const chars = p.todo.reduce((n, item) => n + Object.values(item.texts).join('').length, 0);
-    console.log(`${p.code}: ${p.todo.length} of ${items.length} games (${print(chars)} characters) and ${Object.values(p.terms).flat().length} terms to translate, ${catalogueChunks(p.todo).length + 1} calls`);
+    console.log(`${p.code}: ${p.todo.length} of ${items.length} games (${print(chars)} characters) and ${Object.values(p.terms).flat().length} terms to translate with ${p.model}, ${catalogueChunks(p.todo).length + 1} calls`);
   }
   if (has('dry-run')) return;
 
   await pool(plan.map((p) => async () => {
-    const results = await pool(catalogueChunks(p.todo).map((part) => () => translateGames(p.code, part)), 3);
-    const termResult = Object.values(p.terms).some((list) => list.length) ? await translateTerms(p.code, p.terms) : { terms: {}, entries: [] };
+    const results = await pool(catalogueChunks(p.todo).map((part) => () => translateGames(p.code, part, p.model)), 3);
+    const termResult = Object.values(p.terms).some((list) => list.length) ? await translateTerms(p.code, p.terms, p.model) : { terms: {}, entries: [] };
     const out = { games: { ...(p.current.games || {}) }, terms: { ...(p.current.terms || {}) } };
     const state = { games: { ...(p.state.games || {}) } };
     const failed = [];
@@ -388,12 +391,12 @@ async function translateCatalogue() {
       if (!live.has(slug)) { delete out.games[slug]; delete state.games[slug]; continue; }
       for (const field of Object.keys(out.games[slug])) if (!(field in live.get(slug))) delete out.games[slug][field];
     }
-    const by = [...new Set([...String(p.current.by || '').split(', ').filter(Boolean), MODEL])];
+    const by = [...new Set([...String(p.current.by || '').split(', ').filter(Boolean), p.model])];
     mkdirSync(OUT, { recursive: true });
     mkdirSync(SOURCES, { recursive: true });
     const sortedGames = Object.fromEntries(items.filter((item) => out.games[item.slug]).map((item) => [item.slug, out.games[item.slug]]));
     writeFileSync(p.file, JSON.stringify({ by: by.join(', '), games: sortedGames, terms: out.terms }) + '\n');
-    writeFileSync(p.stateFile, JSON.stringify({ model: MODEL, games: state.games }, null, 1) + '\n');
+    writeFileSync(p.stateFile, JSON.stringify({ model: p.model, games: state.games }, null, 1) + '\n');
     const texts = Object.values(sortedGames).reduce((n, g) => n + Object.keys(g).length, 0);
     console.log(`${p.code}: ${Object.keys(sortedGames).length} games, ${texts} texts, ${Object.values(out.terms).reduce((n, m) => n + Object.keys(m).length, 0)} terms${failed.length ? `, ${failed.length} texts left in English` : ''}`);
   }), JOBS);
@@ -407,15 +410,15 @@ else await translateLines();
 // The run's table: per language, calls, tokens, cost and time.
 const sum = {};
 for (const e of log) {
-  const s = (sum[e.code] ??= { calls: 0, lines: 0, input: 0, cacheWrite: 0, cacheRead: 0, output: 0, cost: 0, ms: 0 });
-  s.calls++; s.lines += e.kind === 'lines' ? e.lines : 0; s.input += e.input; s.cacheWrite += e.cacheWrite; s.cacheRead += e.cacheRead; s.output += e.output; s.cost += e.cost; s.ms += e.ms;
+  const s = (sum[`${e.code} ${e.model.replace('claude-', '')}`] ??= { calls: 0, lines: 0, input: 0, cacheWrite: 0, cacheRead: 0, output: 0, cost: 0, ms: 0 });
+  s.calls++; s.lines += e.kind === 'lines' || e.kind === 'games' ? e.lines : 0; s.input += e.input; s.cacheWrite += e.cacheWrite; s.cacheRead += e.cacheRead; s.output += e.output; s.cost += e.cost; s.ms += e.ms;
 }
 const rows = Object.entries(sum);
 if (rows.length) {
-  console.log(`\n${MODEL} at ${EFFORT} effort, ${((Date.now() - started) / 1000).toFixed(0)} s in all`);
-  console.log('lang      calls  lines   input  c.write  c.read  output    cost   call-s');
+  console.log(`\n${EFFORT} effort, ${((Date.now() - started) / 1000).toFixed(0)} s in all`);
+  console.log('language, model         calls  lines   input  c.write  c.read  output    cost   call-s');
   for (const [code, s] of rows) {
-    console.log(`${code.padEnd(9)} ${String(s.calls).padStart(5)} ${String(s.lines).padStart(6)} ${String(s.input).padStart(7)} ${String(s.cacheWrite).padStart(8)} ${String(s.cacheRead).padStart(7)} ${String(s.output).padStart(7)} ${('$' + s.cost.toFixed(3)).padStart(8)} ${(s.ms / 1000).toFixed(0).padStart(7)}`);
+    console.log(`${code.padEnd(23)} ${String(s.calls).padStart(5)} ${String(s.lines).padStart(6)} ${String(s.input).padStart(7)} ${String(s.cacheWrite).padStart(8)} ${String(s.cacheRead).padStart(7)} ${String(s.output).padStart(7)} ${('$' + s.cost.toFixed(3)).padStart(8)} ${(s.ms / 1000).toFixed(0).padStart(7)}`);
   }
   const total = rows.reduce((t, [, s]) => ({ cost: t.cost + s.cost, output: t.output + s.output }), { cost: 0, output: 0 });
   console.log(`total: $${total.cost.toFixed(3)}, ${total.output} output tokens`);
