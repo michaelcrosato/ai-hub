@@ -14,7 +14,7 @@
 
 import { h } from '../dom.js';
 import { t } from '../lang.js';
-import { tile, glide } from './ui.js';
+import { tile, glide, startScroll } from './ui.js';
 
 export function createShelf(root, { href }) {
   let rows = [];
@@ -88,10 +88,9 @@ export function createShelf(root, { href }) {
     glide(root, { top }, instant ? 0 : undefined);
   }
 
-  /** Glide a row so this tile holds the left edge, or as near as the row's ends allow. */
+  /** Glide a row so this tile holds its start edge, or as near as the row's ends allow. */
   function anchor(row, el, { instant = false } = {}) {
-    const left = el.offsetLeft - parseFloat(getComputedStyle(row.track).paddingLeft);
-    glide(row.track, { left }, instant ? 0 : undefined);
+    glide(row.track, { left: startScroll(row.track, el) }, instant ? 0 : undefined);
   }
 
   /** Where focus is in a row: the one tile Tab reaches, and "12 of 40" by the title. */

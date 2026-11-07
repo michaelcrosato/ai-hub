@@ -206,7 +206,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
     if (open) {
       requestAnimationFrame(() => {
         const box = sub.getBoundingClientRect();
-        sub.classList.toggle('drop__sub--left', box.right > document.documentElement.clientWidth - 8);
+        sub.classList.toggle('drop__sub--flip', getComputedStyle(sub).direction === 'rtl' ? box.left < 8 : box.right > document.documentElement.clientWidth - 8);
       });
     }
     return group;

@@ -11,15 +11,17 @@
 import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
-import { t, bytes, withLanguage } from '../lang.js';
+import { t, bytes, withLanguage, dir as textDir } from '../lang.js';
 import { attemptsAt, similarGames } from '../similar.js';
 import { parseControls, proseParts } from './howto.js';
 import { eyebrow, pageFacts, dateText } from './facts.js';
 import { nearest } from './nav.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
-import { tile, keyRun, keycap, prompt, glide, reducedMotion } from './ui.js';
+import { tile, keyRun, keycap, prompt, glide, reducedMotion, startScroll } from './ui.js';
 import { viewSwitch } from '../ui/views.js';
 import { emblem } from '../ui/friends.js';
+
+const AHEAD = textDir === 'rtl' ? 'left' : 'right';   // the next still is to the left in a right-to-left page
 import { friendsHref, playsOnline } from '../friends/together.js';
 
 /** Each still holds this long before the gallery moves on by itself. */
@@ -71,7 +73,7 @@ function gallery(game) {
     stage,
     /** Left and right step through the stills; past either end, focus moves on. */
     step(dir) {
-      const next = at + (dir === 'right' ? 1 : -1);
+      const next = at + (dir === AHEAD ? 1 : -1);
       if (next < 0 || next >= frames.length) return false;
       go(next);
       return true;
@@ -141,7 +143,7 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
     // The tile Tab reaches in a row, and where an arrow coming into the row lands.
     if (track) for (const sibling of track.children) sibling.tabIndex = sibling === el ? 0 : -1;
     if (via() !== 'keys' && via() !== 'pad') return;
-    if (track) glide(track, { left: el.offsetLeft - parseFloat(getComputedStyle(track).paddingLeft) });
+    if (track) glide(track, { left: startScroll(track, el) });
     reveal(el.closest('.page__rail') || el);
   });
 

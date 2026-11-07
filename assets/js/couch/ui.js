@@ -90,12 +90,23 @@ const glides = new WeakMap();
  * picks up from wherever the last one had got to. A wheel or touch on the
  * container stops it, so a person's own scrolling always wins.
  */
+/** The scrollLeft that brings `el` to the start of its row `track`: the left edge, or the right in a right-to-left page. */
+export function startScroll(track, el) {
+  const style = getComputedStyle(track);
+  if (style.direction !== 'rtl') return el.offsetLeft - parseFloat(style.paddingLeft);
+  const a = el.getBoundingClientRect();
+  const b = track.getBoundingClientRect();
+  return track.scrollLeft + (a.right - b.right) + parseFloat(style.paddingRight) + parseFloat(style.borderRightWidth);
+}
+
 export function glide(el, to, ms = SLIDE_MS) {
   glides.get(el)?.();
   const max = { left: el.scrollWidth - el.clientWidth, top: el.scrollHeight - el.clientHeight };
   const from = { left: el.scrollLeft, top: el.scrollTop };
+  // Right to left, scrollLeft runs from 0 at the start down to minus the overflow.
+  const [low, high] = getComputedStyle(el).direction === 'rtl' ? [-max.left, 0] : [0, max.left];
   const target = {
-    left: Math.max(0, Math.min(max.left, to.left ?? from.left)),
+    left: Math.max(low, Math.min(high, to.left ?? from.left)),
     top: Math.max(0, Math.min(max.top, to.top ?? from.top)),
   };
   if (ms <= 0 || reducedMotion() || (Math.abs(target.left - from.left) < 1 && Math.abs(target.top - from.top) < 1)) {

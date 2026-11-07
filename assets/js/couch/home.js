@@ -14,7 +14,7 @@
  */
 
 import { h } from '../dom.js';
-import { t } from '../lang.js';
+import { t, dir as textDir } from '../lang.js';
 import { shelfOf, SHELVES } from '../filter.js';
 import { buildRails, spotlightOf } from './rails.js';
 import { nearest } from './nav.js';
@@ -22,6 +22,8 @@ import { createStage } from './stage.js';
 import { createHero } from './hero.js';
 import { createShelf } from './shelf.js';
 import { reducedMotion } from './ui.js';
+
+const AHEAD = textDir === 'rtl' ? 'left' : 'right';
 import { friendsHref, playsOnline } from '../friends/together.js';
 
 /** A tile rests this long before it plays its own stills. */
@@ -191,7 +193,7 @@ export function createHome({ couch, stageEl, heroEl, railsEl, bar, games, stats,
   function move(dir) {
     const el = document.activeElement;
     const zone = zoneOf(el);
-    const step = dir === 'right' || dir === 'down' ? 1 : -1;
+    const step = dir === AHEAD || dir === 'down' ? 1 : -1;   // rows run right to left in a right-to-left page
     const rows = shelf.rows();
 
     if (!zone) {
