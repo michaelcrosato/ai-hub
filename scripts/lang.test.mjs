@@ -207,3 +207,27 @@ test('each translation in assets/lang passes the checks, and LANGUAGES lists exa
     if (flags.length) console.log(`${code}: ${flags.length} lines to look at, such as ${flags.slice(0, 3).join('; ')}`);
   }
 });
+
+test('each catalogue translation in data/lang is well formed and belongs to a listed language', () => {
+  const dir = new URL('../data/lang/', import.meta.url);
+  let files = [];
+  try { files = readdirSync(dir).filter((f) => f.endsWith('.json')); } catch {}
+  const listed = JSON.parse(original.match(/export const LANGUAGES = (\[[^\]]*\]);/)[1].replace(/'/g, '"'));
+  for (const file of files) {
+    const code = file.slice(0, -5);
+    assert.ok(listed.includes(code) && code !== 'en', `${code}: a catalogue translation for a language the hub lists`);
+    const data = JSON.parse(readFileSync(new URL(file, dir), 'utf8'));
+    assert.equal(typeof data.by, 'string', `${code}: "by" says who translated it`);
+    assert.ok(data.games && typeof data.games === 'object', `${code}: games`);
+    for (const [slug, texts] of Object.entries(data.games)) {
+      for (const [field, text] of Object.entries(texts)) {
+        assert.ok(['description', 'controls', 'sessionGoal', 'sessionHowto', 'howto', 'goal'].includes(field), `${code}: ${slug}.${field} is a catalogue text`);
+        assert.ok(typeof text === 'string' && text.trim(), `${code}: ${slug}.${field} is text`);
+      }
+    }
+    for (const [kind, map] of Object.entries(data.terms || {})) {
+      assert.ok(['genre', 'type', 'tag'].includes(kind), `${code}: terms.${kind}`);
+      for (const text of Object.values(map)) assert.ok(typeof text === 'string' && text.trim(), `${code}: a ${kind} term is text`);
+    }
+  }
+});

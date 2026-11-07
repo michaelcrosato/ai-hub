@@ -649,30 +649,68 @@ shorten things for testing, in seconds: `&limit=20` (a round's limit),
 
 ## Languages
 
-A game is made ready for translation by following **AI Hub Languages v1**,
-[`lib/hub/languages.md`](lib/hub/languages.md), also at
-<https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/languages.md>.
+The hub shows itself in its players' languages, following **AI Hub Languages
+v1**, [`lib/hub/languages.md`](lib/hub/languages.md) (also at
+<https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/languages.md>),
+the standard that also tells a game how to be ready for translation. What it
+took, measured (tokens, cost, time, sizes, load, the models compared):
+[`docs/languages-report.md`](docs/languages-report.md).
 
-- **The game** keeps the words players read in a `game-lines` block in its
-  page.
-- **A later step,** a stage of the build pipeline or the hub, adds the
-  translations in a `game-translations` block without touching the game's
-  code.
-- **The page also covers:**
-  - the problems that keep a game from being translated;
-  - the three test languages (`?lang=en-XA`, `zh-XC`, `ar-XB`);
-  - how translation is done: faithful, not adapted;
-  - the language codes the hub aims for.
+**Which language:** `?lang=` in the address (test languages too), then the
+choice from the Language menu (kept on this device; the menu sits beside the
+account control in every view), then the browser's languages, then English.
+`assets/js/lang.js` does the choosing, the formats (numbers, dates, sizes,
+lists, sorting) and `t()`.
 
-`scripts/languages.test.mjs` runs the page's example code as printed.
+**The hub's own words** are in `assets/lang/en.js`, shaped like a game's
+`game-lines` block: each line under an id, notes and `max` widths for the
+translator, the names that stay as written, and the translator's brief. Code
+shows a line with `t('id')` (or `tx()` when a sentence holds an element), and a
+page's static text carries `data-line="id"`. A translation is
+`assets/lang/<code>.json`; a line it lacks or gets wrong shows in English.
 
-Not built yet:
-- the hub's language menu, and its passing `?lang=` to every game it opens;
-- the translation step;
-- the script that checks a translation;
-- the hub running the test languages when a game joins.
+**The catalogue's words** (each game's description, controls and session
+text, and the genre, type and tag names) are in `data/lang/<code>.json`, by
+game slug. Game titles stay as written. Search finds both the translated and
+the English text, and the key caps drawn from a game's controls still read
+the English.
 
-No game on the wall has a `game-lines` block yet.
+**Games** open with `?lang=` wherever the hub opens or links to them, sessions
+included, so a game that has translations can follow the player.
+
+**Right to left:** Arabic mirrors the layout. The stylesheets say start and end
+rather than left and right; maps, charts and centred things stay as they are.
+
+**Stays English:** game titles, the nicknames sessions give players, AI model
+names and the developer panel.
+
+### Translating
+
+```bash
+node scripts/translate.mjs                # the hub's lines that are new or changed
+node scripts/translate.mjs --catalogue    # the games' words, after new games arrive
+```
+
+It drives the `claude` CLI with no tools or settings, Haiku 5.5 at medium
+effort by default (`--model claude-sonnet-5-5` for Sonnet 5.5; never Opus),
+on the CLI's own sign-in. Each call's tokens, cost and time go to
+`.cache/translate/runs.jsonl`. Fingerprints of the English each line was
+translated from are in `scripts/lang-sources/`, so a run sends only what
+changed. `pnpm test` checks that every line the code uses is in `en.js`, and
+runs the standard's checks on every translation: a broken line fails the
+test; gaps, lengths and names are listed.
+
+### The test languages
+
+`?lang=en-XA` shows every line accented, bracketed and about 40% longer: plain
+English on the screen is text that isn't a line, and a missing `]` is a box
+that cuts text off. `?lang=zh-XC` shows Chinese characters without spaces, and
+`?lang=ar-XB` runs right to left. `scripts/languages.test.mjs` runs the
+standard's example code as printed.
+
+Not built yet: the hub running the test languages on a game when it joins,
+translating the games themselves (their `game-lines` blocks), and the
+standard's second set of languages.
 
 ## Signing in, votes and play time
 

@@ -368,37 +368,43 @@ async function translateCatalogue() {
   if (has('dry-run')) return;
 
   await pool(plan.map((p) => async () => {
-    const results = await pool(catalogueChunks(p.todo).map((part) => () => translateGames(p.code, part, p.model)), 3);
-    const termResult = Object.values(p.terms).some((list) => list.length) ? await translateTerms(p.code, p.terms, p.model) : { terms: {}, entries: [] };
     const out = { games: { ...(p.current.games || {}) }, terms: { ...(p.current.terms || {}) } };
     const state = { games: { ...(p.state.games || {}) } };
+    const live = new Map(items.map((item) => [item.slug, item.texts]));
     const failed = [];
-    for (const r of results) {
+    // Written after every call, so a run that stops loses only the calls in flight.
+    const save = () => {
+      for (const slug of Object.keys(out.games)) {
+        if (!live.has(slug)) { delete out.games[slug]; delete state.games[slug]; continue; }
+        for (const field of Object.keys(out.games[slug])) if (!(field in live.get(slug))) delete out.games[slug][field];
+      }
+      const by = [...new Set([...String(p.current.by || '').split(', ').filter(Boolean), p.model])];
+      const sortedGames = Object.fromEntries(items.filter((item) => out.games[item.slug]).map((item) => [item.slug, out.games[item.slug]]));
+      mkdirSync(OUT, { recursive: true });
+      mkdirSync(SOURCES, { recursive: true });
+      writeFileSync(p.file, JSON.stringify({ by: by.join(', '), games: sortedGames, terms: out.terms }) + '\n');
+      writeFileSync(p.stateFile, JSON.stringify({ model: p.model, games: state.games }, null, 1) + '\n');
+      return sortedGames;
+    };
+    await pool(catalogueChunks(p.todo).map((part) => async () => {
+      const r = await translateGames(p.code, part, p.model);
       log.push(...r.entries);
       failed.push(...r.failed);
       for (const [slug, texts] of Object.entries(r.good)) {
         out.games[slug] = { ...(out.games[slug] || {}), ...texts };
-        const english = items.find((item) => item.slug === slug).texts;
         state.games[slug] = { ...(state.games[slug] || {}) };
-        for (const field of Object.keys(texts)) state.games[slug][field] = p.fp(english[field]);
+        for (const field of Object.keys(texts)) state.games[slug][field] = p.fp(live.get(slug)[field]);
       }
+      save();
+    }), 3);
+    if (Object.values(p.terms).some((list) => list.length)) {
+      const termResult = await translateTerms(p.code, p.terms, p.model);
+      log.push(...termResult.entries);
+      for (const [kind, map] of Object.entries(termResult.terms)) out.terms[kind] = { ...(out.terms[kind] || {}), ...map };
     }
-    log.push(...termResult.entries);
-    for (const [kind, map] of Object.entries(termResult.terms)) out.terms[kind] = { ...(out.terms[kind] || {}), ...map };
-    // Games and texts that left the catalogue leave the translation too.
-    const live = new Map(items.map((item) => [item.slug, item.texts]));
-    for (const slug of Object.keys(out.games)) {
-      if (!live.has(slug)) { delete out.games[slug]; delete state.games[slug]; continue; }
-      for (const field of Object.keys(out.games[slug])) if (!(field in live.get(slug))) delete out.games[slug][field];
-    }
-    const by = [...new Set([...String(p.current.by || '').split(', ').filter(Boolean), p.model])];
-    mkdirSync(OUT, { recursive: true });
-    mkdirSync(SOURCES, { recursive: true });
-    const sortedGames = Object.fromEntries(items.filter((item) => out.games[item.slug]).map((item) => [item.slug, out.games[item.slug]]));
-    writeFileSync(p.file, JSON.stringify({ by: by.join(', '), games: sortedGames, terms: out.terms }) + '\n');
-    writeFileSync(p.stateFile, JSON.stringify({ model: p.model, games: state.games }, null, 1) + '\n');
-    const texts = Object.values(sortedGames).reduce((n, g) => n + Object.keys(g).length, 0);
-    console.log(`${p.code}: ${Object.keys(sortedGames).length} games, ${texts} texts, ${Object.values(out.terms).reduce((n, m) => n + Object.keys(m).length, 0)} terms${failed.length ? `, ${failed.length} texts left in English` : ''}`);
+    const games = save();
+    const texts = Object.values(games).reduce((n, g) => n + Object.keys(g).length, 0);
+    console.log(`${p.code}: ${Object.keys(games).length} games, ${texts} texts, ${Object.values(out.terms).reduce((n, m) => n + Object.keys(m).length, 0)} terms${failed.length ? `, ${failed.length} texts left in English` : ''}`);
   }), JOBS);
 }
 

@@ -40,6 +40,20 @@ it, and land a better version on main that says which PR it replaces).
   session protocol out of sessions.
 - The repository is public: never commit keys, tokens or personal data.
 
+## Words players read
+
+- The hub's text goes through `t()` (or `tx()`) from `assets/js/lang.js`,
+  with its English in `assets/lang/en.js`: the id written out in full, a
+  note when a short label could be read two ways, `max` for a tight label.
+  A page's static text carries `data-line`. Never glue a sentence from
+  pieces; a counted thing gets plural forms.
+- After changing `en.js`, run `node scripts/translate.mjs` (and
+  `node scripts/translate.mjs --catalogue` after games are added) and commit
+  the translations with the change. Translate with Haiku 5.5 or Sonnet 5.5
+  at medium effort, never Opus.
+- Look at a new screen with `?lang=en-XA` (plain English on it is a missing
+  line) and `?lang=ar-XB` (it should mirror).
+
 ## Outside the repository
 
 Supabase (project `ai-hub`, ref `ncbiljxbxfrotlszdghi`) is changed from its
