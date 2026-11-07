@@ -5,7 +5,7 @@ games, its players' languages, following the ideas in
 [`lib/hub/languages.md`](lib/hub/languages.md), and measure what the work
 costs. Nothing is built yet. When it is done and measured, delete this file.
 
-### Decided
+## Decided
 
 - **Languages:** the standard's first set besides English: `zh-Hans`, `hi`,
   `es-419`, `ar`, `fr`, `bn`, `pt-BR`, `ru`, `id`. The second set comes later.
@@ -23,7 +23,7 @@ costs. Nothing is built yet. When it is done and measured, delete this file.
 - **The language choice** is kept per device in `localStorage`. The browser's
   language is the default.
 
-### How
+## How
 
 - **`assets/js/lang.js`:** adapts the tested example in `lib/hub/languages.md`.
   - It picks the language: a saved choice, then the browser's, then `en`.
@@ -65,7 +65,7 @@ costs. Nothing is built yet. When it is done and measured, delete this file.
   `CLAUDE.md`: hub text goes through `t()` and `en.js`, and `translate.mjs`
   runs after text changes.
 
-### Measure, per phase, and report at the end
+## Measure, per phase, and report at the end
 
 - **The agent's own work:**
   - tokens, summed from `message.usage` in the session's transcript,
@@ -90,7 +90,7 @@ costs. Nothing is built yet. When it is done and measured, delete this file.
   - check results and coverage;
   - a back-translation of a few key screens.
 
-### Watch
+## Watch
 
 - **The weekly limit** was at 90% on 2026-11-07, reset 2026-11-08 19:00 UTC.
   Take a `get_usage` reading at the start and between phases.
