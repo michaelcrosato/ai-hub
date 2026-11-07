@@ -6,6 +6,7 @@ import { createPlayer } from '../ui/player.js';
 import { createDetail } from '../ui/detail.js';
 import { viewSwitch } from '../ui/views.js';
 import { accountButton } from '../account/button.js';
+import { languageMenu } from '../ui/language.js';
 import { selection } from './common.js';
 
 const names = { atlas: 'Atlas', timeline: 'Timeline', deck: 'Deck' };
@@ -32,7 +33,7 @@ let lengthAtPlay = 0;
 let returnPath = '/';
 let openedDetail = false;
 
-$('views').append(viewSwitch(key), accountButton());
+$('views').append(viewSwitch(key), accountButton(), languageMenu());
 
 const play = (game, from, build = game.builds[0]) => {
   if (!build) return;

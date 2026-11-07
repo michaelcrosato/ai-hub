@@ -44,10 +44,11 @@ import { createPlayer } from './ui/player.js';
 import { createDev } from './ui/dev.js';
 import { viewSwitch } from './ui/views.js';
 import { accountButton } from './account/button.js';
+import { languageMenu } from './ui/language.js';
 import { playsOnline } from './friends/together.js';
 
 const wallEl = document.getElementById('wall');
-document.querySelector('.sign__side')?.prepend(viewSwitch('wall'), accountButton({ className: 'sign__account' }));
+document.querySelector('.sign__side')?.prepend(viewSwitch('wall'), accountButton({ className: 'sign__account' }), languageMenu());
 const countEl = document.getElementById('count');
 
 /** The wall as it is now, narrowed (or widened) to one series and game. */

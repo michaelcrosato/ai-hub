@@ -21,6 +21,7 @@ import { plural } from '../format.js';
 import { createPlayer } from '../ui/player.js';
 import { viewSwitch } from '../ui/views.js';
 import { accountButton } from '../account/button.js';
+import { languageMenu } from '../ui/language.js';
 import {
   FIELDS,
   brush,
@@ -52,7 +53,7 @@ const $ = (id) => document.getElementById(id);
 const root = document.body;
 const panes = ['masthead', 'summary', 'facets', 'desk', 'sheet'].map($);
 
-$('views').append(viewSwitch('catalogue'), accountButton());
+$('views').append(viewSwitch('catalogue'), accountButton(), languageMenu());
 
 /** Wide enough for three panes; below it, records open as pages. */
 const wide = matchMedia('(min-width: 1200px)');

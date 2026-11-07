@@ -24,6 +24,7 @@ import { router } from '../router.js';
 import { createPlayer } from '../ui/player.js';
 import { viewSwitch } from '../ui/views.js';
 import { accountButton } from '../account/button.js';
+import { languageMenu } from '../ui/language.js';
 import { emblem } from '../ui/friends.js';
 import { SLOT_COLORS } from '../../../lib/hub/round.js';
 import { LENGTHS } from '../session/pick.js';
@@ -62,7 +63,7 @@ let playFrom = null;
 let lengthAtPlay = 0;
 let launched = false;
 
-$('views').append(viewSwitch('friends'), accountButton({ className: 'friends-head__account' }));
+$('views').append(viewSwitch('friends'), accountButton({ className: 'friends-head__account' }), languageMenu());
 
 /* --- this browser ---------------------------------------------------------- */
 

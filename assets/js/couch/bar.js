@@ -7,6 +7,7 @@
 import { h, icon, ICONS } from '../dom.js';
 import { viewSwitch } from '../ui/views.js';
 import { accountButton } from '../account/button.js';
+import { languageMenu } from '../ui/language.js';
 
 const PAD = 'M7.5 8h9a4.5 4.5 0 0 1 4.3 5.8l-1 3.4a2.3 2.3 0 0 1-3.9.9L14.3 16H9.7l-1.6 2.1a2.3 2.3 0 0 1-3.9-.9l-1-3.4A4.5 4.5 0 0 1 7.5 8zM8 11v3M6.5 12.5h3M15.5 12h.01M17.5 13.5h.01';
 
@@ -28,6 +29,7 @@ export function createBar(root, { onSearch, onSurprise }) {
       { class: 'bar__side' },
       views,
       accountButton({ className: 'bar__account' }),
+      languageMenu({ className: 'bar__language' }),
       round('Search', ICONS.search, onSearch),
       round('Surprise me: a random game', ICONS.dice, onSurprise),
       pad,
