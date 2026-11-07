@@ -1,14 +1,9 @@
-# Handoff: what is left
+# Handoff: the hub's languages
 
-Two parts: the hub's languages, for the next agent session (written
-2026-11-07), and the Vercel clean-up, which is Michael's alone.
-
-## Hub languages (agent work)
-
-Give the hub itself, not the games, its players' languages, following the
-ideas in [`lib/hub/languages.md`](lib/hub/languages.md), and measure what the
-work costs. Nothing is built yet. When it is done and measured, delete this
-section.
+Written 2026-11-07 for the next agent session. Give the hub itself, not the
+games, its players' languages, following the ideas in
+[`lib/hub/languages.md`](lib/hub/languages.md), and measure what the work
+costs. Nothing is built yet. When it is done and measured, delete this file.
 
 ### Decided
 
@@ -103,19 +98,3 @@ section.
   wall, and check the Workers Builds result.
 - **The cc-matrix line** for the standard is Michael's to hand over; leave
   cc-matrix alone.
-
-## Vercel, when you are sure (optional, Michael only)
-
-Deleting these is permanent, so an agent leaves this section as it is.
-
-The Vercel project `crosato-arcade` is paused, and on 2026-11-05 it was
-disconnected from this repository, so no push builds there. Nothing depends on
-it any more: the repository, Supabase's sign-in addresses and the `turn`
-function name only the Cloudflare site and local dev. Deleting the project in
-the Vercel dashboard retires `crosato-arcade.vercel.app` and
-`ai-hub-five-mu.vercel.app` for good.
-
-GitHub still shows Vercel's two deployment environments, Production and
-Preview, with their old deployments, on the repository page. Delete them under
-the repository's Settings → Environments if you want them gone; they are
-history, so they were left for you.
