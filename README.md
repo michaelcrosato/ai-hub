@@ -647,6 +647,33 @@ shorten things for testing, in seconds: `&limit=20` (a round's limit),
 `&results=5` (the results card), `&splash=5` (the card's countdown) and
 `&grace=10` (how long a round waits for a slow game to load).
 
+## Languages
+
+A game is made ready for translation by following **AI Hub Languages v1**,
+[`lib/hub/languages.md`](lib/hub/languages.md), also at
+<https://raw.githubusercontent.com/michaelcrosato/ai-hub/main/lib/hub/languages.md>.
+
+- **The game** keeps the words players read in a `game-lines` block in its
+  page.
+- **A later step,** a stage of the build pipeline or the hub, adds the
+  translations in a `game-translations` block without touching the game's
+  code.
+- **The page also covers:**
+  - the problems that keep a game from being translated;
+  - the three test languages (`?lang=en-XA`, `zh-XC`, `ar-XB`);
+  - how translation is done: faithful, not adapted;
+  - the language codes the hub aims for.
+
+`scripts/languages.test.mjs` runs the page's example code as printed.
+
+Not built yet:
+- the hub's language menu, and its passing `?lang=` to every game it opens;
+- the translation step;
+- the script that checks a translation;
+- the hub running the test languages when a game joins.
+
+No game on the wall has a `game-lines` block yet.
+
 ## Signing in, votes and play time
 
 Nobody needs an account to play. **Sign in** (top corner of every view) uses
