@@ -11,10 +11,10 @@
 import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
-import { bytes, date } from '../format.js';
+import { t, bytes, withLanguage } from '../lang.js';
 import { attemptsAt, similarGames } from '../similar.js';
 import { parseControls, proseParts } from './howto.js';
-import { eyebrow, pageFacts } from './facts.js';
+import { eyebrow, pageFacts, dateText } from './facts.js';
 import { nearest } from './nav.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
 import { tile, keyRun, keycap, prompt, glide, reducedMotion } from './ui.js';
@@ -42,7 +42,7 @@ function gallery(game) {
   const thumbs = frames.map((url, i) =>
     h(
       'button',
-      { type: 'button', class: 'thumb', tabindex: '-1', 'aria-label': `Still ${i + 1} of ${frames.length}`, onclick: () => go(i) },
+      { type: 'button', class: 'thumb', tabindex: '-1', 'aria-label': t('couch.page.still', { number: i + 1, total: frames.length }), onclick: () => go(i) },
       h('img', { src: url, alt: '', loading: 'lazy', decoding: 'async' }),
       h('span', { class: 'thumb__bar' })
     )
@@ -59,8 +59,8 @@ function gallery(game) {
     });
     void thumbs[at].offsetWidth; // restart its progress bar
     thumbs[at].classList.add('is-on');
-    count.textContent = `${at + 1} / ${frames.length}`;
-    stage.setAttribute('aria-label', `${game.name}, still ${at + 1} of ${frames.length}`);
+    count.textContent = t('couch.page.position', { number: at + 1, total: frames.length });
+    stage.setAttribute('aria-label', t('couch.page.stage', { name: game.name, number: at + 1, total: frames.length }));
     clearTimeout(timer);
     if (frames.length > 1 && !reducedMotion()) timer = setTimeout(() => go(at + 1), ADVANCE_MS);
   }
@@ -90,7 +90,7 @@ function howTo(game) {
   return h(
     'section',
     { class: 'howto' },
-    h('h3', { class: 'page__label' }, 'How to play'),
+    h('h3', { class: 'page__label' }, t('couch.page.howto')),
     h(
       'dl',
       { class: 'howto__rows' },
@@ -139,7 +139,7 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
     const el = event.target;
     const track = el.classList.contains('tile') ? el.parentElement : null;
     // The tile Tab reaches in a row, and where an arrow coming into the row lands.
-    if (track) for (const t of track.children) t.tabIndex = t === el ? 0 : -1;
+    if (track) for (const sibling of track.children) sibling.tabIndex = sibling === el ? 0 : -1;
     if (via() !== 'keys' && via() !== 'pad') return;
     if (track) glide(track, { left: el.offsetLeft - parseFloat(getComputedStyle(track).paddingLeft) });
     reveal(el.closest('.page__rail') || el);
@@ -167,7 +167,7 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
     return h(
       'section',
       { class: 'builds' },
-      h('h3', { class: 'page__label' }, 'Builds'),
+      h('h3', { class: 'page__label' }, t('couch.page.builds')),
       h(
         'div',
         { class: 'builds__list' },
@@ -175,8 +175,8 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
           h(
             'button',
             { type: 'button', class: 'build', dataset: { nav: 'page' }, onclick: () => onPlay(next, build) },
-            h('span', { class: 'build__name' }, build.version ? `v${build.version}` : build.label || 'Build'),
-            h('span', { class: 'build__meta' }, i === 0 ? 'Current' : date(build.added)),
+            h('span', { class: 'build__name' }, build.version ? t('couch.page.build_version', { version: String(build.version) }) : build.label || t('couch.page.build')),
+            h('span', { class: 'build__meta' }, i === 0 ? t('couch.page.current') : dateText(build.added)),
             h('span', { class: 'build__meta' }, bytes(build.bytes))
           )
         )
@@ -191,9 +191,9 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
     fave.star = icon(ICONS.star);
     fave.button = h(
       'button',
-      { type: 'button', class: 'btn btn--fave', 'aria-label': 'Favourite', dataset: { nav: 'page' }, 'aria-pressed': 'false', onclick: () => onFave(next) },
+      { type: 'button', class: 'btn btn--fave', 'aria-label': t('couch.page.fave'), dataset: { nav: 'page' }, 'aria-pressed': 'false', onclick: () => onFave(next) },
       fave.star,
-      h('span', { class: 'btn__label' }, 'Favourite'),
+      h('span', { class: 'btn__label' }, t('couch.page.fave')),
       prompt('fave')
     );
     shown = gallery(next);
@@ -208,9 +208,9 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
           { class: 'page__top' },
           h(
             'button',
-            { type: 'button', class: 'page__back', 'aria-label': 'Back', dataset: { nav: 'page' }, onclick: onBack },
+            { type: 'button', class: 'page__back', 'aria-label': t('couch.page.back'), dataset: { nav: 'page' }, onclick: onBack },
             icon(ICONS.back),
-            h('span', {}, 'Back'),
+            h('span', {}, t('couch.page.back')),
             prompt('back')
           ),
           views
@@ -233,7 +233,7 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
                 'button',
                 { type: 'button', class: 'btn btn--play', dataset: { nav: 'page', action: 'play' }, onclick: () => onPlay(next, current) },
                 icon(ICONS.play, { fill: 'currentColor', stroke: 'none' }),
-                h('span', { class: 'btn__label' }, 'Play'),
+                h('span', { class: 'btn__label' }, t('couch.page.play')),
                 prompt('play')
               ),
               playsOnline(next) &&
@@ -241,26 +241,26 @@ export function createPage(root, { games, via, onPlay, onFave, onBrowse, onBack 
                   'a',
                   { class: 'btn btn--friends', href: friendsHref(next), dataset: { nav: 'page', action: 'friends' } },
                   emblem({ size: 22, className: 'friends-emblem btn__emblem' }),
-                  h('span', { class: 'btn__label' }, 'Play with friends')
+                  h('span', { class: 'btn__label' }, t('couch.page.friends'))
                 ),
               fave.button,
               rateButtons(next.slug, { className: 'page__thumbs' }),
               current &&
                 h(
                   'a',
-                  { class: 'btn btn--open', href: current.path, target: '_blank', rel: 'noopener', dataset: { nav: 'page' } },
+                  { class: 'btn btn--open', href: withLanguage(current.path), target: '_blank', rel: 'noopener', dataset: { nav: 'page' } },
                   icon(OPEN),
-                  h('span', { class: 'btn__label' }, 'Open on its own page')
+                  h('span', { class: 'btn__label' }, t('couch.page.open'))
                 )
             ),
             howTo(next),
             facts(next),
-            next.tags.length > 0 && h('ul', { class: 'tags', 'aria-label': 'Tags' }, next.tags.map((tag) => h('li', { class: 'tag' }, tag))),
+            next.tags.length > 0 && h('ul', { class: 'tags', 'aria-label': t('couch.page.tags') }, next.tags.map((tag) => h('li', { class: 'tag' }, tag))),
             builds(next)
           )
         ),
-        rail(`Other attempts at ${next.lineage.title}`, attempts),
-        rail('More like this', similarGames(next, games, { limit: 16 }))
+        rail(t('couch.page.attempts', { title: next.lineage.title }), attempts),
+        rail(t('couch.page.similar'), similarGames(next, games, { limit: 16 }))
       )
     );
     root.scrollTop = 0;

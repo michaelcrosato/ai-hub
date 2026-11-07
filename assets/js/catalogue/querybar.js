@@ -9,11 +9,13 @@
  */
 
 import { h, icon, ICONS } from '../dom.js';
+import { t, tx } from '../lang.js';
 import { EXAMPLES, FIELDS } from './query.js';
 import { accept, suggest } from './suggest.js';
 
 /** A chip's words. A value that cannot mean anything shows as typed, underlined; its title says why. */
-const chipText = (term) => (term.problem ? term.value : `${term.negate ? 'not ' : ''}${term.says}`);
+const chipText = (term) =>
+  term.problem ? term.value : term.negate ? t('catalogue.querybar.chip_not', { says: term.says }) : term.says;
 
 export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
   let suggestions = null;
@@ -24,7 +26,7 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
     id: 'query-input',
     type: 'text',
     role: 'combobox',
-    'aria-label': 'Query the catalogue',
+    'aria-label': t('catalogue.querybar.input_label'),
     'aria-autocomplete': 'list',
     'aria-expanded': 'false',
     'aria-controls': 'query-suggest',
@@ -34,14 +36,14 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
     spellcheck: 'false',
     enterkeyhint: 'search',
     placeholder: matchMedia('(max-width: 560px)').matches
-      ? 'Query: genre:racing size:<1mb'
-      : 'Query the catalogue: try genre:racing or size:<500kb',
+      ? t('catalogue.querybar.placeholder_short')
+      : t('catalogue.querybar.placeholder'),
   });
   const list = h('ul', {
     class: 'query__suggest',
     id: 'query-suggest',
     role: 'listbox',
-    'aria-label': 'Suggestions',
+    'aria-label': t('catalogue.querybar.suggestions'),
     hidden: true,
   });
   const helpButton = h(
@@ -51,20 +53,18 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
       class: 'query__help-toggle',
       'aria-expanded': 'false',
       'aria-controls': 'query-help',
-      title: 'Query syntax',
+      title: t('catalogue.querybar.syntax'),
     },
-    h('span', { class: 'visually-hidden' }, 'Query syntax'),
+    h('span', { class: 'visually-hidden' }, t('catalogue.querybar.syntax')),
     h('span', { 'aria-hidden': 'true' }, '?')
   );
   const help = h(
     'div',
-    { class: 'query__help', id: 'query-help', role: 'dialog', 'aria-label': 'Query syntax', hidden: true },
+    { class: 'query__help', id: 'query-help', role: 'dialog', 'aria-label': t('catalogue.querybar.syntax'), hidden: true },
     h(
       'p',
       { class: 'query__help-lede' },
-      'Words search everything. A field narrows: ',
-      h('code', {}, 'field:value'),
-      '. Click any example to add it.'
+      tx('catalogue.querybar.help_lede', { syntax: h('code', {}, 'field:value') })
     ),
     h(
       'div',
@@ -96,9 +96,9 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
     h(
       'p',
       { class: 'query__help-foot' },
-      'Fields: ',
-      Object.keys(FIELDS).map((field, i) => [i ? ', ' : '', h('code', {}, `${field}:`)]),
-      '. Facet bars and chart columns write terms here too.'
+      tx('catalogue.querybar.help_foot', {
+        fields: h('span', {}, Object.keys(FIELDS).map((field, i) => [i ? ', ' : '', h('code', {}, `${field}:`)])),
+      })
     )
   );
   // Not a live region: it is redrawn on every keystroke. The page announces the count instead.
@@ -110,7 +110,7 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
       { class: 'query__field' },
       icon(ICONS.search, { class: 'query__icon' }),
       input,
-      h('kbd', { class: 'query__key', title: 'Press / to query' }, '/'),
+      h('kbd', { class: 'query__key', title: t('catalogue.querybar.key_title') }, '/'),
       helpButton,
       list,
       help
@@ -251,7 +251,7 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
         h(
           'p',
           { class: 'query__empty' },
-          'No filter yet. Type a query, or click any bar in the facets or figures to start one.'
+          t('catalogue.querybar.empty')
         )
       );
       return;
@@ -259,20 +259,22 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
     // replaceChildren would print a stray false as text, so the list is filtered.
     const nodes = [
       ...shown.map((term) => {
-        const field = term.field ? FIELDS[term.field].label : 'Text';
-        const words = chipText(term) + (term.problem ? `, which ${term.problem}` : '');
+        const field = term.field ? FIELDS[term.field].label : t('catalogue.querybar.chip_text');
+        const words = term.problem
+          ? t('catalogue.querybar.chip_problem', { chip: chipText(term), problem: term.problem })
+          : chipText(term);
         return h(
           'span',
           {
             class: `chip${term.negate ? ' is-not' : ''}${term.problem ? ' is-problem' : ''}`,
-            title: term.problem ? `${field} ${term.problem}` : term.raw,
+            title: term.problem ? t('catalogue.querybar.problem_title', { field, problem: term.problem }) : term.raw,
           },
           h(
             'button',
             {
               type: 'button',
               class: 'chip__edit',
-              'aria-label': `Edit ${field} ${words}`,
+              'aria-label': t('catalogue.querybar.edit', { field, words }),
               onclick: () => {
                 input.focus();
                 input.setSelectionRange(term.start, term.end);
@@ -286,14 +288,14 @@ export function createQueryBar(root, { vocabulary, onInput, onLeave }) {
             {
               type: 'button',
               class: 'chip__remove',
-              'aria-label': `Remove ${field} ${words}`,
+              'aria-label': t('catalogue.querybar.remove', { field, words }),
               onclick: () => onRemove(term),
             },
             icon(ICONS.close)
           )
         );
       }),
-      shown.length > 1 && h('button', { type: 'button', class: 'query__clear', onclick: onClear }, 'Clear all'),
+      shown.length > 1 && h('button', { type: 'button', class: 'query__clear', onclick: onClear }, t('catalogue.querybar.clear_all')),
     ];
     chips.replaceChildren(...nodes.filter(Boolean));
   }

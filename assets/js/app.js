@@ -18,7 +18,7 @@
 
 import { h, icon, ICONS } from './dom.js';
 import { loadManifest, deriveFacets, sameKey, originOf, plainNameOf, ORIGINAL } from './manifest.js';
-import { plural } from './format.js';
+import { t, tx, number, fillPage } from './lang.js';
 import {
   selectGames,
   facetCounts,
@@ -46,6 +46,8 @@ import { viewSwitch } from './ui/views.js';
 import { accountButton } from './account/button.js';
 import { languageMenu } from './ui/language.js';
 import { playsOnline } from './friends/together.js';
+
+fillPage();
 
 const wallEl = document.getElementById('wall');
 document.querySelector('.sign__side')?.prepend(viewSwitch('wall'), accountButton({ className: 'sign__account' }), languageMenu());
@@ -226,7 +228,7 @@ function attemptsOf(game) {
   const query = new URLSearchParams();
   if (shelf !== DEFAULT_SHELF) query.set('shelf', shelf);
   for (const [key, value] of Object.entries(lineageQuery(game.lineage))) if (value) query.set(key, value);
-  return { text: `All ${count} attempts at ${title}`, href: `#/?${query}` };
+  return { text: t('wall.attempts_link', { count, title }), href: `#/?${query}` };
 }
 
 const detail = createDetail(document.getElementById('detail'), {
@@ -265,13 +267,19 @@ const dev = createDev(document.getElementById('dev'), { library: () => manifest 
 function renderCount(state, shown) {
   const shelf = SHELVES.find((s) => s.key === state.shelf);
   const total = games.filter((g) => isVisible(g, state.showAll) && shelfOf(g) === state.shelf).length;
-  const noun = (n) => shelf.noun[n === 1 ? 0 : 1];
+  // One whole line for each shelf and shape: the number leads in English, but not in every language.
+  const n = h('b', {}, number(shown));
+  const all = shown === total;
+  const say = {
+    games: () => (all ? tx('wall.count.games', { count: shown, number: n }) : tx('wall.count.games_of', { count: total, number: n, total })),
+    tools: () => (all ? tx('wall.count.tools', { count: shown, number: n }) : tx('wall.count.tools_of', { count: total, number: n, total })),
+    unsure: () => (all ? tx('wall.count.unsure', { count: shown, number: n }) : tx('wall.count.unsure_of', { count: total, number: n, total })),
+  };
   countEl.replaceChildren(
-    h('b', {}, String(shown)),
-    shown === total ? `${noun(total)} on the wall` : `of ${total} ${noun(total)}`,
+    ...(say[shelf.key] || say.games)(),
     // A reminder that this is not the wall everyone else sees.
     ...(state.showAll
-      ? [h('button', { type: 'button', class: 'sign__dev', onclick: () => dev.open() }, 'Dev: showing hidden content')]
+      ? [h('button', { type: 'button', class: 'sign__dev', onclick: () => dev.open() }, t('wall.dev_showing'))]
       : [])
   );
 }
@@ -292,18 +300,18 @@ function trail(state, shown) {
   ].filter(Boolean);
   return h(
     'nav',
-    { class: 'trail', 'aria-label': 'Source' },
+    { class: 'trail', 'aria-label': t('wall.trail.label') },
     h(
       'a',
       { class: 'trail__up', href: hrefWith({ origin: '', series: '', source: '' }) },
       icon(ICONS.back),
-      'All sources'
+      t('wall.trail.up')
     ),
     steps.map(([text, up], i) => [
       h('span', { class: 'trail__step', 'aria-hidden': 'true' }, '›'),
       i === steps.length - 1 ? h('b', {}, text) : h('a', { href: hrefWith(up) }, text),
     ]),
-    h('span', { class: 'trail__count' }, plural(shown, state.source ? 'attempt' : 'game'))
+    h('span', { class: 'trail__count' }, state.source ? t('wall.trail.attempts', { count: shown }) : t('wall.trail.games', { count: shown }))
   );
 }
 
@@ -335,7 +343,8 @@ function renderWall(state) {
 
   if (!visible.length) {
     grid.message(
-      'Nothing on the wall matches that. ',
+      t('wall.empty.none'),
+      ' ',
       h(
         'button',
         {
@@ -346,7 +355,7 @@ function renderWall(state) {
             router.setQuery(cleared);
           },
         },
-        'Clear the filters'
+        t('wall.empty.clear')
       )
     );
     return;
@@ -447,7 +456,7 @@ addEventListener('keydown', (event) => {
   let taps = [];
   document.querySelector('.sign__name')?.addEventListener('click', () => {
     const now = performance.now();
-    taps = [...taps.filter((t) => now - t < 2500), now];
+    taps = [...taps.filter((tap) => now - tap < 2500), now];
     if (taps.length >= 5) {
       taps = [];
       dev.open();
@@ -458,7 +467,7 @@ addEventListener('keydown', (event) => {
 /* --- go ------------------------------------------------------------------ */
 
 applySize();
-grid.message('Loading the wall…');
+grid.message(t('wall.loading'));
 
 loadManifest()
   .then((loaded) => {
@@ -467,7 +476,7 @@ loadManifest()
     bySlug = new Map(games.map((game) => [game.slug, game]));
 
     if (!games.length) {
-      grid.message('No games yet. Drop an .html file into ', h('code', {}, 'games/'), ' and refresh.');
+      grid.message(tx('wall.empty.no_games', { folder: h('code', {}, 'games/') }));
       return;
     }
 
@@ -478,10 +487,6 @@ loadManifest()
   .catch((error) => {
     console.error(error);
     grid.message(
-      "Couldn't load the game list. Run ",
-      h('code', {}, 'pnpm scan'),
-      ' to rebuild ',
-      h('code', {}, 'data/games.json'),
-      ', then refresh.'
+      tx('wall.error.list', { command: h('code', {}, 'pnpm scan'), file: h('code', {}, 'data/games.json') })
     );
   });

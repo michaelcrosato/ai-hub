@@ -17,7 +17,8 @@
  */
 
 import { sessionOf, sameKey } from '../manifest.js';
-import { SELF_REPORTED, MODE_NAMES } from '../../../lib/hub/round.js';
+import { SELF_REPORTED } from '../../../lib/hub/round.js';
+import { t, date, list, compare } from '../lang.js';
 import { isVisible, shelfOf } from '../filter.js';
 import { shuffleDeck } from '../explore/deck.js';
 
@@ -26,16 +27,20 @@ import { shuffleDeck } from '../explore/deck.js';
  * gets the longest round limit there is, so it counts as long.
  */
 export const LENGTHS = [
-  { value: 'short', label: 'Short', blurb: 'Up to 3 minutes a round', holds: (minutes) => minutes !== null && minutes <= 3 },
-  { value: 'medium', label: 'Medium', blurb: '4 to 6 minutes a round', holds: (minutes) => minutes !== null && minutes > 3 && minutes < 7 },
-  { value: 'long', label: 'Long', blurb: '7 minutes or more a round', holds: (minutes) => minutes === null || minutes >= 7 },
+  { value: 'short', label: t('session.length.short'), blurb: t('session.length.short_blurb'), holds: (minutes) => minutes !== null && minutes <= 3 },
+  { value: 'medium', label: t('session.length.medium'), blurb: t('session.length.medium_blurb'), holds: (minutes) => minutes !== null && minutes > 3 && minutes < 7 },
+  { value: 'long', label: t('session.length.long'), blurb: t('session.length.long_blurb'), holds: (minutes) => minutes === null || minutes >= 7 },
 ];
 
-const MODE_BLURBS = {
-  parallel: 'Everyone plays their own copy, from the same start',
-  ghost: 'Your own copy, with the others shown in it as ghosts',
-  'shared-world': 'One world for everyone',
-};
+/** What a way of playing together is called on screen. */
+export const modeName = (mode) =>
+  mode === 'parallel' ? t('session.mode.parallel') : mode === 'ghost' ? t('session.mode.ghost') : mode === 'shared-world' ? t('session.mode.shared_world') : t('session.mode.game');
+
+const MODES = [
+  { value: 'parallel', label: t('session.mode.parallel'), blurb: t('session.mode.parallel_blurb') },
+  { value: 'ghost', label: t('session.mode.ghost'), blurb: t('session.mode.ghost_blurb') },
+  { value: 'shared-world', label: t('session.mode.shared_world'), blurb: t('session.mode.shared_world_blurb') },
+];
 
 /**
  * How hard the model was asked to think, as the catalogue records it, least
@@ -43,16 +48,22 @@ const MODE_BLURBS = {
  */
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const effortAt = (value) => (EFFORTS.includes(value) ? EFFORTS.indexOf(value) : EFFORTS.length);
-const effortName = (value) => (value === 'xhigh' ? 'Extra high' : value.charAt(0).toUpperCase() + value.slice(1));
+const effortName = (value) =>
+  value === 'low' ? t('session.effort.low')
+  : value === 'medium' ? t('session.effort.medium')
+  : value === 'high' ? t('session.effort.high')
+  : value === 'xhigh' ? t('session.effort.xhigh')
+  : value === 'max' ? t('session.effort.max')
+  : value === 'ultra' ? t('session.effort.ultra')
+  : value.charAt(0).toUpperCase() + value.slice(1);
 
 /** The month a game came into the library, "2026-10": a UTC month, as the Explore timeline files arrivals. */
 const monthOf = (game) => {
   const at = Date.parse(game.added);
   return Number.isFinite(at) ? new Date(at).toISOString().slice(0, 7) : null;
 };
-const MONTH = new Intl.DateTimeFormat('en', { month: 'long', year: 'numeric', timeZone: 'UTC' });
 /** "2026-10" reads "October 2026". Anything else came over the network, and reads as it is. */
-const monthName = (value) => (/^\d{4}-(0[1-9]|1[0-2])$/.test(value) ? MONTH.format(new Date(`${value}-01T12:00:00Z`)) : value);
+const monthName = (value) => (/^\d{4}-(0[1-9]|1[0-2])$/.test(value) ? date(new Date(`${value}-01T12:00:00Z`), { month: 'long', year: 'numeric', timeZone: 'UTC' }) : value);
 
 /**
  * The host's filters on the deal, as groups: a group with values chosen keeps
@@ -64,34 +75,34 @@ const monthName = (value) => (/^\d{4}-(0[1-9]|1[0-2])$/.test(value) ? MONTH.form
 export const FILTERS = [
   {
     key: 'modes',
-    label: 'Play',
+    label: t('session.filter.play'),
     read: (game) => sessionOf(game)?.mode,
-    fixed: Object.entries(MODE_NAMES).map(([value, label]) => ({ value, label, blurb: MODE_BLURBS[value] })),
+    fixed: MODES,
   },
   {
     key: 'lengths',
-    label: 'Length',
+    label: t('session.filter.length'),
     read: (game) => LENGTHS.find((length) => length.holds(sessionOf(game)?.minutes ?? null))?.value,
     fixed: LENGTHS.map(({ value, label, blurb }) => ({ value, label, blurb })),
   },
-  { key: 'genres', label: 'Genre', read: (game) => game.genre },
-  { key: 'models', label: 'Model', read: (game) => game.model },
+  { key: 'genres', label: t('session.filter.genre'), read: (game) => game.genre },
+  { key: 'models', label: t('session.filter.model'), read: (game) => game.model },
   {
     key: 'efforts',
-    label: 'Effort',
+    label: t('session.filter.effort'),
     read: (game) => game.effort,
-    rank: (a, b) => effortAt(a) - effortAt(b) || a.localeCompare(b),
+    rank: (a, b) => effortAt(a) - effortAt(b) || compare(a, b),
     name: effortName,
-    blurb: (value) => `Made at ${value} effort`,
-    say: (text) => `${text} effort`,
+    blurb: (value) => t('session.filter.effort_blurb', { effort: value }),
+    say: (text) => t('session.filter.effort_say', { text }),
   },
   {
     key: 'months',
-    label: 'Added',
+    label: t('session.filter.added'),
     read: monthOf,
     rank: (a, b) => b.localeCompare(a),
     name: monthName,
-    say: (text) => `Added in ${text}`,
+    say: (text) => t('session.filter.added_say', { text }),
   },
 ];
 
@@ -126,7 +137,7 @@ export function describeFilters(filters) {
   const parts = FILTERS.map((group) => {
     const labels = chosenIn(filters, group.key).map((v) => labelOf(group, v));
     if (!labels.length) return null;
-    const text = labels.length > 1 ? `${labels.slice(0, -1).join(', ')} or ${labels.at(-1)}` : labels[0];
+    const text = list(labels, 'disjunction');
     return group.say ? group.say(text) : text;
   }).filter(Boolean);
   return parts.length ? parts.join(' · ') : null;
@@ -177,7 +188,7 @@ export function filterChoices(games, n, { filters = null, ...seats } = {}) {
       for (const value of valuesOf(group.read(game))) seen.set(value, (seen.get(value) || new Set()).add(lineageKey(game)));
     }
     const option = (value) => ({ value, label: labelOf(group, value), ...(group.blurb && { blurb: group.blurb(value) }) });
-    const mostFirst = (a, b) => seen.get(b).size - seen.get(a).size || a.localeCompare(b);
+    const mostFirst = (a, b) => seen.get(b).size - seen.get(a).size || compare(a, b);
     const known = group.fixed ?? [...seen.keys()].sort(group.rank ?? mostFirst).map(option);
     const offered = [...known.filter((o) => seen.has(o.value) || chosen.includes(o.value)), ...chosen.filter((v) => !known.some((o) => o.value === v)).map(option)];
     const options = offered.map((o) => ({

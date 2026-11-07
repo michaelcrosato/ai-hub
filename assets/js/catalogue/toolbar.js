@@ -6,6 +6,7 @@
 
 import { h, icon } from '../dom.js';
 import { COLUMNS, GROUPS } from './order.js';
+import { lang, t } from '../lang.js';
 
 const GLYPHS = {
   figures: 'M4 20V10M9 20V4M14 20v-7M19 20v-11M3 20h18',
@@ -17,12 +18,15 @@ const GLYPHS = {
 /** What a phone's sort menu offers: every column, both ways, said plainly. */
 const SORT_OPTIONS = COLUMNS.flatMap((column) => {
   const words = {
-    name: ['Name, A to Z', 'Name, Z to A'],
-    added: ['Oldest first', 'Newest first'],
-    size: ['Smallest first', 'Largest first'],
-    builds: ['Fewest builds', 'Most builds'],
-    players: ['Fewest players', 'Most players'],
-  }[column.key] || [`${column.label}, A to Z`, `${column.label}, Z to A`];
+    name: [t('catalogue.toolbar.sort_name_up'), t('catalogue.toolbar.sort_name_down')],
+    added: [t('catalogue.toolbar.sort_added_up'), t('catalogue.toolbar.sort_added_down')],
+    size: [t('catalogue.toolbar.sort_size_up'), t('catalogue.toolbar.sort_size_down')],
+    builds: [t('catalogue.toolbar.sort_builds_up'), t('catalogue.toolbar.sort_builds_down')],
+    players: [t('catalogue.toolbar.sort_players_up'), t('catalogue.toolbar.sort_players_down')],
+  }[column.key] || [
+    t('catalogue.toolbar.sort_other_up', { column: column.label }),
+    t('catalogue.toolbar.sort_other_down', { column: column.label }),
+  ];
   return [
     { value: column.key, label: words[0] },
     { value: `-${column.key}`, label: words[1] },
@@ -43,23 +47,23 @@ export function createToolbar(
       onclick: () => onFigures(),
     },
     icon(GLYPHS.figures),
-    h('span', { class: 'tool__text' }, 'Figures')
+    h('span', { class: 'tool__text' }, t('catalogue.toolbar.figures'))
   );
   const filters = h(
     'button',
     { type: 'button', class: 'tool tool--filters', onclick: () => onFilters() },
     icon(GLYPHS.filters),
-    h('span', {}, 'Filters'),
+    h('span', {}, t('catalogue.toolbar.filters')),
     h('span', { class: 'tool__badge', hidden: true })
   );
   const group = h(
     'select',
-    { class: 'tool__select', 'aria-label': 'Group the records', onchange: (event) => onGroup(event.target.value) },
-    GROUPS.map((g) => h('option', { value: g.key }, g.key ? `Group by ${g.label.toLowerCase()}` : 'No grouping'))
+    { class: 'tool__select', 'aria-label': t('catalogue.toolbar.group_label'), onchange: (event) => onGroup(event.target.value) },
+    GROUPS.map((g) => h('option', { value: g.key }, g.key ? t('catalogue.toolbar.group_by', { group: g.label.toLocaleLowerCase(lang) }) : t('catalogue.toolbar.no_grouping')))
   );
   const sort = h(
     'select',
-    { class: 'tool__select', 'aria-label': 'Sort the records', onchange: (event) => onSort(event.target.value) },
+    { class: 'tool__select', 'aria-label': t('catalogue.toolbar.sort_label'), onchange: (event) => onSort(event.target.value) },
     SORT_OPTIONS.map((option) => h('option', { value: option.value }, option.label))
   );
   const density = ['compact', 'comfortable'].map((key) =>
@@ -72,7 +76,7 @@ export function createToolbar(
         dataset: { density: key },
         onclick: () => onDensity(key),
       },
-      key === 'compact' ? 'Compact' : 'Comfortable'
+      key === 'compact' ? t('catalogue.toolbar.compact') : t('catalogue.toolbar.comfortable')
     )
   );
   const marks = h('span', { class: 'toolbar__marks', hidden: true });
@@ -89,7 +93,7 @@ export function createToolbar(
     h(
       'li',
       { role: 'none' },
-      h('button', { type: 'button', role: 'menuitem', class: 'menu__item', onclick: () => run(onCSV) }, 'Download CSV')
+      h('button', { type: 'button', role: 'menuitem', class: 'menu__item', onclick: () => run(onCSV) }, t('catalogue.toolbar.download_csv'))
     ),
     h(
       'li',
@@ -97,7 +101,7 @@ export function createToolbar(
       h(
         'button',
         { type: 'button', role: 'menuitem', class: 'menu__item', onclick: () => run(onMarkdown) },
-        'Copy as Markdown table'
+        t('catalogue.toolbar.copy_markdown')
       )
     )
   );
@@ -111,7 +115,7 @@ export function createToolbar(
       'aria-controls': 'export-menu',
     },
     icon(GLYPHS.download),
-    h('span', { class: 'tool__text' }, 'Export'),
+    h('span', { class: 'tool__text' }, t('catalogue.toolbar.export')),
     icon(GLYPHS.caret, { class: 'tool__caret' })
   );
 
@@ -153,7 +157,7 @@ export function createToolbar(
       figures,
       h('span', { class: 'tool tool--select tool--sort' }, sort),
       h('span', { class: 'tool tool--select tool--group' }, group),
-      h('div', { class: 'seg', role: 'group', 'aria-label': 'Row density' }, density)
+      h('div', { class: 'seg', role: 'group', 'aria-label': t('catalogue.toolbar.density_label') }, density)
     ),
     h(
       'div',
@@ -180,17 +184,17 @@ export function createToolbar(
       marks.replaceChildren(
         ...(markCount
           ? [
-              markCount === 1 && h('span', {}, '1 marked, mark another'),
+              markCount === 1 && h('span', {}, t('catalogue.toolbar.one_marked')),
               h(
                 'button',
                 { type: 'button', class: 'toolbar__unmark', onclick: onClearMarks },
-                markCount === 1 ? 'Clear' : 'Clear marks'
+                markCount === 1 ? t('catalogue.toolbar.clear') : t('catalogue.toolbar.clear_marks')
               ),
             ].filter(Boolean)
           : [])
       );
       compare.hidden = markCount < 2;
-      compare.textContent = `Compare ${markCount}`;
+      compare.textContent = t('catalogue.toolbar.compare', { count: markCount });
     },
   };
 }

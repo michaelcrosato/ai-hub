@@ -10,6 +10,7 @@
 
 import { client, hasSession, attempt, withTimeout } from './cloud.js';
 import { RETURN_KEY } from './config.js';
+import { t } from '../lang.js';
 
 const listeners = new Set();
 let current; // undefined: not asked yet; null: signed out; else the user
@@ -88,7 +89,7 @@ export async function signInAsGuest() {
   const user = await currentUser();
   if (user) return user;
   // A stored sign-in that couldn't be read just now is never replaced by a guest.
-  if (hasSession()) throw new Error('Your account could not be reached just now. Try again.');
+  if (hasSession()) throw new Error(t('account.auth.unreachable'));
   const sb = await client();
   const { data, error } = await sb.auth.signInAnonymously();
   if (error) throw error;

@@ -12,7 +12,8 @@
  * as well) would give, which is what makes the facets usable as a chart.
  */
 
-import { playersOf, sameKey, MULTI, SINGLE } from '../manifest.js';
+import { playersOf, sameKey, valueLabel, MULTI, SINGLE } from '../manifest.js';
+import { t, lang } from '../lang.js';
 import { DAY, buildsOf, formatTerm, parse, select, sizeText, sizeToken, startsWord, valuesOf } from './query.js';
 
 const KB = 1024;
@@ -21,10 +22,10 @@ const GB = MB * KB;
 
 /** The Wall's file-size brackets, written as the query terms that select them. */
 export const SIZE_BRACKETS = [
-  { label: 'Under 250 KB', term: 'size:<250kb' },
-  { label: '250 KB–1 MB', term: 'size:250kb..1mb' },
-  { label: '1–4 MB', term: 'size:1mb..4mb' },
-  { label: 'Over 4 MB', term: 'size:>=4mb' },
+  { label: t('catalogue.tally.size_under_250kb'), term: 'size:<250kb' },
+  { label: t('catalogue.tally.size_250kb_1mb'), term: 'size:250kb..1mb' },
+  { label: t('catalogue.tally.size_1_4mb'), term: 'size:1mb..4mb' },
+  { label: t('catalogue.tally.size_over_4mb'), term: 'size:>=4mb' },
 ];
 const brackets = SIZE_BRACKETS.map((bracket) => ({ ...bracket, test: parse(bracket.term).terms[0].test }));
 const bracketOf = (game) => brackets.find((bracket) => bracket.test(game))?.label;
@@ -37,25 +38,39 @@ const seatsTerm = (value) =>
  * on the facet; `term` writes the query term for a value when the plain
  * `field:value` would not do. `order` pins a scale's order; the rest list by
  * how much of the library carries them, which stays put as the selection
- * changes, so a bar never jumps out from under the pointer.
+ * changes, so a bar never jumps out from under the pointer. `show` words a
+ * value for the panel when the value itself is only what the library calls it.
  */
 export const FACETS = [
-  { field: 'type', label: 'Type', values: (g) => [g.type || 'Game'] },
+  {
+    field: 'type',
+    label: t('catalogue.tally.facet_type'),
+    values: (g) => [g.type || 'Game'],
+    show: (value) => (value === 'Game' ? t('catalogue.tally.type_game') : value),
+  },
   {
     field: 'origin',
-    label: 'Origin',
+    label: t('catalogue.tally.facet_origin'),
     values: (g) => [g.lineage.original ? 'Original' : 'Inspired'],
     order: ['Original', 'Inspired'],
+    show: (value) => (value === 'Original' ? t('catalogue.tally.origin_original') : t('catalogue.tally.origin_inspired')),
     term: (value) => `origin:${value.toLowerCase()}`,
   },
-  { field: 'genre', label: 'Genre', values: (g) => valuesOf(g.genre) },
-  { field: 'players', label: 'Players', values: playersOf, order: [SINGLE, MULTI], term: seatsTerm },
-  { field: 'model', label: 'Model', values: (g) => valuesOf(g.model) },
-  { field: 'series', label: 'Series', values: (g) => (g.lineage.original ? [] : [g.lineage.series]) },
-  { field: 'tag', label: 'Tags', values: (g) => valuesOf(g.tags), limit: 24 },
+  { field: 'genre', label: t('catalogue.tally.facet_genre'), values: (g) => valuesOf(g.genre) },
+  {
+    field: 'players',
+    label: t('catalogue.tally.facet_players'),
+    values: playersOf,
+    order: [SINGLE, MULTI],
+    term: seatsTerm,
+    show: (value) => (value === SINGLE ? t('catalogue.tally.players_single') : value === MULTI ? t('catalogue.tally.players_multi') : valueLabel('players', value)),
+  },
+  { field: 'model', label: t('catalogue.tally.facet_model'), values: (g) => valuesOf(g.model) },
+  { field: 'series', label: t('catalogue.tally.facet_series'), values: (g) => (g.lineage.original ? [] : [g.lineage.series]) },
+  { field: 'tag', label: t('catalogue.tally.facet_tags'), values: (g) => valuesOf(g.tags), limit: 24 },
   {
     field: 'size',
-    label: 'Size',
+    label: t('catalogue.tally.facet_size'),
     values: (g) => [bracketOf(g)].filter(Boolean),
     order: SIZE_BRACKETS.map((bracket) => bracket.label),
     term: (value) => SIZE_BRACKETS.find((bracket) => bracket.label === value).term,
@@ -70,7 +85,7 @@ function countValues(games, values) {
   return counts;
 }
 
-const natural = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
+const natural = new Intl.Collator(lang, { numeric: true, sensitivity: 'base' });
 
 /**
  * The term a facet value writes. Text fields match the start of any word, so
@@ -101,7 +116,7 @@ function shelvesOf(library) {
       return at === -1 ? Infinity : at;
     };
     let options = vocabulary
-      .map((value) => ({ value, total: totals.get(value) }))
+      .map((value) => ({ value, label: facet.show ? facet.show(value) : value, total: totals.get(value) }))
       .sort((a, b) =>
         facet.order
           ? place(a.value) - place(b.value) || natural.compare(a.value, b.value)
@@ -212,7 +227,7 @@ export function tallySizes(library, parsed, ctx = {}, { selection = select(libra
     lo,
     hi: edges[i + 1],
     term: `size:${sizeToken(lo)}..${sizeToken(edges[i + 1])}`,
-    label: `${sizeText(lo)}–${sizeText(edges[i + 1])}`,
+    label: t('catalogue.tally.size_bin', { from: sizeText(lo), to: sizeText(edges[i + 1]) }),
     total: 0,
     other: 0,
     selected: 0,

@@ -8,10 +8,16 @@ import { viewSwitch } from '../ui/views.js';
 import { accountButton } from '../account/button.js';
 import { languageMenu } from '../ui/language.js';
 import { selection } from './common.js';
+import { t, fillPage } from '../lang.js';
 
-const names = { atlas: 'Atlas', timeline: 'Timeline', deck: 'Deck' };
+fillPage();
+
 const key = document.body.dataset.view;
-const label = names[key];
+const backLabels = {
+  atlas: t('explore.page.back_atlas'),
+  timeline: t('explore.page.back_timeline'),
+  deck: t('explore.page.back_deck'),
+};
 const $ = (id) => document.getElementById(id);
 const shell = $('explore-shell');
 const root = $('explore-content');
@@ -55,7 +61,7 @@ function leavePlayer() {
 }
 
 const player = createPlayer($('player'), {
-  backLabel: `Back to the ${label.toLowerCase()}`,
+  backLabel: backLabels[key],
   onExit: leavePlayer,
   onRoll() {
     const unplayed = key === 'deck' && router.current().query.get('unplayed') === '1';
@@ -100,7 +106,7 @@ function render(route) {
   if (!library || !view) return;
   const game = library.bySlug.get(route.slug);
   if (route.slug && !game) {
-    $('explore-notice').textContent = 'That entry is unavailable. Browse the library below.';
+    $('explore-notice').textContent = t('explore.page.entry_unavailable');
     router.go('/', { replace: true });
     return;
   }
@@ -113,7 +119,7 @@ function render(route) {
   if (queryText !== rendered || dirty) {
     pool = selection(library.games, route.query, store, library.showAll);
     $('explore-count').textContent =
-      `${pool.length.toLocaleString()} ${pool.length === 1 ? 'entry' : 'entries'} in this selection`;
+      t('explore.page.count', { count: pool.length });
     dirty = false;
     rendered = queryText;
     view.update({ games: pool, query: route.query, selected: route.slug || null });
@@ -209,7 +215,7 @@ async function boot() {
     const [loaded, renderer] = await Promise.all([loadLibrary(), import(`./${key}.js`)]);
     library = loaded;
     if (library.showAll)
-      $('explore-notice').textContent = 'Dev settings: restricted content is visible on this device.';
+      $('explore-notice').textContent = t('explore.page.dev_visible');
     view = renderer.createView(root, {
       info(game, from) {
         rememberFocus(from);
@@ -236,9 +242,9 @@ async function boot() {
       h(
         'section',
         { class: 'explore-error', role: 'alert' },
-        h('h2', {}, 'The library could not be opened'),
-        h('p', {}, 'Check your connection and try again.'),
-        h('button', { type: 'button', onclick: () => location.reload() }, 'Try again'),
+        h('h2', {}, t('explore.page.error_title')),
+        h('p', {}, t('explore.page.error_hint')),
+        h('button', { type: 'button', onclick: () => location.reload() }, t('explore.page.error_retry')),
       ),
     );
   }

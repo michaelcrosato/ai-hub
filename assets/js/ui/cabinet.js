@@ -11,9 +11,10 @@ import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { screenArt } from '../art.js';
 import { frameAt, FRAME_MS } from '../frames.js';
-import { bytes, plural } from '../format.js';
+import { bytes } from '../format.js';
+import { t } from '../lang.js';
 import { store } from '../store.js';
-import { plainNameOf } from '../manifest.js';
+import { plainNameOf, valueLabel } from '../manifest.js';
 import { emblem } from './friends.js';
 import { friendsHref, playsOnline, togetherLine } from '../friends/together.js';
 
@@ -25,7 +26,7 @@ function faveButton(game) {
       class: 'cab__fave',
       type: 'button',
       'aria-pressed': String(on),
-      'aria-label': on ? `Remove ${game.name} from favourites` : `Add ${game.name} to favourites`,
+      'aria-label': on ? t('game.cabinet.fave_remove', { name: game.name }) : t('game.cabinet.fave_add', { name: game.name }),
       onclick: (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -33,7 +34,7 @@ function faveButton(game) {
         button.setAttribute('aria-pressed', String(next));
         button.setAttribute(
           'aria-label',
-          next ? `Remove ${game.name} from favourites` : `Add ${game.name} to favourites`
+          next ? t('game.cabinet.fave_remove', { name: game.name }) : t('game.cabinet.fave_add', { name: game.name })
         );
         button.firstChild.setAttribute('fill', next ? 'currentColor' : 'none');
       },
@@ -92,9 +93,9 @@ function screen(game) {
     'div',
     { class: 'cab__screen' },
     art(game),
-    game.buildCount > 1 && h('span', { class: 'cab__badge' }, plural(game.buildCount, 'build')),
+    game.buildCount > 1 && h('span', { class: 'cab__badge' }, t('game.cabinet.builds_count', { count: game.buildCount })),
     // Only ever seen with dev settings showing everything.
-    game.restricted === true && h('span', { class: 'cab__flag' }, 'Hidden'),
+    game.restricted === true && h('span', { class: 'cab__flag' }, t('game.cabinet.hidden')),
     h('span', { class: 'cab__glass' }),
     // Sits above the glass so the encode settings stay readable as the stills change.
     frames && game.frameLabel && h('span', { class: 'cab__encode' }, game.frameLabel)
@@ -114,10 +115,15 @@ export function stackCabinet(stack, index = 0, href = '#/') {
   const names = [...new Set(stack.games.map(plainNameOf))];
   const what =
     stack.level === 'series'
-      ? `${plural(stack.titles, 'game')}, ${plural(count, 'attempt')}`
+      ? t('game.cabinet.stack_series', {
+          games: t('game.cabinet.stack_games', { count: stack.titles }),
+          attempts: t('game.cabinet.stack_attempts', { count }),
+        })
       : stack.level === 'facet'
-        ? plural(count, 'game')
-        : plural(count, 'attempt');
+        ? t('game.cabinet.stack_games', { count })
+        : t('game.cabinet.stack_attempts', { count });
+  // A genre or model is shown as it is; "Multiplayer" and the like are the hub's words.
+  const name = stack.level === 'facet' ? valueLabel(stack.facet, stack.label) : stack.label;
 
   return h(
     'article',
@@ -133,8 +139,8 @@ export function stackCabinet(stack, index = 0, href = '#/') {
       { class: 'cab__body' },
       h(
         'a',
-        { class: 'cab__link', href, 'aria-label': `${stack.label}: ${what}. Open the stack.` },
-        h('div', { class: 'cab__marquee' }, h('span', { class: 'cab__name' }, stack.label)),
+        { class: 'cab__link', href, 'aria-label': t('game.cabinet.stack_label', { name, what }) },
+        h('div', { class: 'cab__marquee' }, h('span', { class: 'cab__name' }, name)),
         h(
           'div',
           { class: 'cab__screen' },
@@ -152,8 +158,8 @@ export function stackCabinet(stack, index = 0, href = '#/') {
           { class: 'cab__meta' },
           // The whole tile opens the stack; Details is the game in front, which
           // a stack would otherwise hide.
-          h('span', { class: 'cab__open' }, 'More like this'),
-          h('a', { class: 'cab__info', href: `#/g/${front.slug}` }, 'Details'),
+          h('span', { class: 'cab__open' }, t('game.cabinet.more')),
+          h('a', { class: 'cab__info', href: `#/g/${front.slug}` }, t('game.cabinet.details')),
           h('span', {}, front.genre || bytes(front.bytes))
         )
       )
@@ -169,7 +175,7 @@ export function stackCabinet(stack, index = 0, href = '#/') {
 export function cabinet(game, index = 0, caption = null) {
   const palette = cabinetPalette(game);
 
-  const infoLabel = game.buildCount > 1 ? 'Builds' : game.version ? `v${game.version}` : 'Details';
+  const infoLabel = game.buildCount > 1 ? t('game.cabinet.builds_link') : game.version ? `v${game.version}` : t('game.cabinet.details');
 
   return h(
     'article',
@@ -190,7 +196,7 @@ export function cabinet(game, index = 0, caption = null) {
       h(
         'div',
         { class: 'cab__panel' },
-        h('p', { class: 'cab__tagline' }, game.tagline || game.description || 'No blurb — open it and find out.'),
+        h('p', { class: 'cab__tagline' }, game.tagline || game.description || t('game.cabinet.no_blurb')),
         // Only shown one to a row, where there is room to say more.
         game.tagline && game.description && h('p', { class: 'cab__about' }, game.description),
         h(
@@ -205,9 +211,9 @@ export function cabinet(game, index = 0, caption = null) {
           playsOnline(game) &&
             h(
               'a',
-              { class: 'cab__friends', href: friendsHref(game), title: `Play with friends: ${togetherLine(game)}` },
+              { class: 'cab__friends', href: friendsHref(game), title: t('game.cabinet.friends_hint', { line: togetherLine(game) }) },
               emblem({ size: 12 }),
-              'With friends'
+              t('game.cabinet.friends')
             ),
           // Genre when the catalogue has one; size is the fallback fact. Dev
           // settings can swap in the slug, the key everything else hangs off.

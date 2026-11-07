@@ -17,7 +17,7 @@ import { h } from '../dom.js';
 import { loadLibrary } from '../library.js';
 import { store } from '../store.js';
 import { router } from '../router.js';
-import { plural } from '../format.js';
+import { date, fillPage, t, tx, withLanguage } from '../lang.js';
 import { createPlayer } from '../ui/player.js';
 import { viewSwitch } from '../ui/views.js';
 import { accountButton } from '../account/button.js';
@@ -48,6 +48,8 @@ import { createSheet } from './sheet.js';
 import { createCompare } from './compare.js';
 import { createSummary } from './summary.js';
 import { createToolbar } from './toolbar.js';
+
+fillPage();
 
 const $ = (id) => document.getElementById(id);
 const root = document.body;
@@ -115,7 +117,7 @@ let countTimer = 0;
 function announceCount(n) {
   clearTimeout(countTimer);
   countTimer = setTimeout(() => {
-    $('announce').textContent = `${plural(n, 'record')}`;
+    $('announce').textContent = t('catalogue.app.records', { count: n });
   }, 700);
 }
 
@@ -142,7 +144,7 @@ function emptyNote() {
   return h(
     'div',
     { class: 'void' },
-    h('p', { class: 'void__title' }, 'No records match'),
+    h('p', { class: 'void__title' }, t('catalogue.app.no_match')),
     h('p', { class: 'void__query' }, h('code', {}, parsed.text.trim())),
     h(
       'div',
@@ -150,14 +152,14 @@ function emptyNote() {
       h(
         'button',
         { type: 'button', class: 'btn btn--play', onclick: () => writeQuery('') },
-        h('span', { class: 'btn__text' }, 'Clear the query')
+        h('span', { class: 'btn__text' }, t('catalogue.app.clear_query'))
       ),
       last &&
         parsed.terms.filter((term) => !term.incomplete).length > 1 &&
         h(
           'button',
           { type: 'button', class: 'btn btn--quiet', onclick: () => writeQuery(withoutTerm(parsed.text, last)) },
-          h('span', { class: 'btn__text' }, `Drop ${last.raw}`)
+          h('span', { class: 'btn__text' }, t('catalogue.app.drop_term', { term: last.raw }))
         )
     )
   );
@@ -207,11 +209,10 @@ function renderDesk() {
   ui.ledger.render(listed, groupRecords(listed, groupKey, { sort, library }), {
     sort,
     max: Math.max(0, ...listed.map((game) => game.bytes || 0)),
-    description: `${plural(listed.length, 'record')}, sorted by ${sort.key}${sort.dir < 0 ? ', descending' : ''}`,
     empty: emptyNote,
   });
   ui.ledger.setCursor(cursor);
-  $('done').textContent = listed.length ? `Show ${plural(listed.length, 'record')}` : 'No records match';
+  $('done').textContent = listed.length ? t('catalogue.app.show_records', { count: listed.length }) : t('catalogue.app.no_match');
   renderToolbar();
   announceCount(listed.length);
 }
@@ -311,7 +312,7 @@ function leaveRecord() {
 
 function toggleMark(slug) {
   if (marks.has(slug)) marks.delete(slug);
-  else if (marks.size >= MAX_MARKS) toast('Compare takes up to four records. Unmark one first.');
+  else if (marks.size >= MAX_MARKS) toast(t('catalogue.app.max_marks'));
   else marks.add(slug);
   ui.ledger.setMarks(marks);
   ui.sheet.refresh();
@@ -559,7 +560,7 @@ function onKey(event) {
       break;
     case 'o':
       if (!game) return;
-      window.open(findBuild(game).path, '_blank', 'noopener');
+      window.open(withLanguage(findBuild(game).path), '_blank', 'noopener');
       break;
     case 'c':
       if (marks.size < 2) return;
@@ -639,12 +640,12 @@ function build(manifest) {
       link.click();
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
-      toast(`Downloaded ${plural(listed.length, 'record')} as CSV`);
+      toast(t('catalogue.app.downloaded', { count: listed.length }));
     },
     onMarkdown: () =>
       copyText(
         toMarkdown(listed, { link: recordLink }),
-        `Copied ${plural(listed.length, 'record')} as a Markdown table`
+        t('catalogue.app.copied_table', { count: listed.length })
       ),
   });
   ui.ledger = createLedger($('records'), {
@@ -665,7 +666,7 @@ function build(manifest) {
     onMark: toggleMark,
     onSelect: (slug) => openRecord(slug),
     onQuery: (term) => writeQuery(toggleTerm(parsed.text, term)),
-    onCopy: (game) => copyText(recordLink(game), `Copied the link to ${game.name}`),
+    onCopy: (game) => copyText(recordLink(game), t('catalogue.app.copied_link', { name: game.name })),
     onBack: leaveRecord,
     onStart: () => step(1),
   });
@@ -677,11 +678,10 @@ function build(manifest) {
   });
 
   $('done').addEventListener('click', closeFilters);
-  $('colophon').textContent = `${plural(library.length, 'record')} · compiled ${new Intl.DateTimeFormat('en-GB', {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-  }).format(Date.parse(manifest.generatedAt) || Date.now())}`;
+  $('colophon').textContent = t('catalogue.app.colophon', {
+    count: library.length,
+    date: date(Date.parse(manifest.generatedAt) || Date.now(), { day: 'numeric', month: 'short', year: 'numeric' }),
+  });
 }
 
 function applyPrefs() {
@@ -690,7 +690,7 @@ function applyPrefs() {
 }
 
 player = createPlayer($('player'), {
-  backLabel: 'Back to the catalogue',
+  backLabel: t('catalogue.app.back'),
   onExit: () => (pushed.play ? history.back() : router.go(`/g/${player.current()?.slug}`, { replace: true })),
   // Another game from what the ledger lists, never the one already up.
   onRoll() {
@@ -708,7 +708,7 @@ loadLibrary()
     bySlug = new Map(games.map((game) => [game.slug, game]));
     if (!games.length) {
       $('records').replaceChildren(
-        h('p', { class: 'desk__status' }, 'No games yet. Drop an .html file into games/ and refresh.')
+        h('p', { class: 'desk__status' }, t('catalogue.app.no_games'))
       );
       return;
     }
@@ -738,9 +738,7 @@ loadLibrary()
       h(
         'p',
         { class: 'desk__status' },
-        "Couldn't load the catalogue. Run ",
-        h('code', {}, 'pnpm scan'),
-        ' to rebuild data/games.json, then refresh.'
+        tx('catalogue.app.load_failed', { command: h('code', {}, 'pnpm scan') })
       )
     );
   });

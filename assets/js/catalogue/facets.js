@@ -9,6 +9,7 @@
  */
 
 import { h } from '../dom.js';
+import { t, number } from '../lang.js';
 
 /** Past this many values a facet folds, with a "Show all" to open it. */
 const FOLD = 8;
@@ -19,21 +20,21 @@ export function createFacets(root, { onToggle, onClearField, onClearAll }) {
   const clearAll = h(
     'button',
     { type: 'button', class: 'facets__clear', onclick: onClearAll, hidden: true },
-    'Clear all'
+    t('catalogue.facets.clear_all')
   );
   const list = h('div', { class: 'facets__list' });
   root.append(
     h(
       'header',
       { class: 'facets__head' },
-      h('h2', { class: 'label' }, 'Facets'),
+      h('h2', { class: 'label' }, t('catalogue.facets.title')),
       clearAll,
       h(
         'ul',
-        { class: 'legend', 'aria-label': 'How to read the bars' },
-        h('li', {}, h('i', { class: 'key key--selected', 'aria-hidden': 'true' }), 'Selected'),
-        h('li', {}, h('i', { class: 'key key--other', 'aria-hidden': 'true' }), 'Left out by this facet'),
-        h('li', {}, h('i', { class: 'key key--total', 'aria-hidden': 'true' }), 'Library')
+        { class: 'legend', 'aria-label': t('catalogue.facets.legend') },
+        h('li', {}, h('i', { class: 'key key--selected', 'aria-hidden': 'true' }), t('catalogue.facets.selected')),
+        h('li', {}, h('i', { class: 'key key--other', 'aria-hidden': 'true' }), t('catalogue.facets.left_out')),
+        h('li', {}, h('i', { class: 'key key--total', 'aria-hidden': 'true' }), t('catalogue.facets.library'))
       )
     ),
     list
@@ -50,9 +51,9 @@ export function createFacets(root, { onToggle, onClearField, onClearAll }) {
           class: 'facet__clear',
           hidden: true,
           onclick: () => onClearField(facet.field),
-          'aria-label': `Clear ${facet.label}`,
+          'aria-label': t('catalogue.facets.clear_facet', { facet: facet.label }),
         },
-        'Clear'
+        t('catalogue.facets.clear')
       );
       const items = facet.options.map((option) => {
         const n = h('span', { class: 'bar__n' });
@@ -63,10 +64,10 @@ export function createFacets(root, { onToggle, onClearField, onClearAll }) {
             type: 'button',
             class: 'bar',
             'aria-pressed': 'false',
-            title: `${option.value}. Click to filter by it, Shift-click to leave it out.`,
+            title: t('catalogue.facets.bar_title', { value: option.label }),
             onclick: (event) => onToggle(event.shiftKey ? `-${option.term}` : option.term),
           },
-          h('span', { class: 'bar__label' }, option.value),
+          h('span', { class: 'bar__label' }, option.label),
           h(
             'span',
             { class: 'bar__track', 'aria-hidden': 'true' },
@@ -85,7 +86,7 @@ export function createFacets(root, { onToggle, onClearField, onClearAll }) {
         h(
           'button',
           { type: 'button', class: 'facet__more', 'aria-expanded': 'false' },
-          `Show all ${facet.options.length}`
+          t('catalogue.facets.show_all', { count: facet.options.length })
         );
       const section = h(
         'section',
@@ -98,7 +99,9 @@ export function createFacets(root, { onToggle, onClearField, onClearAll }) {
         more.addEventListener('click', () => {
           const open = section.classList.toggle('is-open');
           more.setAttribute('aria-expanded', String(open));
-          more.textContent = open ? 'Show fewer' : `Show all ${facet.options.length}`;
+          more.textContent = open
+            ? t('catalogue.facets.show_fewer')
+            : t('catalogue.facets.show_all', { count: facet.options.length });
         });
       }
       list.append(section);
@@ -125,14 +128,17 @@ export function createFacets(root, { onToggle, onClearField, onClearAll }) {
           button.setAttribute('aria-pressed', String(option.pressed));
           button.classList.toggle('is-excluded', option.excluded);
           button.classList.toggle('is-empty', option.other === 0);
+          const counts = { value: option.label, other: option.other, total: option.total };
           button.setAttribute(
             'aria-label',
-            `${option.value}: ${option.other} of ${option.total}${option.excluded ? ', left out' : ''}`
+            option.excluded
+              ? t('catalogue.facets.bar_count_left_out', counts)
+              : t('catalogue.facets.bar_count', counts)
           );
           // A pressed or left-out value stays in view even when its facet is folded.
           item.classList.toggle('is-on', option.pressed || option.excluded);
-          n.textContent = String(option.other);
-          of.textContent = option.other === option.total ? '' : `/${option.total}`;
+          n.textContent = number(option.other);
+          of.textContent = option.other === option.total ? '' : t('catalogue.facets.bar_of', { total: option.total });
         }
       }
     },

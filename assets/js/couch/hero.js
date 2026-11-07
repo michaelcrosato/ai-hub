@@ -10,6 +10,7 @@
  */
 
 import { h, icon, append, clear, ICONS } from '../dom.js';
+import { t } from '../lang.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
 import { eyebrow, heroChips } from './facts.js';
@@ -37,10 +38,10 @@ export function createHero(root, { onPlay, onInfo, onFave }) {
 
   const star = icon(ICONS.star);
   const buttons = {
-    play: button('play', 'Play', icon(ICONS.play, { fill: 'currentColor', stroke: 'none' }), () => game && onPlay(game)),
-    friends: button('friends', 'With friends', emblem({ size: 22, className: 'friends-emblem btn__emblem' }), () => game && playsOnline(game) && location.assign(friendsHref(game))),
-    info: button('info', 'More info', icon(INFO), () => game && onInfo(game)),
-    fave: button('fave', 'Favourite', star, () => game && onFave(game), { 'aria-pressed': 'false' }),
+    play: button('play', t('couch.hero.play'), icon(ICONS.play, { fill: 'currentColor', stroke: 'none' }), () => game && onPlay(game)),
+    friends: button('friends', t('couch.hero.friends'), emblem({ size: 22, className: 'friends-emblem btn__emblem' }), () => game && playsOnline(game) && location.assign(friendsHref(game))),
+    info: button('info', t('couch.hero.info'), icon(INFO), () => game && onInfo(game)),
+    fave: button('fave', t('couch.hero.fave'), star, () => game && onFave(game), { 'aria-pressed': 'false' }),
   };
 
   const body = h('div', { class: 'hero__body' });
@@ -61,7 +62,7 @@ export function createHero(root, { onPlay, onInfo, onFave }) {
     game = next;
     const facts = quick ? [] : heroChips(next);
     append(clear(body), [
-      spotlight && h('p', { class: 'hero__spot' }, h('span', { class: 'hero__spark', 'aria-hidden': 'true' }), "Today's spotlight"),
+      spotlight && h('p', { class: 'hero__spot' }, h('span', { class: 'hero__spark', 'aria-hidden': 'true' }), t('couch.hero.spotlight')),
       h('p', { class: 'hero__eyebrow' }, eyebrow(next).join(' · ')),
       h('h2', { class: 'hero__name', 'data-fit': fit(next.name) }, next.name),
       next.tagline && h('p', { class: 'hero__tagline' }, next.tagline),
@@ -69,7 +70,7 @@ export function createHero(root, { onPlay, onInfo, onFave }) {
       facts.length > 0 &&
         h(
           'ul',
-          { class: 'hero__chips', 'aria-label': 'Facts' },
+          { class: 'hero__chips', 'aria-label': t('couch.hero.facts') },
           facts.map((chip) =>
             chip.keys
               ? h('li', { class: 'chip chip--keys', 'aria-label': chip.label }, keyRun(chip.keys))

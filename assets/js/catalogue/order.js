@@ -9,9 +9,10 @@
  */
 
 import { playersOf, sameKey, SINGLE } from '../manifest.js';
+import { t, lang } from '../lang.js';
 import { DAY, buildsOf, dayText, valuesOf } from './query.js';
 
-const collator = new Intl.Collator('en', { sensitivity: 'base', numeric: true });
+const collator = new Intl.Collator(lang, { sensitivity: 'base', numeric: true });
 
 export const byName = (a, b) => collator.compare(a.name, b.name) || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
 
@@ -26,14 +27,14 @@ const first = (value) => valuesOf(value)[0] ?? null;
 
 /** The sortable columns, and what each one sorts by. */
 export const COLUMNS = [
-  { key: 'name', label: 'Name', value: (g) => g.name, text: true },
-  { key: 'genre', label: 'Genre', value: (g) => first(g.genre), text: true },
-  { key: 'lineage', label: 'Lineage', value: (g) => (g.lineage.original ? null : g.lineage.title), text: true },
-  { key: 'model', label: 'Model', value: (g) => first(g.model), text: true },
-  { key: 'players', label: 'Players', value: mostSeats },
-  { key: 'size', label: 'Size', value: (g) => g.bytes || null },
-  { key: 'added', label: 'Added', value: (g) => g.addedAt || null },
-  { key: 'builds', label: 'Builds', value: buildsOf },
+  { key: 'name', label: t('catalogue.order.column_name'), value: (g) => g.name, text: true },
+  { key: 'genre', label: t('catalogue.order.column_genre'), value: (g) => first(g.genre), text: true },
+  { key: 'lineage', label: t('catalogue.order.column_lineage'), value: (g) => (g.lineage.original ? null : g.lineage.title), text: true },
+  { key: 'model', label: t('catalogue.order.column_model'), value: (g) => first(g.model), text: true },
+  { key: 'players', label: t('catalogue.order.column_players'), value: mostSeats },
+  { key: 'size', label: t('catalogue.order.column_size'), value: (g) => g.bytes || null },
+  { key: 'added', label: t('catalogue.order.column_added'), value: (g) => g.addedAt || null },
+  { key: 'builds', label: t('catalogue.order.column_builds'), value: buildsOf },
 ];
 
 export const DEFAULT_SORT = { key: 'name', dir: 1 };
@@ -66,11 +67,11 @@ export function sortRecords(list, { key, dir }) {
 /* --- groups ------------------------------------------------------------- */
 
 export const GROUPS = [
-  { key: '', label: 'None' },
-  { key: 'genre', label: 'Genre' },
-  { key: 'lineage', label: 'Lineage' },
-  { key: 'model', label: 'Model' },
-  { key: 'week', label: 'Week added' },
+  { key: '', label: t('catalogue.order.group_none') },
+  { key: 'genre', label: t('catalogue.order.group_genre') },
+  { key: 'lineage', label: t('catalogue.order.group_lineage') },
+  { key: 'model', label: t('catalogue.order.group_model') },
+  { key: 'week', label: t('catalogue.order.group_week') },
 ];
 
 export const readGroup = (param) => (GROUPS.some((group) => group.key === param) ? param : '');
@@ -88,10 +89,10 @@ export function weekOf(ms) {
  * single row, so those share one bucket at the end.
  */
 const GROUPERS = {
-  genre: () => ({ of: (g) => (first(g.genre) ? [sameKey(first(g.genre)), first(g.genre)] : null), rest: 'No genre' }),
+  genre: () => ({ of: (g) => (first(g.genre) ? [sameKey(first(g.genre)), first(g.genre)] : null), rest: t('catalogue.order.rest_genre') }),
   model: () => ({
     of: (g) => (first(g.model) ? [sameKey(first(g.model)), first(g.model)] : null),
-    rest: 'No model named',
+    rest: t('catalogue.order.rest_model'),
   }),
   lineage(library) {
     const counts = new Map();
@@ -101,18 +102,18 @@ const GROUPERS = {
     }
     return {
       of(g) {
-        if (g.lineage.original) return ['original', 'Original'];
+        if (g.lineage.original) return ['original', t('catalogue.order.group_original')];
         const key = sameKey(g.lineage.series);
         return counts.get(key) > 1 ? [`series:${key}`, g.lineage.series] : null;
       },
-      rest: 'Other sources',
+      rest: t('catalogue.order.rest_lineage'),
       // Originals have no lineage to sort by, so under that sort they sink to the end, as their rows do.
       sinks: (key) => key === 'original',
     };
   },
   week: () => ({
-    of: (g) => (g.addedAt ? [weekOf(g.addedAt), `Week of ${dayText(weekOf(g.addedAt))}`] : null),
-    rest: 'Undated',
+    of: (g) => (g.addedAt ? [weekOf(g.addedAt), t('catalogue.order.week_of', { date: dayText(weekOf(g.addedAt)) })] : null),
+    rest: t('catalogue.order.rest_week'),
     time: true,
   }),
 };

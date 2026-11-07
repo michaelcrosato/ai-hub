@@ -15,7 +15,8 @@
 import { h, clear, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { NOT_A_FACET, sessionOf } from '../manifest.js';
-import { bytes, date, plural } from '../format.js';
+import { bytes, date } from '../format.js';
+import { t, withLanguage } from '../lang.js';
 import { thumbs as rateButtons } from '../account/thumbs.js';
 import { friendsLink } from './friends.js';
 
@@ -25,19 +26,34 @@ const prettyLabel = (key) =>
     .replace(/[-_]+/g, ' ')
     .replace(/^./, (c) => c.toUpperCase());
 
+/** The fields games carry most; any other field is named after its key. */
+const FIELDS = {
+  genre: () => t('game.field.genre'),
+  controls: () => t('game.field.controls'),
+  tags: () => t('game.field.tags'),
+  audioTags: () => t('game.field.audio_tags'),
+  players: () => t('game.field.players'),
+  source: () => t('game.field.source'),
+  series: () => t('game.field.series'),
+  model: () => t('game.field.model'),
+  effort: () => t('game.field.effort'),
+  harness: () => t('game.field.harness'),
+};
+const fieldLabel = (key) => (FIELDS[key] ? FIELDS[key]() : prettyLabel(key));
+
 function facts(game) {
   const rows = [
-    ['Added', date(game.added)],
-    ['Size', bytes(game.bytes)],
+    [t('game.detail.added'), date(game.added)],
+    [t('game.detail.size'), bytes(game.bytes)],
   ];
-  if (game.version) rows.splice(1, 0, ['Current build', `v${game.version}`]);
-  rows.push(['Hub session', sessionOf(game)?.label]);
+  if (game.version) rows.splice(1, 0, [t('game.detail.current_build'), `v${game.version}`]);
+  rows.push([t('game.detail.session'), sessionOf(game)?.label]);
 
   for (const [key, value] of Object.entries(game)) {
     if (NOT_A_FACET.has(key)) continue;
     const text = Array.isArray(value) ? value.join(', ') : value;
     if (typeof text !== 'string' || !text.trim()) continue;
-    rows.push([prettyLabel(key), text]);
+    rows.push([fieldLabel(key), text]);
   }
 
   return h(
@@ -75,7 +91,7 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
 
       const closeButton = h(
         'button',
-        { class: 'detail__close', type: 'button', 'aria-label': 'Close details', onclick: closeTo },
+        { class: 'detail__close', type: 'button', 'aria-label': t('game.detail.close'), onclick: closeTo },
         icon(ICONS.close)
       );
 
@@ -84,8 +100,8 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
         h(
           'section',
           { class: 'builds' },
-          h('h3', { class: 'builds__title' }, plural(game.builds.length, 'build')),
-          h('p', { class: 'builds__note' }, 'Newest first. Older builds are kept exactly as they were.'),
+          h('h3', { class: 'builds__title' }, t('game.detail.builds', { count: game.builds.length })),
+          h('p', { class: 'builds__note' }, t('game.detail.builds_note')),
           ...game.builds.map((build, i) =>
             h(
               'button',
@@ -94,7 +110,7 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
                 type: 'button',
                 onclick: () => onPlay(game, build),
               },
-              h('span', { class: 'build__label' }, build.version ? `v${build.version}` : build.label),
+              h('span', { class: 'build__label', dataset: i === 0 ? { current: t('game.detail.current') } : {} }, build.version ? `v${build.version}` : build.label),
               h('span', { class: 'build__meta' }, date(build.added)),
               h('span', { class: 'build__size' }, bytes(build.bytes))
             )
@@ -104,14 +120,14 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
       clear(root);
       root.hidden = false;
       root.append(
-        h('button', { class: 'detail__scrim', type: 'button', 'aria-label': 'Close details', onclick: closeTo }),
+        h('button', { class: 'detail__scrim', type: 'button', 'aria-label': t('game.detail.close'), onclick: closeTo }),
         h(
           'div',
           {
             class: 'detail__panel',
             role: 'dialog',
             'aria-modal': 'true',
-            'aria-label': `${game.name} details`,
+            'aria-label': t('game.detail.label', { name: game.name }),
             style: paletteVars(palette),
           },
           h(
@@ -132,15 +148,15 @@ export function createDetail(root, { onPlay, attempts = () => null }) {
                 'button',
                 { class: 'detail__play', type: 'button', onclick: () => onPlay(game, current) },
                 icon(ICONS.play, { fill: 'currentColor', stroke: 'none', width: 15, height: 15 }),
-                'Play'
+                t('game.detail.play')
               ),
               friendsLink(game, { className: 'detail__friends' })
             ),
             rateButtons(game.slug, { className: 'detail__thumbs' }),
             h(
               'a',
-              { class: 'detail__aside', href: current.path, target: '_blank', rel: 'noopener' },
-              'Open on its own page'
+              { class: 'detail__aside', href: withLanguage(current.path), target: '_blank', rel: 'noopener' },
+              t('game.detail.own_page')
             ),
             others && h('a', { class: 'detail__aside detail__attempts', href: others.href }, others.text),
             facts(game),

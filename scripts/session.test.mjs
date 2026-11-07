@@ -383,7 +383,7 @@ test('filters toggle one value at a time and read as one line', () => {
   filters = toggleFilter(filters, 'lengths', 'short', false);
   filters = toggleFilter(filters, 'genres', 'Fighting', false);
   assert.equal(describeFilters(filters), 'Racing');
-  assert.equal(describeFilters({ genres: ['A', 'B', 'C'] }), 'A, B or C');
+  assert.equal(describeFilters({ genres: ['A', 'B', 'C'] }), 'A, B, or C');
   assert.equal(anyFilter(toggleFilter(filters, 'genres', 'Racing', false)), false);
 });
 

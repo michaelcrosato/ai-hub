@@ -1,6 +1,7 @@
 import { h } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { selectGames } from '../filter.js';
+import { t, upper } from '../lang.js';
 
 /** Shared scope, with the same search and visibility rules as the wall. */
 export function selection(games, query, stats, showAll = false) {
@@ -19,7 +20,7 @@ export function selection(games, query, stats, showAll = false) {
 }
 
 export function gameMeta(game) {
-  return [Array.isArray(game.genre) ? game.genre.join(' / ') : game.genre, game.source || 'Original']
+  return [Array.isArray(game.genre) ? game.genre.join(' / ') : game.genre, game.source || t('explore.common.original')]
     .filter(Boolean)
     .join(' · ');
 }
@@ -33,7 +34,7 @@ export function gameImage(game, { className = '', loading = 'lazy' } = {}) {
   const fallback = h(
     'span',
     { class: 'explore-image__fallback', 'aria-hidden': 'true' },
-    game.name.slice(0, 2).toUpperCase(),
+    upper(game.name.slice(0, 2)),
   );
   root.append(fallback);
   const src = game.cover || game.frames?.[0];

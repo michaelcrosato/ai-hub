@@ -7,6 +7,7 @@
 import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
+import { t } from '../lang.js';
 
 export const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -32,7 +33,7 @@ export function tile(game, { href }) {
     h('img', { class: 'tile__art', src: game.cover, alt: '', loading: 'lazy', decoding: 'async', draggable: 'false' }),
     h('span', { class: 'tile__name' }, game.name),
     // Only ever seen with dev settings showing everything, as on the wall.
-    game.restricted === true && h('span', { class: 'tile__flag' }, 'Hidden'),
+    game.restricted === true && h('span', { class: 'tile__flag' }, t('couch.ui.hidden')),
     store.isFave(game.slug) && star()
   );
 }
@@ -56,12 +57,12 @@ export const keyRun = (parts) =>
 
 /** The key, and the pad's button: a face button by its letter, Menu by its glyph. */
 const PROMPTS = {
-  play: ['Enter', 'A'],
+  play: [t('couch.ui.key_enter'), 'A'],
   info: ['I', 'Y'],
   fave: ['F', 'X'],
   // No pad button is free: a pad reaches With friends with the arrows.
   friends: ['P', null],
-  back: ['Esc', 'B'],
+  back: [t('couch.ui.key_esc'), 'B'],
   surprise: ['R', PAD_GLYPHS.menu],
 };
 

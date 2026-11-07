@@ -9,8 +9,17 @@
  */
 
 import { h } from '../dom.js';
-import { plural } from '../format.js';
+import { lang, number, t, tx } from '../lang.js';
 import { dayText, sizeText } from './query.js';
+
+/** A size as its number and its unit, apart, in the language's own words: ["3.2", "GB"]. */
+const UNITS = [[1024 ** 3, 'gigabyte'], [1024 ** 2, 'megabyte'], [1024, 'kilobyte'], [1, 'byte']];
+function sizeParts(n) {
+  const [scale, unit] = UNITS.find(([s]) => n >= s) || UNITS[UNITS.length - 1];
+  const parts = new Intl.NumberFormat(lang, { style: 'unit', unit, unitDisplay: 'short', maximumSignificantDigits: 3 }).formatToParts(n / scale);
+  const join = (keep) => parts.filter((p) => keep(p.type)).map((p) => p.value).join('').trim();
+  return [join((type) => type !== 'unit' && type !== 'literal'), join((type) => type === 'unit')];
+}
 
 const tile = (label, ...content) => h('div', { class: 'tile' }, h('p', { class: 'tile__label' }, label), ...content);
 
@@ -18,29 +27,31 @@ export function createSummary(root, { onOrigin, onSelect, onQuery }) {
   return {
     render(s, { total, origin }) {
       const share = s.count ? s.originals / s.count : 0;
-      const [size, unit] = sizeText(s.bytes).split(' ');
+      const [size, unit] = sizeParts(s.bytes);
       root.replaceChildren(
         tile(
-          'Records',
-          h('p', { class: 'tile__value' }, String(s.count), h('span', { class: 'tile__unit' }, ` of ${total}`)),
+          t('catalogue.summary.records'),
+          h('p', { class: 'tile__value' }, number(s.count), h('span', { class: 'tile__unit' }, ` ${t('catalogue.summary.of_total', { total })}`)),
           h(
             'p',
             { class: 'tile__sub' },
-            s.count === total ? 'The whole catalogue' : `${Math.round((s.count / total) * 100)}% of the catalogue`
+            s.count === total
+              ? t('catalogue.summary.whole')
+              : t('catalogue.summary.share', { percent: Math.round((s.count / total) * 100) })
           )
         ),
         tile(
-          'Total size',
+          t('catalogue.summary.total_size'),
           h(
             'p',
             { class: 'tile__value' },
             s.bytes ? size : '0',
-            h('span', { class: 'tile__unit' }, ` ${s.bytes ? unit : 'MB'}`)
+            h('span', { class: 'tile__unit' }, ` ${s.bytes ? unit : t('catalogue.summary.zero_unit')}`)
           ),
-          h('p', { class: 'tile__sub' }, s.count ? `Median ${sizeText(s.median)}` : 'Nothing selected')
+          h('p', { class: 'tile__sub' }, s.count ? t('catalogue.summary.median', { size: sizeText(s.median) }) : t('catalogue.summary.nothing'))
         ),
         tile(
-          'Original and inspired',
+          t('catalogue.summary.origin'),
           h(
             'div',
             { class: 'split', style: { '--share': share } },
@@ -50,7 +61,7 @@ export function createSummary(root, { onOrigin, onSelect, onQuery }) {
                 type: 'button',
                 class: 'split__part split__part--original',
                 'aria-pressed': String(origin === 'original'),
-                'aria-label': `${s.originals} original. Filter to originals`,
+                'aria-label': t('catalogue.summary.filter_originals', { count: s.originals }),
                 onclick: () => onOrigin('original'),
               },
               h('span', { class: 'split__bar', 'aria-hidden': 'true' })
@@ -61,7 +72,7 @@ export function createSummary(root, { onOrigin, onSelect, onQuery }) {
                 type: 'button',
                 class: 'split__part split__part--inspired',
                 'aria-pressed': String(origin === 'inspired'),
-                'aria-label': `${s.inspired} inspired. Filter to inspired`,
+                'aria-label': t('catalogue.summary.filter_inspired', { count: s.inspired }),
                 onclick: () => onOrigin('inspired'),
               },
               h('span', { class: 'split__bar', 'aria-hidden': 'true' })
@@ -74,21 +85,19 @@ export function createSummary(root, { onOrigin, onSelect, onQuery }) {
               'span',
               {},
               h('i', { class: 'split__key split__key--original', 'aria-hidden': 'true' }),
-              h('b', {}, String(s.originals)),
-              ' original'
+              tx('catalogue.summary.legend_original', { count: h('b', {}, number(s.originals)) })
             ),
             h(
               'span',
               {},
               h('i', { class: 'split__key split__key--inspired', 'aria-hidden': 'true' }),
-              h('b', {}, String(s.inspired)),
-              ' inspired'
+              tx('catalogue.summary.legend_inspired', { count: h('b', {}, number(s.inspired)) })
             )
           )
         ),
         tile(
-          'Models named',
-          h('p', { class: 'tile__value' }, String(s.models.length)),
+          t('catalogue.summary.models'),
+          h('p', { class: 'tile__value' }, number(s.models.length)),
           h(
             'p',
             { class: 'tile__sub' },
@@ -96,31 +105,31 @@ export function createSummary(root, { onOrigin, onSelect, onQuery }) {
               ? h(
                   'button',
                   { type: 'button', class: 'xref', onclick: () => onQuery('has:model') },
-                  `on ${plural(s.modelRecords, 'record')}`
+                  t('catalogue.summary.on_records', { count: s.modelRecords })
                 )
-              : 'None named'
+              : t('catalogue.summary.none_named')
           )
         ),
         tile(
-          'Newest addition',
+          t('catalogue.summary.newest'),
           h('p', { class: 'tile__value tile__value--date' }, s.newest?.addedAt ? dayText(s.newest.addedAt) : '—'),
           h(
             'p',
             { class: 'tile__sub' },
             s.newest
               ? h('button', { type: 'button', class: 'xref', onclick: () => onSelect(s.newest.slug) }, s.newest.name)
-              : 'Nothing selected'
+              : t('catalogue.summary.nothing')
           )
         ),
         tile(
-          'Several builds',
-          h('p', { class: 'tile__value' }, String(s.several)),
+          t('catalogue.summary.several'),
+          h('p', { class: 'tile__value' }, number(s.several)),
           h(
             'p',
             { class: 'tile__sub' },
             s.several
-              ? h('button', { type: 'button', class: 'xref', onclick: () => onQuery('builds:>1') }, 'Show them')
-              : 'All single builds'
+              ? h('button', { type: 'button', class: 'xref', onclick: () => onQuery('builds:>1') }, t('catalogue.summary.show_them'))
+              : t('catalogue.summary.all_single')
           )
         )
       );

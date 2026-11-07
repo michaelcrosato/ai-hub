@@ -13,7 +13,7 @@
 import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { attemptsAt, similarGames } from '../similar.js';
-import { plural } from '../format.js';
+import { number, t, tx, withLanguage } from '../lang.js';
 import { buildsOf, dayText, dayToken, sizeText, valuesOf } from './query.js';
 import { keycaps } from './keycaps.js';
 import { byName } from './order.js';
@@ -27,8 +27,6 @@ const GLYPHS = {
   link: 'M9.5 14.5l5-5M8 11l-2.2 2.2a3.2 3.2 0 0 0 4.5 4.5L12.5 15.5M16 13l2.2-2.2a3.2 3.2 0 0 0-4.5-4.5L11.5 8.5',
   compare: 'M4 5h6v14H4zM14 5h6v14h-6z',
 };
-
-const count = new Intl.NumberFormat('en-GB');
 
 /** The record's controls with every key set as a keycap. */
 function controlsLine(controls) {
@@ -51,7 +49,7 @@ export function createSheet(
   const bar = h(
     'div',
     { class: 'sheet__bar' },
-    h('button', { type: 'button', class: 'sheet__back', onclick: () => onBack() }, icon(ICONS.back), 'Records'),
+    h('button', { type: 'button', class: 'sheet__back', onclick: () => onBack() }, icon(ICONS.back), t('catalogue.sheet.back')),
     barName
   );
   root.append(bar, body);
@@ -63,7 +61,7 @@ export function createSheet(
       {
         type: 'button',
         class: 'xref',
-        title: `Add ${field}:${value.toLowerCase()} to the query`,
+        title: t('catalogue.sheet.add_term', { term: `${field}:${value.toLowerCase()}` }),
         onclick: () => onQuery(termFor(field, value)),
       },
       value
@@ -84,14 +82,14 @@ export function createSheet(
     const big = h('img', {
       class: 'record__cover',
       src: frames[0],
-      alt: `${entry.name}: still 1 of ${frames.length}`,
+      alt: t('catalogue.sheet.still_alt', { name: entry.name, n: 1, total: frames.length }),
       width: 640,
       height: 480,
       decoding: 'async',
     });
     const show = (i) => {
       big.src = frames[i];
-      big.alt = `${entry.name}: still ${i + 1} of ${frames.length}`;
+      big.alt = t('catalogue.sheet.still_alt', { name: entry.name, n: i + 1, total: frames.length });
     };
     const thumbs = frames.map((src, i) =>
       h(
@@ -100,12 +98,12 @@ export function createSheet(
           type: 'button',
           class: 'record__frame',
           'aria-pressed': String(i === 0),
-          'aria-label': `Show still ${i + 1} of ${frames.length}`,
+          'aria-label': t('catalogue.sheet.still_show', { n: i + 1, total: frames.length }),
           onpointerenter: () => show(i),
           onfocus: () => show(i),
           onclick: () => {
             pinned = i;
-            thumbs.forEach((t, j) => t.setAttribute('aria-pressed', String(j === i)));
+            thumbs.forEach((thumb, j) => thumb.setAttribute('aria-pressed', String(j === i)));
             show(i);
           },
         },
@@ -119,7 +117,7 @@ export function createSheet(
       frames.length > 1 &&
         h(
           'div',
-          { class: 'record__frames', role: 'group', 'aria-label': 'Stills', onpointerleave: () => show(pinned) },
+          { class: 'record__frames', role: 'group', 'aria-label': t('catalogue.sheet.stills'), onpointerleave: () => show(pinned) },
           thumbs
         )
     );
@@ -134,18 +132,18 @@ export function createSheet(
         'p',
         { class: 'record__note' },
         entry.lineage.original
-          ? ['An original. Nothing else in the catalogue is called ', title, '.']
-          : ['The only attempt at ', title, ' in the catalogue.']
+          ? tx('catalogue.sheet.original_note', { title })
+          : tx('catalogue.sheet.only_attempt', { title })
       );
     }
     return [
       h(
         'p',
         { class: 'record__note' },
-        h('b', {}, `${at} of ${all.length}`),
-        ' attempts at ',
-        title,
-        ', in the order they arrived.'
+        tx('catalogue.sheet.attempts', {
+          position: h('b', {}, t('catalogue.sheet.position', { at, total: all.length })),
+          title,
+        })
       ),
       h(
         'table',
@@ -156,10 +154,10 @@ export function createSheet(
           h(
             'tr',
             {},
-            h('th', { scope: 'col' }, 'Name'),
-            h('th', { scope: 'col' }, 'Model'),
-            h('th', { scope: 'col', class: 'num' }, 'Added'),
-            h('th', { scope: 'col', class: 'num' }, 'Size')
+            h('th', { scope: 'col' }, t('catalogue.sheet.col_name')),
+            h('th', { scope: 'col' }, t('catalogue.sheet.col_model')),
+            h('th', { scope: 'col', class: 'num' }, t('catalogue.sheet.col_added')),
+            h('th', { scope: 'col', class: 'num' }, t('catalogue.sheet.col_size'))
           )
         ),
         h(
@@ -192,7 +190,7 @@ export function createSheet(
 
   function similar(entry) {
     const list = similarGames(entry, library, { limit: 6 });
-    if (!list.length) return h('p', { class: 'record__note' }, 'Nothing else in the catalogue is much like it.');
+    if (!list.length) return h('p', { class: 'record__note' }, t('catalogue.sheet.nothing_similar'));
     return h(
       'ol',
       { class: 'likeness' },
@@ -233,11 +231,15 @@ export function createSheet(
           h(
             'span',
             { class: 'builds__label' },
-            build.version ? `v${build.version}` : i ? `Build ${entry.builds.length - i}` : 'Current'
+            build.version
+              ? `v${build.version}`
+              : i
+                ? t('catalogue.sheet.build_n', { n: entry.builds.length - i })
+                : t('catalogue.sheet.build_current')
           ),
           h('span', { class: 'builds__date num' }, build.added ? dayText(Date.parse(build.added)) : ''),
           h('span', { class: 'builds__size num' }, sizeText(build.bytes)),
-          h('button', { type: 'button', class: 'builds__play', onclick: () => onPlay(entry.slug, build) }, 'Play')
+          h('button', { type: 'button', class: 'builds__play', onclick: () => onPlay(entry.slug, build) }, t('catalogue.sheet.play'))
         )
       )
     );
@@ -254,7 +256,7 @@ export function createSheet(
       'button',
       { type: 'button', class: 'btn btn--fave', onclick: () => onFave(entry.slug) },
       icon(ICONS.star),
-      h('span', { class: 'btn__text' }, 'Favourite')
+      h('span', { class: 'btn__text' }, t('catalogue.sheet.favourite'))
     );
     const markButton = h(
       'button',
@@ -263,7 +265,7 @@ export function createSheet(
       h('span', { class: 'btn__text' })
     );
     pressed(faveButton, isFave(entry.slug));
-    pressed(markButton, isMarked(entry.slug), ['Marked', 'Compare']);
+    pressed(markButton, isMarked(entry.slug), [t('catalogue.sheet.marked'), t('catalogue.sheet.compare')]);
 
     const genre = valuesOf(entry.genre);
     const models = valuesOf(entry.model);
@@ -280,9 +282,9 @@ export function createSheet(
         h(
           'p',
           { class: 'record__eyebrow' },
-          h('span', { class: 'label' }, 'Record'),
-          h('span', { class: 'record__no' }, `No. ${String(accession.get(entry.slug) ?? '').padStart(4, '0')}`),
-          h('span', { class: 'record__kind' }, [entry.type || 'Game', ...genre].join(' · '))
+          h('span', { class: 'label' }, t('catalogue.sheet.record')),
+          h('span', { class: 'record__no' }, t('catalogue.sheet.number', { number: String(accession.get(entry.slug) ?? '').padStart(4, '0') })),
+          h('span', { class: 'record__kind' }, [entry.type || t('catalogue.sheet.game'), ...genre].join(' · '))
         ),
         plate(entry),
         h('h2', { class: 'record__name', id: 'record-name' }, entry.name),
@@ -294,7 +296,7 @@ export function createSheet(
             'button',
             { type: 'button', class: 'btn btn--play', onclick: () => onPlay(entry.slug) },
             icon(ICONS.play, { fill: 'currentColor', stroke: 'none' }),
-            h('span', { class: 'btn__text' }, 'Play'),
+            h('span', { class: 'btn__text' }, t('catalogue.sheet.play')),
             h('kbd', { class: 'btn__key' }, 'Enter')
           ),
           friendsLink(entry, { className: 'record__friends' }),
@@ -307,43 +309,43 @@ export function createSheet(
           { class: 'record__links' },
           h(
             'a',
-            { class: 'quiet-link', href: build.path, target: '_blank', rel: 'noopener' },
+            { class: 'quiet-link', href: withLanguage(build.path), target: '_blank', rel: 'noopener' },
             icon(GLYPHS.external),
-            'Open on its own page'
+            t('catalogue.sheet.open_own')
           ),
           h(
             'button',
             { type: 'button', class: 'quiet-link', onclick: () => onCopy(entry) },
             icon(GLYPHS.link),
-            'Copy link'
+            t('catalogue.sheet.copy_link')
           )
         )
       ),
       entry.description &&
         h('section', { class: 'record__section' }, h('p', { class: 'record__desc' }, entry.description)),
       section(
-        'Record',
+        t('catalogue.sheet.record'),
         h(
           'dl',
           { class: 'facts' },
-          fact('Slug', h('code', {}, entry.slug)),
-          fact('Type', entry.type || 'Game'),
-          fact('Genre', genre.length && genre.map((value) => query('genre', value))),
-          fact('Origin', entry.lineage.original ? 'Original' : 'Inspired'),
-          fact('Source', entry.source && query('source', entry.source)),
+          fact(t('catalogue.sheet.fact_slug'), h('code', {}, entry.slug)),
+          fact(t('catalogue.sheet.fact_type'), entry.type || t('catalogue.sheet.game')),
+          fact(t('catalogue.sheet.fact_genre'), genre.length && genre.map((value) => query('genre', value))),
+          fact(t('catalogue.sheet.fact_origin'), entry.lineage.original ? t('catalogue.sheet.original') : t('catalogue.sheet.inspired')),
+          fact(t('catalogue.sheet.fact_source'), entry.source && query('source', entry.source)),
           fact(
-            'Series',
+            t('catalogue.sheet.fact_series'),
             !entry.lineage.original && entry.lineage.series !== entry.source && query('series', entry.lineage.series)
           ),
           fact(
-            'Model',
-            models.length ? models.map((value) => query('model', value)) : h('span', { class: 'nil' }, 'Not named')
+            t('catalogue.sheet.fact_model'),
+            models.length ? models.map((value) => query('model', value)) : h('span', { class: 'nil' }, t('catalogue.sheet.not_named'))
           ),
-          fact('Players', playersText(entry)),
-          fact('Hub session', sessionOf(entry)?.label),
-          fact('Controls', entry.controls && controlsLine(entry.controls)),
+          fact(t('catalogue.sheet.fact_players'), playersText(entry)),
+          fact(t('catalogue.sheet.fact_session'), sessionOf(entry)?.label),
+          fact(t('catalogue.sheet.fact_controls'), entry.controls && controlsLine(entry.controls)),
           fact(
-            'Tags',
+            t('catalogue.sheet.fact_tags'),
             tags.length &&
               h(
                 'span',
@@ -354,7 +356,7 @@ export function createSheet(
                     {
                       type: 'button',
                       class: 'tag',
-                      title: `Add tag:${tag} to the query`,
+                      title: t('catalogue.sheet.add_term', { term: `tag:${tag}` }),
                       onclick: () => onQuery(termFor('tag', tag)),
                     },
                     tag
@@ -363,23 +365,23 @@ export function createSheet(
               )
           ),
           fact(
-            'Size',
+            t('catalogue.sheet.fact_size'),
             h(
               'span',
               {},
               h('span', { class: 'num' }, sizeText(entry.bytes)),
-              h('span', { class: 'facts__aside num' }, ` ${count.format(entry.bytes)} bytes`)
+              h('span', { class: 'facts__aside num' }, ` ${t('catalogue.sheet.bytes', { count: entry.bytes })}`)
             )
           ),
-          fact('Added', entry.addedAt && h('time', { datetime: dayToken(entry.addedAt) }, dayText(entry.addedAt))),
+          fact(t('catalogue.sheet.fact_added'), entry.addedAt && h('time', { datetime: dayToken(entry.addedAt) }, dayText(entry.addedAt))),
           fact(
-            'Updated',
+            t('catalogue.sheet.fact_updated'),
             entry.updatedAt && h('time', { datetime: dayToken(entry.updatedAt) }, dayText(entry.updatedAt))
           ),
-          fact('Builds', String(buildsOf(entry))),
-          fact('Path', h('code', {}, build.path)),
+          fact(t('catalogue.sheet.fact_builds'), number(buildsOf(entry))),
+          fact(t('catalogue.sheet.fact_path'), h('code', {}, build.path)),
           fact(
-            'Colour',
+            t('catalogue.sheet.fact_colour'),
             h(
               'span',
               { class: 'proof' },
@@ -389,9 +391,9 @@ export function createSheet(
           )
         )
       ),
-      section('Lineage', lineage(entry)),
-      section('Similar', similar(entry)),
-      entry.builds.length > 1 && section('Builds', builds(entry))
+      section(t('catalogue.sheet.lineage'), lineage(entry)),
+      section(t('catalogue.sheet.similar'), similar(entry)),
+      entry.builds.length > 1 && section(t('catalogue.sheet.builds'), builds(entry))
     );
   }
 
@@ -408,36 +410,34 @@ export function createSheet(
       game = null;
       barName.textContent = '';
       const keys = [
-        [['↑', '↓'], 'or', ['J', 'K'], 'Move through the records'],
-        [['Enter'], '', [], 'Play the record'],
-        [['Space'], '', [], 'Mark it for compare'],
-        [['F'], '', [], 'Favourite it'],
-        [['O'], '', [], 'Open it on its own page'],
-        [['/'], '', [], 'Write a query'],
-        [['?'], '', [], 'The query syntax, by example'],
-        [['G', 'G'], 'and', ['⇧', 'G'], 'The top and the bottom'],
-        [['Esc'], '', [], 'Leave the query, or clear the marks'],
+        [['↑', '↓'], t('catalogue.sheet.keys_or'), ['J', 'K'], t('catalogue.sheet.key_move')],
+        [['Enter'], '', [], t('catalogue.sheet.key_play')],
+        [['Space'], '', [], t('catalogue.sheet.key_mark')],
+        [['F'], '', [], t('catalogue.sheet.key_fave')],
+        [['O'], '', [], t('catalogue.sheet.key_open')],
+        [['/'], '', [], t('catalogue.sheet.key_query')],
+        [['?'], '', [], t('catalogue.sheet.key_syntax')],
+        [['G', 'G'], t('catalogue.sheet.keys_and'), ['⇧', 'G'], t('catalogue.sheet.key_ends')],
+        [['Esc'], '', [], t('catalogue.sheet.key_leave')],
       ];
       body.replaceChildren(
         h(
           'article',
           { class: 'colophon' },
-          h('p', { class: 'label' }, 'The catalogue'),
-          h('h2', { class: 'colophon__title' }, 'Every game, as a record'),
+          h('p', { class: 'label' }, t('catalogue.sheet.colophon_label')),
+          h('h2', { class: 'colophon__title' }, t('catalogue.sheet.colophon_title')),
           h(
             'p',
             { class: 'colophon__lede' },
-            `${plural(total, 'record')} of games built by AI models, ${sizeText(bytes)} in all, ` +
-              `compiled ${dayText(compiled)}. `,
-            'Query them, chart them, compare them, and play any of them without leaving the page.'
+            t('catalogue.sheet.colophon_lede', { count: total, size: sizeText(bytes), date: dayText(compiled) })
           ),
           h(
             'button',
             { type: 'button', class: 'btn btn--play colophon__start', onclick: onStart },
-            h('span', { class: 'btn__text' }, 'Start at the first record'),
+            h('span', { class: 'btn__text' }, t('catalogue.sheet.start')),
             h('kbd', { class: 'btn__key' }, 'J')
           ),
-          h('h3', { class: 'record__head label' }, 'Reading the desk'),
+          h('h3', { class: 'record__head label' }, t('catalogue.sheet.reading')),
           h(
             'dl',
             { class: 'keys' },
@@ -459,8 +459,7 @@ export function createSheet(
           h(
             'p',
             { class: 'colophon__note' },
-            'Every bar in the facets and every column in the figures writes a term into the query. ' +
-              'Shift-click a bar to leave its value out.'
+            t('catalogue.sheet.colophon_note')
           )
         )
       );
@@ -472,7 +471,7 @@ export function createSheet(
       const fave = body.querySelector('.btn--fave');
       const mark = body.querySelector('.btn--mark');
       if (fave) pressed(fave, isFave(game.slug));
-      if (mark) pressed(mark, isMarked(game.slug), ['Marked', 'Compare']);
+      if (mark) pressed(mark, isMarked(game.slug), [t('catalogue.sheet.marked'), t('catalogue.sheet.compare')]);
     },
 
     current: () => game,

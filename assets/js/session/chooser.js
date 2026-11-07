@@ -11,6 +11,7 @@
 import { h, clear, append, icon, ICONS } from '../dom.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { tokenize } from '../filter.js';
+import { t, compare } from '../lang.js';
 import { WAYS, togetherOf, togetherLine } from '../friends/together.js';
 
 /** The session's three ways to play: couch co-op is no session's. */
@@ -32,7 +33,7 @@ export function createChooser(root, { games, fitsNow = () => true, picked, onTog
   const search = h('input', {
     type: 'search',
     id: 'chooser-search',
-    placeholder: 'Search the games',
+    placeholder: t('session.chooser.search'),
     autocomplete: 'off',
     enterkeyhint: 'search',
     oninput: () => {
@@ -40,21 +41,21 @@ export function createChooser(root, { games, fitsNow = () => true, picked, onTog
       draw();
     },
   });
-  const ways = h('div', { class: 'chooser__ways', role: 'radiogroup', 'aria-label': 'How it plays' });
+  const ways = h('div', { class: 'chooser__ways', role: 'radiogroup', 'aria-label': t('session.chooser.ways') });
   const count = h('p', { class: 'chooser__count', role: 'status' });
   const list = h('ul', { class: 'chooser__list' });
-  const done = h('button', { type: 'button', class: 'primary chooser__done', onclick: () => close() }, 'Done');
+  const done = h('button', { type: 'button', class: 'primary chooser__done', onclick: () => close() }, t('session.chooser.done'));
   const panel = h(
     'div',
     { class: 'chooser__panel', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'chooser-title' },
-    h('header', { class: 'chooser__head' }, h('h2', { id: 'chooser-title' }, 'Pick the games'), done),
-    h('p', { class: 'hint chooser__hint' }, 'They play first, in the order you pick them. Then the hub deals the rest at random.'),
-    h('label', { class: 'chooser__search' }, h('span', { class: 'visually-hidden' }, 'Search the games'), icon(ICONS.search, { width: 16, height: 16 }), search),
+    h('header', { class: 'chooser__head' }, h('h2', { id: 'chooser-title' }, t('session.chooser.title')), done),
+    h('p', { class: 'hint chooser__hint' }, t('session.chooser.hint')),
+    h('label', { class: 'chooser__search' }, h('span', { class: 'visually-hidden' }, t('session.chooser.search')), icon(ICONS.search, { width: 16, height: 16 }), search),
     ways,
     count,
     list
   );
-  root.append(h('button', { type: 'button', class: 'chooser__scrim', tabindex: '-1', 'aria-label': 'Close', onclick: () => close() }), panel);
+  root.append(h('button', { type: 'button', class: 'chooser__scrim', tabindex: '-1', 'aria-label': t('session.chooser.close'), onclick: () => close() }), panel);
 
   function drawWays(all) {
     const option = (value, label) =>
@@ -74,7 +75,7 @@ export function createChooser(root, { games, fitsNow = () => true, picked, onTog
         h('span', { class: 'chooser__way-count' }, String(value ? all.filter((g) => togetherOf(g)?.way.key === value).length : all.length))
       );
     clear(ways);
-    append(ways, [option('', 'All'), MODES.map((m) => option(m.key, m.label))]);
+    append(ways, [option('', t('session.chooser.all')), MODES.map((m) => option(m.key, m.label))]);
   }
 
   function draw() {
@@ -82,11 +83,11 @@ export function createChooser(root, { games, fitsNow = () => true, picked, onTog
     const queue = picked();
     const tokens = tokenize(q);
     const shown = all
-      .filter((game) => (!way || togetherOf(game)?.way.key === way) && tokens.every((t) => game.search?.includes(t)))
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .filter((game) => (!way || togetherOf(game)?.way.key === way) && tokens.every((token) => game.search?.includes(token)))
+      .sort((a, b) => compare(a.name, b.name));
     const full = queue.length >= most;
     drawWays(all);
-    count.textContent = `${shown.length} game${shown.length === 1 ? '' : 's'} · ${queue.length} picked${full ? ' (the most there can be)' : ''}`;
+    count.textContent = full ? t('session.chooser.count_full', { count: shown.length, picked: queue.length }) : t('session.chooser.count', { count: shown.length, picked: queue.length });
     clear(list);
     append(list, [
       shown.map((game) => {
@@ -111,14 +112,14 @@ export function createChooser(root, { games, fitsNow = () => true, picked, onTog
               'span',
               { class: 'chooser__text' },
               h('span', { class: 'chooser__name' }, game.name),
-              h('span', { class: 'chooser__meta' }, fitsNow(game) ? togetherLine(game) : `${togetherLine(game)} · waits for more players`)
+              h('span', { class: 'chooser__meta' }, fitsNow(game) ? togetherLine(game) : t('session.chooser.waits', { together: togetherLine(game) }))
             ),
             h('span', { class: 'chooser__mark', 'aria-hidden': 'true' }, on ? String(at + 1) : '+')
           )
         );
       }),
     ]);
-    if (!shown.length) list.append(h('li', { class: 'hint chooser__empty' }, 'No game here fits.'));
+    if (!shown.length) list.append(h('li', { class: 'hint chooser__empty' }, t('session.chooser.empty')));
   }
 
   function open() {

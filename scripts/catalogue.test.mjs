@@ -354,7 +354,7 @@ test('every term says what it does, for its chip', () => {
   ]);
   assert.deepEqual(
     says('added:>2026-09-20 added:2026-09-01..2026-09-15 added:<7d added:>30d added:2026-08-30..2026-09-02'),
-    ['after 20 Sept 2026', '1–15 Sept 2026', 'in the last 7 days', 'more than 30 days ago', '30 Aug – 2 Sept 2026']
+    ['after Sep 20, 2026', 'Sep 1\u2009–\u200915, 2026', 'in the last 7 days', 'more than 30 days ago', 'Aug 30\u2009–\u2009Sep 2, 2026']
   );
   assert.deepEqual(says('builds:>1 builds:2 builds:1..3 players:2 players:multi is:fav "metal slug"'), [
     'more than 1',
@@ -690,10 +690,10 @@ test('weeks start on Monday, newest first unless the sort runs oldest first', ()
   assert.equal(weekOf(Date.parse('2026-09-14T00:00:00Z')), Date.UTC(2026, 8, 14));
   assert.equal(weekOf(Date.parse('2026-09-20T23:59:00Z')), Date.UTC(2026, 8, 14));
   const weeks = groupRecords(lib, 'week');
-  assert.equal(weeks[0].label, 'Week of 28 Sept 2026');
-  assert.equal(weeks.at(-1).label, 'Week of 3 Aug 2026');
+  assert.equal(weeks[0].label, 'Week of Sep 28, 2026');
+  assert.equal(weeks.at(-1).label, 'Week of Aug 3, 2026');
   const oldest = groupRecords(lib, 'week', { sort: { key: 'added', dir: 1 } });
-  assert.equal(oldest[0].label, 'Week of 3 Aug 2026');
+  assert.equal(oldest[0].label, 'Week of Aug 3, 2026');
 });
 
 /* --- export -------------------------------------------------------------- */
@@ -731,7 +731,7 @@ test('Markdown keeps every value inside its cell', () => {
   assert.equal(lines[1], '| --- | --- | --- | --- | --- | ---: | --- |');
   assert.equal(
     lines[2],
-    '| [Brass Hopper](https://hub/catalogue#/g/slug-a) | Shooter | after Metal Slug 3 (Metal Slug) |  | 1–4 | 4 MB | 3 Oct 2026 |'
+    '| [Brass Hopper](https://hub/catalogue#/g/slug-a) | Shooter | after Metal Slug 3 (Metal Slug) |  | 1–4 | 4 MB | Oct 3, 2026 |'
   );
   assert.match(lines[3], /^\| \[Pipe \\\| Dream \\\[beta\\\]\]\(/);
   assert.equal(lines.length, 4);

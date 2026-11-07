@@ -72,6 +72,17 @@ export function gameLanguage() {
   return [asked(), saved(), globalThis.navigator?.languages?.[0], lang].find((code) => code && valid(code));
 }
 
+/**
+ * A game's address with the player's language: the hub adds ?lang= every
+ * time it opens or links to a game, sessions included (lib/hub/languages.md).
+ */
+export function withLanguage(address) {
+  const code = gameLanguage();
+  const [path, hash] = String(address).split('#');
+  if (!code || /[?&]lang=/.test(path)) return address;
+  return `${path}${path.includes('?') ? '&' : '?'}lang=${encodeURIComponent(code)}${hash === undefined ? '' : `#${hash}`}`;
+}
+
 /** For the Language menu: a language's name in that language. */
 export function languageName(code) {
   let name = code;

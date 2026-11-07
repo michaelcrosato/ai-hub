@@ -21,23 +21,23 @@ import { h, icon, ICONS } from '../dom.js';
 import { cabinetPalette } from '../color.js';
 import { playersOf } from '../manifest.js';
 import { buildsOf, dayText, dayToken, sizeText, valuesOf } from './query.js';
-import { plural } from '../format.js';
+import { lang, number, t, tx } from '../lang.js';
 
 /** The columns, left to right. `sort` names the key a header click sorts by. */
 const HEADS = [
-  { key: 'mark', label: 'Mark for compare' },
-  { key: 'swatch', label: 'Colour' },
-  { key: 'thumb', label: 'Picture' },
-  { key: 'name', label: 'Name', sort: 'name' },
-  { key: 'genre', label: 'Genre', sort: 'genre' },
-  { key: 'lineage', label: 'Lineage', sort: 'lineage' },
-  { key: 'model', label: 'Model', sort: 'model' },
-  { key: 'players', label: 'Players', sort: 'players', num: true },
-  { key: 'size', label: 'Size', sort: 'size', num: true },
-  { key: 'added', label: 'Added', sort: 'added', num: true },
-  { key: 'builds', label: 'Builds', sort: 'builds', num: true },
-  { key: 'fav', label: 'Favourite' },
-  { key: 'play', label: 'Play' },
+  { key: 'mark', label: t('catalogue.ledger.head_mark') },
+  { key: 'swatch', label: t('catalogue.ledger.head_colour') },
+  { key: 'thumb', label: t('catalogue.ledger.head_picture') },
+  { key: 'name', label: t('catalogue.ledger.head_name'), sort: 'name' },
+  { key: 'genre', label: t('catalogue.ledger.head_genre'), sort: 'genre' },
+  { key: 'lineage', label: t('catalogue.ledger.head_lineage'), sort: 'lineage' },
+  { key: 'model', label: t('catalogue.ledger.head_model'), sort: 'model' },
+  { key: 'players', label: t('catalogue.ledger.head_players'), sort: 'players', num: true },
+  { key: 'size', label: t('catalogue.ledger.head_size'), sort: 'size', num: true },
+  { key: 'added', label: t('catalogue.ledger.head_added'), sort: 'added', num: true },
+  { key: 'builds', label: t('catalogue.ledger.head_builds'), sort: 'builds', num: true },
+  { key: 'fav', label: t('catalogue.ledger.head_favourite') },
+  { key: 'play', label: t('catalogue.ledger.head_play') },
 ];
 
 /** Who a game is for, as the ledger prints it: "1–4", "1", or a dash for a tool. */
@@ -48,13 +48,12 @@ export function playersText(game) {
 
 /** "after Metal Slug 3", with the series in grey when it says something more. */
 function lineageCell(game) {
-  if (game.lineage.original) return h('span', { class: 'lineage is-original' }, 'Original');
+  if (game.lineage.original) return h('span', { class: 'lineage is-original' }, t('catalogue.ledger.original'));
   const { title, series } = game.lineage;
   return h(
     'span',
     { class: 'lineage' },
-    h('span', { class: 'lineage__after' }, 'after '),
-    h('cite', {}, title),
+    tx('catalogue.ledger.after', { title: h('cite', {}, title) }),
     series && series !== title && h('span', { class: 'lineage__series' }, ` ${series}`)
   );
 }
@@ -128,7 +127,7 @@ export function createLedger(root, { onSort, onPlay, onFave, onMark, onOpen }) {
           type: 'checkbox',
           class: 'ledger__mark',
           tabindex: '-1',
-          'aria-label': `Mark ${game.name} to compare`,
+          'aria-label': t('catalogue.ledger.mark_label', { name: game.name }),
         })
       ),
       h('td', { class: 'c-swatch' }, h('span', { class: 'swatch', style: { background: palette.light } })),
@@ -171,7 +170,7 @@ export function createLedger(root, { onSort, onPlay, onFave, onMark, onOpen }) {
         { class: 'c-added num' },
         game.addedAt ? h('time', { datetime: dayToken(game.addedAt) }, dayText(game.addedAt)) : DASH()
       ),
-      h('td', { class: 'c-builds num' }, String(buildsOf(game))),
+      h('td', { class: 'c-builds num' }, number(buildsOf(game))),
       h(
         'td',
         { class: 'c-fav' },
@@ -182,7 +181,7 @@ export function createLedger(root, { onSort, onPlay, onFave, onMark, onOpen }) {
             class: 'ledger__fav',
             tabindex: '-1',
             'aria-pressed': 'false',
-            'aria-label': `Favourite ${game.name}`,
+            'aria-label': t('catalogue.ledger.fave_label', { name: game.name }),
           },
           icon(ICONS.star)
         )
@@ -192,7 +191,7 @@ export function createLedger(root, { onSort, onPlay, onFave, onMark, onOpen }) {
         { class: 'c-play' },
         h(
           'button',
-          { type: 'button', class: 'ledger__play', tabindex: '-1', 'aria-label': `Play ${game.name}` },
+          { type: 'button', class: 'ledger__play', tabindex: '-1', 'aria-label': t('catalogue.ledger.play_label', { name: game.name }) },
           icon(ICONS.play, { fill: 'currentColor', stroke: 'none' })
         )
       )
@@ -219,7 +218,7 @@ export function createLedger(root, { onSort, onPlay, onFave, onMark, onOpen }) {
         h(
           'span',
           { class: 'ledger__group-meta' },
-          `${plural(group.games.length, 'record')} · ${sizeText(group.bytes)}`
+          t('catalogue.ledger.group_meta', { count: group.games.length, size: sizeText(group.bytes) })
         )
       )
     );
@@ -257,8 +256,11 @@ export function createLedger(root, { onSort, onPlay, onFave, onMark, onOpen }) {
      * Lay out the records: `groups` (from order.js) or a flat list. `max` is
      * the largest size in view, which every size bar is scaled against.
      */
-    render(list, groups, { sort, max, description, empty: emptyNote }) {
-      caption.textContent = description;
+    render(list, groups, { sort, max, empty: emptyNote }) {
+      const sortedBy = (HEADS.find((col) => col.sort === sort.key)?.label ?? sort.key).toLocaleLowerCase(lang);
+      const values = { count: list.length, column: sortedBy };
+      caption.textContent =
+        sort.dir < 0 ? t('catalogue.ledger.caption_descending', values) : t('catalogue.ledger.caption', values);
       for (const col of HEADS) {
         if (!col.sort) continue;
         const th = heads.get(col.key);

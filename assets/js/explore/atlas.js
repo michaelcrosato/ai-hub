@@ -4,6 +4,7 @@ import { hashInt } from '../color.js';
 import { h, ICONS, icon } from '../dom.js';
 import { sameKey } from '../manifest.js';
 import { gameImage, gameMeta } from './common.js';
+import { t, compare } from '../lang.js';
 
 const LINES = ['#265e9b', '#a23b38', '#497044', '#8b5425', '#72568f', '#25716c'];
 const MAP_SIZE = 8;
@@ -19,7 +20,7 @@ export function districtsOf(games) {
       .map((value) => value.trim().replace(/\s+/g, ' '));
     const entries = genres.length
       ? genres.map((label) => ({ key: `genre:${sameKey(label)}`, label }))
-      : [{ key: 'unmapped', label: 'Uncharted' }];
+      : [{ key: 'unmapped', label: t('explore.atlas.uncharted') }];
     for (const { key, label } of entries) {
       if (!groups.has(key)) groups.set(key, { key, label, games: [], seen: new Set() });
       const group = groups.get(key);
@@ -31,7 +32,7 @@ export function districtsOf(games) {
   }
   return [...groups.values()]
     .map(({ key, label, games: members }) => ({ key, label, games: members }))
-    .sort((a, b) => b.games.length - a.games.length || a.label.localeCompare(b.label, 'en'));
+    .sort((a, b) => b.games.length - a.games.length || compare(a.label, b.label));
 }
 
 /** Clamp stale page state after filtering, while keeping every result reachable. */
@@ -115,7 +116,7 @@ export function createView(root, actions) {
         h(
           'span',
           { class: 'atlas-station-count' },
-          `${district.games.length} ${district.games.length === 1 ? 'title' : 'titles'}`,
+          t('explore.atlas.station_titles', { count: district.games.length }),
         ),
       );
     };
@@ -126,9 +127,9 @@ export function createView(root, actions) {
       h(
         'div',
         { class: 'atlas-map-heading' },
-        h('span', { class: 'atlas-kicker' }, '01 / Choose your district'),
-        h('h2', { id: 'atlas-map-heading' }, 'The genre map'),
-        h('p', null, 'Take a familiar route. Or go somewhere new.'),
+        h('span', { class: 'atlas-kicker' }, t('explore.atlas.map_kicker')),
+        h('h2', { id: 'atlas-map-heading' }, t('explore.atlas.map_heading')),
+        h('p', null, t('explore.atlas.map_tagline')),
       ),
       h(
         'button',
@@ -140,13 +141,13 @@ export function createView(root, actions) {
           onclick: () => chooseDistrict(null),
         },
         h('span', { class: 'atlas-interchange', 'aria-hidden': 'true' }, '◎'),
-        h('span', null, h('strong', null, 'All districts'), h('span', null, 'Explore the whole network')),
+        h('span', null, h('strong', null, t('explore.atlas.all_districts')), h('span', null, t('explore.atlas.all_districts_hint'))),
         h('span', { class: 'atlas-total' }, state.games.length),
       ),
       shown.games.length
         ? h(
             'div',
-            { class: 'atlas-map', 'aria-label': 'Genre districts' },
+            { class: 'atlas-map', 'aria-label': t('explore.atlas.districts_label') },
             h(
               'svg',
               {
@@ -177,7 +178,7 @@ export function createView(root, actions) {
             'div',
             { class: 'atlas-map-empty' },
             h('span', { class: 'atlas-map-empty-icon', 'aria-hidden': 'true' }, '◎'),
-            h('p', null, 'No districts on this route. Try a different search or shelf.'),
+            h('p', null, t('explore.atlas.no_districts_route')),
           ),
       h(
         'div',
@@ -185,14 +186,16 @@ export function createView(root, actions) {
         h(
           'span',
           { class: 'atlas-kicker' },
-          districts.length ? `Districts ${shown.start}–${shown.end} of ${districts.length}` : 'No districts',
+          districts.length
+            ? t('explore.atlas.districts_range', { start: shown.start, end: shown.end, total: districts.length })
+            : t('explore.atlas.no_districts'),
         ),
         shown.pages > 1 &&
           h(
             'div',
-            { class: 'atlas-pagination', 'aria-label': 'District map pages' },
+            { class: 'atlas-pagination', 'aria-label': t('explore.atlas.map_pages') },
             pagingButton(
-              'Previous districts',
+              t('explore.atlas.previous_districts'),
               '←',
               shown.page === 0,
               () => {
@@ -203,7 +206,7 @@ export function createView(root, actions) {
               'map-prev',
             ),
             pagingButton(
-              'Next districts',
+              t('explore.atlas.next_districts'),
               '→',
               shown.page >= shown.pages - 1,
               () => {
@@ -218,8 +221,8 @@ export function createView(root, actions) {
       h(
         'div',
         { class: 'atlas-map-note' },
-        h('span', { class: 'atlas-north', 'aria-hidden': 'true' }, '↑ N'),
-        h('span', null, 'A little direction.', h('br'), 'A lot to discover.'),
+        h('span', { class: 'atlas-north', 'aria-hidden': 'true' }, t('explore.atlas.north')),
+        h('span', null, t('explore.atlas.note_line1'), h('br'), t('explore.atlas.note_line2')),
       ),
     );
   }
@@ -243,7 +246,7 @@ export function createView(root, actions) {
           {
             type: 'button',
             class: 'atlas-stop-art',
-            'aria-label': `Details for ${title}`,
+            'aria-label': t('explore.atlas.details_for', { title }),
             'data-atlas-focus': `art:${game.slug}`,
             onclick: (event) => actions.info(game, event.currentTarget),
           },
@@ -270,7 +273,7 @@ export function createView(root, actions) {
           h(
             'p',
             { class: 'atlas-stop-description' },
-            game.tagline || game.description || 'A new stop on your route.',
+            game.tagline || game.description || t('explore.atlas.stop_fallback'),
           ),
           h(
             'div',
@@ -281,11 +284,11 @@ export function createView(root, actions) {
                 type: 'button',
                 class: 'atlas-play',
                 'data-atlas-focus': `play:${game.slug}`,
-                'aria-label': `Play ${title}`,
+                'aria-label': t('explore.atlas.play_title', { title }),
                 onclick: (event) => actions.play(game, event.currentTarget),
               },
               icon(ICONS.play),
-              'Play',
+              t('explore.atlas.play'),
             ),
             h(
               'button',
@@ -293,10 +296,10 @@ export function createView(root, actions) {
                 type: 'button',
                 class: 'atlas-details',
                 'data-atlas-focus': `details:${game.slug}`,
-                'aria-label': `Details for ${title}`,
+                'aria-label': t('explore.atlas.details_for', { title }),
                 onclick: (event) => actions.info(game, event.currentTarget),
               },
-              'Details',
+              t('explore.atlas.details'),
             ),
             h(
               'button',
@@ -305,7 +308,9 @@ export function createView(root, actions) {
                 class: `atlas-fave${starred ? ' is-fave' : ''}`,
                 'data-atlas-focus': `fave:${game.slug}`,
                 'aria-pressed': String(starred),
-                'aria-label': `${starred ? 'Unfavourite' : 'Favourite'} ${title}`,
+                'aria-label': starred
+                  ? t('explore.atlas.unfavourite', { title })
+                  : t('explore.atlas.favourite', { title }),
                 onclick: () => actions.fave(game),
               },
               icon(ICONS.star),
@@ -322,7 +327,7 @@ export function createView(root, actions) {
     const page = pageStops(games, gamePage);
     gamePage = page.page;
     const color = selectedKey ? lineColor(selectedKey) : '#265e9b';
-    const heading = selectedKey ? district?.label || 'District unavailable' : 'All districts';
+    const heading = selectedKey ? district?.label || t('explore.atlas.district_unavailable') : t('explore.atlas.all_districts_heading');
     return h(
       'section',
       {
@@ -333,7 +338,7 @@ export function createView(root, actions) {
       h(
         'div',
         { class: 'atlas-departures-heading' },
-        h('span', { class: 'atlas-kicker' }, '02 / Find your next stop'),
+        h('span', { class: 'atlas-kicker' }, t('explore.atlas.stops_kicker')),
         h(
           'div',
           { class: 'atlas-line-title' },
@@ -351,8 +356,14 @@ export function createView(root, actions) {
         h(
           'div',
           { class: 'atlas-departures-summary', role: 'status' },
-          h('span', null, `${page.total} ${page.total === 1 ? 'title' : 'titles'} on this route`),
-          h('span', null, page.total ? `Stops ${page.start}–${page.end}` : 'No departures'),
+          h('span', null, t('explore.atlas.route_titles', { count: page.total })),
+          h(
+            'span',
+            null,
+            page.total
+              ? t('explore.atlas.stops_range', { start: page.start, end: page.end })
+              : t('explore.atlas.no_departures'),
+          ),
         ),
       ),
       games.length
@@ -365,13 +376,13 @@ export function createView(root, actions) {
             'div',
             { class: 'atlas-empty' },
             h('span', { class: 'atlas-empty-symbol', 'aria-hidden': 'true' }, '⊙'),
-            h('h3', null, 'A quiet corner of the map'),
+            h('h3', null, t('explore.atlas.empty_heading')),
             h(
               'p',
               null,
               selectedKey
-                ? 'No titles in this district match your current filters. Visit all districts or change your search.'
-                : 'No titles match your current filters. Try another search or shelf.',
+                ? t('explore.atlas.empty_district')
+                : t('explore.atlas.empty_all'),
             ),
             selectedKey &&
               h(
@@ -381,16 +392,16 @@ export function createView(root, actions) {
                   class: 'atlas-return',
                   onclick: () => chooseDistrict(null),
                 },
-                'Visit all districts →',
+                t('explore.atlas.visit_all'),
               ),
           ),
       page.pages > 1 &&
         h(
           'nav',
-          { class: 'atlas-board-footer', 'aria-label': 'Game stops pages' },
+          { class: 'atlas-board-footer', 'aria-label': t('explore.atlas.stops_pages') },
           pagingButton(
-            'Previous game stops',
-            '← Previous stops',
+            t('explore.atlas.previous_stops_label'),
+            t('explore.atlas.previous_stops'),
             page.page === 0,
             () => {
               gamePage--;
@@ -399,10 +410,10 @@ export function createView(root, actions) {
             },
             'stops-prev',
           ),
-          h('span', { class: 'atlas-kicker' }, `${page.page + 1} / ${page.pages}`),
+          h('span', { class: 'atlas-kicker' }, t('explore.atlas.page_of', { page: page.page + 1, pages: page.pages })),
           pagingButton(
-            'Next game stops',
-            'Next stops →',
+            t('explore.atlas.next_stops_label'),
+            t('explore.atlas.next_stops'),
             page.page >= page.pages - 1,
             () => {
               gamePage++;

@@ -9,6 +9,7 @@
  */
 
 import { fold, sameKey } from './manifest.js';
+import { compare } from './lang.js';
 
 const sameAttempt = (a, b) =>
   sameKey(a.lineage.title) === sameKey(b.lineage.title) && sameKey(a.lineage.series) === sameKey(b.lineage.series);
@@ -17,7 +18,7 @@ const sameAttempt = (a, b) =>
 export const attemptsAt = (game, games) =>
   games
     .filter((other) => other.slug !== game.slug && sameAttempt(game, other))
-    .sort((a, b) => b.addedAt - a.addedAt || a.name.localeCompare(b.name));
+    .sort((a, b) => b.addedAt - a.addedAt || compare(a.name, b.name));
 
 const tagsOf = (game) => new Set((game.tags || []).map((tag) => fold(tag).trim()).filter(Boolean));
 
@@ -44,7 +45,7 @@ export function similarGames(game, games, { limit = 12 } = {}) {
   return games
     .map((other) => [other, likeness(game, other)])
     .filter(([, score]) => score > 1)
-    .sort(([a, x], [b, y]) => y - x || b.addedAt - a.addedAt || a.name.localeCompare(b.name))
+    .sort(([a, x], [b, y]) => y - x || b.addedAt - a.addedAt || compare(a.name, b.name))
     .slice(0, limit)
     .map(([other]) => other);
 }

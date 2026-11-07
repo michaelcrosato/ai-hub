@@ -10,6 +10,8 @@
  * awards as bonus points at the end (docs/session-hub.md).
  */
 
+import { t, number, compare } from '../lang.js';
+
 /** Each player's place (1 is best) from standings, best first, ties grouped. */
 export function placesOf(standings) {
   const places = new Map();
@@ -78,7 +80,7 @@ export function liveOrder(rows) {
 export function leaderboard(totals) {
   const avg = (row) => (row.rounds ? row.placeSum / row.rounds : Infinity);
   return Object.values(totals).sort(
-    (a, b) => b.points - a.points || b.wins - a.wins || avg(a) - avg(b) || a.name.localeCompare(b.name)
+    (a, b) => b.points - a.points || b.wins - a.wins || avg(a) - avg(b) || compare(a.name, b.name)
   );
 }
 
@@ -86,10 +88,10 @@ export function leaderboard(totals) {
 
 /** How a session can be won. The host picks one in the lobby. */
 export const FORMATS = Object.freeze({
-  party: { label: 'Party', rounds: 8, bonus: 3, blurb: '8 rounds, then three bonus awards worth 3 points each' },
-  sprint: { label: 'Sprint', rounds: 5, bonus: 0, blurb: '5 rounds, most points wins' },
-  first12: { label: 'First to 12', target: 12, bonus: 0, blurb: 'The first to 12 points wins' },
-  endless: { label: 'Endless', bonus: 0, blurb: 'Play until the host ends it' },
+  party: { label: t('session.format.party'), rounds: 8, bonus: 3, blurb: t('session.format.party_blurb', { rounds: 8, count: 3 }) },
+  sprint: { label: t('session.format.sprint'), rounds: 5, bonus: 0, blurb: t('session.format.sprint_blurb', { rounds: 5 }) },
+  first12: { label: t('session.format.first12'), target: 12, bonus: 0, blurb: t('session.format.first12_blurb', { target: 12 }) },
+  endless: { label: t('session.format.endless'), bonus: 0, blurb: t('session.format.endless_blurb') },
 });
 export const DEFAULT_FORMAT = 'party';
 export const formatOf = (key) => FORMATS[key] || FORMATS[DEFAULT_FORMAT];
@@ -109,11 +111,11 @@ export function formatProgress(key, history, totals) {
   const format = formatOf(key);
   if (format.rounds) {
     const left = format.rounds - counted(history);
-    return left <= 1 ? 'Final round' : `Round ${counted(history) + 1} of ${format.rounds}`;
+    return left <= 1 ? t('session.progress.final') : t('session.progress.round', { round: counted(history) + 1, total: format.rounds });
   }
   const lead = leaderboard(totals)[0];
-  if (format.target) return lead ? `First to ${format.target}: ${lead.name} has ${lead.points}` : `First to ${format.target} points`;
-  return lead ? `${lead.name} leads with ${lead.points}` : 'Endless';
+  if (format.target) return lead ? t('session.progress.first_to', { target: format.target, name: lead.name, points: lead.points }) : t('session.progress.first_to_none', { target: format.target });
+  return lead ? t('session.progress.leads', { name: lead.name, points: lead.points }) : t('session.progress.endless');
 }
 
 /** Each player's longest run of wins, over the rounds they played. */
@@ -149,12 +151,24 @@ export function sessionAwards(history, totals) {
   const run = streaks(history);
   const out = [];
   const shows = top((row) => row.awards || 0, (a, b) => a > b, (v) => v > 0);
-  if (shows) out.push({ title: 'Showstopper', detail: `${shows.value} game award${shows.value === 1 ? '' : 's'}`, keys: shows.keys });
+  if (shows) out.push({ id: 'showstopper', value: shows.value, ...awardText({ id: 'showstopper', value: shows.value }), keys: shows.keys });
   const hot = top((row) => run.get(row.key) || 0, (a, b) => a > b, (v) => v >= 2);
-  if (hot) out.push({ title: 'Hot streak', detail: `${hot.value} wins in a row`, keys: hot.keys });
+  if (hot) out.push({ id: 'hot', value: hot.value, ...awardText({ id: 'hot', value: hot.value }), keys: hot.keys });
   const steady = top((row) => Math.round((row.placeSum / row.rounds) * 100) / 100, (a, b) => a < b, () => true);
-  if (steady) out.push({ title: 'Steady hand', detail: `average place ${steady.value.toFixed(1)}`, keys: steady.keys });
+  if (steady) out.push({ id: 'steady', value: steady.value, ...awardText({ id: 'steady', value: steady.value }), keys: steady.keys });
   return out;
+}
+
+/**
+ * The words for a session award, in this player's language. The award travels
+ * with the session's state as an id and a value, so each player reads it in
+ * their own language; an award without a known id shows the title and detail it carries.
+ */
+export function awardText(award) {
+  if (award.id === 'showstopper') return { title: t('session.award.showstopper'), detail: t('session.award.showstopper_detail', { count: award.value }) };
+  if (award.id === 'hot') return { title: t('session.award.hot'), detail: t('session.award.hot_detail', { count: award.value }) };
+  if (award.id === 'steady') return { title: t('session.award.steady'), detail: t('session.award.steady_detail', { place: number(award.value, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) }) };
+  return { title: award.title, detail: award.detail };
 }
 
 /**

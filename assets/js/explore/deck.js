@@ -4,6 +4,7 @@ import { store } from '../store.js';
 import { gameImage, gameMeta } from './common.js';
 import { emblem } from '../ui/friends.js';
 import { friendsHref, playsOnline } from '../friends/together.js';
+import { t, tx } from '../lang.js';
 
 export const DEFAULT_SEED = 'first-deal';
 
@@ -91,12 +92,12 @@ export function createView(root, actions) {
   let lastQuery = null;
   root.classList.add('deck-view');
 
-  const count = h('span', { class: 'deck-count' }, '0 / 0');
+  const count = h('span', { class: 'deck-count' }, t('explore.deck.count', { current: 0, total: 0 }));
   const progress = h('progress', {
     class: 'deck-progress',
     max: 1,
     value: 0,
-    'aria-label': 'Cards explored',
+    'aria-label': t('explore.deck.progress'),
   });
   const live = h('p', {
     class: 'deck-sr-only',
@@ -105,7 +106,7 @@ export function createView(root, actions) {
     'aria-atomic': 'true',
   });
   const surface = h('div', { class: 'deck-surface' });
-  const card = h('article', { class: 'deck-card', tabindex: 0, 'aria-label': 'Discovery card' }, surface);
+  const card = h('article', { class: 'deck-card', tabindex: 0, 'aria-label': t('explore.deck.card') }, surface);
 
   const previous = h(
     'button',
@@ -115,7 +116,7 @@ export function createView(root, actions) {
       onclick: () => advance(-1),
     },
     icon(ICONS.back),
-    'Previous',
+    t('explore.deck.previous'),
   );
   const skip = h(
     'button',
@@ -124,7 +125,7 @@ export function createView(root, actions) {
       class: 'deck-button deck-button--skip',
       onclick: () => advance(1),
     },
-    'Next card',
+    t('explore.deck.next'),
     icon(ICONS.back, { class: 'deck-forward' }),
   );
   const play = h(
@@ -135,7 +136,7 @@ export function createView(root, actions) {
       onclick: (event) => state.current && actions.play(state.current, event.currentTarget),
     },
     icon(ICONS.play, { fill: 'currentColor', stroke: 'none' }),
-    'Play this',
+    t('explore.deck.play'),
   );
   const details = h(
     'button',
@@ -144,14 +145,14 @@ export function createView(root, actions) {
       class: 'deck-button deck-button--details',
       onclick: (event) => state.current && actions.info(state.current, event.currentTarget),
     },
-    'Details',
+    t('explore.deck.details'),
   );
   const favourite = h(
     'button',
     {
       type: 'button',
       class: 'deck-button deck-button--favourite',
-      'aria-label': 'Add to favourites',
+      'aria-label': t('explore.deck.add_favourite'),
       'aria-pressed': 'false',
       onclick: () => {
         if (!state.current) return;
@@ -169,7 +170,7 @@ export function createView(root, actions) {
       onclick: dealAgain,
     },
     icon(ICONS.dice),
-    'Shuffle & redeal',
+    t('explore.deck.redeal'),
   );
   const unplayed = h('input', {
     type: 'checkbox',
@@ -181,17 +182,17 @@ export function createView(root, actions) {
         deckDone: null,
       }),
   });
-  const filter = h('label', { class: 'deck-filter' }, unplayed, h('span', {}, 'Only unplayed'));
+  const filter = h('label', { class: 'deck-filter' }, unplayed, h('span', {}, t('explore.deck.only_unplayed')));
   // The card's game with friends, when it plays in a session.
   const friends = h(
     'a',
     { class: 'deck-button deck-button--friends', href: '/friends', hidden: true },
     emblem({ size: 16 }),
-    'With friends',
+    t('explore.deck.with_friends'),
   );
   const actionsRow = h(
     'div',
-    { class: 'deck-actions', 'aria-label': 'Current card actions' },
+    { class: 'deck-actions', 'aria-label': t('explore.deck.actions') },
     play,
     friends,
     details,
@@ -202,7 +203,7 @@ export function createView(root, actions) {
   root.append(
     h(
       'section',
-      { class: 'deck-layout', 'aria-label': 'Discovery deck' },
+      { class: 'deck-layout', 'aria-label': t('explore.deck.layout') },
       h(
         'aside',
         { class: 'deck-intro' },
@@ -210,18 +211,24 @@ export function createView(root, actions) {
           'p',
           { class: 'deck-eyebrow' },
           h('span', { class: 'deck-mark', 'aria-hidden': 'true' }, '✳'),
-          'THE DISCOVERY DECK',
+          t('explore.deck.eyebrow'),
         ),
-        h('h1', { class: 'deck-heading' }, 'Less browsing.', h('br'), h('em', {}, 'More playing.')),
+        h(
+          'h1',
+          { class: 'deck-heading' },
+          t('explore.deck.heading_line1'),
+          h('br'),
+          h('em', {}, t('explore.deck.heading_line2')),
+        ),
         h(
           'p',
           { class: 'deck-description' },
-          'One game at a time. Follow your curiosity, save a favourite, or turn the next card.',
+          t('explore.deck.description'),
         ),
         h(
           'div',
           { class: 'deck-session' },
-          h('div', { class: 'deck-session-heading' }, h('span', {}, 'YOUR DEAL'), count),
+          h('div', { class: 'deck-session-heading' }, h('span', {}, t('explore.deck.your_deal')), count),
           progress,
           remaining,
         ),
@@ -230,10 +237,7 @@ export function createView(root, actions) {
         h(
           'p',
           { class: 'deck-hint' },
-          h('kbd', {}, '←'),
-          ' ',
-          h('kbd', {}, '→'),
-          ' to browse · swipe on the card',
+          tx('explore.deck.hint', { left: h('kbd', {}, '←'), right: h('kbd', {}, '→') }),
         ),
       ),
       h(
@@ -243,9 +247,9 @@ export function createView(root, actions) {
         actionsRow,
         h(
           'nav',
-          { class: 'deck-turn', 'aria-label': 'Move through the deck' },
+          { class: 'deck-turn', 'aria-label': t('explore.deck.move') },
           previous,
-          h('span', { class: 'deck-turn-note', 'aria-hidden': 'true' }, 'WHAT WILL YOU FIND?'),
+          h('span', { class: 'deck-turn-note', 'aria-hidden': 'true' }, t('explore.deck.turn_note')),
           skip,
         ),
       ),
@@ -271,7 +275,10 @@ export function createView(root, actions) {
   function syncFavourite() {
     const saved = Boolean(state.current && actions.isFave(state.current.slug));
     favourite.setAttribute('aria-pressed', String(saved));
-    favourite.setAttribute('aria-label', saved ? 'Remove from favourites' : 'Add to favourites');
+    favourite.setAttribute(
+      'aria-label',
+      saved ? t('explore.deck.remove_favourite') : t('explore.deck.add_favourite'),
+    );
     favourite.querySelector('svg').setAttribute('fill', saved ? 'currentColor' : 'none');
   }
 
@@ -328,12 +335,12 @@ export function createView(root, actions) {
       lastQuery = queryText;
       unplayed.checked = query.get('unplayed') === '1';
       const total = state.cards.length;
-      count.textContent = `${Math.min(state.index + 1, total)} / ${total}`;
+      count.textContent = t('explore.deck.count', { current: Math.min(state.index + 1, total), total });
       progress.max = Math.max(1, total);
       progress.value = Math.min(state.index + 1, total);
       remaining.textContent = total
-        ? `${Math.max(0, total - state.index - 1)} cards still to discover`
-        : 'No cards in this deal';
+        ? t('explore.deck.remaining', { count: Math.max(0, total - state.index - 1) })
+        : t('explore.deck.no_cards');
       previous.disabled = !total || state.index === 0;
       skip.disabled = !state.current;
       play.disabled = !state.current;
@@ -348,7 +355,7 @@ export function createView(root, actions) {
         const game = state.current;
         card.setAttribute(
           'aria-label',
-          `${game.name}. Press Enter for details, or use arrow keys to browse.`,
+          t('explore.deck.card_label', { name: game.name }),
         );
         if (drawnSlug !== game.slug || currentSeed !== seed) {
           surface.replaceChildren(
@@ -356,7 +363,7 @@ export function createView(root, actions) {
               'div',
               { class: 'deck-art' },
               gameImage(game, { className: 'deck-image', loading: 'eager' }),
-              h('span', { class: 'deck-art-label' }, 'TODAY, TRY SOMETHING NEW'),
+              h('span', { class: 'deck-art-label' }, t('explore.deck.art_label')),
             ),
             h(
               'div',
@@ -366,25 +373,25 @@ export function createView(root, actions) {
               h(
                 'p',
                 { class: 'deck-tagline' },
-                game.tagline || game.description || 'A new discovery is one play away. Take it for a spin.',
+                game.tagline || game.description || t('explore.deck.tagline_fallback'),
               ),
             ),
           );
-          live.textContent = `Card ${state.index + 1} of ${total}: ${game.name}`;
+          live.textContent = t('explore.deck.card_live', { current: state.index + 1, total, name: game.name });
         }
       } else if (state.exhausted) {
-        card.setAttribute('aria-label', 'Deal complete');
+        card.setAttribute('aria-label', t('explore.deck.complete_label'));
         surface.replaceChildren(
           h(
             'div',
             { class: 'deck-empty' },
             h('span', { class: 'deck-empty-symbol', 'aria-hidden': 'true' }, '✳'),
-            h('p', { class: 'deck-eyebrow' }, 'DEAL COMPLETE'),
-            h('h2', {}, 'You’ve seen them all.'),
+            h('p', { class: 'deck-eyebrow' }, t('explore.deck.complete_eyebrow')),
+            h('h2', {}, t('explore.deck.complete_heading')),
             h(
               'p',
               {},
-              `That’s ${total} ${total === 1 ? 'game' : 'games'} explored. Shuffle for a fresh order, or go back to the last card.`,
+              t('explore.deck.complete_text', { count: total }),
             ),
             h(
               'button',
@@ -394,27 +401,27 @@ export function createView(root, actions) {
                 onclick: dealAgain,
               },
               icon(ICONS.dice),
-              'Deal again',
+              t('explore.deck.deal_again'),
             ),
           ),
         );
-        if (!wasExhausted) live.textContent = `Deal complete. All ${total} cards explored.`;
-        remaining.textContent = 'Every card explored. Ready for another round?';
+        if (!wasExhausted) live.textContent = t('explore.deck.complete_live', { count: total });
+        remaining.textContent = t('explore.deck.complete_remaining');
       } else {
-        card.setAttribute('aria-label', 'No matching cards');
+        card.setAttribute('aria-label', t('explore.deck.empty_label'));
         surface.replaceChildren(
           h(
             'div',
             { class: 'deck-empty' },
             h('span', { class: 'deck-empty-symbol', 'aria-hidden': 'true' }, '◇'),
-            h('p', { class: 'deck-eyebrow' }, 'AN EMPTY DECK'),
-            h('h2', {}, unplayed.checked ? 'All caught up.' : 'No cards this time.'),
+            h('p', { class: 'deck-eyebrow' }, t('explore.deck.empty_eyebrow')),
+            h('h2', {}, unplayed.checked ? t('explore.deck.caught_up') : t('explore.deck.no_cards_heading')),
             h(
               'p',
               {},
               unplayed.checked
-                ? 'Try turning off Only unplayed, or broaden your search to find more games.'
-                : 'Broaden your search or change the shelf to build a new deal.',
+                ? t('explore.deck.caught_up_text')
+                : t('explore.deck.no_cards_text'),
             ),
             unplayed.checked &&
               h(
@@ -429,11 +436,11 @@ export function createView(root, actions) {
                       deckDone: null,
                     }),
                 },
-                'Include played games',
+                t('explore.deck.include_played'),
               ),
           ),
         );
-        live.textContent = 'No matching cards. Change your filters to build a new deal.';
+        live.textContent = t('explore.deck.empty_live');
       }
       drawnSlug = state.current?.slug || null;
       currentSeed = seed;

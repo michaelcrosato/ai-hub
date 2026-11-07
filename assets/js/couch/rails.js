@@ -14,6 +14,7 @@ import { sameKey, playersOf, MULTI } from '../manifest.js';
 import { shelfOf, SHELVES } from '../filter.js';
 import { fnv1a } from '../color.js';
 import { playsOnline } from '../friends/together.js';
+import { t, upper, compare } from '../lang.js';
 
 /** The most tiles a rail holds. Past this a row stops being browsable. */
 export const CAP = { recent: 20, fresh: 24, library: 40 };
@@ -29,22 +30,22 @@ const CADENCE = 2;
 /** Genres as a row title: a natural plural, in sentence case. */
 const GENRE_TITLES = new Map(
   Object.entries({
-    rpg: 'RPGs',
-    shooter: 'Shooters',
-    action: 'Action games',
-    adventure: 'Adventures',
-    flight: 'Flight games',
-    sports: 'Sports games',
-    'life sim': 'Life sims',
-    platformer: 'Platformers',
-    racing: 'Racing games',
-    simulation: 'Simulations',
-    strategy: 'Strategy games',
-    'kids & learning': 'Kids & learning',
-    horror: 'Horror games',
-    puzzle: 'Puzzles',
-    fighting: 'Fighting games',
-    'tech demo': 'Tech demos',
+    rpg: t('couch.rails.genre_rpg'),
+    shooter: t('couch.rails.genre_shooter'),
+    action: t('couch.rails.genre_action'),
+    adventure: t('couch.rails.genre_adventure'),
+    flight: t('couch.rails.genre_flight'),
+    sports: t('couch.rails.genre_sports'),
+    'life sim': t('couch.rails.genre_life_sim'),
+    platformer: t('couch.rails.genre_platformer'),
+    racing: t('couch.rails.genre_racing'),
+    simulation: t('couch.rails.genre_simulation'),
+    strategy: t('couch.rails.genre_strategy'),
+    'kids & learning': t('couch.rails.genre_kids'),
+    horror: t('couch.rails.genre_horror'),
+    puzzle: t('couch.rails.genre_puzzle'),
+    fighting: t('couch.rails.genre_fighting'),
+    'tech demo': t('couch.rails.genre_tech_demo'),
   })
 );
 
@@ -52,10 +53,10 @@ export function genreTitle(genre) {
   const known = GENRE_TITLES.get(sameKey(genre));
   if (known) return known;
   const text = String(genre).trim();
-  return `${text.charAt(0).toUpperCase()}${text.slice(1).toLowerCase()} games`;
+  return t('couch.rails.genre_other', { genre: `${upper(text.charAt(0))}${text.slice(1).toLowerCase()}` });
 }
 
-const byName = (a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' });
+const byName = (a, b) => compare(a.name, b.name);
 const newest = (a, b) => b.addedAt - a.addedAt || byName(a, b);
 
 const GAMES = SHELVES[0].key;
@@ -149,9 +150,9 @@ export function buildRails(games, stats, { now = Date.now(), seed = dayKey(now) 
   const others = [...series, ...models]
     .sort((a, b) => b.games.length - a.games.length || turn(a) - turn(b) || a.label.localeCompare(b.label))
     .map((group) => {
-      if (group.kind === 'model') return rail(`model:${group.key}`, `Built by ${group.label}`, group.games);
+      if (group.kind === 'model') return rail(`model:${group.key}`, t('couch.rails.model', { model: group.label }), group.games);
       // "Inspired by" and "After" take turns, so a run of series reads less like a list.
-      const title = told++ % 2 ? `After ${group.label}` : `Inspired by ${group.label}`;
+      const title = told++ % 2 ? t('couch.rails.series_after', { series: group.label }) : t('couch.rails.series_inspired', { series: group.label });
       return rail(`series:${group.key}`, title, group.games);
     });
 
@@ -160,14 +161,14 @@ export function buildRails(games, stats, { now = Date.now(), seed = dayKey(now) 
   const worth = (fewest, row) => (row.games.length >= fewest ? row : null);
 
   return [
-    worth(FEWEST.personal, { key: 'recent', title: 'Jump back in', games: recent }),
-    worth(FEWEST.personal, { key: 'faves', title: 'Your favourites', games: faves }),
-    worth(FEWEST.library, rail('fresh', 'Fresh on the wall', games, CAP.fresh)),
-    worth(FEWEST.together, rail('friends', 'Play with friends', friends)),
+    worth(FEWEST.personal, { key: 'recent', title: t('couch.rails.recent'), games: recent }),
+    worth(FEWEST.personal, { key: 'faves', title: t('couch.rails.faves'), games: faves }),
+    worth(FEWEST.library, rail('fresh', t('couch.rails.fresh'), games, CAP.fresh)),
+    worth(FEWEST.together, rail('friends', t('couch.rails.friends'), friends)),
     ...weave(genres, others),
-    worth(FEWEST.library, rail('originals', 'Originals', shelf.filter((game) => game.lineage.original))),
-    worth(FEWEST.together, rail('together', 'Couch co-op', together)),
-    worth(1, rail('unsure', 'Unsure', unsure)),
-    worth(FEWEST.library, rail('tools', 'Tech demos & tools', tools)),
+    worth(FEWEST.library, rail('originals', t('couch.rails.originals'), shelf.filter((game) => game.lineage.original))),
+    worth(FEWEST.together, rail('together', t('couch.rails.together'), together)),
+    worth(1, rail('unsure', t('couch.rails.unsure'), unsure)),
+    worth(FEWEST.library, rail('tools', t('couch.rails.tools'), tools)),
   ].filter(Boolean);
 }

@@ -24,6 +24,7 @@ import { cabinetPalette, paletteVars } from '../color.js';
 import { store } from '../store.js';
 import { startPlay, stopPlay } from '../account/plays.js';
 import { askAfterPlay } from '../account/thumbs.js';
+import { t, lang, withLanguage } from '../lang.js';
 
 const HOLD_MS = 700;
 const IDLE_MS = 3500;
@@ -77,11 +78,15 @@ export function createPlayer(
   {
     onExit,
     onRoll,
-    backLabel = 'Back to the wall',
+    backLabel = t('game.player.back'),
     src = (build) => build.path,
     onFrame = null,
     canRoll = () => true,
-    confirmExit = () => ({ title: 'Close this game?', detail: `${backLabel}.`, action: 'Close the game' }),
+    confirmExit = () => ({
+      title: t('game.player.close_title'),
+      detail: t('game.player.close_detail', { place: backLabel }),
+      action: t('game.player.close_action'),
+    }),
     keepFocus = () => false,
     honorStandalone = true,
     askToRate = true,
@@ -164,7 +169,7 @@ export function createPlayer(
           'div',
           { class: 'player__ask-actions' },
           h('button', { type: 'button', class: 'player__ask-go', onclick: () => { close(); onExit(); } }, words.action),
-          h('button', { type: 'button', class: 'player__ask-stay', onclick: close }, 'Keep playing')
+          h('button', { type: 'button', class: 'player__ask-stay', onclick: close }, t('game.player.keep'))
         )
       )
     );
@@ -231,15 +236,15 @@ export function createPlayer(
     return h(
       'div',
       { class: 'player__bail' },
-      h('h2', {}, `${game.name} opens on its own page`),
+      h('h2', {}, t('game.player.bail_title', { name: game.name })),
       h(
         'p',
         {},
         everyGame
-          ? 'Dev settings are set to open every game in a plain tab, with nothing wrapped around it.'
-          : 'You asked for this one to run outside the hub, so it gets a plain tab of its own with nothing wrapped around it.'
+          ? t('game.player.bail_dev')
+          : t('game.player.bail_own')
       ),
-      h('a', { href: build.path, target: '_blank', rel: 'noopener' }, 'Open it now'),
+      h('a', { href: withLanguage(build.path), target: '_blank', rel: 'noopener' }, t('game.player.bail_open')),
       h(
         'button',
         {
@@ -250,7 +255,7 @@ export function createPlayer(
             open(game, build);
           },
         },
-        everyGame ? 'Play inside the hub again' : 'Try it inside the hub again'
+        everyGame ? t('game.player.bail_again_dev') : t('game.player.bail_again')
       )
     );
   }
@@ -264,10 +269,10 @@ export function createPlayer(
     Object.entries(paletteVars(palette)).forEach(([k, v]) => root.style.setProperty(k, v));
     clear(root);
 
-    const address = src(build);
+    const address = withLanguage(src(build));
     if (!onThisSite(build.path) || !onThisSite(address)) {
       const { el: barEl } = exitBar();
-      root.append(barEl, h('div', { class: 'player__bail' }, h('h2', {}, `${game.name} cannot be opened`), h('p', {}, 'Its address is not a page of this site.')));
+      root.append(barEl, h('div', { class: 'player__bail' }, h('h2', {}, t('game.player.bad_title', { name: game.name })), h('p', {}, t('game.player.bad_text'))));
       session = { game, build, unbind: [], idle: 0, hold: null, ask: null };
       return;
     }
@@ -304,7 +309,7 @@ export function createPlayer(
     });
 
     pageTitle = document.title;
-    document.title = `${game.name} — AI Hub`;
+    document.title = t('game.player.page_title', { name: game.name });
     store.recordPlay(game.slug);
     startPlay({ slug: game.slug, build: build.id ?? null });
     wake();
@@ -348,12 +353,12 @@ export function createPlayer(
     const el = h(
       'div',
       { class: 'player__exit' },
-      tool('player__close', `Hold to close: ${backLabel.toLowerCase()}`, [ring(), icon(ICONS.close)], holdable(askToExit, endHold)),
-      tool('player__roll', 'Roll: play another random game', icon(ICONS.dice), { onclick: () => onRoll(), hidden: !canRoll() }),
+      tool('player__close', t('game.player.hold_close', { place: backLabel.charAt(0).toLocaleLowerCase(lang) + backLabel.slice(1) }), [ring(), icon(ICONS.close)], holdable(askToExit, endHold)),
+      tool('player__roll', t('game.player.roll'), icon(ICONS.dice), { onclick: () => onRoll(), hidden: !canRoll() }),
       h('div', { class: 'player__slot' }),
       tool(
         'player__fold',
-        'Tap to fold this bar away, hold to remove it until you reload',
+        t('game.player.fold'),
         [ring(), icon(ICONS.back)],
         holdable(() => setBar('gone'), releaseFold)
       )

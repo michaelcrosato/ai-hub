@@ -9,6 +9,7 @@
  */
 
 import { sameKey } from '../manifest.js';
+import { t, compare } from '../lang.js';
 import { FIELDS, parse, startsWord } from './query.js';
 import { FACETS, facetTerm } from './tally.js';
 
@@ -20,25 +21,25 @@ const LISTED = ['genre', 'type', 'origin', 'model', 'series', 'source', 'tag', '
 /** Values that are shapes rather than words: offered as examples. */
 const SHAPES = {
   size: [
-    ['<250kb', 'Under 250 KB'],
-    ['1mb..4mb', '1 MB up to 4 MB'],
-    ['>=4mb', '4 MB or more'],
+    ['<250kb', t('catalogue.suggest.size_under')],
+    ['1mb..4mb', t('catalogue.suggest.size_range')],
+    ['>=4mb', t('catalogue.suggest.size_at_least')],
   ],
   added: [
-    ['<7d', 'In the last week'],
-    ['<30d', 'In the last 30 days'],
+    ['<7d', t('catalogue.suggest.added_week')],
+    ['<30d', t('catalogue.suggest.added_month')],
   ],
-  updated: [['<7d', 'In the last week']],
-  builds: [['>1', 'More than one build']],
+  updated: [['<7d', t('catalogue.suggest.updated_week')]],
+  builds: [['>1', t('catalogue.suggest.builds_many')]],
   is: [
-    ['fav', 'Your favourites'],
-    ['played', 'Played on this device'],
-    ['new', 'Added this week'],
+    ['fav', t('catalogue.suggest.is_fav')],
+    ['played', t('catalogue.suggest.is_played')],
+    ['new', t('catalogue.suggest.is_new')],
   ],
   has: [
-    ['model', 'Names its model'],
-    ['series', 'Names a series'],
-    ['players', 'Says who it seats'],
+    ['model', t('catalogue.suggest.has_model')],
+    ['series', t('catalogue.suggest.has_series')],
+    ['players', t('catalogue.suggest.has_players')],
   ],
 };
 
@@ -55,8 +56,13 @@ export function vocabularyOf(library) {
       for (const value of new Set(facet.values(game))) counts.set(value, (counts.get(value) || 0) + 1);
     const values = [...counts.keys()];
     out[field] = [...counts]
-      .map(([value, count]) => ({ value, count, term: facetTerm(facet, value, values) }))
-      .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+      .map(([value, count]) => ({
+        value,
+        count,
+        label: facet.show ? facet.show(value) : value,
+        term: facetTerm(facet, value, values),
+      }))
+      .sort((a, b) => b.count - a.count || compare(a.value, b.value));
   }
   const months = new Map();
   for (const game of library) {
@@ -86,14 +92,14 @@ export function suggest(text, caret, vocabulary) {
     if (vocabulary[term.field]) {
       items = vocabulary[term.field]
         .filter(({ value }) => !partial || startsWord(sameKey(value), partial))
-        .map(({ value, count, term: written }) => ({
+        .map(({ label, count, term: written }) => ({
           insert: withSign(term.negate, written),
-          label: value,
+          label,
           hint: String(count),
         }));
     } else {
       const shapes = SHAPES[term.field] || [];
-      const months = term.kind === 'date' ? vocabulary.months.map(([month, count]) => [month, `${count} added`]) : [];
+      const months = term.kind === 'date' ? vocabulary.months.map(([month, count]) => [month, t('catalogue.suggest.month_added', { count })]) : [];
       items = [...shapes, ...months]
         .filter(([value]) => !partial || value.startsWith(partial))
         .map(([value, hint]) => ({ insert: withSign(term.negate, `${term.field}:${value}`), label: value, hint }));
@@ -119,12 +125,12 @@ export function suggest(text, caret, vocabulary) {
       : LISTED.flatMap((field) =>
           vocabulary[field]
             .filter(({ value }) => startsWord(sameKey(value), word))
-            .map(({ value, count, term: written }) => ({ field, value, count, written }))
+            .map(({ value, label, count, term: written }) => ({ field, value, label, count, written }))
         ).sort((a, b) => b.count - a.count);
-  const named = values.map(({ field, value, count, written }) => ({
+  const named = values.map(({ field, label, count, written }) => ({
     insert: withSign(term.negate, written),
-    label: value,
-    hint: `${FIELDS[field].label} · ${count}`,
+    label,
+    hint: t('catalogue.suggest.field_count', { field: FIELDS[field].label, count }),
   }));
   const items = [...fields, ...named].slice(0, MAX);
   return items.length ? { from: term.start, to: term.end, items } : null;

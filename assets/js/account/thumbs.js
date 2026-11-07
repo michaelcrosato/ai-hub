@@ -5,6 +5,7 @@
  */
 
 import { h } from '../dom.js';
+import { t, tx } from '../lang.js';
 import { attempt, hasSession } from './cloud.js';
 import { currentUser, signInWithGoogle } from './auth.js';
 import { toast } from './toast.js';
@@ -42,9 +43,9 @@ export async function setVote(slug, vote) {
 
 /** The two buttons for one game. Signed out, a press asks to sign in with Google. */
 export function thumbs(slug, { className = '' } = {}) {
-  const up = h('button', { type: 'button', class: 'thumbs__up', 'aria-label': 'I like this game', title: 'I like this game', 'aria-pressed': 'false' }, '👍');
-  const down = h('button', { type: 'button', class: 'thumbs__down', 'aria-label': 'Not for me', title: 'Not for me', 'aria-pressed': 'false' }, '👎');
-  const el = h('div', { class: `thumbs ${className}`.trim(), role: 'group', 'aria-label': 'Rate this game' }, up, down);
+  const up = h('button', { type: 'button', class: 'thumbs__up', 'aria-label': t('account.thumbs.like'), title: t('account.thumbs.like'), 'aria-pressed': 'false' }, '👍');
+  const down = h('button', { type: 'button', class: 'thumbs__down', 'aria-label': t('account.thumbs.dislike'), title: t('account.thumbs.dislike'), 'aria-pressed': 'false' }, '👎');
+  const el = h('div', { class: `thumbs ${className}`.trim(), role: 'group', 'aria-label': t('account.thumbs.group') }, up, down);
 
   const show = (vote) => {
     up.setAttribute('aria-pressed', String(vote === 1));
@@ -56,7 +57,7 @@ export function thumbs(slug, { className = '' } = {}) {
 
   const press = async (vote) => {
     if (!(await canVote())) {
-      toast(h('span', {}, 'Sign in with Google to rate games. ', h('button', { type: 'button', class: 'account-link', onclick: () => signInWithGoogle() }, 'Sign in')));
+      toast(h('span', {}, tx('account.thumbs.sign_in', { button: h('button', { type: 'button', class: 'account-link', onclick: () => signInWithGoogle() }, t('account.thumbs.sign_in_button')) })));
       return;
     }
     const before = (await myVotes()).get(slug) || 0;
@@ -64,7 +65,7 @@ export function thumbs(slug, { className = '' } = {}) {
     show(next);
     if (!(await setVote(slug, next))) {
       show(before);
-      toast('Your vote could not be saved just now.');
+      toast(t('account.thumbs.save_failed'));
     }
   };
   up.addEventListener('click', () => press(1));
@@ -76,5 +77,5 @@ export function thumbs(slug, { className = '' } = {}) {
 export async function askAfterPlay(game, seconds) {
   if (seconds < 30 || !hasSession() || !(await canVote())) return;
   if ((await myVotes()).has(game.slug)) return;
-  toast(h('span', { class: 'account-ask' }, `How was ${game.name}?`, thumbs(game.slug)), 9_000);
+  toast(h('span', { class: 'account-ask' }, t('account.thumbs.ask', { game: game.name }), thumbs(game.slug)), 9_000);
 }

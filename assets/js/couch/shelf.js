@@ -13,6 +13,7 @@
  */
 
 import { h } from '../dom.js';
+import { t } from '../lang.js';
 import { tile, glide } from './ui.js';
 
 export function createShelf(root, { href }) {
@@ -96,8 +97,8 @@ export function createShelf(root, { href }) {
   /** Where focus is in a row: the one tile Tab reaches, and "12 of 40" by the title. */
   function mark(row, el) {
     const tiles = tilesOf(row);
-    for (const t of tiles) t.tabIndex = t === el ? 0 : -1;
-    row.pos.textContent = `${tiles.indexOf(el) + 1} of ${tiles.length}`;
+    for (const sibling of tiles) sibling.tabIndex = sibling === el ? 0 : -1;
+    row.pos.textContent = t('couch.shelf.position', { number: tiles.indexOf(el) + 1, total: tiles.length });
   }
 
   /** A tile for this game: in the first row `prefer` likes that holds it, else the first row that does. */

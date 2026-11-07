@@ -24,6 +24,7 @@
  */
 
 import { fold, sameKey, playersOf, SINGLE } from '../manifest.js';
+import { t, ago, date, lang } from '../lang.js';
 
 export const DAY = 86_400_000;
 const KB = 1024;
@@ -43,20 +44,20 @@ export const valuesOf = (value) =>
  * catalogue names no series, and nothing for an original.
  */
 export const FIELDS = {
-  genre: { label: 'Genre', kind: 'text', read: (g) => g.genre },
-  type: { label: 'Type', kind: 'text', read: (g) => g.type || 'Game' },
-  origin: { label: 'Origin', kind: 'origin' },
-  source: { label: 'Source', kind: 'text', read: (g) => g.source },
-  series: { label: 'Series', kind: 'text', read: (g) => (g.lineage.original ? null : g.lineage.series) },
-  model: { label: 'Model', kind: 'text', read: (g) => g.model },
-  tag: { label: 'Tag', kind: 'text', read: (g) => g.tags },
-  players: { label: 'Players', kind: 'players' },
-  size: { label: 'Size', kind: 'size' },
-  added: { label: 'Added', kind: 'date', read: (g) => g.addedAt },
-  updated: { label: 'Updated', kind: 'date', read: (g) => g.updatedAt },
-  builds: { label: 'Builds', kind: 'count', read: (g) => buildsOf(g) },
-  is: { label: 'Is', kind: 'flag' },
-  has: { label: 'Has', kind: 'has' },
+  genre: { label: t('catalogue.query.field_genre'), kind: 'text', read: (g) => g.genre },
+  type: { label: t('catalogue.query.field_type'), kind: 'text', read: (g) => g.type || 'Game' },
+  origin: { label: t('catalogue.query.field_origin'), kind: 'origin' },
+  source: { label: t('catalogue.query.field_source'), kind: 'text', read: (g) => g.source },
+  series: { label: t('catalogue.query.field_series'), kind: 'text', read: (g) => (g.lineage.original ? null : g.lineage.series) },
+  model: { label: t('catalogue.query.field_model'), kind: 'text', read: (g) => g.model },
+  tag: { label: t('catalogue.query.field_tag'), kind: 'text', read: (g) => g.tags },
+  players: { label: t('catalogue.query.field_players'), kind: 'players' },
+  size: { label: t('catalogue.query.field_size'), kind: 'size' },
+  added: { label: t('catalogue.query.field_added'), kind: 'date', read: (g) => g.addedAt },
+  updated: { label: t('catalogue.query.field_updated'), kind: 'date', read: (g) => g.updatedAt },
+  builds: { label: t('catalogue.query.field_builds'), kind: 'count', read: (g) => buildsOf(g) },
+  is: { label: t('catalogue.query.field_is'), kind: 'flag' },
+  has: { label: t('catalogue.query.field_has'), kind: 'has' },
 };
 
 /** Spellings people reach for that mean a known field. */
@@ -76,6 +77,19 @@ const NEW_FOR = 7 * DAY;
 
 /** What `has:` can ask about: fields a game may or may not carry. */
 const HAS = ['model', 'source', 'series', 'tagline', 'players', 'controls', 'tags', 'description', 'session'];
+
+/** The words on a `has:` chip: the field a game may carry. */
+const HAS_SAYS = {
+  model: t('catalogue.query.has_model'),
+  source: t('catalogue.query.has_source'),
+  series: t('catalogue.query.has_series'),
+  tagline: t('catalogue.query.has_tagline'),
+  players: t('catalogue.query.has_players'),
+  controls: t('catalogue.query.has_controls'),
+  tags: t('catalogue.query.has_tags'),
+  description: t('catalogue.query.has_description'),
+  session: t('catalogue.query.has_session'),
+};
 
 /** Folded copies of every text field, worked out once per game. */
 const foldedFacts = new WeakMap();
@@ -250,8 +264,11 @@ function readDateInterval(value) {
 /** "1.5 KB", "100 KB", "2 MB": sizes as the chips and axes say them. */
 export function sizeText(n) {
   if (!Number.isFinite(n)) return '∞';
-  const [value, unit] = n < KB ? [n, 'B'] : n < MB ? [n / KB, 'KB'] : n < GB ? [n / MB, 'MB'] : [n / GB, 'GB'];
-  return `${Number(value.toPrecision(3))} ${unit}`;
+  const three = (value) => Number(value.toPrecision(3));
+  if (n < KB) return t('catalogue.query.size_b', { value: three(n) });
+  if (n < MB) return t('catalogue.query.size_kb', { value: three(n / KB) });
+  if (n < GB) return t('catalogue.query.size_mb', { value: three(n / MB) });
+  return t('catalogue.query.size_gb', { value: three(n / GB) });
 }
 
 /** The shortest way to write a size in a query: 102400 → "100kb". */
@@ -260,34 +277,26 @@ export function sizeToken(n) {
   return `${Number(value.toFixed(2))}${unit}`;
 }
 
-const DAY_FORMAT = new Intl.DateTimeFormat('en-GB', {
-  day: 'numeric',
-  month: 'short',
-  year: 'numeric',
-  timeZone: 'UTC',
-});
-const MONTH_FORMAT = new Intl.DateTimeFormat('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+const DAY_STYLE = { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' };
+const MONTH = { month: 'short', year: 'numeric', timeZone: 'UTC' };
 
 /** "15 Sep 2026", in UTC like every day the Catalogue counts. */
-export const dayText = (ms) => DAY_FORMAT.format(ms);
+export const dayText = (ms) => date(ms, DAY_STYLE);
 
 /** "2026-09-15": a day as the query writes it. */
 export const dayToken = (ms) => new Date(ms).toISOString().slice(0, 10);
 
+/** An age as the chips say it: "3 days ago", "1 hour ago". */
+const ageText = (end) => ago(-end.n, AGE_WORDS[end.unit], { numeric: 'always' });
+
 function dateEndText(end) {
-  if (end.age !== undefined) return `${end.n} ${AGE_WORDS[end.unit]}${end.n === 1 ? '' : 's'} ago`;
-  if (end.grain === 'year') return String(new Date(end.start).getUTCFullYear());
-  return end.grain === 'month' ? MONTH_FORMAT.format(end.start) : dayText(end.start);
+  if (end.age !== undefined) return ageText(end);
+  if (end.grain === 'year') return date(end.start, { year: 'numeric', timeZone: 'UTC' });
+  return end.grain === 'month' ? date(end.start, MONTH) : dayText(end.start);
 }
 
-/** "1–15 Sep 2026" rather than the same month and year twice. */
-function dayRangeText(a, b) {
-  const [x, y] = [new Date(a.start), new Date(b.start)];
-  const sameYear = x.getUTCFullYear() === y.getUTCFullYear();
-  if (sameYear && x.getUTCMonth() === y.getUTCMonth()) return `${x.getUTCDate()}–${dayText(b.start)}`;
-  if (sameYear) return `${dayText(a.start).replace(/ \d{4}$/, '')} – ${dayText(b.start)}`;
-  return `${dayText(a.start)} – ${dayText(b.start)}`;
-}
+/** "1–15 Sep 2026" rather than the same month and year twice, as the language writes it. */
+const dayRangeText = (a, b) => new Intl.DateTimeFormat(lang, DAY_STYLE).formatRange(a.start, b.start);
 
 function dateSays(range) {
   const { op, a, b } = range;
@@ -296,52 +305,59 @@ function dateSays(range) {
       return dayRangeText(a.start <= b.start ? a : b, a.start <= b.start ? b : a);
     if (a && b && a.age !== undefined && b.age !== undefined) {
       const [near, far] = a.age <= b.age ? [a, b] : [b, a];
-      return near.unit === far.unit
-        ? `${near.n} to ${dateEndText(far)}`
-        : `${dateEndText(near)} to ${dateEndText(far)}`;
+      if (near.unit !== far.unit) return t('catalogue.query.date_range', { from: dateEndText(near), to: dateEndText(far) });
+      const values = { count: far.n, near: near.n, far: far.n };
+      if (far.unit === 'h') return t('catalogue.query.age_range_hours', values);
+      if (far.unit === 'd') return t('catalogue.query.age_range_days', values);
+      return t('catalogue.query.age_range_weeks', values);
     }
-    if (a && b) return `${dateEndText(a)} to ${dateEndText(b)}`;
-    return a ? `from ${dateEndText(a)}` : `up to ${dateEndText(b)}`;
+    if (a && b) return t('catalogue.query.date_range', { from: dateEndText(a), to: dateEndText(b) });
+    return a
+      ? t('catalogue.query.date_from', { when: dateEndText(a) })
+      : t('catalogue.query.date_upto', { when: dateEndText(b) });
   }
   if (a.age !== undefined) {
-    const span = a.n === 1 ? AGE_WORDS[a.unit] : `${a.n} ${AGE_WORDS[a.unit]}s`;
-    return op === '>' || op === '>=' ? `more than ${dateEndText(a)}` : `in the last ${span}`;
+    if (op === '>' || op === '>=') return t('catalogue.query.date_older', { age: dateEndText(a) });
+    if (a.unit === 'h') return t('catalogue.query.date_last_hours', { count: a.n });
+    if (a.unit === 'd') return t('catalogue.query.date_last_days', { count: a.n });
+    return t('catalogue.query.date_last_weeks', { count: a.n });
   }
   const when = dateEndText(a);
-  return (
-    { '<': `before ${when}`, '<=': `on or before ${when}`, '>': `after ${when}`, '>=': `on or after ${when}` }[op] ||
-    (a.grain === 'day' ? `on ${when}` : `in ${when}`)
-  );
+  if (op === '<') return t('catalogue.query.date_before', { when });
+  if (op === '<=') return t('catalogue.query.date_on_or_before', { when });
+  if (op === '>') return t('catalogue.query.date_after', { when });
+  if (op === '>=') return t('catalogue.query.date_on_or_after', { when });
+  return a.grain === 'day' ? t('catalogue.query.date_on', { when }) : t('catalogue.query.date_in', { when });
 }
 
 function sizeSays({ op, lo, hi, open }) {
-  if (op === '<') return `under ${sizeText(hi)}`;
-  if (op === '<=') return `${sizeText(hi - 1)} or less`;
-  if (op === '>') return `over ${sizeText(lo - 1)}`;
-  if (op === '>=') return `${sizeText(lo)} or more`;
-  if (op === '=') return `exactly ${lo} bytes`;
-  if (open?.[0]) return `under ${sizeText(hi)}`;
-  if (open?.[1]) return `${sizeText(lo)} or more`;
-  return `${sizeText(lo)} to ${sizeText(hi)}`;
+  if (op === '<') return t('catalogue.query.size_under', { size: sizeText(hi) });
+  if (op === '<=') return t('catalogue.query.size_at_most', { size: sizeText(hi - 1) });
+  if (op === '>') return t('catalogue.query.size_over', { size: sizeText(lo - 1) });
+  if (op === '>=') return t('catalogue.query.size_at_least', { size: sizeText(lo) });
+  if (op === '=') return t('catalogue.query.size_exactly', { count: lo });
+  if (open?.[0]) return t('catalogue.query.size_under', { size: sizeText(hi) });
+  if (open?.[1]) return t('catalogue.query.size_at_least', { size: sizeText(lo) });
+  return t('catalogue.query.size_between', { from: sizeText(lo), to: sizeText(hi) });
 }
 
 /** Said the way it was typed: `>1` is "more than 1", not the equal "2 or more". */
 function countSays({ op, lo, hi }) {
-  if (op === '>') return `more than ${lo - 1}`;
-  if (op === '<') return `fewer than ${hi}`;
-  if (hi === Infinity) return `${lo} or more`;
-  if (lo <= 0) return `${hi - 1} or fewer`;
-  if (hi - lo === 1) return `exactly ${lo}`;
-  return `${lo} to ${hi - 1}`;
+  if (op === '>') return t('catalogue.query.count_more', { number: lo - 1 });
+  if (op === '<') return t('catalogue.query.count_fewer', { number: hi });
+  if (hi === Infinity) return t('catalogue.query.count_at_least', { number: lo });
+  if (lo <= 0) return t('catalogue.query.count_at_most', { number: hi - 1 });
+  if (hi - lo === 1) return t('catalogue.query.count_exactly', { number: lo });
+  return t('catalogue.query.count_between', { from: lo, to: hi - 1 });
 }
 
 function playersSays({ lo, hi }) {
-  if (lo === 1 && hi === 2) return 'single player';
-  if (lo === 2 && hi === Infinity) return 'multiplayer';
-  if (hi - lo === 1) return `seats ${lo}`;
-  if (hi === Infinity) return `seats ${lo} or more`;
-  if (lo <= 1) return `seats up to ${hi - 1}`;
-  return `seats ${lo} to ${hi - 1}`;
+  if (lo === 1 && hi === 2) return t('catalogue.query.players_single');
+  if (lo === 2 && hi === Infinity) return t('catalogue.query.players_multi');
+  if (hi - lo === 1) return t('catalogue.query.seats_exactly', { number: lo });
+  if (hi === Infinity) return t('catalogue.query.seats_at_least', { number: lo });
+  if (lo <= 1) return t('catalogue.query.seats_at_most', { number: hi - 1 });
+  return t('catalogue.query.seats_between', { from: lo, to: hi - 1 });
 }
 
 /* --- building a term ------------------------------------------------------ */
@@ -358,18 +374,18 @@ const KINDS = {
     return {
       key: `${field}:${exact ? '=' : ''}${needle}`,
       test: (game) => factsOf(game)[field].some((hay) => (exact ? hay === needle : startsWord(hay, needle))),
-      says: exact ? `exactly ${value}` : value,
+      says: exact ? t('catalogue.query.text_exactly', { value }) : value,
     };
   },
 
   origin(value) {
     const v = sameKey(value);
     const hit = ['original', 'inspired'].find((o) => o.startsWith(v));
-    if (!hit) return { problem: 'is original or inspired' };
+    if (!hit) return { problem: t('catalogue.query.problem_origin') };
     return {
       key: `origin:${hit}`,
       test: (game) => (game.lineage.original ? 'original' : 'inspired') === hit,
-      says: hit,
+      says: hit === 'original' ? t('catalogue.query.origin_original') : t('catalogue.query.origin_inspired'),
     };
   },
 
@@ -381,7 +397,7 @@ const KINDS = {
     ];
     const named = words.find(([list]) => list.some((w) => w.startsWith(v)))?.[1];
     const range = named || readInterval(value, readCount, { inclusive: true });
-    if (!range) return { problem: 'is a head count like 2, or multi' };
+    if (!range) return { problem: t('catalogue.query.problem_players') };
     const { lo, hi } = range;
     return {
       key: `players:${lo}..${hi}`,
@@ -392,7 +408,7 @@ const KINDS = {
 
   size(value) {
     const range = readInterval(value, readBytes, { inclusive: false });
-    if (!range) return { problem: 'is a size like <500kb or 1mb..4mb' };
+    if (!range) return { problem: t('catalogue.query.problem_size') };
     const { lo, hi } = range;
     return {
       key: `size:${lo}..${hi}`,
@@ -404,7 +420,7 @@ const KINDS = {
 
   count(value, { field, spec }) {
     const range = readInterval(value, readCount, { inclusive: true });
-    if (!range) return { problem: 'is a count like 2, >1 or 1..3' };
+    if (!range) return { problem: t('catalogue.query.problem_count') };
     const { lo, hi } = range;
     return {
       key: `${field}:${lo}..${hi}`,
@@ -418,7 +434,7 @@ const KINDS = {
 
   date(value, { field, spec }) {
     const range = readDateInterval(value);
-    if (!range) return { problem: 'is a date like 2026-09-20, a range a..b, or an age like <7d' };
+    if (!range) return { problem: t('catalogue.query.problem_date') };
     const fixed = range.a?.age === undefined && range.b?.age === undefined;
     return {
       key: fixed ? `${field}:${range.bounds(0).join('..')}` : `${field}:${value.replace(/\s+/g, '').toLowerCase()}`,
@@ -436,21 +452,25 @@ const KINDS = {
   flag(value) {
     const v = sameKey(value);
     const hit = Object.keys(FLAGS).find((flag) => FLAGS[flag].some((word) => word.startsWith(v)));
-    if (!hit) return { problem: 'is fav, played or new' };
+    if (!hit) return { problem: t('catalogue.query.problem_flag') };
     const tests = {
       fav: (game, ctx) => ctx.isFave(game.slug),
       played: (game, ctx) => ctx.isPlayed(game.slug),
       new: (game, ctx) => game.addedAt > 0 && game.addedAt >= ctx.now - NEW_FOR,
     };
-    const says = { fav: 'a favourite', played: 'played here', new: 'new this week' };
+    const says = {
+      fav: t('catalogue.query.flag_fav'),
+      played: t('catalogue.query.flag_played'),
+      new: t('catalogue.query.flag_new'),
+    };
     return { key: `is:${hit}`, flag: hit, test: tests[hit], says: says[hit] };
   },
 
   has(value) {
     const v = sameKey(value);
     const hit = HAS.find((name) => name.startsWith(v));
-    if (!hit) return { problem: `is one of ${HAS.join(', ')}` };
-    return { key: `has:${hit}`, test: (game) => valuesOf(game[hit]).length > 0, says: hit };
+    if (!hit) return { problem: t('catalogue.query.problem_has', { keywords: HAS.join(', ') }) };
+    return { key: `has:${hit}`, test: (game) => valuesOf(game[hit]).length > 0, says: HAS_SAYS[hit] };
   },
 };
 
@@ -516,7 +536,7 @@ function termOf(token, text) {
       quoted: token.quoted,
       key: `text:${phrase}`,
       test: (game) => (game.search || '').includes(phrase),
-      says: token.quoted ? `“${value}”` : value,
+      says: token.quoted ? t('catalogue.query.phrase', { value }) : value,
     };
   }
 
@@ -659,47 +679,47 @@ export function brush(text, field, written) {
 /** The syntax, by example. Each one is a working query; clicking one adds it. */
 export const EXAMPLES = [
   {
-    title: 'Fields',
+    title: t('catalogue.query.examples_fields'),
     items: [
-      ['genre:racing', 'A genre, or the start of one'],
-      ['genre:"life sim"', 'Quotes keep words together'],
-      ['model:gpt', 'Built by any GPT model'],
-      ['source:"metal slug"', 'Attempts at a classic'],
-      ['series:"final fantasy"', 'Anything in a series'],
-      ['tag:pixel', 'A tag'],
-      ['type:demo', 'Tech demos (or game, tool)'],
-      ['origin:original', 'Its own idea (or inspired)'],
-      ['players:2', 'Seats two; players:multi for any'],
+      ['genre:racing', t('catalogue.query.example_genre')],
+      ['genre:"life sim"', t('catalogue.query.example_quotes')],
+      ['model:gpt', t('catalogue.query.example_model')],
+      ['source:"metal slug"', t('catalogue.query.example_source')],
+      ['series:"final fantasy"', t('catalogue.query.example_series')],
+      ['tag:pixel', t('catalogue.query.example_tag')],
+      ['type:demo', t('catalogue.query.example_type')],
+      ['origin:original', t('catalogue.query.example_origin')],
+      ['players:2', t('catalogue.query.example_players')],
     ],
   },
   {
-    title: 'Sizes, dates and counts',
+    title: t('catalogue.query.examples_sizes'),
     items: [
-      ['size:<500kb', 'Under 500 KB'],
-      ['size:1mb..4mb', 'From 1 MB up to 4 MB'],
-      ['added:>2026-09-20', 'Added after 20 September'],
-      ['added:2026-09-01..2026-09-15', 'Both days included'],
-      ['added:<7d', 'In the last seven days'],
-      ['builds:>1', 'More than one build'],
+      ['size:<500kb', t('catalogue.query.example_size_under')],
+      ['size:1mb..4mb', t('catalogue.query.example_size_range')],
+      ['added:>2026-09-20', t('catalogue.query.example_added_after')],
+      ['added:2026-09-01..2026-09-15', t('catalogue.query.example_added_range')],
+      ['added:<7d', t('catalogue.query.example_added_week')],
+      ['builds:>1', t('catalogue.query.example_builds')],
     ],
   },
   {
-    title: 'Flags',
+    title: t('catalogue.query.examples_flags'),
     items: [
-      ['is:fav', 'Your favourites'],
-      ['is:played', 'Played on this device'],
-      ['is:new', 'Added this week'],
-      ['has:model', 'Names the model that made it'],
-      ['has:session', 'Plays in an AI Hub session'],
+      ['is:fav', t('catalogue.query.example_fav')],
+      ['is:played', t('catalogue.query.example_played')],
+      ['is:new', t('catalogue.query.example_new')],
+      ['has:model', t('catalogue.query.example_has_model')],
+      ['has:session', t('catalogue.query.example_has_session')],
     ],
   },
   {
-    title: 'Combining',
+    title: t('catalogue.query.examples_combining'),
     items: [
-      ['-genre:shooter', 'A minus leaves matches out'],
-      ['genre:racing genre:flight', 'One field twice: either'],
-      ['genre:rpg tag:3d', 'Two fields: both'],
-      ['orbit', 'Bare words search everything'],
+      ['-genre:shooter', t('catalogue.query.example_minus')],
+      ['genre:racing genre:flight', t('catalogue.query.example_either')],
+      ['genre:rpg tag:3d', t('catalogue.query.example_both')],
+      ['orbit', t('catalogue.query.example_bare')],
     ],
   },
 ];

@@ -7,12 +7,15 @@
  * bytes and dates are ISO days, because a spreadsheet does arithmetic.
  */
 
+import { t } from '../lang.js';
 import { buildsOf, dayText, dayToken, sizeText, valuesOf } from './query.js';
 
 const lineageText = (g) => {
-  if (g.lineage.original) return 'Original';
-  const series = g.lineage.series && g.lineage.series !== g.lineage.title ? ` (${g.lineage.series})` : '';
-  return `after ${g.lineage.title}${series}`;
+  if (g.lineage.original) return t('catalogue.export.original');
+  const { title, series } = g.lineage;
+  return series && series !== title
+    ? t('catalogue.export.after_series', { title, series })
+    : t('catalogue.export.after', { title });
 };
 
 /** Several values in one cell, the way the spec sheet lists them. */
@@ -66,7 +69,15 @@ export const markdownCell = (value) =>
  * `link`, each name links to its record.
  */
 export function toMarkdown(games, { link } = {}) {
-  const head = ['Name', 'Genre', 'Lineage', 'Model', 'Players', 'Size', 'Added'];
+  const head = [
+    t('catalogue.export.name'),
+    t('catalogue.export.genre'),
+    t('catalogue.export.lineage'),
+    t('catalogue.export.model'),
+    t('catalogue.export.players'),
+    t('catalogue.export.size'),
+    t('catalogue.export.added'),
+  ];
   const rule = ['---', '---', '---', '---', '---', '---:', '---'];
   const label = (g) => markdownCell(g.name).replace(/[[\]]/g, '\\$&');
   const rows = games.map((g) => [

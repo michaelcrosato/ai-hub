@@ -31,19 +31,25 @@
  */
 
 import { h, clear } from '../dom.js';
+import { t, tx, list, fillPage } from '../lang.js';
+import { languageMenu } from '../ui/language.js';
 import { loadManifest, normalize, sessionOf } from '../manifest.js';
 import { fnv1a, cabinetPalette, paletteVars } from '../color.js';
 import { createPlayer } from '../ui/player.js';
 import { createBridge, attachFrame, postTo, cleanProgress } from '/lib/hub/bridge.js';
-import { createRound, limitFor, rankResults, seedsRandom, MODE_NAMES, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
+import { createRound, limitFor, rankResults, seedsRandom, SELF_REPORTED, SLOT_COLORS } from '/lib/hub/round.js';
 import { createLocalNet } from './local.js';
 import { createRelayNet, supabaseRelay, plainProblem } from './net.js';
 import { nameChoices } from './names.js';
-import { pickNext, eligible, sessionPool, roundGame, filterChoices, anyFilter, describeFilters, toggleFilter, countGames, cleanQueue, takeQueued, pickable, MOST_PICKS } from './pick.js';
+import { pickNext, eligible, sessionPool, roundGame, filterChoices, anyFilter, describeFilters, toggleFilter, countGames, cleanQueue, takeQueued, pickable, modeName, MOST_PICKS } from './pick.js';
 import { createChooser } from './chooser.js';
 import { FRIENDS_PATH, inviteCode, joinHref, togetherLine } from '../friends/together.js';
 import { emblem } from '../ui/friends.js';
-import { scoreRound, addRound, leaderboard, liveOrder, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, finalTable } from './score.js';
+import { scoreRound, addRound, leaderboard, liveOrder, FORMATS, DEFAULT_FORMAT, formatOf, formatOver, formatProgress, sessionAwards, awardText, finalTable } from './score.js';
+
+fillPage();
+// The page's header carries the Language menu (it stays hidden while English is the only language).
+document.querySelector('.session-head')?.append(languageMenu());
 
 const SEATS = 4;
 const STATE_EVERY_MS = 2_000;
@@ -109,9 +115,9 @@ const chooser = createChooser(document.getElementById('chooser'), {
 
 /** The reference games, one per kind of round, for a session with nothing else to play. */
 const EXAMPLES = [
-  { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Shared world: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'shared-world', sessionMinutes: '2', sessionGoal: 'First to ten stars wins', sessionHowto: 'Move: arrows, WASD or a stick · sprint: Space or Cross · or hold a finger' },
-  { slug: 'hub-example-ghost', name: 'Comet Dash', tagline: 'Ghost: race the others’ ghosts', path: '/lib/hub/examples/ghost.html', themeColor: '#0f1b2e', sessionMode: 'ghost', sessionMinutes: '1', sessionGoal: 'Fastest to the end of the course wins', sessionHowto: 'Steer: ← →, A D or a stick · boost: Space or Cross · or drag a finger' },
-  { slug: 'hub-example-parallel', name: 'Starfall', tagline: 'Parallel: one minute of falling stars', path: '/lib/hub/examples/parallel.html', themeColor: '#15103a', sessionMode: 'parallel', sessionPlayers: '1-4', sessionMinutes: '1', sessionGoal: 'Most points in one minute: catch stars, dodge rocks', sessionHowto: 'Move: ← →, A D or a stick · dash: Space or Cross · or drag a finger' },
+  { slug: 'hub-example-arena', name: 'Star Arena', tagline: 'Shared world: first to ten stars', path: '/lib/hub/examples/arena.html', themeColor: '#1b1530', sessionMode: 'shared-world', sessionMinutes: '2', sessionGoal: t('session.example.arena_goal'), sessionHowto: t('session.example.arena_howto') },
+  { slug: 'hub-example-ghost', name: 'Comet Dash', tagline: 'Ghost: race the others’ ghosts', path: '/lib/hub/examples/ghost.html', themeColor: '#0f1b2e', sessionMode: 'ghost', sessionMinutes: '1', sessionGoal: t('session.example.ghost_goal'), sessionHowto: t('session.example.ghost_howto') },
+  { slug: 'hub-example-parallel', name: 'Starfall', tagline: 'Parallel: one minute of falling stars', path: '/lib/hub/examples/parallel.html', themeColor: '#15103a', sessionMode: 'parallel', sessionPlayers: '1-4', sessionMinutes: '1', sessionGoal: t('session.example.parallel_goal'), sessionHowto: t('session.example.parallel_howto') },
 ].map((g) => normalize({ sessionPlayers: '2-4', ...g, type: 'Game', session: '1', tags: ['touch'], builds: [{ id: 'current', path: g.path }] }));
 
 let pool = [];
@@ -138,12 +144,12 @@ const player = createPlayer(document.getElementById('player'), {
   canRoll: () => isHost(),
   confirmExit: () =>
     isHost()
-      ? { title: 'End Random Mode for everyone?', detail: 'Everyone goes back to the lobby and keeps their seat. The rounds played so far stay on the table.', action: 'End Random Mode' }
-      : { title: 'Leave the session?', detail: 'The others play on without you.', action: 'Leave the session' },
+      ? { title: t('session.exit.end_title'), detail: t('session.exit.end_detail'), action: t('session.exit.end_action') }
+      : { title: t('session.exit.leave_title'), detail: t('session.exit.leave_detail'), action: t('session.exit.leave_action') },
   keepFocus: () => !overlay.hidden,
   honorStandalone: false,
   askToRate: false,
-  backLabel: 'Leave the session',
+  backLabel: t('session.exit.leave_action'),
   src: (build) => roundSrc(build.path, pendingRound),
   onFrame: (frame) => attachRound(frame),
 });
@@ -325,8 +331,8 @@ function startRound({ under = false } = {}) {
     ? { game: queued.game, cycle: state.cycle, played: [...state.played, queued.game.slug], queue: queued.queue, picked: true }
     : pickNext(pool, { seed: state.seed, n: players.length, cycle: state.cycle, played: state.played, ...seatsCan(), filters: state.filters });
   if (!pick) {
-    const n = `${players.length} player${players.length === 1 ? '' : 's'}`;
-    publish({ ...state, phase: 'lobby', notice: anyFilter(state.filters) ? `No game fits ${n} with these filters.` : `No game in the library fits ${n} yet.` });
+    // The notice travels as a code and a count: every player reads it in their own language.
+    publish({ ...state, phase: 'lobby', notice: { id: anyFilter(state.filters) ? 'filters' : 'library', count: players.length } });
     return;
   }
   const { game } = pick;
@@ -620,10 +626,10 @@ async function leaveSession() {
 
 /** The host removes a player for the rest of the session (online: the database bars them). */
 async function kick(member) {
-  if (!confirm(`Remove ${member.name} from this session?`)) return;
+  if (!confirm(t('session.kick.confirm', { name: member.name }))) return;
   if (online) {
     const { error } = await online.sb.rpc('kick_from_session', { p_session: online.sessionId, p_user: member.key });
-    if (error) return alert(`Could not remove ${member.name}: ${error.message}`);
+    if (error) return alert(t('session.kick.failed', { name: member.name, reason: error.message }));
   }
   net.broadcast({ k: 's', t: 'kick', key: member.key });
   coordinator?.leave(member.key, 'kicked');
@@ -661,21 +667,21 @@ function render() {
   // The lobby is drawn afresh on every change: keep the keyboard where it was.
   const focused = app.contains(document.activeElement) && document.activeElement.id;
   clear(app);
-  if (removed) app.append(h('section', { class: 'panel panel--note' }, h('h2', {}, 'You were removed from this session'), h('a', { class: 'primary', href: FRIENDS_PATH }, 'Back to Friends')));
+  if (removed) app.append(h('section', { class: 'panel panel--note' }, h('h2', {}, t('session.removed.title')), h('a', { class: 'primary', href: FRIENDS_PATH }, t('session.back_to_friends'))));
   else if (superseded)
     app.append(
       h(
         'section',
         { class: 'panel panel--note' },
-        h('h2', {}, 'This session is open in another tab'),
-        h('p', {}, 'You joined it again somewhere else with the same account, so this tab stepped aside. To play with a second account, use a private window.'),
-        h('button', { type: 'button', class: 'primary', onclick: () => location.reload() }, 'Play here instead')
+        h('h2', {}, t('session.superseded.title')),
+        h('p', {}, t('session.superseded.text')),
+        h('button', { type: 'button', class: 'primary', onclick: () => location.reload() }, t('session.superseded.play_here'))
       )
     );
   else if (!name && transport === 'online' && !code && !(user && !user.guest)) app.append(hostIntro());
   else if (!name) app.append(joinScreen());
   else if (mine().status === 'full')
-    app.append(h('section', { class: 'panel panel--note' }, h('h2', {}, 'This session is full'), h('p', {}, 'Four players are already in it.'), h('a', { class: 'primary', href: FRIENDS_PATH }, 'Back to Friends')));
+    app.append(h('section', { class: 'panel panel--note' }, h('h2', {}, t('session.full.title')), h('p', {}, t('session.full.text')), h('a', { class: 'primary', href: FRIENDS_PATH }, t('session.back_to_friends'))));
   else if (state?.phase === 'ended') app.append(endScreen());
   else app.append(lobbyScreen());
   if (focused) document.getElementById(focused)?.focus();
@@ -695,14 +701,14 @@ function firstCard() {
     'div',
     { class: 'first-pick', style: paletteVars(cabinetPalette(game)) },
     game.cover && h('img', { class: 'first-pick__shot', src: game.cover, alt: '', loading: 'eager', decoding: 'async', onerror: (e) => e.currentTarget.remove() }),
-    h('span', { class: 'first-pick__text' }, h('span', { class: 'first-pick__label' }, 'Opening with'), h('span', { class: 'first-pick__name' }, game.name), h('span', { class: 'first-pick__meta' }, togetherLine(game)))
+    h('span', { class: 'first-pick__text' }, h('span', { class: 'first-pick__label' }, t('session.first_pick.label')), h('span', { class: 'first-pick__name' }, game.name), h('span', { class: 'first-pick__meta' }, togetherLine(game)))
   );
 }
 
 /** Paste an invite: the code, the link, or a message with the link in it. */
 function joinBox() {
-  const input = h('input', { type: 'text', id: 'invite-paste', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', placeholder: 'Paste the invite link or code' });
-  const note = h('span', { class: 'hint join-box__note' }, 'No account needed to join.');
+  const input = h('input', { type: 'text', id: 'invite-paste', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', placeholder: t('session.join_box.placeholder') });
+  const note = h('span', { class: 'hint join-box__note' }, t('session.join_box.note'));
   return h(
     'form',
     {
@@ -711,7 +717,7 @@ function joinBox() {
         event.preventDefault();
         const found = inviteCode(input.value);
         if (!found) {
-          note.textContent = 'That has no invite code in it: the ten letters and digits after the # in the link.';
+          note.textContent = t('session.join_box.no_code');
           input.focus();
           return;
         }
@@ -723,8 +729,8 @@ function joinBox() {
         } else location.href = target.href;
       },
     },
-    h('label', { class: 'join-box__label', for: 'invite-paste' }, 'Got an invite?'),
-    h('span', { class: 'join-box__field' }, input, h('button', { type: 'submit' }, 'Join')),
+    h('label', { class: 'join-box__label', for: 'invite-paste' }, t('session.join_box.label')),
+    h('span', { class: 'join-box__field' }, input, h('button', { type: 'submit' }, t('session.join_box.join'))),
     note
   );
 }
@@ -735,16 +741,16 @@ function hostIntro() {
     'section',
     { class: 'panel intro' },
     emblem({ size: 44, className: 'intro__emblem' }),
-    h('h2', {}, 'Host a game night'),
-    h('p', { class: 'intro__blurb' }, 'Sign in with Google to host. You get an invite link to send; friends open it, pick a name and play, with no account. The hub deals the games, keeps time and keeps score. There is no chat, so talk in an app of your own.'),
+    h('h2', {}, t('session.intro.title')),
+    h('p', { class: 'intro__blurb' }, t('session.intro.blurb')),
     firstCard(),
     h(
       'button',
-      { type: 'button', class: 'primary primary--big', onclick: () => import('../account/auth.js').then((a) => a.signInWithGoogle()).catch(() => alert('Sign-in is unavailable right now.')) },
-      'Sign in with Google to host'
+      { type: 'button', class: 'primary primary--big', onclick: () => import('../account/auth.js').then((a) => a.signInWithGoogle()).catch(() => alert(t('session.intro.sign_in_failed'))) },
+      t('session.intro.sign_in')
     ),
     joinBox(),
-    h('p', { class: 'hint' }, 'Or ', h('a', { href: tryHref }, 'try a session in this browser'), ': open it in up to four tabs, one seat each.')
+    h('p', { class: 'hint' }, tx('session.intro.try', { link: h('a', { href: tryHref }, t('session.intro.try_link')) }))
   );
 }
 
@@ -756,17 +762,17 @@ function joinScreen() {
   return h(
     'section',
     { class: 'panel join' },
-    h('p', { class: 'eyebrow' }, hosting ? 'Hosting' : code && code !== 'local' && code !== 'try' ? 'Joining a session' : 'Taking a seat'),
-    h('h2', {}, hosting ? 'Pick your name to host' : 'Pick your name'),
+    h('p', { class: 'eyebrow' }, hosting ? t('session.join.hosting') : code && code !== 'local' && code !== 'try' ? t('session.join.joining') : t('session.join.taking')),
+    h('h2', {}, hosting ? t('session.join.pick_host') : t('session.join.pick')),
     problem && h('p', { class: 'notice' }, problem),
-    h('p', { class: 'hint' }, 'Everyone in the session sees it. Names come from the hub: there is no chat, so talk in an app of your own.'),
+    h('p', { class: 'hint' }, t('session.join.hint')),
     (hosting || !net?.members().some((m) => m.name)) && firstCard(),
     h(
       'div',
       { class: 'join__names', style: { '--seat': SLOT_COLORS[free ?? 0] ?? SLOT_COLORS[0] } },
       choices.map((choice) => h('button', { type: 'button', class: 'join__name', onclick: () => join(choice) }, choice))
     ),
-    h('button', { type: 'button', class: 'link', onclick: () => { reroll++; render(); } }, 'Other names')
+    h('button', { type: 'button', class: 'link', onclick: () => { reroll++; render(); } }, t('session.join.other_names'))
   );
 }
 
@@ -794,7 +800,7 @@ async function joinOnline(choice) {
   user = await auth.currentUser();
   let sessionId;
   if (!code) {
-    if (!user || user.guest) throw new Error('Sign in with Google to host a session.');
+    if (!user || user.guest) throw new Error(t('session.join.sign_in_to_host'));
     const { data, error } = await sb.rpc('create_session', { p_nickname: choice });
     if (error) throw error;
     ({ session_id: sessionId, code, slot: fixedSeat } = data[0]);
@@ -836,7 +842,7 @@ function lobbyScreen() {
   const seats = seated();
   const n = seats.length;
   const fits = countGames(eligible(pool, n, { ...seatsCan(), filters: state?.filters }));
-  const none = anyFilter(state?.filters) ? `No game fits ${n} player${n === 1 ? '' : 's'} with these filters` : `No game fits ${n} player${n === 1 ? '' : 's'} yet`;
+  const none = anyFilter(state?.filters) ? t('session.lobby.none_filters', { count: n }) : t('session.lobby.none_yet', { count: n });
   const cur = state?.current;
   const host = isHost();
   const inRound = state?.phase === 'round' && cur && !cur.players.some((p) => p.key === key);
@@ -850,8 +856,8 @@ function lobbyScreen() {
       h(
         'header',
         { class: 'lobby__head' },
-        h('h2', {}, 'The table'),
-        h('span', { class: 'lobby__count' }, `${n} of ${SEATS} seats taken`)
+        h('h2', {}, t('session.lobby.table')),
+        h('span', { class: 'lobby__count' }, t('session.lobby.seats_taken', { taken: n, total: SEATS }))
       ),
       h(
         'ol',
@@ -862,16 +868,16 @@ function lobbyScreen() {
             'li',
             { class: `seat${m ? '' : ' is-empty'}${m?.key === key ? ' is-me' : ''}`, style: { '--seat': SLOT_COLORS[slot] } },
             h('span', { class: 'seat__puck', 'aria-hidden': 'true' }, String(slot + 1)),
-            h('span', { class: 'seat__name' }, m ? m.name : 'Open seat'),
+            h('span', { class: 'seat__name' }, m ? m.name : t('session.lobby.open_seat')),
             h(
               'span',
               { class: 'seat__tags' },
-              m?.key === key && h('span', { class: 'seat__tag' }, 'You'),
-              m && m.key === hostKey() && h('span', { class: 'seat__tag' }, 'Host'),
-              m && m.key !== key && net.link?.(m.key) === 'failed' && h('span', { class: 'seat__tag is-bad' }, 'No connection'),
-              !m && h('span', { class: 'seat__tag is-quiet' }, transport === 'online' ? 'Waiting for a friend' : 'Open in another tab')
+              m?.key === key && h('span', { class: 'seat__tag' }, t('session.lobby.you')),
+              m && m.key === hostKey() && h('span', { class: 'seat__tag' }, t('session.lobby.host')),
+              m && m.key !== key && net.link?.(m.key) === 'failed' && h('span', { class: 'seat__tag is-bad' }, t('session.lobby.no_connection')),
+              !m && h('span', { class: 'seat__tag is-quiet' }, transport === 'online' ? t('session.lobby.waiting_friend') : t('session.lobby.open_tab'))
             ),
-            m && m.key !== key && isHost() && transport !== 'local' && h('button', { type: 'button', class: 'link seat__kick', onclick: () => kick(m) }, 'Remove')
+            m && m.key !== key && isHost() && transport !== 'local' && h('button', { type: 'button', class: 'link seat__kick', onclick: () => kick(m) }, t('session.lobby.remove'))
           );
         })
       ),
@@ -880,12 +886,11 @@ function lobbyScreen() {
         : h(
             'p',
             { class: 'invite invite--local' },
-            h('span', { class: 'invite__label' }, 'More players'),
-            h('span', {}, 'Open this page again in another tab of this browser: '),
-            h('a', { href: `${location.pathname}?transport=local${knobs.examples ? '&examples=1' : ''}#${encodeURIComponent(code)}`, target: '_blank' }, 'new seat')
+            h('span', { class: 'invite__label' }, t('session.lobby.more_players')),
+            h('span', {}, tx('session.lobby.open_again', { link: h('a', { href: `${location.pathname}?transport=local${knobs.examples ? '&examples=1' : ''}#${encodeURIComponent(code)}`, target: '_blank' }, t('session.lobby.new_seat')) }))
           ),
-      state?.notice && h('p', { class: 'notice' }, state.notice),
-      inRound && h('p', { class: 'notice' }, `${cur.name} is being played. You join from the next round.`),
+      state?.notice && h('p', { class: 'notice' }, noticeText(state.notice)),
+      inRound && h('p', { class: 'notice' }, t('session.lobby.in_round', { game: cur.name })),
       upNext(n),
       host && state?.phase === 'lobby'
         ? h(
@@ -894,16 +899,16 @@ function lobbyScreen() {
             h(
               'button',
               { type: 'button', class: 'primary primary--big', id: 'start', disabled: !fits && !next ? true : undefined, onclick: () => startRound() },
-              next ? `Start with ${next.game.name}` : 'Start Random Mode'
+              next ? t('session.lobby.start_with', { game: next.game.name }) : t('session.lobby.start_random')
             ),
-            h('span', { class: 'hint' }, next ? (fits ? `Then the hub deals from ${fits} game${fits === 1 ? '' : 's'}` : 'Then the hub deals') : fits ? `${fits} game${fits === 1 ? ' fits' : 's fit'} ${n} player${n === 1 ? '' : 's'}` : none)
+            h('span', { class: 'hint' }, next ? (fits ? t('session.lobby.then_deals_from', { count: fits }) : t('session.lobby.then_deals')) : fits ? t('session.lobby.fits', { count: fits, games: t('session.games', { count: fits }), players: t('session.players', { count: n }) }) : none)
           )
-        : state?.phase === 'lobby' && h('p', { class: 'hint lobby__wait' }, `Waiting for ${nameOf(hostKey()) ?? 'the host'} to start.`),
-      host && (state?.phase !== 'lobby' || state.history.length > 0) && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, 'End the session')
+        : state?.phase === 'lobby' && h('p', { class: 'hint lobby__wait' }, nameOf(hostKey()) ? t('session.lobby.waiting_host', { name: nameOf(hostKey()) }) : t('session.lobby.waiting_host_unknown')),
+      host && (state?.phase !== 'lobby' || state.history.length > 0) && h('button', { type: 'button', class: 'link', onclick: () => endSession() }, t('session.end_session'))
     ),
     h(
       'aside',
-      { class: 'lobby__side', 'aria-label': 'Session settings' },
+      { class: 'lobby__side', 'aria-label': t('session.lobby.settings') },
       formatPicker(),
       cardPicker(),
       filterPicker(n),
@@ -931,8 +936,8 @@ function upNext(n) {
     h(
       'header',
       { class: 'upnext__head' },
-      h('h3', { id: 'upnext-title' }, 'Up next'),
-      host && items.length < MOST_PICKS && h('button', { type: 'button', class: 'upnext__add', id: 'choose', onclick: () => chooser.open() }, items.length ? 'Pick more games' : 'Pick the games')
+      h('h3', { id: 'upnext-title' }, t('session.upnext.title')),
+      host && items.length < MOST_PICKS && h('button', { type: 'button', class: 'upnext__add', id: 'choose', onclick: () => chooser.open() }, items.length ? t('session.upnext.pick_more') : t('session.upnext.pick'))
     ),
     items.length
       ? h(
@@ -948,14 +953,14 @@ function upNext(n) {
                 'span',
                 { class: 'upnext__text' },
                 h('span', { class: 'upnext__name' }, game.name),
-                h('span', { class: 'upnext__meta' }, can.has(slug) ? togetherLine(game) : `Waits for ${sessionOf(game)?.seats?.[0] > n ? `${sessionOf(game).seats[0]} players` : 'every player to have WebGPU'}`)
+                h('span', { class: 'upnext__meta' }, can.has(slug) ? togetherLine(game) : sessionOf(game)?.seats?.[0] > n ? t('session.upnext.waits_players', { count: sessionOf(game).seats[0] }) : t('session.upnext.waits_webgpu'))
               ),
-              host && h('button', { type: 'button', class: 'upnext__remove', 'aria-label': `Take ${game.name} off the list`, onclick: () => remove(slug) }, '✕')
+              host && h('button', { type: 'button', class: 'upnext__remove', 'aria-label': t('session.upnext.remove', { game: game.name }), onclick: () => remove(slug) }, '✕')
             )
           )
         )
-      : h('p', { class: 'hint upnext__empty' }, 'Nothing picked: the hub deals every game at random. Pick games to play them first, in your order.'),
-    items.length > 0 && h('p', { class: 'hint upnext__then' }, 'Then the hub deals the rest at random.')
+      : h('p', { class: 'hint upnext__empty' }, t('session.upnext.empty')),
+    items.length > 0 && h('p', { class: 'hint upnext__then' }, t('session.upnext.then'))
   );
 }
 
@@ -963,11 +968,11 @@ function upNext(n) {
 function formatPicker() {
   const chosen = state?.format ?? DEFAULT_FORMAT;
   const editable = isHost() && state?.phase === 'lobby' && !state.history.length;
-  if (!editable) return h('p', { class: 'hint format-line' }, `${formatOf(chosen).label}: ${formatOf(chosen).blurb}.`);
+  if (!editable) return h('p', { class: 'hint format-line' }, t('session.format.line', { format: formatOf(chosen).label, blurb: formatOf(chosen).blurb }));
   return h(
     'fieldset',
     { class: 'formats' },
-    h('legend', {}, 'How to win'),
+    h('legend', {}, t('session.format.legend')),
     Object.entries(FORMATS).map(([id, format]) =>
       h(
         'label',
@@ -984,24 +989,24 @@ function formatPicker() {
 function cardPicker() {
   const chosen = cardSecondsOf(state);
   if (state?.knobs?.splashMs) return null;
-  if (!isHost() || state?.phase !== 'lobby') return h('p', { class: 'hint format-line' }, `Each game's card counts down ${chosen} seconds.`);
+  if (!isHost() || state?.phase !== 'lobby') return h('p', { class: 'hint format-line' }, t('session.card.line', { count: chosen }));
   return h(
     'fieldset',
     { class: 'filters' },
-    h('legend', {}, 'Before each game'),
+    h('legend', {}, t('session.card.legend')),
     h(
       'div',
-      { class: 'filters__group', role: 'radiogroup', 'aria-label': 'Timer' },
-      h('span', { class: 'filters__label', 'aria-hidden': 'true' }, 'Timer'),
+      { class: 'filters__group', role: 'radiogroup', 'aria-label': t('session.card.timer') },
+      h('span', { class: 'filters__label', 'aria-hidden': 'true' }, t('session.card.timer')),
       h(
         'div',
         { class: 'filters__options' },
         CARD_SECONDS.map((sec) =>
           h(
             'label',
-            { class: `filter${sec === chosen ? ' is-chosen' : ''}`, title: `${sec} seconds to read the card and get ready` },
+            { class: `filter${sec === chosen ? ' is-chosen' : ''}`, title: t('session.card.option_hint', { count: sec }) },
             h('input', { type: 'radio', name: 'card-seconds', id: `card-${sec}`, value: sec, checked: sec === chosen, onchange: () => publish({ ...state, cardSeconds: sec }) }),
-            h('span', { class: 'filter__name' }, `${sec}s`)
+            h('span', { class: 'filter__name' }, t('session.card.option', { seconds: sec }))
           )
         )
       )
@@ -1018,14 +1023,14 @@ function filterPicker(n) {
   const filters = state?.filters ?? {};
   if (!isHost() || state?.phase !== 'lobby') {
     const chosen = describeFilters(filters);
-    return chosen && h('p', { class: 'hint format-line' }, `Games: ${chosen}.`);
+    return chosen && h('p', { class: 'hint format-line' }, t('session.filter.games_line', { chosen }));
   }
   const groups = filterChoices(pool, n, { ...seatsCan(), filters }).filter((g) => g.options.length > 1 || g.options.some((o) => o.chosen));
   if (!groups.length) return null;
   return h(
     'fieldset',
     { class: 'filters' },
-    h('legend', {}, 'Which games'),
+    h('legend', {}, t('session.filter.legend')),
     groups.map((group) =>
       h(
         'div',
@@ -1056,8 +1061,8 @@ function filterPicker(n) {
       'p',
       { class: 'hint filters__note' },
       anyFilter(filters)
-        ? h('button', { type: 'button', class: 'link', id: 'filters-clear', onclick: () => publish({ ...state, notice: null, filters: {} }) }, 'Show every game again')
-        : 'A row with nothing chosen keeps every game.'
+        ? h('button', { type: 'button', class: 'link', id: 'filters-clear', onclick: () => publish({ ...state, notice: null, filters: {} }) }, t('session.filter.clear'))
+        : t('session.filter.note')
     )
   );
 }
@@ -1086,8 +1091,8 @@ function relaySwitch() {
         net?.relayOnly?.(e.target.checked);
       },
     }),
-    h('span', { class: 'relay-switch__name' }, 'Relay only'),
-    h('span', { class: 'hint' }, 'Reach the others only through the relay server, so they never see your IP address. It can add a little lag.')
+    h('span', { class: 'relay-switch__name' }, t('session.relay.name')),
+    h('span', { class: 'hint' }, t('session.relay.hint'))
   );
 }
 
@@ -1095,23 +1100,23 @@ function inviteLine() {
   const link = `${location.origin}/session#${code}`;
   const copy = h(
     'button',
-    { type: 'button', class: 'invite__copy', onclick: () => navigator.clipboard?.writeText(link).then(() => (copy.textContent = 'Copied'), () => (copy.textContent = 'Select the link to copy it')) },
-    'Copy link'
+    { type: 'button', class: 'invite__copy', onclick: () => navigator.clipboard?.writeText(link).then(() => (copy.textContent = t('session.invite.copied')), () => (copy.textContent = t('session.invite.select'))) },
+    t('session.invite.copy')
   );
   const share =
     typeof navigator.share === 'function' &&
     h(
       'button',
-      { type: 'button', class: 'invite__share', onclick: () => navigator.share({ title: 'Play with me on the AI Hub', text: 'Join my game night: pick a name and play, no account needed.', url: link }).catch(() => {}) },
-      'Share'
+      { type: 'button', class: 'invite__share', onclick: () => navigator.share({ title: t('session.invite.share_title'), text: t('session.invite.share_text'), url: link }).catch(() => {}) },
+      t('session.invite.share')
     );
   return h(
     'div',
     { class: 'invite' },
-    h('span', { class: 'invite__label' }, 'Invite friends'),
+    h('span', { class: 'invite__label' }, t('session.invite.label')),
     h('code', { class: 'invite__link' }, link),
     h('span', { class: 'invite__buttons' }, copy, share),
-    h('span', { class: 'hint invite__note' }, 'Friends open the link, pick a name and take a seat. No account needed.')
+    h('span', { class: 'hint invite__note' }, t('session.invite.note'))
   );
 }
 
@@ -1126,8 +1131,8 @@ function standingsTable({ before = null } = {}) {
   return h(
     'table',
     { class: 'table' },
-    h('caption', {}, `Standings after ${state.history.length} round${state.history.length === 1 ? '' : 's'}`),
-    h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Player'), h('th', {}, 'Points'), h('th', {}, 'Wins'), h('th', {}, 'Awards'), h('th', {}, 'Rounds'))),
+    h('caption', {}, t('session.standings.caption', { count: state.history.length })),
+    h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, t('session.table.player')), h('th', {}, t('session.table.points')), h('th', {}, t('session.table.wins')), h('th', {}, t('session.table.awards')), h('th', {}, t('session.table.rounds')))),
     h(
       'tbody',
       {},
@@ -1164,8 +1169,8 @@ function renderStrip() {
   // Native append would print a false or null child as text: drop them first.
   strip.append(...[
     h('span', { class: 'strip__title' }, formatProgress(state.format, state.history, state.totals)),
-    waiting.length ? h('span', {}, `Waiting for ${waiting.join(', ')}`) : status?.phase === 'grace' ? h('span', {}, 'Time!') : null,
-    isHost() && h('button', { type: 'button', onclick: () => coordinator?.timeUp() }, 'End round'),
+    waiting.length ? h('span', {}, t('session.strip.waiting', { names: list(waiting) })) : status?.phase === 'grace' ? h('span', {}, t('session.strip.time')) : null,
+    isHost() && h('button', { type: 'button', onclick: () => coordinator?.timeUp() }, t('session.strip.end_round')),
   ].filter(Boolean));
 }
 
@@ -1173,7 +1178,7 @@ function renderStrip() {
 
 const BOARD_KEY = 'ai-hub:board';
 /** Over the game, top right, clear of the corner bar: one row a player, for games that report progress. */
-const board = h('aside', { class: 'session-board', 'aria-label': 'Scores', hidden: true });
+const board = h('aside', { class: 'session-board', 'aria-label': t('session.board.label'), hidden: true });
 let boardRound = null;
 let progressById = new Map();
 
@@ -1220,7 +1225,7 @@ function renderBoard() {
   const folded = boardFolded();
   clear(board);
   // The button never takes focus from the game (pointerdown's default would).
-  board.append(h('button', { type: 'button', class: 'board__toggle', 'aria-expanded': String(!folded), onpointerdown: (e) => e.preventDefault(), onclick: foldBoard }, folded ? 'Scores ▾' : 'Scores ▴'));
+  board.append(h('button', { type: 'button', class: 'board__toggle', 'aria-expanded': String(!folded), onpointerdown: (e) => e.preventDefault(), onclick: foldBoard }, folded ? t('session.board.folded') : t('session.board.shown')));
   if (folded) return;
   board.append(
     h(
@@ -1232,7 +1237,7 @@ function renderBoard() {
           { class: r.key === key ? 'is-me' : r.out ? 'is-out' : '', style: `--seat: ${r.color}` },
           h('span', { class: 'board__place' }, r.out ? '–' : String(i + 1)),
           h('span', { class: 'board__name' }, r.name),
-          h('span', { class: 'board__label' }, r.out ? 'left' : r.result ? 'done' : (r.progress?.label ?? '')),
+          h('span', { class: 'board__label' }, r.out ? t('session.board.left') : r.result ? t('session.board.done') : (r.progress?.label ?? '')),
           h('span', { class: 'board__score' }, r.result ? resultText(r.result) : r.progress ? String(r.progress.score) : '')
         )
       )
@@ -1240,18 +1245,24 @@ function renderBoard() {
   );
 }
 
+/** Why a round gave no points, for the headline: lowercase, the end of a sentence. */
 const REASONS = {
-  'host-left': 'the host left',
-  'host-not-ready': 'the host was not ready',
-  'host-hidden': "the host's tab was hidden",
-  'host-error': 'the game failed for the host',
-  'no-result': 'the game reported no result',
-  'no-players': 'nobody could play',
-  skipped: 'the host skipped it',
+  'host-left': () => t('session.reason.host_left'),
+  'host-not-ready': () => t('session.reason.host_not_ready'),
+  'host-hidden': () => t('session.reason.host_hidden'),
+  'host-error': () => t('session.reason.host_error'),
+  'no-result': () => t('session.reason.no_result'),
+  'no-players': () => t('session.reason.no_players'),
+  skipped: () => t('session.reason.skipped'),
 };
+const reasonText = (reason) => (Object.hasOwn(REASONS, reason) ? REASONS[reason]() : reason);
+
+/** The lobby's notice from the host: a code and a count (older state carried the words themselves). */
+const noticeText = (notice) =>
+  typeof notice === 'string' ? notice : notice?.id === 'filters' ? t('session.notice.filters', { count: notice.count }) : notice?.id === 'library' ? t('session.notice.library', { count: notice.count }) : '';
 
 const resultText = (row) =>
-  Number.isFinite(row.time) ? `${(row.time / 1000).toFixed(2)} s` : Number.isFinite(row.score) ? String(row.score) : '';
+  Number.isFinite(row.time) ? t('session.result.seconds', { seconds: (row.time / 1000).toFixed(2) }) : Number.isFinite(row.score) ? String(row.score) : '';
 
 /* --- between rounds: the results, then the next game -------------------------- */
 
@@ -1324,7 +1335,7 @@ function renderResults() {
     }
   }
   const count = overlay.querySelector('.results__count');
-  if (count && stage === 'results') count.textContent = `Next game in ${Math.max(0, Math.ceil((state.reveal.resultsUntil - hostNow()) / 1000))} s`;
+  if (count && stage === 'results') count.textContent = t('session.results.next_in', { seconds: Math.max(0, Math.ceil((state.reveal.resultsUntil - hostNow()) / 1000)) });
   if (stage === 'splash') updateSplash(state.current);
   if (stage === 'own') sendCard(state.current);
   // The card lifted, or the game shows its own: hand the keyboard to the game.
@@ -1335,8 +1346,7 @@ function renderResults() {
 
 const MEDALS = ['🥇', '🥈', '🥉'];
 /** "Ana", "Ana and Bo", "Ana, Bo and Cy". */
-const names = (list) => (list.length > 1 ? `${list.slice(0, -1).join(', ')} and ${list.at(-1)}` : list[0] ?? '');
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const names = (people) => list(people);
 const statsLine = (stats) =>
   stats ? Object.entries(stats).map(([name, value]) => `${name} ${typeof value === 'number' ? Math.round(value * 100) / 100 : value}`).join(' · ') : '';
 
@@ -1344,12 +1354,12 @@ const statsLine = (stats) =>
 const teamResult = (entry) => typeof entry.won === 'boolean';
 
 function headline(entry) {
-  if (entry.status !== 'played') return `No points this round: ${REASONS[entry.reason] ?? entry.reason}.`;
+  if (entry.status !== 'played') return t('session.results.no_points', { reason: reasonText(entry.reason) });
   const winners = entry.rows.filter((r) => r.place === 1);
-  if (teamResult(entry)) return entry.won ? 'The team did it!' : 'So close. The team fell short.';
-  if (winners.length === entry.rows.length && winners.length > 1) return 'Dead heat!';
-  if (winners.length > 1) return `${names(winners.map((r) => r.name))} share the win!`;
-  return winners.length ? `${winners[0].name} wins!` : 'Round over';
+  if (teamResult(entry)) return entry.won ? t('session.results.team_won') : t('session.results.team_short');
+  if (winners.length === entry.rows.length && winners.length > 1) return t('session.results.dead_heat');
+  if (winners.length > 1) return t('session.results.share_win', { names: names(winners.map((r) => r.name)) });
+  return winners.length ? t('session.results.wins', { name: winners[0].name }) : t('session.results.over');
 }
 
 function resultsCard(entry) {
@@ -1357,7 +1367,7 @@ function resultsCard(entry) {
   return h(
     'div',
     { class: 'results__card is-results' },
-    h('p', { class: 'eyebrow' }, `Round ${entry.round} · ${entry.name}`),
+    h('p', { class: 'eyebrow' }, t('session.results.eyebrow', { round: entry.round, game: entry.name })),
     h('h2', { class: 'results__headline' }, headline(entry)),
     entry.status === 'played' &&
       h(
@@ -1372,7 +1382,7 @@ function resultsCard(entry) {
             h(
               'span',
               { class: 'results__who' },
-              h('span', { class: 'results__name' }, row.name, row.out ? ` (${row.out === 'not-ready' ? 'sat out' : 'left'})` : ''),
+              h('span', { class: 'results__name' }, row.name, row.out ? [' ', row.out === 'not-ready' ? t('session.results.sat_out') : t('session.results.left')] : ''),
               row.awards?.length > 0 &&
                 h('span', { class: 'results__awards' }, row.awards.map((a) => h('span', { class: 'award', title: a.detail || '' }, '🏅 ', a.title, a.detail ? h('small', {}, ` ${a.detail}`) : null))),
               row.stats && h('span', { class: 'results__stats' }, statsLine(row.stats))
@@ -1387,9 +1397,9 @@ function resultsCard(entry) {
       'div',
       { class: 'results__next' },
       h('span', { class: 'hint results__count' }),
-      host && h('button', { type: 'button', class: 'primary', onclick: nextGameNow }, 'Next game now'),
-      host && h('button', { type: 'button', onclick: backToLobby }, 'Back to the lobby'),
-      host && h('button', { type: 'button', onclick: () => endSession() }, 'End the session')
+      host && h('button', { type: 'button', class: 'primary', onclick: nextGameNow }, t('session.results.next_now')),
+      host && h('button', { type: 'button', onclick: backToLobby }, t('session.back_to_lobby')),
+      host && h('button', { type: 'button', onclick: () => endSession() }, t('session.end_session'))
     )
   );
 }
@@ -1414,15 +1424,15 @@ function splashCard(cur) {
   return h(
     'div',
     { class: 'results__card is-next' },
-    h('p', { class: 'eyebrow' }, `${cur.picked ? 'The host’s pick' : 'Next up'} · ${formatProgress(state.format, state.history, state.totals)}`),
+    h('p', { class: 'eyebrow' }, (cur.picked ? t('session.splash.pick', { progress: formatProgress(state.format, state.history, state.totals) }) : t('session.splash.next', { progress: formatProgress(state.format, state.history, state.totals) }))),
     reel.length > 0 && h('div', { class: 'reel', 'aria-hidden': 'true' }, h('div', { class: 'reel__strip', style: { '--n': reel.length } }, reel.map((n) => h('span', {}, n)), h('span', { class: 'is-it' }, cur.name))),
     h('h2', { class: 'next__name' }, cur.name),
     h(
       'p',
       { class: 'next__mode' },
-      h('span', { class: 'chip' }, MODE_NAMES[cur.mode] ?? 'Game'),
+      h('span', { class: 'chip' }, modeName(cur.mode)),
       ' ',
-      `${cur.players.length} player${cur.players.length === 1 ? '' : 's'}`
+      t('session.players', { count: cur.players.length })
     ),
     info?.goal && h('p', { class: 'next__goal' }, info.goal),
     info?.howto && h('p', { class: 'next__howto' }, info.howto),
@@ -1431,11 +1441,11 @@ function splashCard(cur) {
       h(
         'div',
         { class: 'splash__buttons' },
-        h('button', { type: 'button', class: 'primary splash__ready', onclick: () => press('ready') }, 'Ready', h('small', {}, ' Enter · ✕ Cross')),
-        h('button', { type: 'button', class: 'splash__more', onclick: () => press('more') }, 'I need more time', h('small', {}, ' △ Triangle'))
+        h('button', { type: 'button', class: 'primary splash__ready', onclick: () => press('ready') }, t('session.splash.ready'), h('small', {}, ' ', t('session.splash.ready_keys'))),
+        h('button', { type: 'button', class: 'splash__more', onclick: () => press('more') }, t('session.splash.more'), h('small', {}, ' ', t('session.splash.more_key')))
       ),
     h('p', { class: 'hint splash__note', 'aria-live': 'polite' }),
-    isHost() && h('div', { class: 'results__next' }, h('button', { type: 'button', onclick: backToLobby }, 'Back to the lobby'))
+    isHost() && h('div', { class: 'results__next' }, h('button', { type: 'button', onclick: backToLobby }, t('session.back_to_lobby')))
   );
 }
 
@@ -1451,30 +1461,30 @@ function updateSplash(cur) {
   if (count) {
     count.textContent = sp.released
       ? loading
-        ? `Starting as soon as ${loading === 1 ? 'one more game has' : `${loading} more games have`} loaded…`
-        : 'Starting…'
+        ? t('session.splash.loading', { count: loading })
+        : t('session.splash.starting')
       : sp.paused !== null
-        ? 'Paused: most players need more time'
-        : `Starts in ${Math.max(0, Math.ceil((sp.until - hostNow()) / 1000))}`;
+        ? t('session.splash.paused')
+        : t('session.splash.starts_in', { seconds: Math.max(0, Math.ceil((sp.until - hostNow()) / 1000)) });
     count.classList.toggle('is-paused', sp.paused !== null && !sp.released);
   }
   const ready = overlay.querySelector('.splash__ready');
   const more = overlay.querySelector('.splash__more');
   if (ready) {
     ready.disabled = sp.released || myAnswer.ready;
-    ready.firstChild.textContent = myAnswer.ready ? 'Ready ✓' : 'Ready';
+    ready.firstChild.textContent = myAnswer.ready ? t('session.splash.ready_done') : t('session.splash.ready');
   }
   if (more) {
     more.disabled = sp.released;
     more.setAttribute('aria-pressed', String(myAnswer.more));
-    more.firstChild.textContent = myAnswer.more ? 'Take back my request' : 'I need more time';
+    more.firstChild.textContent = myAnswer.more ? t('session.splash.more_undo') : t('session.splash.more');
   }
   const note = overlay.querySelector('.splash__note');
   if (note) {
     const someoneAsked = sp.notice && hostNow() - sp.notice < 4_000 && !(myAnswer.more && Math.abs(sp.notice - myAnswer.moreAt) < 1_500);
     note.textContent = [
-      `${readyCount} of ${seats.length} ready`,
-      myAnswer.more ? 'You asked for more time' : someoneAsked ? 'A player needs more time' : sp.marked ? `${sp.marked} asking for more time` : '',
+      t('session.splash.ready_count', { ready: readyCount, total: seats.length }),
+      myAnswer.more ? t('session.splash.you_asked') : someoneAsked ? t('session.splash.someone_asked') : sp.marked ? t('session.splash.n_asking', { count: sp.marked }) : '',
     ]
       .filter(Boolean)
       .join(' · ');
@@ -1506,8 +1516,8 @@ function endScreen() {
   return h(
     'section',
     { class: 'panel finale' },
-    h('p', { class: 'eyebrow' }, `${formatOf(state.format).label} · ${plural(state.history.filter((e) => e.status === 'played').length, 'round')}`),
-    h('h2', {}, rows.length ? (champions.length > 1 ? `${names(champions.map((r) => r.name))} share the crown!` : `${champions[0].name} wins the session!`) : 'Session over'),
+    h('p', { class: 'eyebrow' }, t('session.finale.eyebrow', { format: formatOf(state.format).label, rounds: t('session.rounds', { count: state.history.filter((e) => e.status === 'played').length }) })),
+    h('h2', {}, rows.length ? (champions.length > 1 ? t('session.finale.share_crown', { names: names(champions.map((r) => r.name)) }) : t('session.finale.wins', { name: champions[0].name })) : t('session.finale.over')),
     rows.length > 0 &&
       h(
         'div',
@@ -1520,7 +1530,7 @@ function endScreen() {
                 h('span', { class: 'podium__medal' }, MEDALS[row.place - 1] ?? ''),
                 swatch(row.slot),
                 h('span', { class: 'podium__name' }, row.name),
-                h('span', { class: 'podium__points' }, `${row.points} pts`)
+                h('span', { class: 'podium__points' }, t('session.finale.pts', { points: row.points }))
               )
             : h('div', { class: 'podium__step is-empty' })
         )
@@ -1529,15 +1539,16 @@ function endScreen() {
       h(
         'ul',
         { class: 'finale__awards' },
-        final.awards.map((a) =>
-          h('li', {}, h('strong', {}, `🏆 ${a.title}`), ` ${names(a.keys.map(nameOfKey))} — ${a.detail}`, final.bonus ? h('span', { class: 'bonus' }, ` +${final.bonus}`) : null)
-        )
+        final.awards.map((a) => {
+          const text = awardText(a);
+          return h('li', {}, h('strong', {}, `🏆 ${text.title}`), ' ', t('session.finale.award_line', { names: names(a.keys.map(nameOfKey)), detail: text.detail }), final.bonus ? h('span', { class: 'bonus' }, ` +${final.bonus}`) : null);
+        })
       ),
     rows.length
       ? h(
           'table',
           { class: 'table' },
-          h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Player'), h('th', {}, 'Points'), final.bonus ? h('th', {}, 'Bonus') : null, h('th', {}, 'Wins'), h('th', {}, 'Awards'))),
+          h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, t('session.table.player')), h('th', {}, t('session.table.points')), final.bonus ? h('th', {}, t('session.table.bonus')) : null, h('th', {}, t('session.table.wins')), h('th', {}, t('session.table.awards')))),
           h(
             'tbody',
             {},
@@ -1555,7 +1566,7 @@ function endScreen() {
             )
           )
         )
-      : h('p', { class: 'hint' }, 'No rounds were played.'),
+      : h('p', { class: 'hint' }, t('session.finale.none')),
     h(
       'ol',
       { class: 'history' },
@@ -1563,16 +1574,15 @@ function endScreen() {
         h(
           'li',
           {},
-          `Round ${e.round}: ${e.name} — `,
           e.status === 'played'
             ? teamResult(e)
-              ? e.won ? 'the team won' : 'the team fell short'
-              : `won by ${names(e.rows.filter((r) => r.place === 1).map((r) => r.name))}`
-            : 'no points'
+              ? e.won ? t('session.history.team_won', { round: e.round, game: e.name }) : t('session.history.team_short', { round: e.round, game: e.name })
+              : t('session.history.won_by', { round: e.round, game: e.name, names: names(e.rows.filter((r) => r.place === 1).map((r) => r.name)) })
+            : t('session.history.no_points', { round: e.round, game: e.name })
         )
       )
     ),
-    h('div', { class: 'finale__out' }, h('a', { class: 'primary', href: FRIENDS_PATH }, 'Back to Friends'), h('a', { class: 'link', href: '/' }, 'To the wall'))
+    h('div', { class: 'finale__out' }, h('a', { class: 'primary', href: FRIENDS_PATH }, t('session.back_to_friends')), h('a', { class: 'link', href: '/' }, t('session.to_wall')))
   );
 }
 

@@ -14,6 +14,7 @@
  */
 
 import { h } from '../dom.js';
+import { t } from '../lang.js';
 import { shelfOf, SHELVES } from '../filter.js';
 import { buildRails, spotlightOf } from './rails.js';
 import { nearest } from './nav.js';
@@ -49,9 +50,9 @@ export function createHome({ couch, stageEl, heroEl, railsEl, bar, games, stats,
     h(
       'p',
       { class: 'hero__idle', 'aria-hidden': 'true' },
-      h('span', { class: 'for-keys' }, 'Press any key to come back'),
-      h('span', { class: 'for-pad' }, 'Press any button to come back'),
-      h('span', { class: 'for-touch' }, 'Touch the screen to come back')
+      h('span', { class: 'for-keys' }, t('couch.home.idle_keys')),
+      h('span', { class: 'for-pad' }, t('couch.home.idle_pad')),
+      h('span', { class: 'for-touch' }, t('couch.home.idle_touch'))
     )
   );
 
@@ -185,7 +186,7 @@ export function createHome({ couch, stageEl, heroEl, railsEl, bar, games, stats,
 
   // The hero button last used, unless the game now in the hero hides it (With friends).
   const heroEntry = () => (lastHero && !lastHero.hidden ? lastHero : hero.button('play'));
-  const barEntry = () => lastBar || bar.items().find((el) => el.getAttribute('aria-label') === 'Search') || bar.items()[0];
+  const barEntry = () => lastBar || bar.items().find((el) => el.dataset.bar === 'search') || bar.items()[0];
 
   function move(dir) {
     const el = document.activeElement;
@@ -383,7 +384,9 @@ export function createHome({ couch, stageEl, heroEl, railsEl, bar, games, stats,
         return true;
       case 'press':
         // A focused button or tile presses itself; with nothing focused, the hero's game plays.
-        if (zoneOf(el)) el.click();
+        if (el instanceof HTMLSelectElement) {
+          try { el.showPicker(); } catch {}   // the Language menu; a browser may want a real key or click
+        } else if (zoneOf(el)) el.click();
         else if (current) onPlay(current, heroEl);
         return true;
       case 'info':

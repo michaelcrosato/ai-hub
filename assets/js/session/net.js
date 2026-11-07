@@ -12,6 +12,7 @@
 
 import { createMesh } from './mesh.js';
 import { createClock } from './clock.js';
+import { t } from '../lang.js';
 
 const ASK_TIMEOUT_MS = 2_000;
 
@@ -26,9 +27,9 @@ export function plainProblem(error) {
   const text = String(error?.message ?? error ?? '').trim();
   const status = Number(error?.status ?? error?.statusCode ?? 0);
   if (status >= 500 || /failed to fetch|fetch failed|networkerror|load failed|network request failed|timed? ?out|upstream|paused|^5\d\d\b/i.test(text)) {
-    return 'Game night cannot reach its server right now. Check your connection and try again in a minute.';
+    return t('session.problem.unreachable');
   }
-  return text || 'Something went wrong. Try again in a minute.';
+  return text || t('session.problem.generic');
 }
 
 /**

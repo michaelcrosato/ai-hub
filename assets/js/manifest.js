@@ -8,7 +8,8 @@
  * metadata now, room for more later".
  */
 
-import { modeOf, MODE_NAMES } from '../../lib/hub/round.js';
+import { modeOf } from '../../lib/hub/round.js';
+import { t, lang, compare } from './lang.js';
 
 /** Fields that describe a specific game rather than classify it. Never a rail.
  *  The drawer reuses this to decide which fields are worth listing as facts. */
@@ -45,11 +46,12 @@ const MOST_SEATS = 12;
 
 const KB = 1024;
 const MB = 1024 * KB;
+/** `label` is the value a game's file-size rail carries (data); `shown` is what players read. */
 const SIZES = [
-  { under: 250 * KB, label: 'Under 250 KB' },
-  { under: 1 * MB, label: '250 KB–1 MB' },
-  { under: 4 * MB, label: '1–4 MB' },
-  { under: Infinity, label: 'Over 4 MB' },
+  { under: 250 * KB, label: 'Under 250 KB', shown: () => t('filter.filesize.under_250kb') },
+  { under: 1 * MB, label: '250 KB–1 MB', shown: () => t('filter.filesize.250kb_1mb') },
+  { under: 4 * MB, label: '1–4 MB', shown: () => t('filter.filesize.1_4mb') },
+  { under: Infinity, label: 'Over 4 MB', shown: () => t('filter.filesize.over_4mb') },
 ];
 
 /**
@@ -83,9 +85,13 @@ export function sessionOf(game) {
   const seats = low ? [low, high] : [2, 4];
   const mode = modeOf(game.sessionMode);
   const minutes = Number(game.sessionMinutes) > 0 ? Number(game.sessionMinutes) : null;
-  const parts = [seats[0] === seats[1] ? `${seats[0]} players` : `${seats[0]}–${seats[1]} players`];
-  if (mode) parts.push(MODE_NAMES[mode]);
-  if (minutes) parts.push(`about ${minutes} min`);
+  const parts = [
+    seats[0] === seats[1]
+      ? t('game.session.seats', { count: seats[0] })
+      : t('game.session.seat_range', { low: seats[0], high: seats[1] }),
+  ];
+  if (mode) parts.push(mode === 'parallel' ? t('session.mode.parallel') : mode === 'ghost' ? t('session.mode.ghost') : t('session.mode.shared_world'));
+  if (minutes) parts.push(t('game.session.minutes', { minutes }));
   const line = (text, most) => String(text ?? '').trim().slice(0, most) || null;
   return {
     version,
@@ -101,6 +107,22 @@ export function sessionOf(game) {
 
 /** The bracket a file's size falls in. */
 export const sizeOf = (bytes) => SIZES.find((size) => bytes < size.under).label;
+
+/**
+ * What a rail's value reads as on screen. Values stay as they are in the data
+ * (the address, the stacks and the filters compare them); only the words the
+ * hub writes itself are translated: single player, multiplayer, a head count
+ * and a size bracket. A genre or a model shows as it is.
+ */
+export function valueLabel(key, value) {
+  if (key === 'players') {
+    if (value === SINGLE) return t('filter.players.single');
+    if (value === MULTI) return t('filter.players.multi');
+    if (SEATS.test(value)) return t('filter.players.seats', { count: Number.parseInt(value, 10) });
+  }
+  if (key === 'fileSize') return SIZES.find((size) => size.label === value)?.shown() ?? value;
+  return value;
+}
 
 /** Rails read through a lens rather than as written. The fields themselves
  *  stay as they are, for the drawer and the search. */
@@ -162,11 +184,11 @@ function haystack(game) {
 export async function loadManifest(url = '/data/games.json') {
   const response = await fetch(url, { cache: 'no-cache' });
   if (!response.ok) {
-    throw new Error(`games.json responded ${response.status}`);
+    throw new Error(t('filter.manifest.status', { status: response.status }));
   }
   const data = await response.json();
   if (!data || !Array.isArray(data.games)) {
-    throw new Error('games.json has no games array');
+    throw new Error(t('filter.manifest.no_games'));
   }
   return {
     ...data,
@@ -248,7 +270,30 @@ const prettyLabel = (key) =>
     .replace(/[-_]+/g, ' ')
     .replace(/^./, (c) => c.toUpperCase());
 
-const natural = (a, b) => a.value.localeCompare(b.value, 'en', { numeric: true });
+/** The rails the hub knows by name; one invented tomorrow reads off its field name. */
+const FACET_LABELS = {
+  genre: () => t('filter.facet.genre'),
+  players: () => t('filter.facet.players'),
+  model: () => t('filter.facet.model'),
+  tags: () => t('filter.facet.tags'),
+  fileSize: () => t('filter.facet.file_size'),
+  collection: () => t('filter.facet.collection'),
+};
+const facetLabel = (key) => (FACET_LABELS[key] ? FACET_LABELS[key]() : prettyLabel(key));
+
+/** The first row of a rail's menu, the one that clears it: "Any genre". */
+const ANY_FACET = {
+  genre: () => t('filter.any.genre'),
+  players: () => t('filter.any.players'),
+  model: () => t('filter.any.model'),
+  tags: () => t('filter.any.tags'),
+  fileSize: () => t('filter.any.file_size'),
+  collection: () => t('filter.any.collection'),
+};
+const anyFacet = (key) =>
+  ANY_FACET[key] ? ANY_FACET[key]() : t('filter.any.other', { facet: prettyLabel(key).toLocaleLowerCase(lang) });
+
+const natural = (a, b) => a.value.localeCompare(b.value, lang, { numeric: true });
 
 /**
  * Every string-valued field carried by enough games becomes a rail, sorted by
@@ -281,7 +326,8 @@ export function deriveFacets(games) {
     };
     facets.push({
       key,
-      label: prettyLabel(key),
+      label: facetLabel(key),
+      any: anyFacet(key),
       coverage,
       options: [...counts.entries()]
         .map(([value, count]) => {
@@ -294,7 +340,7 @@ export function deriveFacets(games) {
   }
 
   return facets.sort(
-    (a, b) => rankOf(a.key) - rankOf(b.key) || b.coverage - a.coverage || a.label.localeCompare(b.label)
+    (a, b) => rankOf(a.key) - rankOf(b.key) || b.coverage - a.coverage || compare(a.label, b.label)
   );
 }
 

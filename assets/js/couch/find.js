@@ -9,6 +9,7 @@
  */
 
 import { h, icon, ICONS } from '../dom.js';
+import { t } from '../lang.js';
 import { selectGames } from '../filter.js';
 import { nearest } from './nav.js';
 import { tile, glide, prompt, reducedMotion } from './ui.js';
@@ -18,8 +19,17 @@ import { viewSwitch } from '../ui/views.js';
 const KEYS = 'abcdefghijklmnopqrstuvwxyz1234567890'.split('');
 /** Results are drawn a batch at a time as focus or the scroll nears the end. */
 const BATCH = 24;
-/** Words to start from when nothing is typed yet. */
-const STARTERS = ['RPG', 'Shooter', 'Racing', 'Flight', 'Platformer', 'Puzzle', 'Space', 'Co-op'];
+/** Words to start from when nothing is typed yet: what is searched for, and what the chip says. */
+const STARTERS = [
+  { word: 'RPG', label: t('couch.find.starter_rpg') },
+  { word: 'Shooter', label: t('couch.find.starter_shooter') },
+  { word: 'Racing', label: t('couch.find.starter_racing') },
+  { word: 'Flight', label: t('couch.find.starter_flight') },
+  { word: 'Platformer', label: t('couch.find.starter_platformer') },
+  { word: 'Puzzle', label: t('couch.find.starter_puzzle') },
+  { word: 'Space', label: t('couch.find.starter_space') },
+  { word: 'Co-op', label: t('couch.find.starter_coop') },
+];
 const DELETE = 'M21 6H9l-6 6 6 6h12zM18 9l-6 6M12 9l6 6';
 /** Phones bring their own keyboard; the grid would only be in its way. */
 const ownKeyboard = () => matchMedia('(pointer: coarse), (max-width: 40rem)').matches;
@@ -33,12 +43,12 @@ export function createFind(root, { games, stats, showAll, via, onQuery, onPlay, 
   const field = h('input', {
     class: 'find__field',
     type: 'search',
-    placeholder: 'Search',
+    placeholder: t('couch.find.placeholder'),
     autocomplete: 'off',
     autocapitalize: 'off',
     spellcheck: 'false',
     enterkeyhint: 'search',
-    'aria-label': 'Search games',
+    'aria-label': t('couch.find.field'),
     dataset: { nav: 'find' },
   });
   const echo = h('div', { class: 'find__echo', 'aria-hidden': 'true' });
@@ -53,11 +63,11 @@ export function createFind(root, { games, stats, showAll, via, onQuery, onPlay, 
   const key = (label, props, ...kids) => h('button', { type: 'button', class: 'osk__key', dataset: { nav: 'find', ...props.dataset }, ...props.attrs }, ...kids, label);
   const osk = h(
     'div',
-    { class: 'osk', role: 'group', 'aria-label': 'On-screen keyboard' },
+    { class: 'osk', role: 'group', 'aria-label': t('couch.find.keyboard') },
     KEYS.map((char) => key(char.toUpperCase(), { dataset: { char }, attrs: { 'aria-label': char.toUpperCase() } })),
-    key('Space', { dataset: { char: ' ', wide: '' } }, h('span', { class: 'osk__pad', 'aria-hidden': 'true' }, 'Y')),
-    key('', { dataset: { edit: 'delete', wide: '' }, attrs: { 'aria-label': 'Delete' } }, icon(DELETE), h('span', { class: 'osk__pad', 'aria-hidden': 'true' }, 'X')),
-    key('Clear', { dataset: { edit: 'clear', wide: '' } })
+    key(t('couch.find.space'), { dataset: { char: ' ', wide: '' } }, h('span', { class: 'osk__pad', 'aria-hidden': 'true' }, 'Y')),
+    key('', { dataset: { edit: 'delete', wide: '' }, attrs: { 'aria-label': t('couch.find.delete') } }, icon(DELETE), h('span', { class: 'osk__pad', 'aria-hidden': 'true' }, 'X')),
+    key(t('couch.find.clear'), { dataset: { edit: 'clear', wide: '' } })
   );
 
   root.append(
@@ -69,9 +79,9 @@ export function createFind(root, { games, stats, showAll, via, onQuery, onPlay, 
         { class: 'find__top' },
         h(
           'button',
-          { type: 'button', class: 'page__back', 'aria-label': 'Back', dataset: { nav: 'find' }, onclick: onBack },
+          { type: 'button', class: 'page__back', 'aria-label': t('couch.find.back'), dataset: { nav: 'find' }, onclick: onBack },
           icon(ICONS.back),
-          h('span', {}, 'Back'),
+          h('span', {}, t('couch.find.back')),
           prompt('back')
         ),
         h('label', { class: 'find__query' }, icon(ICONS.search, { class: 'find__glass' }), h('span', { class: 'find__line' }, field, echo), count),
@@ -122,7 +132,7 @@ export function createFind(root, { games, stats, showAll, via, onQuery, onPlay, 
   }
 
   function draw() {
-    echo.replaceChildren(query ? h('span', {}, query) : h('span', { class: 'find__hint' }, 'Search'), h('span', { class: 'find__caret' }));
+    echo.replaceChildren(query ? h('span', {}, query) : h('span', { class: 'find__hint' }, t('couch.find.hint')), h('span', { class: 'find__caret' }));
     const had = grid.contains(document.activeElement) ? document.activeElement : null;
     list = query.trim() ? selectGames(games, { query, shelf: null, showAll, sort: 'name', favesOnly: false, facets: {} }, stats) : [];
     drawn = 0;
@@ -131,19 +141,19 @@ export function createFind(root, { games, stats, showAll, via, onQuery, onPlay, 
     if (!query.trim()) {
       count.textContent = '';
       empty(
-        h('p', { class: 'find__big' }, `Type to search ${games.length} games`),
-        h('p', { class: 'find__small' }, 'Names, blurbs, genres, the classics they riff on, the models that made them.'),
-        h('div', { class: 'find__starters' }, STARTERS.map((word) => h('button', { type: 'button', class: 'chip chip--button', dataset: { nav: 'find' }, onclick: () => set(word) }, word)))
+        h('p', { class: 'find__big' }, t('couch.find.type', { count: games.length })),
+        h('p', { class: 'find__small' }, t('couch.find.type_help')),
+        h('div', { class: 'find__starters' }, STARTERS.map(({ word, label }) => h('button', { type: 'button', class: 'chip chip--button', dataset: { nav: 'find' }, onclick: () => set(word) }, label)))
       );
     } else if (!list.length) {
-      count.textContent = 'No games';
+      count.textContent = t('couch.find.count', { count: 0 });
       empty(
-        h('p', { class: 'find__big' }, `Nothing matches “${query.trim()}”`),
-        h('p', { class: 'find__small' }, 'Try fewer letters, or let the couch pick for you.'),
-        h('button', { type: 'button', class: 'btn btn--play', dataset: { nav: 'find' }, onclick: onSurprise }, icon(ICONS.dice), h('span', { class: 'btn__label' }, 'Surprise me'), prompt('surprise'))
+        h('p', { class: 'find__big' }, t('couch.find.none', { query: query.trim() })),
+        h('p', { class: 'find__small' }, t('couch.find.none_help')),
+        h('button', { type: 'button', class: 'btn btn--play', dataset: { nav: 'find' }, onclick: onSurprise }, icon(ICONS.dice), h('span', { class: 'btn__label' }, t('couch.find.surprise')), prompt('surprise'))
       );
     } else {
-      count.textContent = list.length === 1 ? '1 game' : `${list.length} games`;
+      count.textContent = t('couch.find.count', { count: list.length });
       drawMore();
     }
     // Typing while something in the results had focus keeps focus there:

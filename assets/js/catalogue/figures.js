@@ -14,6 +14,7 @@
  */
 
 import { h } from '../dom.js';
+import { date, lang, list, number, t, tx } from '../lang.js';
 import { DAY, dayText, sizeText } from './query.js';
 
 const TOP = 8;
@@ -29,7 +30,7 @@ function scale(max) {
   const step = steps.find((s) => max / s <= 3) || steps.at(-1);
   const top = Math.max(step, Math.ceil(max / step) * step);
   const ticks = [];
-  for (let t = 0; t <= top; t += step) ticks.push(t);
+  for (let tick = 0; tick <= top; tick += step) ticks.push(tick);
   return { top, ticks };
 }
 
@@ -67,22 +68,20 @@ function columnChart(config) {
       tabindex: '0',
       role: 'group',
       'aria-roledescription': 'chart',
-      'aria-label':
-        `${config.title}. Arrow keys move between columns, Shift with an arrow marks a range, ` +
-        'Enter selects it, Delete clears it.',
+      'aria-label': t('catalogue.figures.plot_label', { title: config.title }),
     },
     svg,
     tip
   );
   const note = h('span', { class: 'figure__note' });
   const range = h('span', { class: 'figure__range' });
-  const toggle = h('button', { type: 'button', class: 'figure__toggle', 'aria-pressed': 'false' }, 'Table');
+  const toggle = h('button', { type: 'button', class: 'figure__toggle', 'aria-pressed': 'false' }, t('catalogue.figures.table'));
   const data = h('div', {
     class: 'figure__data',
     hidden: true,
     tabindex: '0',
     role: 'region',
-    'aria-label': `${config.title}, as a table`,
+    'aria-label': t('catalogue.figures.table_label', { title: config.title }),
   });
   const live = h('p', { class: 'visually-hidden', 'aria-live': 'polite' });
   const figure = h(
@@ -107,7 +106,7 @@ function columnChart(config) {
     data.hidden = !table;
     plot.hidden = table;
     toggle.setAttribute('aria-pressed', String(table));
-    toggle.textContent = table ? 'Chart' : 'Table';
+    toggle.textContent = table ? t('catalogue.figures.chart') : t('catalogue.figures.table');
     if (table) data.replaceChildren(config.table(items));
   });
 
@@ -140,9 +139,9 @@ function columnChart(config) {
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
     const nodes = [];
-    for (const t of ticks) {
-      nodes.push(h('line', { x1: GUTTER, x2: width, y1: y(t), y2: y(t), class: t ? 'grid' : 'baseline' }));
-      nodes.push(svgText(GUTTER - 7, y(t) + 3.5, String(t), 'tick tick--y', 'end'));
+    for (const tick of ticks) {
+      nodes.push(h('line', { x1: GUTTER, x2: width, y1: y(tick), y2: y(tick), class: tick ? 'grid' : 'baseline' }));
+      nodes.push(svgText(GUTTER - 7, y(tick) + 3.5, number(tick), 'tick tick--y', 'end'));
     }
     const band = (from, to, cls) =>
       nodes.push(
@@ -307,7 +306,7 @@ function columnChart(config) {
                 {
                   type: 'button',
                   class: 'figure__range-clear',
-                  'aria-label': `Clear ${config.title.toLowerCase()} filter`,
+                  'aria-label': t('catalogue.figures.clear_label', { title: config.title.toLocaleLowerCase(lang) }),
                   onclick: config.onClear,
                 },
                 '×'
@@ -322,8 +321,16 @@ function columnChart(config) {
   };
 }
 
-const short = (ms) => dayText(ms).replace(/ \d{4}$/, '');
-const weekday = new Intl.DateTimeFormat('en-GB', { weekday: 'short', timeZone: 'UTC' });
+const short = (ms) => date(ms, { day: 'numeric', month: 'short', timeZone: 'UTC' });
+const weekday = (ms) => date(ms, { weekday: 'short', timeZone: 'UTC' });
+
+/** True for the sizes the axis labels: 1, 10, 100 or 1000 of whatever unit sizeText writes. */
+function isRoundSize(n) {
+  const unit = n < 1024 ? 1 : n < 1024 ** 2 ? 1024 : n < 1024 ** 3 ? 1024 ** 2 : 1024 ** 3;
+  return [1, 10, 100, 1000].includes(Number((n / unit).toPrecision(3)));
+}
+
+const sizeRange = (bin) => t('catalogue.figures.size_range', { from: sizeText(bin.lo), to: sizeText(bin.hi) });
 
 function tipLines(item, title) {
   const names =
@@ -338,23 +345,20 @@ function tipLines(item, title) {
       'p',
       { class: 'figure__tip-row' },
       h('i', { class: 'key key--selected' }),
-      h('b', {}, String(item.selected)),
-      ' selected'
+      tx('catalogue.figures.tip_selected', { count: h('b', {}, number(item.selected)) })
     ),
     item.other !== item.selected &&
       h(
         'p',
         { class: 'figure__tip-row' },
         h('i', { class: 'key key--other' }),
-        h('b', {}, String(item.other - item.selected)),
-        ' left out by this figure'
+        tx('catalogue.figures.tip_left_out', { count: h('b', {}, number(item.other - item.selected)) })
       ),
     h(
       'p',
       { class: 'figure__tip-row' },
       h('i', { class: 'key key--total' }),
-      h('b', {}, String(item.total)),
-      ' in the library'
+      tx('catalogue.figures.tip_library', { count: h('b', {}, number(item.total)) })
     ),
     names.length > 0 &&
       h(
@@ -403,8 +407,8 @@ export function createFigures(root, { onPick, onClear }) {
 
   const daysChart = columnChart({
     key: 'days',
-    number: 'Fig. 1',
-    title: 'Added over time',
+    number: t('catalogue.figures.days_number'),
+    title: t('catalogue.figures.days_title'),
     onPick: (a, b, opts) => onPick('added', days[a], days[b], opts),
     onClear: () => onClear('added'),
     ticks(items, slot) {
@@ -412,32 +416,34 @@ export function createFigures(root, { onPick, onClear }) {
       const every = slot * 7 < 46 ? 2 : 1;
       return mondays.filter((_, i) => i % every === 0).map(([day, i]) => ({ at: i, label: short(day.start) }));
     },
-    tip: (day) => tipLines(day, `${weekday.format(day.start)} ${dayText(day.start)}`),
-    say: (day) => `${dayText(day.start)}: ${day.selected} selected of ${day.total} added`,
+    tip: (day) => tipLines(day, t('catalogue.figures.tip_day', { weekday: weekday(day.start), date: dayText(day.start) })),
+    say: (day) =>
+      t('catalogue.figures.say_day', { date: dayText(day.start), selected: day.selected, total: day.total }),
     table: (items) =>
       dataTable(
-        ['Day', 'Added', 'Selected'],
-        items.filter((day) => day.total).map((day) => [dayText(day.start), String(day.total), String(day.selected)])
+        [t('catalogue.figures.col_day'), t('catalogue.figures.col_added'), t('catalogue.figures.col_selected')],
+        items.filter((day) => day.total).map((day) => [dayText(day.start), number(day.total), number(day.selected)])
       ),
   });
 
   const sizesChart = columnChart({
     key: 'sizes',
-    number: 'Fig. 2',
-    title: 'File size',
+    number: t('catalogue.figures.sizes_number'),
+    title: t('catalogue.figures.sizes_title'),
     onPick: (a, b, opts) => onPick('size', bins[a], bins[b], opts),
     onClear: () => onClear('size'),
     ticks: (items) =>
       items
         .map((bin, i) => [bin, i])
-        .filter(([bin]) => /^1 /.test(sizeText(bin.lo)) || /^10+ /.test(sizeText(bin.lo)))
+        .filter(([bin]) => isRoundSize(bin.lo))
         .map(([bin, i]) => ({ at: i, label: sizeText(bin.lo) })),
-    tip: (bin) => tipLines({ ...bin, games: [], picked: [] }, `${sizeText(bin.lo)} to ${sizeText(bin.hi)}`),
-    say: (bin) => `${sizeText(bin.lo)} to ${sizeText(bin.hi)}: ${bin.selected} selected of ${bin.total}`,
+    tip: (bin) => tipLines({ ...bin, games: [], picked: [] }, sizeRange(bin)),
+    say: (bin) =>
+      t('catalogue.figures.say_size', { range: sizeRange(bin), selected: bin.selected, total: bin.total }),
     table: (items) =>
       dataTable(
-        ['Size', 'Records', 'Selected'],
-        items.map((bin) => [`${sizeText(bin.lo)} to ${sizeText(bin.hi)}`, String(bin.total), String(bin.selected)])
+        [t('catalogue.figures.col_size'), t('catalogue.figures.col_records'), t('catalogue.figures.col_selected')],
+        items.map((bin) => [sizeRange(bin), number(bin.total), number(bin.selected)])
       ),
   });
 
@@ -445,13 +451,13 @@ export function createFigures(root, { onPick, onClear }) {
     h(
       'header',
       { class: 'figures__head' },
-      h('h2', { class: 'label' }, 'Figures'),
+      h('h2', { class: 'label' }, t('catalogue.figures.heading')),
       h(
         'ul',
-        { class: 'legend', 'aria-label': 'How to read the columns' },
-        h('li', {}, h('i', { class: 'key key--selected', 'aria-hidden': 'true' }), 'Selected'),
-        h('li', {}, h('i', { class: 'key key--other', 'aria-hidden': 'true' }), 'Left out by the figure’s own range'),
-        h('li', {}, h('i', { class: 'key key--total', 'aria-hidden': 'true' }), 'Library')
+        { class: 'legend', 'aria-label': t('catalogue.figures.legend_label') },
+        h('li', {}, h('i', { class: 'key key--selected', 'aria-hidden': 'true' }), t('catalogue.figures.legend_selected')),
+        h('li', {}, h('i', { class: 'key key--other', 'aria-hidden': 'true' }), t('catalogue.figures.legend_left_out')),
+        h('li', {}, h('i', { class: 'key key--total', 'aria-hidden': 'true' }), t('catalogue.figures.legend_library'))
       )
     ),
     h('div', { class: 'figures__row' }, daysChart.figure, sizesChart.figure)
@@ -473,14 +479,14 @@ export function createFigures(root, { onPick, onClear }) {
       daysChart.render({
         items: days,
         covered: days.map((day) => added.length > 0 && inside(added, day.start, day.start + DAY)),
-        note: days.length ? `Daily, ${dayText(from)} to ${dayText(to - DAY)}` : '',
-        filter: added.map((term) => term.says).join(' or '),
+        note: days.length ? t('catalogue.figures.note_days', { from: dayText(from), to: dayText(to - DAY) }) : '',
+        filter: list(added.map((term) => term.says), 'disjunction'),
       });
       sizesChart.render({
         items: bins,
         covered: bins.map((bin) => size.length > 0 && inside(size, bin.lo, bin.hi)),
-        note: 'Log scale, 1–2–5 bins',
-        filter: size.map((term) => term.says).join(' or '),
+        note: t('catalogue.figures.note_sizes'),
+        filter: list(size.map((term) => term.says), 'disjunction'),
       });
     },
   };

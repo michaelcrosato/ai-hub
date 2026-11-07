@@ -9,6 +9,7 @@
  */
 
 import { h } from '../dom.js';
+import { t } from '../lang.js';
 import { SLOT_COLORS } from '../../../lib/hub/round.js';
 import { FRIENDS_PATH, friendsHref, playsOnline, togetherOf } from '../friends/together.js';
 
@@ -31,9 +32,9 @@ export function emblem({ size = 18, className = 'friends-emblem' } = {}) {
 export function friendsButton({ className = '' } = {}) {
   return h(
     'a',
-    { class: `friends-cta ${className}`.trim(), href: FRIENDS_PATH, title: 'Host or join a session: up to four players, each on their own device' },
+    { class: `friends-cta ${className}`.trim(), href: FRIENDS_PATH, title: t('friends.cta.title') },
     emblem({ size: 16 }),
-    h('span', { class: 'friends-cta__label' }, 'Play with friends')
+    h('span', { class: 'friends-cta__label' }, t('friends.cta.label'))
   );
 }
 
@@ -42,12 +43,12 @@ export function friendsButton({ className = '' } = {}) {
  * how it plays in a session and hosts one that opens with it. Null for a game
  * that plays in no session (couch co-op is the game's own Play).
  */
-export function friendsLink(game, { className = '', label = 'Play with friends' } = {}) {
+export function friendsLink(game, { className = '', label = t('friends.link.label') } = {}) {
   if (!game || !playsOnline(game)) return null;
-  const t = togetherOf(game);
+  const how = togetherOf(game);
   return h(
     'a',
-    { class: `friends-link ${className}`.trim(), href: friendsHref(game), title: `${t.way.label}: ${t.way.blurb}` },
+    { class: `friends-link ${className}`.trim(), href: friendsHref(game), title: t('friends.link.title', { way: how.way.label, blurb: how.way.blurb }) },
     emblem({ size: 15 }),
     h('span', { class: 'friends-link__label' }, label)
   );

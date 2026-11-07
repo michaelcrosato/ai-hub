@@ -17,6 +17,7 @@
  */
 
 import { h, icon } from '../dom.js';
+import { t, tx, fillPage } from '../lang.js';
 import { loadLibrary } from '../library.js';
 import { store } from '../store.js';
 import { router } from '../router.js';
@@ -29,6 +30,8 @@ import { keyAction, createRepeatGate, MOVES } from './input.js';
 import { watchPads } from './pad.js';
 import { createToast, syncStars, PAD_GLYPHS } from './ui.js';
 import { shelfOf, SHELVES } from '../filter.js';
+
+fillPage();
 
 const couch = document.getElementById('couch');
 const heroEl = document.getElementById('hero');
@@ -148,7 +151,8 @@ function fave(slug) {
   const game = library.bySlug.get(slug);
   if (!game) return;
   const on = store.toggleFave(slug);
-  toast.show(h('span', {}, h('b', {}, game.name), on ? ' added to your favourites' : ' removed from your favourites'));
+  const name = h('b', {}, game.name);
+  toast.show(h('span', {}, on ? tx('couch.app.fave_on', { name }) : tx('couch.app.fave_off', { name })));
 }
 
 /**
@@ -168,7 +172,7 @@ function leaveGame() {
 }
 
 const player = createPlayer(playerEl, {
-  backLabel: 'Back to the couch',
+  backLabel: t('couch.app.back'),
   onExit: leaveGame,
   // Another game from the Games shelf, never the one already up.
   onRoll() {
@@ -265,11 +269,7 @@ const exitHint = (progress = 0) =>
     'span',
     { class: 'toast__exit' },
     h('svg', { class: 'toast__ring', viewBox: '0 0 24 24', 'aria-hidden': 'true' }, h('circle', { cx: 12, cy: 12, r: 10, pathLength: 1, style: { 'stroke-dashoffset': String(1 - progress) } })),
-    'Hold ',
-    glyph(PAD_GLYPHS.view),
-    ' + ',
-    glyph(PAD_GLYPHS.menu),
-    ' to come back'
+    tx('couch.app.exit_hint', { view: glyph(PAD_GLYPHS.view), menu: glyph(PAD_GLYPHS.menu) })
   );
 
 function onChord(progress, fired) {
@@ -408,8 +408,8 @@ loadLibrary()
   .catch((error) => {
     console.error(error);
     heroEl.replaceChildren(
-      h('p', { class: 'hero__eyebrow' }, 'Nothing to show'),
-      h('h2', { class: 'hero__name' }, 'The couch is empty'),
-      h('p', { class: 'hero__blurb' }, "Couldn't load the game list. Run pnpm scan to rebuild data/games.json, then refresh.")
+      h('p', { class: 'hero__eyebrow' }, t('couch.app.empty_eyebrow')),
+      h('h2', { class: 'hero__name' }, t('couch.app.empty_title')),
+      h('p', { class: 'hero__blurb' }, t('couch.app.empty_blurb'))
     );
   });

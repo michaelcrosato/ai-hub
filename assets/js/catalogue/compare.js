@@ -13,27 +13,31 @@ import { cabinetPalette, paletteVars } from '../color.js';
 import { buildsOf, dayText, sizeText, valuesOf } from './query.js';
 import { keycaps } from './keycaps.js';
 import { playersText } from './ledger.js';
+import { number, t } from '../lang.js';
 
 const listed = (value) => valuesOf(value).join(', ');
 
 /** Each row: a label, what it compares, and how it is drawn. */
 const ROWS = [
-  { label: 'Type', value: (g) => g.type || 'Game' },
-  { label: 'Genre', value: (g) => listed(g.genre) },
-  { label: 'Origin', value: (g) => (g.lineage.original ? 'Original' : 'Inspired') },
-  { label: 'Source', value: (g) => g.source || '' },
-  { label: 'Series', value: (g) => (g.lineage.original ? '' : g.lineage.series) },
-  { label: 'Model', value: (g) => listed(g.model) },
-  { label: 'Players', value: playersText },
-  { label: 'Size', value: (g) => g.bytes, draw: 'amount', say: sizeText },
-  { label: 'Builds', value: buildsOf, draw: 'amount', say: String },
-  { label: 'Added', value: (g) => g.addedAt, draw: 'when' },
-  { label: 'Tags', value: (g) => valuesOf(g.tags).slice().sort().join(', '), draw: 'tags' },
-  { label: 'Controls', value: (g) => listed(g.controls), draw: 'keys' },
+  { label: t('catalogue.compare.row_type'), value: (g) => g.type || t('catalogue.compare.game') },
+  { label: t('catalogue.compare.row_genre'), value: (g) => listed(g.genre) },
+  {
+    label: t('catalogue.compare.row_origin'),
+    value: (g) => (g.lineage.original ? t('catalogue.compare.original') : t('catalogue.compare.inspired')),
+  },
+  { label: t('catalogue.compare.row_source'), value: (g) => g.source || '' },
+  { label: t('catalogue.compare.row_series'), value: (g) => (g.lineage.original ? '' : g.lineage.series) },
+  { label: t('catalogue.compare.row_model'), value: (g) => listed(g.model) },
+  { label: t('catalogue.compare.row_players'), value: playersText },
+  { label: t('catalogue.compare.row_size'), value: (g) => g.bytes, draw: 'amount', say: sizeText },
+  { label: t('catalogue.compare.row_builds'), value: buildsOf, draw: 'amount', say: (n) => number(n) },
+  { label: t('catalogue.compare.row_added'), value: (g) => g.addedAt, draw: 'when' },
+  { label: t('catalogue.compare.row_tags'), value: (g) => valuesOf(g.tags).slice().sort().join(', '), draw: 'tags' },
+  { label: t('catalogue.compare.row_controls'), value: (g) => listed(g.controls), draw: 'keys' },
   // Prose always differs, so marking it would mark nothing.
-  { label: 'Description', value: (g) => g.description, draw: 'prose', same: true },
-  { label: 'Slug', value: (g) => g.slug, draw: 'code', same: true },
-  { label: 'Path', value: (g) => g.builds[0]?.path || g.path, draw: 'code', same: true },
+  { label: t('catalogue.compare.row_description'), value: (g) => g.description, draw: 'prose', same: true },
+  { label: t('catalogue.compare.row_slug'), value: (g) => g.slug, draw: 'code', same: true },
+  { label: t('catalogue.compare.row_path'), value: (g) => g.builds[0]?.path || g.path, draw: 'code', same: true },
 ];
 
 function cell(row, game, { max, from, to }) {
@@ -89,13 +93,13 @@ export function createCompare(root, { onPlay, onRemove, onClose, onSelect }) {
         'button',
         { type: 'button', class: 'tool compare__close', onclick: onClose },
         icon(ICONS.back),
-        'Back to the records',
+        t('catalogue.compare.back'),
         h('kbd', {}, 'Esc')
       );
       const head = h(
         'tr',
         {},
-        h('th', { scope: 'col', class: 'cmp__corner' }, h('span', { class: 'visually-hidden' }, 'Fact')),
+        h('th', { scope: 'col', class: 'cmp__corner' }, h('span', { class: 'visually-hidden' }, t('catalogue.compare.fact'))),
         games.map((game) =>
           h(
             'th',
@@ -113,10 +117,10 @@ export function createCompare(root, { onPlay, onRemove, onClose, onSelect }) {
                   type: 'button',
                   class: 'btn btn--play btn--small',
                   onclick: () => onPlay(game.slug),
-                  'aria-label': `Play ${game.name}`,
+                  'aria-label': t('catalogue.compare.play_label', { name: game.name }),
                 },
                 icon(ICONS.play, { fill: 'currentColor', stroke: 'none' }),
-                h('span', { class: 'btn__text' }, 'Play')
+                h('span', { class: 'btn__text' }, t('catalogue.compare.play'))
               ),
               h(
                 'button',
@@ -124,10 +128,10 @@ export function createCompare(root, { onPlay, onRemove, onClose, onSelect }) {
                   type: 'button',
                   class: 'btn btn--quiet btn--small',
                   onclick: () => onRemove(game.slug),
-                  'aria-label': `Remove ${game.name} from the comparison`,
+                  'aria-label': t('catalogue.compare.remove_label', { name: game.name }),
                 },
                 icon(ICONS.close),
-                h('span', { class: 'btn__text' }, 'Remove')
+                h('span', { class: 'btn__text' }, t('catalogue.compare.remove'))
               )
             )
           )
@@ -144,7 +148,7 @@ export function createCompare(root, { onPlay, onRemove, onClose, onSelect }) {
             return h(
               'td',
               { class: differs ? 'is-different' : null },
-              differs && h('span', { class: 'visually-hidden' }, 'Differs: '),
+              differs && h('span', { class: 'visually-hidden' }, t('catalogue.compare.differs')),
               cell(row, game, { max: maxes.get(row), from, to })
             );
           })
@@ -157,14 +161,14 @@ export function createCompare(root, { onPlay, onRemove, onClose, onSelect }) {
           h(
             'h2',
             { class: 'compare__title' },
-            'Compare',
-            h('span', { class: 'compare__count' }, `${games.length} records`)
+            t('catalogue.compare.title'),
+            h('span', { class: 'compare__count' }, t('catalogue.compare.count', { count: games.length }))
           ),
           h(
             'p',
             { class: 'compare__note' },
             h('i', { class: 'diff-key', 'aria-hidden': 'true' }),
-            'Differs from the first record'
+            t('catalogue.compare.note')
           ),
           close
         ),

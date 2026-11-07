@@ -10,6 +10,7 @@
  */
 
 import { h } from '../dom.js';
+import { t, number } from '../lang.js';
 import { SHELVES } from '../filter.js';
 import { SLOT_COLORS } from '../../../lib/hub/round.js';
 import { FRIENDS_PATH } from '../friends/together.js';
@@ -94,9 +95,9 @@ const button = (key, label, sub, onclick, extra = {}) => {
 };
 
 const SOURCES = [
-  { key: 'all', origin: '', label: 'All', sub: 'Original and inspired' },
-  { key: 'original', origin: 'original', label: 'Original', sub: 'Its own idea' },
-  { key: 'inspired', origin: 'inspired', label: 'Inspired', sub: 'After a classic' },
+  { key: 'all', origin: '', label: t('wall.source.all'), sub: t('wall.source.all_sub') },
+  { key: 'original', origin: 'original', label: t('wall.source.original'), sub: t('wall.source.original_sub') },
+  { key: 'inspired', origin: 'inspired', label: t('wall.source.inspired'), sub: t('wall.source.inspired_sub') },
 ];
 
 export function createShelves(root, { onSelect, onSource, onSurprise }) {
@@ -108,17 +109,17 @@ export function createShelves(root, { onSelect, onSource, onSurprise }) {
     source,
     ...button(source.key, source.label, source.sub, () => onSource(source.origin)),
   }));
-  const surprise = button('surprise', 'Surprise me', 'A random game', () => onSurprise(), {
-    title: 'Play a random game from the ones showing',
+  const surprise = button('surprise', t('wall.surprise'), t('wall.surprise_sub'), () => onSurprise(), {
+    title: t('wall.surprise_hint'),
     'aria-pressed': null,
   });
   // Not a shelf of this wall: the way to the Friends view, so it is a link.
-  const friendsNote = h('span', { class: 'shelf__count' }, 'Host or join a session');
+  const friendsNote = h('span', { class: 'shelf__count' }, t('wall.friends_sub'));
   const friends = h(
     'a',
-    { class: 'shelf shelf--friends', href: FRIENDS_PATH, title: 'Up to four players, each on their own device: host a session or join one' },
+    { class: 'shelf shelf--friends', href: FRIENDS_PATH, title: t('wall.friends_hint') },
     art('friends'),
-    h('span', { class: 'shelf__text' }, h('span', { class: 'shelf__label' }, 'Play with friends'), friendsNote)
+    h('span', { class: 'shelf__text' }, h('span', { class: 'shelf__label' }, t('wall.friends')), friendsNote)
   );
 
   root.append(
@@ -133,10 +134,10 @@ export function createShelves(root, { onSelect, onSource, onSurprise }) {
      * @param together how many games play in a session
      */
     render(current, counts, { origin = '', origins = [], canSurprise = true, together = 0 } = {}) {
-      friendsNote.textContent = together ? `${together} games · host or join a session` : 'Host or join a session';
+      friendsNote.textContent = together ? t('wall.friends_count', { count: together }) : t('wall.friends_sub');
       for (const { shelf, el, note } of [games, tools, unsure]) {
         el.setAttribute('aria-pressed', String(shelf.key === current));
-        note.textContent = String(counts.get(shelf.key) || 0);
+        note.textContent = number(counts.get(shelf.key) || 0);
         // An empty shelf is not worth a big button; the current one always shows.
         el.hidden = !counts.get(shelf.key) && shelf.key !== current;
       }

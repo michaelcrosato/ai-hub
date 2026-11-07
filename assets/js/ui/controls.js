@@ -20,14 +20,15 @@
 
 import { h, append, clear, icon, ICONS } from '../dom.js';
 import { SORTS, GROUPINGS } from '../filter.js';
-import { MULTI } from '../manifest.js';
+import { MULTI, valueLabel } from '../manifest.js';
+import { t, lang } from '../lang.js';
 import { store } from '../store.js';
 
 /** Cabinet layouts: a wide row, three columns, or as many compact tiles as fit. */
 export const SIZES = [
-  { key: 'wide', label: 'One per row' },
-  { key: 'three', label: 'Three per row' },
-  { key: 'auto', label: 'Auto fit (320 × 240)' },
+  { key: 'wide', label: t('filter.layout.wide') },
+  { key: 'three', label: t('filter.layout.three') },
+  { key: 'auto', label: t('filter.layout.auto') },
 ];
 export const currentSize = () => (SIZES.some((s) => s.key === store.ui().size) ? store.ui().size : SIZES[0].key);
 
@@ -35,7 +36,21 @@ export const currentSize = () => (SIZES.some((s) => s.key === store.ui().size) ?
 const OWN_BOX = ['genre', 'players'];
 
 /** How a filter's values read on its box: "Any", "Racing", "Racing +2". */
-const summary = (values) => (!values.length ? 'Any' : values.length === 1 ? values[0] : `${values[0]} +${values.length - 1}`);
+const summary = (values) =>
+  !values.length
+    ? t('filter.summary.any')
+    : values.length === 1
+      ? values[0]
+      : t('filter.summary.more', { first: values[0], more: values.length - 1 });
+
+/** How the View box reads for each way of stacking, so each is a whole line. */
+const STACKING = {
+  source: () => t('filter.view.by_source'),
+  genre: () => t('filter.view.by_genre'),
+  players: () => t('filter.view.by_players'),
+  model: () => t('filter.view.by_model'),
+  none: () => t('filter.view.none'),
+};
 
 /**
  * @param root        the sticky toolbar, with the active filters under it
@@ -48,8 +63,8 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
 
   const input = h('input', {
     type: 'search',
-    placeholder: 'Search the wall…',
-    'aria-label': 'Search games by name, blurb or tag',
+    placeholder: t('filter.search.placeholder'),
+    'aria-label': t('filter.search.label'),
     autocomplete: 'off',
     spellcheck: 'false',
     oninput: () => {
@@ -63,7 +78,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
     {
       class: 'hunt__clear',
       type: 'button',
-      'aria-label': 'Clear the search',
+      'aria-label': t('filter.search.clear'),
       hidden: true,
       onclick: () => {
         input.value = '';
@@ -78,7 +93,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
   const boxes = Object.fromEntries(
     ['genre', 'players', 'filters', 'sort', 'view'].map((key) => [key, dropBox(key)])
   );
-  const actives = h('div', { class: 'actives', 'aria-label': 'Active filters' });
+  const actives = h('div', { class: 'actives', 'aria-label': t('filter.active.label') });
 
   searchRoot.append(
     h('div', { class: 'hunt' }, icon(ICONS.search, { class: 'hunt__icon' }), input, clearButton)
@@ -113,7 +128,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
 
   function setBox(box, label, value, on) {
     box.button.classList.toggle('is-on', on);
-    box.button.setAttribute('aria-label', `${label}: ${value}`);
+    box.button.setAttribute('aria-label', t('filter.box.aria', { label, value }));
     append(clear(box.button), [
       h('span', { class: 'box__text' }, h('span', { class: 'box__label' }, label), h('span', { class: 'box__value' }, value)),
       icon(ICONS.caret, { width: 14, height: 14, class: 'box__caret' }),
@@ -209,7 +224,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
     const active = state.facets[facet.key] || [];
     const set = (next) => onChange({ [facet.key]: next.join(',') });
     const zero = (option) => (counted.get(option.value) ?? 0) === 0;
-    const rows = [item(`Any ${facet.label.toLowerCase()}`, { on: !active.length, onclick: () => set([]), check: 'radio' })];
+    const rows = [item(facet.any, { on: !active.length, onclick: () => set([]), check: 'radio' })];
     for (const option of facet.options.filter((o) => !o.under)) {
       const inner = facet.options.filter((o) => o.under === option.value);
       const group = [option.value, ...inner.map((o) => o.value)];
@@ -217,7 +232,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
       const others = active.filter((v) => !group.includes(v));
       if (!inner.length) {
         rows.push(
-          item(option.value, {
+          item(valueLabel(facet.key, option.value), {
             on,
             disabled: zero(option),
             onclick: () => set(on ? others : [...active, option.value]),
@@ -227,15 +242,20 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
       }
       const picked = inner.find((o) => active.includes(o.value));
       rows.push(
-        submenu(menuKey, `${facet.key}:${option.value}`, option.value, on ? picked?.value ?? 'Any number' : null, [
-          item(option.value === MULTI ? 'Any number' : `Any ${option.value.toLowerCase()}`, {
-            on: active.includes(option.value),
-            disabled: zero(option),
-            check: 'radio',
-            onclick: () => set(active.includes(option.value) ? others : [...others, option.value]),
-          }),
+        submenu(menuKey, `${facet.key}:${option.value}`, valueLabel(facet.key, option.value), on ? (picked ? valueLabel(facet.key, picked.value) : t('filter.any_number')) : null, [
+          item(
+            option.value === MULTI
+              ? t('filter.any_number')
+              : t('filter.any.other', { facet: valueLabel(facet.key, option.value).toLocaleLowerCase(lang) }),
+            {
+              on: active.includes(option.value),
+              disabled: zero(option),
+              check: 'radio',
+              onclick: () => set(active.includes(option.value) ? others : [...others, option.value]),
+            }
+          ),
           inner.map((o) =>
-            item(o.value, {
+            item(valueLabel(facet.key, o.value), {
               on: active.includes(o.value),
               disabled: zero(o),
               check: 'radio',
@@ -252,7 +272,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
     box.wrap.hidden = !facet;
     if (!facet) return;
     const active = state.facets[facet.key] || [];
-    setBox(box, facet.label, summary(active), active.length > 0);
+    setBox(box, facet.label, summary(active.map((value) => valueLabel(facet.key, value))), active.length > 0);
     clear(box.menu).append(...facetRows(box.key, facet, state, counts.get(facet.key) || new Map()));
   }
 
@@ -262,12 +282,12 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
     const faves = store.faveCount() > 0;
     box.wrap.hidden = !rest.length && !faves;
     const on = rest.filter((facet) => (state.facets[facet.key] || []).length).map((facet) => facet.label);
-    if (state.favesOnly) on.unshift('Favourites');
-    setBox(box, 'Filters', summary(on), on.length > 0);
+    if (state.favesOnly) on.unshift(t('filter.favourites'));
+    setBox(box, t('filter.box.filters'), summary(on), on.length > 0);
     clear(box.menu).append(
       ...(faves
         ? [
-            item('Favourites only', {
+            item(t('filter.favourites_only'), {
               on: state.favesOnly,
               onclick: () => onChange({ fav: state.favesOnly ? '' : '1' }),
             }),
@@ -279,7 +299,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
           'filters',
           facet.key,
           facet.label,
-          active.length ? summary(active) : null,
+          active.length ? summary(active.map((value) => valueLabel(facet.key, value))) : null,
           facetRows('filters', facet, state, counts.get(facet.key) || new Map())
         );
       })
@@ -294,7 +314,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
       (sort) => !['played', 'recent'].includes(sort.key) || store.playedCount() > 0
     );
     const current = available.find((s) => s.key === state.sort) || available[0];
-    setBox(boxes.sort, 'Sort', current.label, false);
+    setBox(boxes.sort, t('filter.box.sort'), current.label, false);
     clear(boxes.sort.menu).append(
       ...available.map((sort) =>
         item(sort.label, { on: sort === current, check: 'radio', close: true, onclick: () => onChange({ sort: sort.key }) })
@@ -304,13 +324,13 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
 
   function renderView() {
     const current = GROUPINGS.find((g) => g.key === store.ui().group) || GROUPINGS[0];
-    setBox(boxes.view, 'View', current.key === 'none' ? 'No stacks' : `Stack by ${current.label.toLowerCase()}`, false);
+    setBox(boxes.view, t('filter.box.view'), STACKING[current.key](), false);
     clear(boxes.view.menu).append(
-      h('p', { class: 'drop__head' }, 'Size'),
+      h('p', { class: 'drop__head' }, t('filter.view.size')),
       ...SIZES.map((size) =>
         item(size.label, { on: size.key === currentSize(), check: 'radio', close: true, onclick: () => onSize(size.key) })
       ),
-      h('p', { class: 'drop__head' }, 'Stack by'),
+      h('p', { class: 'drop__head' }, t('filter.view.stack_by')),
       ...GROUPINGS.map((g) =>
         item(g.label, { on: g === current, check: 'radio', close: true, onclick: () => onGroup(g.key) })
       )
@@ -324,18 +344,18 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
     const pill = (text, patch) =>
       h(
         'button',
-        { class: 'pill', type: 'button', 'aria-label': `Remove ${text}`, onclick: () => onChange(patch) },
+        { class: 'pill', type: 'button', 'aria-label': t('filter.pill.remove', { name: text }), onclick: () => onChange(patch) },
         text,
         icon(ICONS.close, { width: 12, height: 12 })
       );
-    if (state.favesOnly) chips.push(pill('Favourites', { fav: '' }));
+    if (state.favesOnly) chips.push(pill(t('filter.favourites'), { fav: '' }));
     for (const facet of facets) {
       const active = state.facets[facet.key] || [];
       for (const value of active) {
         const next = active.filter((v) => v !== value);
         // Knocking off a head count leaves Multiplayer on, the step above it.
         const above = facet.options.find((o) => o.value === value)?.under;
-        chips.push(pill(value, { [facet.key]: (above ? [...next, above] : next).join(',') }));
+        chips.push(pill(valueLabel(facet.key, value), { [facet.key]: (above ? [...next, above] : next).join(',') }));
       }
     }
     clear(actives);
@@ -345,7 +365,7 @@ export function createControls(root, { searchRoot = root, onChange, onGroup, onS
     for (const facet of facets) patch[facet.key] = '';
     actives.append(
       ...chips,
-      h('button', { class: 'actives__clear', type: 'button', onclick: () => onChange(patch) }, 'Clear all')
+      h('button', { class: 'actives__clear', type: 'button', onclick: () => onChange(patch) }, t('filter.clear_all'))
     );
   }
 

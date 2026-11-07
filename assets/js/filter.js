@@ -7,24 +7,25 @@
  */
 
 import { matchesFacet, fold, sameKey, originOf, MULTI, SINGLE } from './manifest.js';
+import { t, compare } from './lang.js';
 
-const byName = (a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' });
+const byName = (a, b) => compare(a.name, b.name);
 
 export const SORTS = [
-  { key: 'name', label: 'A to Z', compare: byName },
-  { key: 'newest', label: 'Newest first', compare: (a, b) => b.addedAt - a.addedAt || byName(a, b) },
-  { key: 'updated', label: 'Recently updated', compare: (a, b) => b.updatedAt - a.updatedAt || byName(a, b) },
+  { key: 'name', label: t('filter.sort.name'), compare: byName },
+  { key: 'newest', label: t('filter.sort.newest'), compare: (a, b) => b.addedAt - a.addedAt || byName(a, b) },
+  { key: 'updated', label: t('filter.sort.updated'), compare: (a, b) => b.updatedAt - a.updatedAt || byName(a, b) },
   {
     key: 'played',
-    label: 'Most played',
+    label: t('filter.sort.played'),
     compare: (a, b, s) => s.plays(b.slug) - s.plays(a.slug) || byName(a, b),
   },
   {
     key: 'recent',
-    label: 'Recently played',
+    label: t('filter.sort.recent'),
     compare: (a, b, s) => s.lastPlayed(b.slug) - s.lastPlayed(a.slug) || byName(a, b),
   },
-  { key: 'biggest', label: 'Biggest first', compare: (a, b) => b.bytes - a.bytes || byName(a, b) },
+  { key: 'biggest', label: t('filter.sort.biggest'), compare: (a, b) => b.bytes - a.bytes || byName(a, b) },
 ];
 
 export const DEFAULT_SORT = SORTS[0].key;
@@ -35,14 +36,13 @@ export const DEFAULT_SORT = SORTS[0].key;
  * almost everything dropped into games/ is.
  */
 export const SHELVES = [
-  { key: 'games', label: 'Games', noun: ['game', 'games'], holds: (type) => !type || type === 'Game' },
+  { key: 'games', label: t('filter.shelf.games'), holds: (type) => !type || type === 'Game' },
   {
     key: 'tools',
-    label: 'Tech demos & tools',
-    noun: ['demo or tool', 'demos & tools'],
+    label: t('filter.shelf.tools'),
     holds: (type) => type === 'Tech demo' || type === 'Tool' || type === 'Website',
   },
-  { key: 'unsure', label: 'Unsure', noun: ['entry to review', 'entries to review'], holds: () => false },
+  { key: 'unsure', label: t('filter.shelf.unsure'), holds: () => false },
 ];
 
 /** Shelf keys from before the demos and tools shelves were one. */
@@ -61,8 +61,8 @@ const inScope = (game, state) =>
 
 /** The first step of the Source rail. Every game is one or the other. */
 export const ORIGINS = [
-  { key: 'original', label: 'Original' },
-  { key: 'inspired', label: 'Inspired' },
+  { key: 'original', label: t('filter.origin.original') },
+  { key: 'inspired', label: t('filter.origin.inspired') },
 ];
 
 /** Original or inspired, then the series and the one game in it, as far as
@@ -74,7 +74,7 @@ const inLineage = (game, state) =>
 
 export const tokenize = (query) => fold(query).split(/\s+/).filter(Boolean);
 
-const hasAllTokens = (game, tokens) => tokens.every((t) => game.search.includes(t));
+const hasAllTokens = (game, tokens) => tokens.every((token) => game.search.includes(token));
 
 /** Name matches outrank blurb matches, so typing "orbit" surfaces Little Orbit first. */
 function relevance(game, tokens) {
@@ -170,11 +170,11 @@ export function sourceCounts(games, state, stats) {
  * such a stack filters the wall to it.
  */
 export const GROUPINGS = [
-  { key: 'source', label: 'Source' },
-  { key: 'genre', label: 'Genre' },
-  { key: 'players', label: 'Players' },
-  { key: 'model', label: 'Model' },
-  { key: 'none', label: "Don't stack" },
+  { key: 'source', label: t('filter.group.source') },
+  { key: 'genre', label: t('filter.group.genre') },
+  { key: 'players', label: t('filter.group.players') },
+  { key: 'model', label: t('filter.group.model') },
+  { key: 'none', label: t('filter.group.none') },
 ];
 
 export const DEFAULT_GROUPING = GROUPINGS[0].key;
@@ -223,7 +223,7 @@ function orderStacks(items, list, state) {
   items.sort((a, b) => first(a) - first(b));
   if (state.sort === 'name' && !tokenize(state.query).length) {
     const label = (item) => (item.stack ? item.label : item.name);
-    items.sort((a, b) => label(a).localeCompare(label(b), 'en', { sensitivity: 'base' }));
+    items.sort((a, b) => compare(label(a), label(b)));
   }
   return items;
 }
@@ -269,7 +269,7 @@ function stackBySource(list, state) {
 
   if (state.sort === 'name' && !tokenize(state.query).length) {
     const label = (item) => (item.stack ? item.label : item.name);
-    items.sort((a, b) => label(a).localeCompare(label(b), 'en', { sensitivity: 'base' }));
+    items.sort((a, b) => compare(label(a), label(b)));
   }
   return items;
 }

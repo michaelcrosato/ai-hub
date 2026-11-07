@@ -100,9 +100,9 @@ test('sign-in only ever returns to a page on this site, never to /auth/ itself',
 
 test('play time reads plainly', () => {
   assert.equal(duration(20), 'under a minute');
-  assert.equal(duration(125), '2 min');
-  assert.equal(duration(3_600), '1 h');
-  assert.equal(duration(11_100), '3 h 5 min');
+  assert.equal(duration(125), '2m');
+  assert.equal(duration(3_600), '1h');
+  assert.equal(duration(11_100), '3h 5m');
 });
 
 test("the store shows a signed-in player's plays from every device, without saving them", () => {

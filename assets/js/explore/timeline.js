@@ -2,28 +2,15 @@
 
 import { h, ICONS, icon } from '../dom.js';
 import { gameImage, gameMeta } from './common.js';
+import { t, tx, number, date, compare as collate } from '../lang.js';
 
 const BATCH_SIZE = 24;
-const monthFormatter = new Intl.DateTimeFormat('en', {
-  month: 'long',
-  year: 'numeric',
-  timeZone: 'UTC',
-});
-const dayFormatter = new Intl.DateTimeFormat('en', {
-  weekday: 'long',
-  month: 'long',
-  day: 'numeric',
-  year: 'numeric',
-  timeZone: 'UTC',
-});
-const weekdayFormatter = new Intl.DateTimeFormat('en', {
-  weekday: 'short',
-  timeZone: 'UTC',
-});
-const number = new Intl.NumberFormat('en');
+const MONTH = { month: 'long', year: 'numeric', timeZone: 'UTC' };
+const DAY = { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' };
+const WEEKDAY = { weekday: 'short', timeZone: 'UTC' };
 const dateFromKey = (key) => new Date(`${key.length === 7 ? `${key}-01` : key}T12:00:00Z`);
-const monthLabel = (key) => monthFormatter.format(dateFromKey(key));
-const dayLabel = (key) => dayFormatter.format(dateFromKey(key));
+const monthLabel = (key) => date(dateFromKey(key), MONTH);
+const dayLabel = (key) => date(dateFromKey(key), DAY);
 
 /** Reject rollover dates instead of silently filing February 30 under March. */
 export function addedDay(game) {
@@ -82,7 +69,7 @@ export function buildTimeline(games, { month = '', order = 'newest' } = {}) {
           if (time) return ascending ? time : -time;
         }
         return (
-          String(a.name || a.slug).localeCompare(String(b.name || b.slug)) || a.slug.localeCompare(b.slug)
+          collate(String(a.name || a.slug), String(b.name || b.slug)) || a.slug.localeCompare(b.slug)
         );
       }),
     }));
@@ -125,7 +112,7 @@ export function createView(root, actions) {
       {
         type: 'button',
         class: 'timeline-card__open',
-        'aria-label': `Details for ${game.name}`,
+        'aria-label': t('explore.timeline.details_for', { name: game.name }),
         dataset: { timelineFocus: `info:${game.slug}` },
         onclick: (event) => actions.info(game, event.currentTarget),
       },
@@ -138,12 +125,12 @@ export function createView(root, actions) {
         h(
           'span',
           { class: 'timeline-card__description' },
-          game.tagline || game.description || 'Open the details and discover something new.',
+          game.tagline || game.description || t('explore.timeline.card_fallback'),
         ),
         h(
           'span',
           { class: 'timeline-card__details' },
-          'Read more',
+          t('explore.timeline.read_more'),
           h('span', { 'aria-hidden': 'true' }, ' ↗'),
         ),
       ),
@@ -154,7 +141,9 @@ export function createView(root, actions) {
         type: 'button',
         class: 'timeline-card__fave',
         'aria-pressed': String(favorite),
-        'aria-label': `${favorite ? 'Remove' : 'Add'} ${game.name} ${favorite ? 'from' : 'to'} favourites`,
+        'aria-label': favorite
+          ? t('explore.timeline.remove_favourite', { name: game.name })
+          : t('explore.timeline.add_favourite', { name: game.name }),
         dataset: {
           timelineFocus: `fave:${game.slug}`,
           timelineFave: game.slug,
@@ -181,12 +170,12 @@ export function createView(root, actions) {
           {
             type: 'button',
             class: 'timeline-card__play',
-            'aria-label': `Play ${game.name}`,
+            'aria-label': t('explore.timeline.play_name', { name: game.name }),
             dataset: { timelineFocus: `play:${game.slug}` },
             onclick: (event) => actions.play(game, event.currentTarget),
           },
           icon(ICONS.play),
-          'Play',
+          t('explore.timeline.play'),
         ),
         fave,
       ),
@@ -206,7 +195,9 @@ export function createView(root, actions) {
       const title = article.querySelector('.timeline-card__title').textContent;
       fave.setAttribute(
         'aria-label',
-        `${active ? 'Remove' : 'Add'} ${title} ${active ? 'from' : 'to'} favourites`,
+        active
+          ? t('explore.timeline.remove_favourite', { name: title })
+          : t('explore.timeline.add_favourite', { name: title }),
       );
     }
   }
@@ -217,12 +208,12 @@ export function createView(root, actions) {
     stream.replaceChildren(
       ...page.map((group) => {
         const undated = group.key === 'undated';
-        const date = undated ? null : dateFromKey(group.key);
+        const when = undated ? null : dateFromKey(group.key);
         return h(
           'section',
           {
             class: 'timeline-day',
-            'aria-label': undated ? 'Undated arrivals' : dayLabel(group.key),
+            'aria-label': undated ? t('explore.timeline.undated_arrivals') : dayLabel(group.key),
           },
           h(
             'div',
@@ -230,7 +221,7 @@ export function createView(root, actions) {
             h(
               'span',
               { class: 'timeline-day__weekday' },
-              undated ? 'Unknown' : weekdayFormatter.format(date),
+              undated ? t('explore.timeline.unknown') : date(when, WEEKDAY),
             ),
             h(
               'span',
@@ -240,7 +231,7 @@ export function createView(root, actions) {
             h(
               'span',
               { class: 'timeline-day__month' },
-              undated ? 'Arrival date' : monthLabel(group.key.slice(0, 7)),
+              undated ? t('explore.timeline.arrival_date') : monthLabel(group.key.slice(0, 7)),
             ),
           ),
           h(
@@ -249,11 +240,11 @@ export function createView(root, actions) {
             h(
               'div',
               { class: 'timeline-day__heading' },
-              h('h3', {}, undated ? 'Still part of the story' : dayLabel(group.key)),
-              h('span', {}, `${number.format(group.total)} ${group.total === 1 ? 'arrival' : 'arrivals'}`),
+              h('h3', {}, undated ? t('explore.timeline.still_story') : dayLabel(group.key)),
+              h('span', {}, t('explore.timeline.day_arrivals', { count: group.total })),
             ),
             undated &&
-              h('p', { class: 'timeline-day__note' }, 'These entries do not have a recorded arrival date.'),
+              h('p', { class: 'timeline-day__note' }, t('explore.timeline.undated_note')),
             h('div', { class: 'timeline-day__cards' }, group.games.map(card)),
           ),
         );
@@ -264,14 +255,14 @@ export function createView(root, actions) {
         h(
           'div',
           { class: 'timeline-empty' },
-          h('p', { class: 'timeline-eyebrow' }, 'A quiet chapter'),
-          h('h3', {}, 'No arrivals here yet.'),
+          h('p', { class: 'timeline-eyebrow' }, t('explore.timeline.empty_eyebrow')),
+          h('h3', {}, t('explore.timeline.empty_heading')),
           h(
             'p',
             {},
             state.selection
-              ? 'Choose another date, or see all dates with your current filters.'
-              : 'Try another search or change the filters to find an arrival.',
+              ? t('explore.timeline.empty_dated')
+              : t('explore.timeline.empty_all'),
           ),
           state.selection &&
             h(
@@ -281,12 +272,12 @@ export function createView(root, actions) {
                 class: 'timeline-reset',
                 onclick: () => actions.setQuery({ month: null }),
               },
-              'See all dates',
+              t('explore.timeline.see_all'),
             ),
         ),
       );
     footer.replaceChildren(
-      h('p', {}, `${number.format(shown)} of ${number.format(state.total)} entries shown`),
+      h('p', {}, t('explore.timeline.shown', { shown, total: state.total })),
     );
     if (shown < state.total)
       footer.append(
@@ -304,11 +295,11 @@ export function createView(root, actions) {
               next?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
             },
           },
-          `Continue the story`,
+          t('explore.timeline.more'),
           h('span', { 'aria-hidden': 'true' }, ' ↓'),
         ),
       );
-    live.textContent = `${number.format(shown)} of ${number.format(state.total)} entries shown.`;
+    live.textContent = t('explore.timeline.shown_live', { shown, total: state.total });
     syncSelection();
   }
 
@@ -330,7 +321,7 @@ export function createView(root, actions) {
           onclick: () => actions.setQuery({ month: key || null }),
         },
         h('span', { class: 'timeline-index__label' }, label),
-        h('span', { class: 'timeline-index__count' }, number.format(count)),
+        h('span', { class: 'timeline-index__count' }, number(count)),
         key &&
           key !== 'undated' &&
           h('span', {
@@ -357,10 +348,10 @@ export function createView(root, actions) {
         {
           value: state.selection.length === 10 ? selectedMonth : state.selection,
         },
-        'Every day',
+        t('explore.timeline.every_day'),
       ),
       dateOptions.map(({ key, count }) =>
-        h('option', { value: key }, `${dayLabel(key)} (${number.format(count)})`),
+        h('option', { value: key }, t('explore.timeline.day_option', { day: dayLabel(key), count })),
       ),
     );
     daySelect.value = state.selection.length === 10 ? state.selection : state.selection || '';
@@ -374,12 +365,12 @@ export function createView(root, actions) {
     });
     const activeLabel =
       state.selection === 'undated'
-        ? 'Undated arrivals'
+        ? t('explore.timeline.undated_arrivals')
         : state.selection.length === 10
           ? dayLabel(state.selection)
           : state.selection
             ? monthLabel(state.selection)
-            : 'The complete story';
+            : t('explore.timeline.complete_story');
     root.replaceChildren(
       h(
         'div',
@@ -390,19 +381,19 @@ export function createView(root, actions) {
           h(
             'div',
             {},
-            h('p', { class: 'timeline-eyebrow' }, 'The arrival journal'),
-            h('h1', {}, 'Follow the ', h('em', {}, 'arrivals.')),
+            h('p', { class: 'timeline-eyebrow' }, t('explore.timeline.eyebrow')),
+            h('h1', {}, tx('explore.timeline.heading', { arrivals: h('em', {}, t('explore.timeline.heading_arrivals')) })),
             h(
               'p',
               { class: 'timeline-intro__description' },
-              'A living record of the hub. Revisit a day, discover a new favourite, and see how the collection grew.',
+              t('explore.timeline.description'),
             ),
           ),
           h(
             'div',
             { class: 'timeline-intro__stat' },
-            h('strong', {}, number.format(current.games.length)),
-            h('span', {}, 'entries in this selection'),
+            h('strong', {}, number(current.games.length)),
+            h('span', {}, t('explore.timeline.stat_label', { count: current.games.length })),
           ),
         ),
         h(
@@ -412,23 +403,23 @@ export function createView(root, actions) {
             'aside',
             {
               class: 'timeline-index',
-              'aria-label': 'Choose an arrival month',
+              'aria-label': t('explore.timeline.index_label'),
             },
-            h('h3', { class: 'timeline-eyebrow' }, 'Browse the archive'),
+            h('h3', { class: 'timeline-eyebrow' }, t('explore.timeline.archive')),
             h(
               'div',
               { class: 'timeline-index__items' },
-              navButton('', 'All dates', current.games.length, !state.selection),
+              navButton('', t('explore.timeline.all_dates'), current.games.length, !state.selection),
               state.months.map(({ key, count }) =>
                 navButton(key, monthLabel(key), count, selectedMonth === key),
               ),
               (state.undated > 0 || state.selection === 'undated') &&
-                navButton('undated', 'Undated', state.undated, state.selection === 'undated'),
+                navButton('undated', t('explore.timeline.undated'), state.undated, state.selection === 'undated'),
             ),
             h(
               'p',
               { class: 'timeline-index__note' },
-              'Dates mark the first arrival in the hub. Times are grouped by UTC date.',
+              t('explore.timeline.index_note'),
             ),
           ),
           h(
@@ -440,7 +431,7 @@ export function createView(root, actions) {
               h(
                 'div',
                 { class: 'timeline-toolbar__chapter' },
-                h('p', { class: 'timeline-eyebrow' }, 'Now reading'),
+                h('p', { class: 'timeline-eyebrow' }, t('explore.timeline.now_reading')),
                 h('h2', {}, activeLabel),
               ),
               h(
@@ -448,7 +439,7 @@ export function createView(root, actions) {
                 {
                   class: 'timeline-order',
                   role: 'group',
-                  'aria-label': 'Timeline order',
+                  'aria-label': t('explore.timeline.order'),
                 },
                 ['newest', 'oldest'].map((value) =>
                   h(
@@ -459,7 +450,7 @@ export function createView(root, actions) {
                       dataset: { timelineFocus: `order:${value}` },
                       onclick: () => actions.setQuery({ order: value }),
                     },
-                    `${value === 'newest' ? 'Newest' : 'Oldest'} first`,
+                    value === 'newest' ? t('explore.timeline.newest_first') : t('explore.timeline.oldest_first'),
                   ),
                 ),
               ),
@@ -467,7 +458,7 @@ export function createView(root, actions) {
             h(
               'div',
               { class: 'timeline-date-filter' },
-              h('label', { for: 'timeline-day-select' }, 'Jump to a day'),
+              h('label', { for: 'timeline-day-select' }, t('explore.timeline.jump')),
               daySelect,
               state.selection &&
                 h(
@@ -478,7 +469,7 @@ export function createView(root, actions) {
                     dataset: { timelineFocus: 'clear' },
                     onclick: () => actions.setQuery({ month: null }),
                   },
-                  'Clear date ×',
+                  t('explore.timeline.clear_date'),
                 ),
             ),
             stream,

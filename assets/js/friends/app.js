@@ -18,6 +18,7 @@
  */
 
 import { h, clear, append, icon, ICONS } from '../dom.js';
+import { t, tx, fillPage, number } from '../lang.js';
 import { cabinetPalette, paletteVars } from '../color.js';
 import { loadLibrary } from '../library.js';
 import { router } from '../router.js';
@@ -45,6 +46,8 @@ import {
   joinHref,
   inviteCode,
 } from './together.js';
+
+fillPage();
 
 const $ = (id) => document.getElementById(id);
 /** A row shows this many before "See all". */
@@ -118,8 +121,8 @@ function hostButton(game = null, { className = '' } = {}) {
     h(
       'span',
       { class: 'party-host__text' },
-      h('span', { class: 'party-host__label' }, game ? 'Host with this game' : 'Host a game night'),
-      h('span', { class: 'party-host__sub' }, signedIn() ? 'You get an invite link to send' : 'Sign in with Google to host')
+      h('span', { class: 'party-host__label' }, game ? t('friends.host.with_game') : t('friends.host.label')),
+      h('span', { class: 'party-host__sub' }, signedIn() ? t('friends.host.sub_signed_in') : t('friends.host.sub_signed_out'))
     )
   );
 }
@@ -132,10 +135,10 @@ function joinForm() {
     autocomplete: 'off',
     autocapitalize: 'none',
     spellcheck: 'false',
-    placeholder: 'Paste the invite link or code',
+    placeholder: t('friends.join.placeholder'),
     'aria-describedby': 'join-note',
   });
-  const note = h('span', { class: 'join-code__note', id: 'join-note' }, 'Friends join without an account.');
+  const note = h('span', { class: 'join-code__note', id: 'join-note' }, t('friends.join.note'));
   const form = h(
     'form',
     {
@@ -144,7 +147,7 @@ function joinForm() {
         event.preventDefault();
         const code = inviteCode(input.value);
         if (!code) {
-          note.textContent = 'That has no invite code in it: the code is the ten letters and digits after the # in the link.';
+          note.textContent = t('friends.join.wrong');
           form.classList.add('is-wrong');
           input.focus();
           return;
@@ -152,14 +155,14 @@ function joinForm() {
         location.href = joinHref(code);
       },
     },
-    h('label', { class: 'join-code__label', for: 'join-code' }, 'Got an invite?'),
-    h('span', { class: 'join-code__field' }, input, h('button', { type: 'submit', class: 'join-code__go' }, 'Join')),
+    h('label', { class: 'join-code__label', for: 'join-code' }, t('friends.join.label')),
+    h('span', { class: 'join-code__field' }, input, h('button', { type: 'submit', class: 'join-code__go' }, t('friends.join.go'))),
     note
   );
   input.addEventListener('input', () => {
     if (!form.classList.contains('is-wrong')) return;
     form.classList.remove('is-wrong');
-    note.textContent = 'Friends join without an account.';
+    note.textContent = t('friends.join.note');
   });
   return form;
 }
@@ -169,20 +172,18 @@ function renderParty() {
   const typed = actions.querySelector('#join-code')?.value ?? '';
   clear(actions).append(hostButton(), joinForm());
   if (typed) actions.querySelector('#join-code').value = typed;
-  clear($('party-local')).append(
-    'New to it? ',
-    h('a', { href: hostHref(null, { local: true }) }, 'Try a session on this computer'),
-    ': open it in up to four tabs, one seat each, with the hub’s practice games.'
-  );
+  append(clear($('party-local')), [
+    tx('friends.party.local', { link: h('a', { href: hostHref(null, { local: true }) }, t('friends.party.local_link')) }),
+  ]);
 }
 
 /** The table before anyone sits down: you, two friends and a seat still open. */
 function renderTable() {
   const seats = [
-    { name: 'You', tag: 'Host' },
-    { name: 'A friend', tag: 'Guest' },
-    { name: 'A friend', tag: 'Guest' },
-    { name: 'Open seat', tag: null },
+    { name: t('friends.table.you'), tag: t('friends.table.host') },
+    { name: t('friends.table.friend'), tag: t('friends.table.guest') },
+    { name: t('friends.table.friend'), tag: t('friends.table.guest') },
+    { name: t('friends.table.open'), tag: null },
   ];
   clear($('party-table')).append(
     h(
@@ -198,15 +199,15 @@ function renderTable() {
         )
       )
     ),
-    h('p', { class: 'table-note' }, `${MOST_SEATS} seats, each on their own device`)
+    h('p', { class: 'table-note' }, t('friends.table.note', { count: MOST_SEATS }))
   );
 }
 
 function renderSteps() {
   const steps = [
-    ['Host', 'Sign in with Google and pick a name from the hub. You get an invite link.'],
-    ['Invite', 'Send it wherever you already talk. Friends open it, pick a name and take a seat: no account needed.'],
-    ['Play', 'The hub deals a game to everyone, counts you in together and keeps the table. About half a minute between games.'],
+    [t('friends.steps.host.title'), t('friends.steps.host.text')],
+    [t('friends.steps.invite.title'), t('friends.steps.invite.text')],
+    [t('friends.steps.play.title'), t('friends.steps.play.text')],
   ];
   append(clear($('steps')), [
     steps.map(([title, text], i) =>
@@ -218,7 +219,7 @@ function renderSteps() {
 function renderFormats() {
   append(clear($('formats')), [
     Object.values(FORMATS).map((format) =>
-      h('li', { class: 'format-card' }, h('h3', { class: 'format-card__name' }, format.label), h('p', { class: 'format-card__blurb' }, `${format.blurb}.`))
+      h('li', { class: 'format-card' }, h('h3', { class: 'format-card__name' }, format.label), h('p', { class: 'format-card__blurb' }, t('friends.formats.blurb', { blurb: format.blurb })))
     ),
   ]);
 }
@@ -249,15 +250,15 @@ function shot(game, { className = 'shot', loading = 'lazy' } = {}) {
   );
 }
 
-function badges(t) {
+function badges(how) {
   return [
-    t.webgpu && webgpu === false && h('span', { class: 'badge badge--warn', title: 'This browser has no WebGPU, which this game needs' }, 'Needs WebGPU'),
-    t.touch && h('span', { class: 'badge', title: 'Plays on a touch screen too' }, 'Touch'),
+    how.webgpu && webgpu === false && h('span', { class: 'badge badge--warn', title: t('friends.badge.webgpu_title') }, t('friends.badge.webgpu')),
+    how.touch && h('span', { class: 'badge', title: t('friends.badge.touch_title') }, t('friends.badge.touch')),
   ].filter(Boolean);
 }
 
 function card(game, { big = false } = {}) {
-  const t = togetherOf(game);
+  const how = togetherOf(game);
   return h(
     'a',
     {
@@ -265,17 +266,17 @@ function card(game, { big = false } = {}) {
       href: `#/g/${encodeURIComponent(game.slug)}`,
       style: paletteVars(cabinetPalette(game)),
       dataset: { slug: game.slug },
-      'aria-label': `${game.name}: ${togetherLine(game)}`,
+      'aria-label': t('friends.card.label', { game: game.name, line: togetherLine(game) }),
     },
     shot(game, { className: 'tcard__shot', loading: big ? 'eager' : 'lazy' }),
-    h('span', { class: 'tcard__way' }, wayGlyph(t.way.key), t.way.label),
+    h('span', { class: 'tcard__way' }, wayGlyph(how.way.key), how.way.label),
     h(
       'span',
       { class: 'tcard__body' },
       h('span', { class: 'tcard__name' }, game.name),
-      h('span', { class: 'tcard__meta' }, [seatsText(t.seats), t.minutes && `about ${t.minutes} min`].filter(Boolean).join(' · ')),
-      (t.goal || game.tagline) && h('span', { class: 'tcard__goal' }, t.goal || game.tagline),
-      h('span', { class: 'tcard__badges' }, badges(t))
+      h('span', { class: 'tcard__meta' }, how.minutes ? t('friends.card.meta', { seats: seatsText(how.seats), minutes: how.minutes }) : seatsText(how.seats)),
+      (how.goal || game.tagline) && h('span', { class: 'tcard__goal' }, how.goal || game.tagline),
+      h('span', { class: 'tcard__badges' }, badges(how))
     )
   );
 }
@@ -319,7 +320,7 @@ function segmented(name, label, options, current, onPick) {
           },
           o.glyph,
           h('span', {}, o.label),
-          o.count != null && h('span', { class: 'seg__count' }, String(o.count))
+          o.count != null && h('span', { class: 'seg__count' }, number(o.count))
         )
       )
     )
@@ -342,14 +343,14 @@ function renderBar(scope) {
     searchEl = h('input', {
       type: 'search',
       id: 'together-search',
-      placeholder: 'Search games to play together',
+      placeholder: t('friends.search.placeholder'),
       autocomplete: 'off',
       enterkeyhint: 'search',
       oninput: () => set({ q: searchEl.value }),
     });
     choicesEl = h('div', { class: 'together__choices' });
     $('together-bar').append(
-      h('label', { class: 'together__search' }, h('span', { class: 'visually-hidden' }, 'Search games to play together'), icon(ICONS.search, { width: 16, height: 16 }), searchEl),
+      h('label', { class: 'together__search' }, h('span', { class: 'visually-hidden' }, t('friends.search.label')), icon(ICONS.search, { width: 16, height: 16 }), searchEl),
       choicesEl
     );
   }
@@ -358,26 +359,26 @@ function renderBar(scope) {
   append(clear(choicesEl), [
     segmented(
       'players',
-      'Players',
-      [{ value: 0, label: 'Any' }, ...PARTY_SIZES.map((n) => ({ value: n, label: String(n), title: `Games that seat ${n}`, count: countWith({ players: n }) }))],
+      t('friends.filter.players'),
+      [{ value: 0, label: t('friends.filter.any') }, ...PARTY_SIZES.map((n) => ({ value: n, label: number(n), title: t('friends.filter.seats_title', { count: n }), count: countWith({ players: n }) }))],
       scope.players,
       (value) => set({ players: value || null })
     ),
     segmented(
       'way',
-      'How',
-      [{ value: '', label: 'Every way' }, ...WAYS.map((w) => ({ value: w.key, label: w.label, title: w.blurb, glyph: wayGlyph(w.key), count: countWith({ way: w.key }) }))],
+      t('friends.filter.how'),
+      [{ value: '', label: t('friends.filter.every_way') }, ...WAYS.map((w) => ({ value: w.key, label: w.label, title: w.blurb, glyph: wayGlyph(w.key), count: countWith({ way: w.key }) }))],
       scope.way,
       (value) => set({ way: value || null })
     ),
     segmented(
       'length',
-      'Round',
-      [{ value: '', label: 'Any length' }, ...LENGTHS.map((l) => ({ value: l.value, label: l.label, title: l.blurb, count: countWith({ length: l.value }) }))],
+      t('friends.filter.round'),
+      [{ value: '', label: t('friends.filter.any_length') }, ...LENGTHS.map((l) => ({ value: l.value, label: l.label, title: l.blurb, count: countWith({ length: l.value }) }))],
       scope.length,
       (value) => set({ length: value || null })
     ),
-    anyScope(scope) && h('button', { type: 'button', class: 'together__reset', id: 'together-reset', onclick: () => set({ q: null, players: null, way: null, length: null }) }, 'Show every game'),
+    anyScope(scope) && h('button', { type: 'button', class: 'together__reset', id: 'together-reset', onclick: () => set({ q: null, players: null, way: null, length: null }) }, t('friends.filter.reset')),
   ]);
   if (keepFocus) (document.getElementById(keepFocus) ?? searchEl).focus();
 }
@@ -391,15 +392,15 @@ function row(r) {
       'header',
       { class: 'trow__head' },
       h('h3', { class: 'trow__title', id: `row-${r.key}` }, wayGlyph(r.key, 18), r.title),
-      h('p', { class: 'trow__blurb' }, h('strong', {}, `${r.label}. `), r.blurb),
+      h('p', { class: 'trow__blurb' }, tx('friends.way.intro', { title: h('strong', {}, r.label), blurb: r.blurb })),
       h(
         'button',
         { type: 'button', class: 'trow__all', onclick: () => setScope({ way: r.key }) },
-        `See all ${r.games.length}`,
+        t('friends.row.see_all', { count: r.games.length }),
         icon('M9 5l7 7-7 7', { width: 14, height: 14 })
       )
     ),
-    h('div', { class: 'trow__strip' }, r.games.slice(0, ROW_MOST).map((game) => card(game)), more > 0 && h('button', { type: 'button', class: 'trow__more', onclick: () => setScope({ way: r.key }) }, h('span', {}, `+${more}`), h('span', {}, 'more')))
+    h('div', { class: 'trow__strip' }, r.games.slice(0, ROW_MOST).map((game) => card(game)), more > 0 && h('button', { type: 'button', class: 'trow__more', onclick: () => setScope({ way: r.key }) }, h('span', {}, t('friends.row.more_count', { count: more })), h('span', {}, t('friends.row.more'))))
   );
 }
 
@@ -412,18 +413,26 @@ function renderTogether(route, { force = false } = {}) {
   const games = selectTogether(library.games, scope);
   const counts = tally(library.games);
   $('together-count').textContent = anyScope(scope)
-    ? `${games.length.toLocaleString()} of ${counts.all.toLocaleString()} games`
-    : `${counts.online.toLocaleString()} play in a session, each on your own device · ${counts.screen.toLocaleString()} more on one screen`;
+    ? t('friends.count.filtered', { shown: games.length, total: counts.all })
+    : t('friends.count.all', { online: counts.online, screen: counts.screen });
   const needGpu = games.filter((game) => togetherOf(game).webgpu).length;
   const notice = $('together-notice');
   notice.hidden = !(webgpu === false && needGpu > 0);
   notice.textContent = notice.hidden
     ? ''
-    : `This browser has no WebGPU, and ${needGpu.toLocaleString()} of these games need it. A session only deals them when every player can run them, so they are marked.`;
+    : t('friends.notice.webgpu', { count: needGpu });
 
   const body = clear($('together-body'));
   if (!games.length) {
-    body.append(h('p', { class: 'together__empty' }, 'No game fits all of that. ', h('button', { type: 'button', class: 'link', onclick: () => setScope({ q: null, players: null, way: null, length: null }) }, 'Show every game')));
+    body.append(
+      h(
+        'p',
+        { class: 'together__empty' },
+        tx('friends.empty.line', {
+          button: h('button', { type: 'button', class: 'link', onclick: () => setScope({ q: null, players: null, way: null, length: null }) }, t('friends.filter.reset')),
+        })
+      )
+    );
     return;
   }
   if (!anyScope(scope)) {
@@ -432,7 +441,7 @@ function renderTogether(route, { force = false } = {}) {
   }
   const way = wayOf(scope.way);
   append(body, [
-    way && h('p', { class: 'together__way' }, wayGlyph(way.key, 18), h('strong', {}, `${way.title}. `), way.blurb),
+    way && h('p', { class: 'together__way' }, wayGlyph(way.key, 18), tx('friends.way.intro', { title: h('strong', {}, way.title), blurb: way.blurb })),
     h('div', { class: 'tgrid' }, games.slice(0, shown).map((game) => card(game))),
     games.length > shown &&
       h(
@@ -445,7 +454,7 @@ function renderTogether(route, { force = false } = {}) {
             renderTogether(router.current(), { force: true });
           },
         },
-        `Show more (${(games.length - shown).toLocaleString()} left)`
+        t('friends.together.show_more', { count: games.length - shown })
       ),
   ]);
 }
@@ -464,25 +473,25 @@ function fact(label, value) {
 }
 
 function openSheet(game) {
-  const t = togetherOf(game);
+  const how = togetherOf(game);
   // Back to what opened it: a card on this page. Coming back from practice, keep the one it had.
   const from = document.activeElement;
   const returnTo = from instanceof HTMLElement && $('friends-shell').contains(from) ? from : sheetRoot.returnTo?.isConnected ? sheetRoot.returnTo : null;
-  const close = h('button', { type: 'button', class: 'sheet__close', 'aria-label': 'Close', onclick: closeSheet }, icon(ICONS.close));
-  const actions = t.online
+  const close = h('button', { type: 'button', class: 'sheet__close', 'aria-label': t('friends.sheet.close'), onclick: closeSheet }, icon(ICONS.close));
+  const actions = how.online
     ? [
         hostButton(game, { className: 'sheet__host' }),
         h(
           'a',
-          { class: 'sheet__action', href: hostHref(game, { local: true }), title: 'A session in this browser: open it again in other tabs for more seats' },
+          { class: 'sheet__action', href: hostHref(game, { local: true }), title: t('friends.sheet.try_title') },
           icon('M4 5h16v11H4zM8 20h8M12 16v4', { width: 16, height: 16 }),
-          'Try it on this computer'
+          t('friends.sheet.try')
         ),
         h(
           'a',
           { class: 'sheet__action', href: `#/play/${encodeURIComponent(game.slug)}` },
           icon(ICONS.play, { width: 15, height: 15, fill: 'currentColor', stroke: 'none' }),
-          'Practise alone'
+          t('friends.sheet.practise')
         ),
       ]
     : [
@@ -490,7 +499,7 @@ function openSheet(game) {
           'a',
           { class: 'party-host sheet__host', href: `#/play/${encodeURIComponent(game.slug)}` },
           icon(ICONS.play, { width: 20, height: 20, fill: 'currentColor', stroke: 'none' }),
-          h('span', { class: 'party-host__text' }, h('span', { class: 'party-host__label' }, 'Play on this screen'), h('span', { class: 'party-host__sub' }, 'Plug in a controller for each player'))
+          h('span', { class: 'party-host__text' }, h('span', { class: 'party-host__label' }, t('friends.sheet.screen')), h('span', { class: 'party-host__sub' }, t('friends.sheet.screen_sub')))
         ),
       ];
   const panel = h(
@@ -501,27 +510,27 @@ function openSheet(game) {
     h(
       'div',
       { class: 'sheet__body' },
-      h('p', { class: 'sheet__eyebrow' }, wayGlyph(t.way.key), togetherLine(game)),
+      h('p', { class: 'sheet__eyebrow' }, wayGlyph(how.way.key), togetherLine(game)),
       h('h2', { class: 'sheet__name', id: 'sheet-name' }, game.name),
       game.tagline && h('p', { class: 'sheet__tagline' }, game.tagline),
-      h('p', { class: 'sheet__way' }, h('strong', {}, `${t.way.title}. `), t.way.blurb),
+      h('p', { class: 'sheet__way' }, tx('friends.way.intro', { title: h('strong', {}, how.way.title), blurb: how.way.blurb })),
       h('div', { class: 'sheet__actions' }, actions),
-      t.online && h('p', { class: 'sheet__hint' }, 'Hosting opens a lobby with this game first; after it, the hub deals the rest at random. Friends join from the link you send.'),
+      how.online && h('p', { class: 'sheet__hint' }, t('friends.sheet.hint')),
       h(
         'dl',
         { class: 'sheet__facts' },
-        fact('To win', t.goal),
-        fact('Controls', t.howto),
-        fact('Seats', t.online ? `${seatsText(t.seats)}, each on their own device` : `${seatsText(t.seats)} on one screen`),
-        fact('A round', t.minutes ? `about ${t.minutes} min` : null),
-        t.online && t.screen && fact('Also', `${seatsText(t.screen)} on one screen`),
-        t.webgpu && fact('Needs', webgpu === false ? 'WebGPU, which this browser does not have' : 'WebGPU on every player’s device')
+        fact(t('friends.sheet.goal'), how.goal),
+        fact(t('friends.sheet.controls'), how.howto),
+        fact(t('friends.sheet.seats'), how.online ? t('friends.sheet.seats_online', { seats: seatsText(how.seats) }) : t('friends.sheet.seats_screen', { seats: seatsText(how.seats) })),
+        fact(t('friends.sheet.round'), how.minutes ? t('friends.minutes', { minutes: how.minutes }) : null),
+        how.online && how.screen && fact(t('friends.sheet.also'), t('friends.sheet.seats_screen', { seats: seatsText(how.screen) })),
+        how.webgpu && fact(t('friends.sheet.needs'), webgpu === false ? t('friends.sheet.needs_no_webgpu') : t('friends.sheet.needs_webgpu'))
       ),
       game.description && h('p', { class: 'sheet__blurb' }, game.description),
-      h('a', { class: 'sheet__wall', href: `/#/g/${encodeURIComponent(game.slug)}` }, 'All its details on the wall')
+      h('a', { class: 'sheet__wall', href: `/#/g/${encodeURIComponent(game.slug)}` }, t('friends.sheet.wall'))
     )
   );
-  clear(sheetRoot).append(h('button', { type: 'button', class: 'sheet__scrim', 'aria-label': 'Close', tabindex: '-1', onclick: closeSheet }), panel);
+  clear(sheetRoot).append(h('button', { type: 'button', class: 'sheet__scrim', 'aria-label': t('friends.sheet.close'), tabindex: '-1', onclick: closeSheet }), panel);
   sheetRoot.hidden = false;
   sheetRoot.returnTo = returnTo;
   $('friends-shell').inert = true;
@@ -569,7 +578,7 @@ addEventListener('keydown', (event) => {
 
 let returnPath = '/';
 const player = createPlayer($('player'), {
-  backLabel: 'Back to Friends',
+  backLabel: t('friends.player.back'),
   onExit() {
     const playing = location.href;
     if (launched) history.go(-1 - Math.max(0, history.length - lengthAtPlay));
@@ -645,6 +654,7 @@ async function boot() {
   renderTable();
   renderSteps();
   renderFormats();
+  append(clear($('friends-foot')), [tx('friends.foot', { link: h('a', { href: '/privacy/' }, t('friends.foot.link')) })]);
   import('../account/auth.js')
     .then(async (auth) => {
       user = await auth.currentUser();
@@ -664,7 +674,7 @@ async function boot() {
     router.start();
   } catch (error) {
     console.error(error);
-    $('together-count').textContent = 'The library could not be opened. Check your connection and try again.';
+    $('together-count').textContent = t('friends.library.failed');
   }
 }
 

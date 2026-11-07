@@ -16,6 +16,7 @@
 import { sessionOf, playersOf, MULTI, sameKey } from '../manifest.js';
 import { shelfOf, isVisible, tokenize } from '../filter.js';
 import { LENGTHS } from '../session/pick.js';
+import { t, compare } from '../lang.js';
 
 export const FRIENDS_PATH = '/friends';
 export const SESSION_PATH = '/session';
@@ -26,27 +27,27 @@ export const MOST_SEATS = 4;
 export const WAYS = [
   {
     key: 'shared-world',
-    label: 'Shared world',
-    title: 'One world for everyone',
-    blurb: 'Co-op and versus: everyone in the same game, run by the host’s copy.',
+    label: t('friends.way.shared_world.label'),
+    title: t('friends.way.shared_world.title'),
+    blurb: t('friends.way.shared_world.blurb'),
   },
   {
     key: 'ghost',
-    label: 'Ghost',
-    title: 'Race each other’s ghosts',
-    blurb: 'Your own copy of the game, with the others racing through it as ghosts.',
+    label: t('friends.way.ghost.label'),
+    title: t('friends.way.ghost.title'),
+    blurb: t('friends.way.ghost.blurb'),
   },
   {
     key: 'parallel',
-    label: 'Parallel',
-    title: 'Same start, side by side',
-    blurb: 'Everyone plays their own copy from the same start, and a live scoreboard shows who is ahead.',
+    label: t('friends.way.parallel.label'),
+    title: t('friends.way.parallel.title'),
+    blurb: t('friends.way.parallel.blurb'),
   },
   {
     key: 'couch',
-    label: 'One screen',
-    title: 'Couch co-op',
-    blurb: 'One screen and a controller each. The game seats everyone itself.',
+    label: t('friends.way.couch.label'),
+    title: t('friends.way.couch.title'),
+    blurb: t('friends.way.couch.blurb'),
   },
 ];
 
@@ -65,7 +66,7 @@ export function playsOnOneScreen(game, { showAll = false } = {}) {
 export const playsTogether = (game, options) => playsOnline(game, options) || playsOnOneScreen(game, options);
 
 /** "2–4 players", "4 players". */
-export const seatsText = ([low, high]) => (low === high ? `${low} players` : `${low}–${high} players`);
+export const seatsText = ([low, high]) => (low === high ? t('friends.seats.exact', { count: low }) : t('friends.seats.range', { low, high }));
 
 /** The seats a game's own `players` names, for one screen: [2, 4] for "1–4". */
 function screenSeats(game) {
@@ -98,9 +99,10 @@ export function togetherOf(game, options) {
 
 /** One line under a game's name: "Shared world · 1–4 players · about 4 min". */
 export function togetherLine(game, options) {
-  const t = togetherOf(game, options);
-  if (!t) return '';
-  return [t.way.label, seatsText(t.seats), t.minutes && `about ${t.minutes} min`].filter(Boolean).join(' · ');
+  const how = togetherOf(game, options);
+  if (!how) return '';
+  const values = { way: how.way.label, seats: seatsText(how.seats), minutes: how.minutes };
+  return how.minutes ? t('friends.together.line_minutes', values) : t('friends.together.line', values);
 }
 
 /** Where "Play with friends" on a game leads: its page in the Friends view. */
@@ -149,10 +151,10 @@ export const PARTY_SIZES = [2, 3, 4];
 
 /** Whether a game seats `n` together, in a session or on one screen. */
 function seats(game, n, options) {
-  const t = togetherOf(game, options);
-  if (!t) return false;
-  const online = t.online && sessionOf(game).seats[0] <= n && n <= sessionOf(game).seats[1];
-  const screen = t.screen && t.screen[0] <= n && n <= t.screen[1] && n >= 2;
+  const how = togetherOf(game, options);
+  if (!how) return false;
+  const online = how.online && sessionOf(game).seats[0] <= n && n <= sessionOf(game).seats[1];
+  const screen = how.screen && how.screen[0] <= n && n <= how.screen[1] && n >= 2;
   return Boolean(online || screen);
 }
 
@@ -170,14 +172,14 @@ export function selectTogether(games, { q = '', players = 0, way = '', length = 
   const span = LENGTHS.find((l) => l.value === length);
   return games
     .filter((game) => {
-      const t = togetherOf(game, options);
-      if (!t) return false;
+      const how = togetherOf(game, options);
+      if (!how) return false;
       if (way && filedUnder(game, options) !== way) return false;
       if (n && !seats(game, n, options)) return false;
-      if (span && !(t.online && span.holds(t.minutes))) return false;
+      if (span && !(how.online && span.holds(how.minutes))) return false;
       return tokens.every((token) => game.search?.includes(token));
     })
-    .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0) || a.name.localeCompare(b.name));
+    .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0) || compare(a.name, b.name));
 }
 
 /** The selection as the Friends view's rows: one per way, in WAYS order, empty ones left out. */

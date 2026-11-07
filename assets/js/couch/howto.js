@@ -19,6 +19,8 @@
  * and { text } for the words between them ("or", "/", "hold").
  */
 
+import { t, upper } from '../lang.js';
+
 const ARROWS = '←↑↓→';
 const DIRECTIONS = { up: '↑', down: '↓', left: '←', right: '→' };
 
@@ -27,57 +29,55 @@ const NAMED = new Map(
   Object.entries({
     wasd: 'WASD',
     arrows: ARROWS,
-    space: 'Space',
-    spacebar: 'Space',
-    shift: 'Shift',
-    enter: 'Enter',
-    return: 'Enter',
-    esc: 'Esc',
-    escape: 'Esc',
-    tab: 'Tab',
-    ctrl: 'Ctrl',
-    alt: 'Alt',
-    backspace: 'Backspace',
+    space: t('couch.howto.key_space'),
+    spacebar: t('couch.howto.key_space'),
+    shift: t('couch.howto.key_shift'),
+    enter: t('couch.howto.key_enter'),
+    return: t('couch.howto.key_enter'),
+    esc: t('couch.howto.key_esc'),
+    escape: t('couch.howto.key_esc'),
+    tab: t('couch.howto.key_tab'),
+    ctrl: t('couch.howto.key_ctrl'),
+    alt: t('couch.howto.key_alt'),
+    backspace: t('couch.howto.key_backspace'),
   })
 );
 
 /** Inputs that are not keys: drawn as rounder chips. */
 const POINTER = new Map(
   Object.entries({
-    mouse: 'Mouse',
-    click: 'Click',
-    drag: 'Drag',
-    scroll: 'Scroll',
-    wheel: 'Wheel',
-    pointer: 'Pointer',
-    tap: 'Tap',
-    swipe: 'Swipe',
-    touch: 'Touch',
-    joystick: 'Joystick',
-    gamepad: 'Gamepad',
-    gamepads: 'Gamepad',
+    mouse: t('couch.howto.key_mouse'),
+    click: t('couch.howto.key_click'),
+    drag: t('couch.howto.key_drag'),
+    scroll: t('couch.howto.key_scroll'),
+    wheel: t('couch.howto.key_wheel'),
+    pointer: t('couch.howto.key_pointer'),
+    tap: t('couch.howto.key_tap'),
+    swipe: t('couch.howto.key_swipe'),
+    touch: t('couch.howto.key_touch'),
+    joystick: t('couch.howto.key_joystick'),
+    gamepad: t('couch.howto.key_gamepad'),
+    gamepads: t('couch.howto.key_gamepad'),
   })
 );
 
 /** Two- and three-word inputs, tried before single words. */
 const PHRASES = [
-  [/^(left|right) shift$/i, (m) => ({ key: `${cap(m[1])} Shift` })],
-  [/^right mouse$/i, () => ({ key: 'Right mouse', pointer: true })],
-  [/^mouse wheel$/i, () => ({ key: 'Wheel', pointer: true })],
-  [/^right click$/i, () => ({ key: 'Right-click', pointer: true })],
-  [/^left click$/i, () => ({ key: 'Click', pointer: true })],
+  [/^(left|right) shift$/i, (m) => ({ key: m[1].toLowerCase() === 'left' ? t('couch.howto.key_left_shift') : t('couch.howto.key_right_shift') })],
+  [/^right mouse$/i, () => ({ key: t('couch.howto.key_right_mouse'), pointer: true })],
+  [/^mouse wheel$/i, () => ({ key: t('couch.howto.key_wheel'), pointer: true })],
+  [/^right click$/i, () => ({ key: t('couch.howto.key_right_click'), pointer: true })],
+  [/^left click$/i, () => ({ key: t('couch.howto.key_click'), pointer: true })],
   [/^arrow keys$/i, () => ({ key: ARROWS })],
   [/^number keys$/i, () => ({ key: '1–9' })],
-  [/^movement pad$/i, () => ({ key: 'Movement pad', pointer: true })],
-  [/^point and click$/i, () => ({ key: 'Point and click', pointer: true })],
+  [/^movement pad$/i, () => ({ key: t('couch.howto.key_movement_pad'), pointer: true })],
+  [/^point and click$/i, () => ({ key: t('couch.howto.key_point_and_click'), pointer: true })],
 ];
 
 /** Words that join keys, kept as written between them. */
 const JOINS = new Set(['or', 'and', '/', '+', ',']);
 /** Words that may sit in front of a key and add nothing ("the arrows", "keys 1–3"). */
 const FILLER = new Set(['the', 'keys']);
-
-const cap = (word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
 
 /** Words, numbers (with an en dash range) and the symbols that can be keys or joins. */
 const TOKEN = /[A-Za-z0-9–'!.-]+|[/+−,]/g;
@@ -109,8 +109,8 @@ function readKey(tokens, i, first) {
   // Shift-click, Ctrl-drag, right-click, right-drag.
   const held = /^(shift|ctrl|alt|right)-(click|drag)$/i.exec(word);
   if (held) {
-    if (held[1].toLowerCase() === 'right') return { parts: [{ key: `Right-${held[2].toLowerCase()}`, pointer: true }], used: 1 };
-    return { parts: [{ key: NAMED.get(held[1].toLowerCase()) }, { text: '+' }, { key: cap(held[2]), pointer: true }], used: 1 };
+    if (held[1].toLowerCase() === 'right') return { parts: [{ key: held[2].toLowerCase() === 'click' ? t('couch.howto.key_right_click') : t('couch.howto.key_right_drag'), pointer: true }], used: 1 };
+    return { parts: [{ key: NAMED.get(held[1].toLowerCase()) }, { text: '+' }, { key: held[2].toLowerCase() === 'click' ? t('couch.howto.key_click') : t('couch.howto.key_drag'), pointer: true }], used: 1 };
   }
 
   if (/^[A-Z]$/.test(word) || /^F\d{1,2}$/.test(word)) return { parts: [{ key: word }], used: 1 };
@@ -134,7 +134,7 @@ function leadingKeys(fragment) {
     const lower = word.toLowerCase();
     if (wanted) {
       if ((lower === 'hold' || FILLER.has(lower)) && readKey(tokens, i + 1, false)) {
-        if (lower === 'hold') parts.push({ text: 'hold' });
+        if (lower === 'hold') parts.push({ text: t('couch.howto.hold') });
         i += 1;
         continue;
       }
@@ -178,10 +178,10 @@ function splitOutside(text, marks) {
 
 /** "to move" reads "Move"; "for the map" reads "The map"; a tail starting "and …" stays as it is. */
 function tidy(action) {
-  if (/^controls$/i.test(action)) return 'Also supported';
+  if (/^controls$/i.test(action)) return t('couch.howto.also_supported');
   const text = action.replace(/^(?:to|for)\s+/i, '');
   if (/^(?:and|or|then)\b/i.test(text)) return text;
-  return text.charAt(0).toUpperCase() + text.slice(1);
+  return upper(text.charAt(0)) + text.slice(1);
 }
 
 /**
