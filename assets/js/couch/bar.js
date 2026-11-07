@@ -24,7 +24,9 @@ export function createBar(root, { onSearch, onSurprise }) {
   for (const link of views.querySelectorAll('a')) link.dataset.nav = 'bar';
 
   // The Language menu's select is reached with the arrows like the other controls.
-  const language = languageMenu({ className: 'bar__language' });
+  // Its keys stay the Couch's: an arrow moves on and a letter is a shortcut,
+  // none of them picks a language, and Enter opens the list (home.js).
+  const language = languageMenu({ className: 'bar__language', openOnKeys: false });
   const select = language.querySelector('select');
   if (select) select.dataset.nav = 'bar';
 
